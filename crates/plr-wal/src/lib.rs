@@ -11,5 +11,10 @@
 //! daemon and is never mocked here.
 
 pub mod crc32c;
+pub mod record;
 
 pub use crc32c::{crc32c, Crc32c};
+pub use record::{
+    Context, FanTarget, GcodeState, Heartbeat, HeaterTarget, Marker, MarkerKind, RecordKind,
+    StepChunk, StepperRange, TransformObservations, TrapqSegment, VirtualSdState, WalRecord,
+};
