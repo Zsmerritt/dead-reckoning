@@ -1,0 +1,6 @@
+# Keep rustfmt config minimal: defaults are good, and unstable options
+# error on stable toolchains.
+edition = "2021"
+# LF everywhere so diffs and Git Bash tooling behave identically on
+# Windows and Linux.
+newline_style = "Unix"

@@ -1,0 +1,7 @@
+# Normalize line endings: LF in the repo and in working trees.
+# Shell scripts and hooks MUST be LF or they break under sh/Git Bash.
+* text=auto eol=lf
+*.sh text eol=lf
+.githooks/* text eol=lf
+
+# Binary-ish assets (none yet) would be marked -text here.

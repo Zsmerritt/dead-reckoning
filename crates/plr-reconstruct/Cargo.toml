@@ -1,0 +1,12 @@
+[package]
+name = "plr-reconstruct"
+description = "Printer state reconstruction from a recovered write-ahead log"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[lints]
+workspace = true

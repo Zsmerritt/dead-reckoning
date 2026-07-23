@@ -1,0 +1,24 @@
+[package]
+name = "plrd"
+description = "The dead-reckoning daemon: Linux-only runtime for durable WAL I/O and Klipper integration"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tokio-tungstenite = { workspace = true }
+
+# Durability syscalls (fdatasync, O_DSYNC) are Linux-only by design and are
+# never mocked; keep rustix off non-Linux builds entirely.
+[target.'cfg(target_os = "linux")'.dependencies]
+rustix = { workspace = true }
+
+[lints]
+workspace = true

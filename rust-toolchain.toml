@@ -1,0 +1,4 @@
+[toolchain]
+# Pinned current stable (2026-07-14). Bump deliberately, in its own commit.
+channel = "1.97.1"
+components = ["rustfmt", "clippy", "llvm-tools-preview"]

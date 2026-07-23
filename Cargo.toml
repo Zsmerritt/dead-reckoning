@@ -1,0 +1,64 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/plr-analyzer",
+    "crates/plr-gcode",
+    "crates/plr-klipper",
+    "crates/plr-reconstruct",
+    "crates/plr-recovery",
+    "crates/plr-wal",
+    "crates/plrd",
+]
+# The pure-logic crates are cross-platform by construction, so a bare
+# `cargo test` / `cargo check` works everywhere (including Windows).
+# `plrd` is Linux-only and must be selected explicitly (`-p plrd` or
+# `--workspace`).
+default-members = [
+    "crates/plr-analyzer",
+    "crates/plr-gcode",
+    "crates/plr-klipper",
+    "crates/plr-reconstruct",
+    "crates/plr-recovery",
+    "crates/plr-wal",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.97"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/zsmerritt/dead-reckoning"
+
+# Single source of truth for dependency versions. Crates opt in with
+# `<dep>.workspace = true`; placeholder crates may carry zero deps for now.
+[workspace.dependencies]
+tokio = { version = "1.53.1", features = ["full"] }
+tokio-tungstenite = "0.30.0"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+thiserror = "2.0.19"
+rustix = { version = "1.1.4", features = ["fs"] }
+proptest = "1.11.0"
+
+# Inherited by every crate via `[lints] workspace = true`.
+# Warnings are promoted to errors only in the pre-commit hook and CI
+# (`-D warnings`), never here, so local iteration stays unblocked.
+[workspace.lints.rust]
+# Durability code must be auditable; if `plrd` ever needs unsafe (e.g. raw
+# fd plumbing) it gets a targeted, justified `#[allow]` at the site.
+unsafe_code = "deny"
+missing_docs = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+# Pedantic lints that are noise for this codebase, each justified:
+# Crates are prefixed `plr-`, so items like `wal::WalRecord` are idiomatic
+# here; renaming to satisfy the lint would hurt grep-ability.
+module_name_repetitions = "allow"
+# Error enums are documented at the type level via `thiserror` messages;
+# requiring an `# Errors` section on every fallible fn adds bulk, not info.
+missing_errors_doc = "allow"
+# Same rationale as `missing_errors_doc`: panics in this codebase are
+# programming errors (asserts/invariants), not API surface to document.
+missing_panics_doc = "allow"
