@@ -11,9 +11,16 @@
 //! daemon and is never mocked here.
 
 pub mod crc32c;
+pub mod frame;
 pub mod record;
 
+mod bytes;
+
 pub use crc32c::{crc32c, Crc32c};
+pub use frame::{
+    scan, scan_read, RecoveryScan, ScanEnd, ScannedRecord, SegmentHeader, WalError, WalReader,
+    WalWriter,
+};
 pub use record::{
     Context, FanTarget, GcodeState, Heartbeat, HeaterTarget, Marker, MarkerKind, RecordKind,
     StepChunk, StepperRange, TransformObservations, TrapqSegment, VirtualSdState, WalRecord,
