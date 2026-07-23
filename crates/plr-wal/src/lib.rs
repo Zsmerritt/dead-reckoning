@@ -1,30 +1,32 @@
 //! Append-only motion write-ahead log for power-loss recovery: record
 //! formats, encoding/decoding, and integrity checking for durable
-//! print-state journaling. Pure logic — no syscalls or I/O here; all
-//! durability I/O (fdatasync, `O_DSYNC`) lives in `plrd` and is never mocked.
+//! print-state journaling.
+//!
+//! # Pure logic, no I/O
+//!
+//! This crate performs **no syscalls and no file I/O**. Every API operates
+//! on byte slices, in-memory buffers, or caller-supplied
+//! [`std::io::Write`]/[`std::io::Read`] values. Durability — file handles,
+//! `fdatasync`, `O_DSYNC`, write ordering — is owned entirely by the `plrd`
+//! daemon and is never mocked here.
 
-/// One-line statement of this crate's purpose, used in diagnostics.
-pub const PURPOSE: &str = "motion write-ahead log record formats and integrity checks";
+pub mod crc32c;
+pub mod frame;
+pub mod heartbeat;
+pub mod record;
 
-/// Placeholder API: composes the crate's name and purpose.
-///
-/// Exists so the test harness, lints, and coverage gate exercise real code
-/// in this crate; feature APIs replace it.
-#[must_use]
-pub fn crate_summary() -> String {
-    let name = env!("CARGO_PKG_NAME");
-    format!("{name}: {PURPOSE}")
-}
+mod bytes;
 
-#[cfg(test)]
-mod tests {
-    use super::{crate_summary, PURPOSE};
-
-    #[test]
-    fn summary_is_name_prefixed_and_ends_with_purpose() {
-        let summary = crate_summary();
-        assert!(summary.starts_with("plr-wal: "));
-        assert!(summary.ends_with(PURPOSE));
-        assert_eq!(summary.len(), "plr-wal: ".len() + PURPOSE.len());
-    }
-}
+pub use crc32c::{crc32c, Crc32c};
+pub use frame::{
+    scan, scan_read, RecoveryScan, ScanEnd, ScannedRecord, SegmentHeader, WalError, WalReader,
+    WalWriter,
+};
+pub use heartbeat::{
+    decode_slot, encode_slot, recover_heartbeat, slot_for_sequence, HeartbeatError,
+    HeartbeatRecovery, SlotError, SlotId,
+};
+pub use record::{
+    Context, FanTarget, GcodeState, Heartbeat, HeaterTarget, Marker, MarkerKind, RecordKind,
+    StepChunk, StepperRange, TransformObservations, TrapqSegment, VirtualSdState, WalRecord,
+};

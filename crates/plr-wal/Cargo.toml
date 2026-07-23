@@ -8,5 +8,16 @@ license.workspace = true
 repository.workspace = true
 publish = false
 
+[dependencies]
+serde.workspace = true
+# float_roundtrip is load-bearing: without it serde_json's parser may
+# lose ULPs on f64s, and WAL payloads carry positions/velocities that
+# must survive encode/decode bit-for-bit (enforced by proptest).
+serde_json = { workspace = true, features = ["float_roundtrip"] }
+thiserror.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+
 [lints]
 workspace = true

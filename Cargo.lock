@@ -327,6 +327,12 @@ version = "0.1.0"
 [[package]]
 name = "plr-wal"
 version = "0.1.0"
+dependencies = [
+ "proptest",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
 
 [[package]]
 name = "plrd"
