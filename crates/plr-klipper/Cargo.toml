@@ -1,0 +1,12 @@
+[package]
+name = "plr-klipper"
+description = "Klipper/Moonraker API object model and protocol message parsing"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[lints]
+workspace = true

@@ -1,0 +1,12 @@
+[package]
+name = "plr-wal"
+description = "Motion write-ahead log record formats and integrity checks"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[lints]
+workspace = true
