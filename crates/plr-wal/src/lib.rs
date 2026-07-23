@@ -12,6 +12,7 @@
 
 pub mod crc32c;
 pub mod frame;
+pub mod heartbeat;
 pub mod record;
 
 mod bytes;
@@ -20,6 +21,10 @@ pub use crc32c::{crc32c, Crc32c};
 pub use frame::{
     scan, scan_read, RecoveryScan, ScanEnd, ScannedRecord, SegmentHeader, WalError, WalReader,
     WalWriter,
+};
+pub use heartbeat::{
+    decode_slot, encode_slot, recover_heartbeat, slot_for_sequence, HeartbeatError,
+    HeartbeatRecovery, SlotError, SlotId,
 };
 pub use record::{
     Context, FanTarget, GcodeState, Heartbeat, HeaterTarget, Marker, MarkerKind, RecordKind,

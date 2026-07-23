@@ -22,6 +22,13 @@ pub(crate) fn le_u64(bytes: &[u8], at: usize) -> Option<u64> {
     Some(u64::from_le_bytes(array))
 }
 
+/// Reads an `f64` stored as little-endian IEEE-754 bits at byte offset `at`.
+///
+/// Bit-exact: NaN payloads and signed zeros round-trip unchanged.
+pub(crate) fn le_f64(bytes: &[u8], at: usize) -> Option<f64> {
+    le_u64(bytes, at).map(f64::from_bits)
+}
+
 /// Copies `src` into `buf[at..at + src.len()]`.
 ///
 /// A no-op if the destination range does not fit inside `buf`; callers use
@@ -39,7 +46,7 @@ pub(crate) fn write_at(buf: &mut [u8], at: usize, src: &[u8]) {
 
 #[cfg(test)]
 mod tests {
-    use super::{le_u32, le_u64, write_at};
+    use super::{le_f64, le_u32, le_u64, write_at};
 
     #[test]
     fn le_u32_reads_in_bounds() {
@@ -67,6 +74,23 @@ mod tests {
         let bytes = [0_u8; 8];
         assert_eq!(le_u64(&bytes, 1), None);
         assert_eq!(le_u64(&bytes, usize::MAX), None);
+    }
+
+    #[test]
+    fn le_f64_is_bit_exact() {
+        let value = -0.0_f64;
+        let bytes = value.to_bits().to_le_bytes();
+        let read = le_f64(&bytes, 0).unwrap();
+        assert_eq!(read.to_bits(), value.to_bits());
+
+        let nan_bits = f64::NAN.to_bits() | 0xDEAD;
+        let bytes = nan_bits.to_le_bytes();
+        assert_eq!(le_f64(&bytes, 0).unwrap().to_bits(), nan_bits);
+    }
+
+    #[test]
+    fn le_f64_rejects_out_of_bounds() {
+        assert_eq!(le_f64(&[0_u8; 7], 0), None);
     }
 
     #[test]
