@@ -1,29 +1,46 @@
-//! Pure-logic model of the Klipper/Moonraker API: object schemas and
-//! protocol message parsing, with no Klipper patches required. No sockets
-//! or I/O here — the websocket transport lives in `plrd`.
+//! Pure-logic model of Klipper's Unix API socket protocol: wire framing,
+//! typed request construction, response/notification classification,
+//! typed status and motion-dump payloads, and clock-correlation math.
+//!
+//! No sockets and no I/O live here — the daemon (`plrd`) owns the
+//! transport and feeds received bytes into this crate.
+//!
+//! Every payload shape is grounded in the Klipper source; each type's
+//! documentation cites the file (relative to a Klipper checkout, e.g.
+//! `klippy/webhooks.py`) and function that emits it.
+//!
+//! # Typical receive path
+//!
+//! 1. Feed socket bytes into [`frame::FrameSplitter`] to recover
+//!    `0x03`-terminated frames.
+//! 2. Pass each frame to [`message::classify`] to obtain responses,
+//!    errors, or notifications.
+//! 3. Parse notification payloads with the typed helpers
+//!    ([`message::Notification::status_update`],
+//!    [`message::Notification::trapq_batch`], ...).
+//! 4. Correlate time axes with [`clock::ClockCorrelator`] /
+//!    [`clock::McuClock`], and widen `receive_seq` with
+//!    [`clock::ReceiveSeqWidener`].
 
-/// One-line statement of this crate's purpose, used in diagnostics.
-pub const PURPOSE: &str = "Klipper/Moonraker API object model and message parsing";
+pub mod clock;
+pub mod dump;
+pub mod error;
+pub mod frame;
+pub mod message;
+pub mod request;
+pub mod status;
 
-/// Placeholder API: composes the crate's name and purpose.
-///
-/// Exists so the test harness, lints, and coverage gate exercise real code
-/// in this crate; feature APIs replace it.
-#[must_use]
-pub fn crate_summary() -> String {
-    let name = env!("CARGO_PKG_NAME");
-    format!("{name}: {PURPOSE}")
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{crate_summary, PURPOSE};
-
-    #[test]
-    fn summary_is_name_prefixed_and_ends_with_purpose() {
-        let summary = crate_summary();
-        assert!(summary.starts_with("plr-klipper: "));
-        assert!(summary.ends_with(PURPOSE));
-        assert_eq!(summary.len(), "plr-klipper: ".len() + PURPOSE.len());
-    }
-}
+pub use clock::{ClockCorrelator, McuClock, ReceiveSeqWidener, SampleOutcome, SeqKind, SeqUpdate};
+pub use dump::{StepperBatch, StepperStep, TrapqBatch, TrapqMove};
+pub use error::{ClockError, EncodeError, MessageError};
+pub use frame::{FrameEvent, FrameSplitter, DEFAULT_MAX_FRAME_LEN, ETX};
+pub use message::{
+    classify, ApiError, DumpHeader, GcodeOutput, Inbound, InfoResponse, Notification,
+};
+pub use request::{Request, ResponseTemplate, SubscriptionObjects};
+pub use status::{
+    BedMeshStatus, ExcludeObjectDefinition, ExcludeObjectStatus, FanStatus, GcodeMoveStatus,
+    HeaterStatus, IdleTimeoutStatus, McuLastStats, McuStatus, ProbeStatus, SkewCorrectionStatus,
+    Status, StatusUpdate, ToolheadStatus, VirtualSdcardStatus, WebhooksStatus,
+    ZThermalAdjustStatus,
+};
