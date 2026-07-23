@@ -1,0 +1,47 @@
+#!/bin/sh
+# dead-reckoning pre-commit gate. Fail-fast, in order:
+#   1. cargo fmt --all --check
+#   2. cargo clippy (-D warnings; plrd included only on Linux)
+#   3. cargo test (workspace default members)
+#   4. scripts/coverage.sh (>=90% line coverage)
+#
+# Install with: sh scripts/setup-hooks.sh
+# POSIX sh only — this must run under Git Bash on Windows unchanged.
+set -u
+
+# Git GUI clients sometimes run hooks without the user's login PATH.
+if ! command -v cargo >/dev/null 2>&1 && [ -d "$HOME/.cargo/bin" ]; then
+    PATH="$HOME/.cargo/bin:$PATH"
+    export PATH
+fi
+
+banner() {
+    printf '\n=== pre-commit %s ===\n' "$1"
+}
+
+fail() {
+    printf '\npre-commit RESULT: FAIL (%s)\n' "$1" >&2
+    exit 1
+}
+
+case "$(uname -s)" in
+    Linux) clippy_scope="--workspace" ;;
+    # plrd is Linux-only; its clippy authority is the Linux CI job.
+    *) clippy_scope="--workspace --exclude plrd" ;;
+esac
+
+banner "1/4: cargo fmt --all --check"
+cargo fmt --all --check || fail "formatting — run 'cargo fmt --all'"
+
+banner "2/4: cargo clippy $clippy_scope --all-targets -- -D warnings"
+# $clippy_scope is intentionally word-split: it holds flags, not a path.
+# shellcheck disable=SC2086
+cargo clippy $clippy_scope --all-targets -- -D warnings || fail "clippy"
+
+banner "3/4: cargo test (default members)"
+cargo test || fail "tests"
+
+banner "4/4: coverage gate (scripts/coverage.sh)"
+sh scripts/coverage.sh || fail "coverage below threshold"
+
+printf '\npre-commit RESULT: PASS\n'
