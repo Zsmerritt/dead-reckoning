@@ -683,6 +683,23 @@ mod tests {
     }
 
     #[test]
+    fn json_float_roundtrip_is_ulp_exact() {
+        // Regression: without serde_json's `float_roundtrip` feature this
+        // value parses back one ULP off (-918209536388.2688). Positions
+        // and velocities must survive the WAL bit-for-bit.
+        let mut seg = sample_trapq();
+        seg.start_y = -918_209_536_388.268_9;
+        let record = WalRecord::TrapqSegment(seg);
+        let WalRecord::TrapqSegment(decoded) = roundtrip(&record) else {
+            panic!("variant changed in roundtrip");
+        };
+        assert_eq!(
+            decoded.start_y.to_bits(),
+            (-918_209_536_388.268_9_f64).to_bits()
+        );
+    }
+
+    #[test]
     fn record_json_carries_type_tag() {
         let json = serde_json::to_string(&WalRecord::Marker(sample_marker())).unwrap();
         assert!(json.contains(r#""type":"Marker""#), "{json}");
