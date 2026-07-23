@@ -11,6 +11,14 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
 
+# Toolchain policy: rust-toolchain.toml is the single source of truth for
+# the Rust version AND components (rustfmt, clippy, llvm-tools-preview).
+# Every job runs a bare `rustup toolchain install`, which reads that file,
+# so CI always uses exactly the toolchain developers run locally. Bump the
+# pin in rust-toolchain.toml only — CI follows automatically. (We avoid
+# toolchain-installing actions here because they export RUSTUP_TOOLCHAIN,
+# which would silently override the repo pin.)
+
 jobs:
   # Linux is the authority for plrd: lint the FULL workspace here.
   lint:
@@ -18,9 +26,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
+      - name: Install pinned toolchain (rust-toolchain.toml)
+        run: rustup toolchain install && rustup show
       - uses: Swatinem/rust-cache@v2
       - name: rustfmt
         run: cargo fmt --all --check
@@ -32,7 +39,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Install pinned toolchain (rust-toolchain.toml)
+        run: rustup toolchain install && rustup show
       - uses: Swatinem/rust-cache@v2
       - name: cargo test --workspace
         run: cargo test --workspace
@@ -42,7 +50,8 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Install pinned toolchain (rust-toolchain.toml)
+        run: rustup toolchain install; rustup show
       - uses: Swatinem/rust-cache@v2
       - name: cargo test (default members)
         run: cargo test
@@ -52,9 +61,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: llvm-tools-preview
+      # llvm-tools-preview comes from rust-toolchain.toml's components.
+      - name: Install pinned toolchain (rust-toolchain.toml)
+        run: rustup toolchain install && rustup show
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@v2
         with:
