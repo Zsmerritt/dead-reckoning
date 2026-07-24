@@ -1,9 +1,58 @@
 # Operations
 
-Day-2 usage of a deployed `plrd`: reading scan reports, disk expectations,
-the post-power-loss procedure for v1, and troubleshooting. Companion
-documents: [install](install.md) · [architecture](architecture.md) ·
+Day-2 usage of a deployed `plrd`: understanding its logs, reading scan
+reports, disk expectations, the post-power-loss procedure for v1, and
+troubleshooting. Companion documents: [install](install.md) ·
+[architecture](architecture.md) ·
 [worked example](../examples/recovery-walkthrough.md).
+
+## Understanding plrd's logs
+
+The daemon logs to stderr, which systemd routes to journald:
+
+```sh
+journalctl -u plrd -f        # follow live
+journalctl -u plrd -b -1     # the boot before this one (post-mortems)
+```
+
+Every line is prefixed `plrd:`. The complete catalog of messages the daemon
+emits, what each means, and what (if anything) to do:
+
+**Connection lifecycle** (normal operation — plrd is designed to wait for
+and outlive Klipper):
+
+| Message | Meaning / action |
+| --- | --- |
+| `cannot connect to <socket>: <err>; retrying in <t>` | Klipper is down or `klipper_socket` is wrong. Capped exponential backoff (250 ms → 8 s). Persistent while Klipper runs ⇒ fix the socket path ([troubleshooting](#troubleshooting)) |
+| `klippy state <state>; waiting for ready` | Connected, but klippy is still starting (or in error/shutdown); plrd polls `info` until `ready` before subscribing |
+| `klippy state changed to "<state>"` | The periodic info poll saw a transition. A `"shutdown"` here keeps the socket and subscriptions alive — motion just stops (the quiet-tail crash classification is built to read exactly this); a klippy `RESTART` instead drops the socket |
+| `klipper session ended: <err>` | The socket dropped. If subscriptions were live, a `SocketLost` marker is journaled (immediately durable), heartbeats pause (no liveness claim without a live socket), and plrd reconnects; the first successful resubscribe journals `Resubscribed` |
+
+**Data-quality warnings** (recording continues; the affected record is
+skipped and reconstruction sees an honest gap rather than wrong data):
+
+| Message | Meaning / action |
+| --- | --- |
+| `unparseable <route> payload: <err>` | A `dump_trapq`/`dump_stepper`/status notification did not match the expected shape. One-off: ignore. Every batch for one stepper: a format mismatch between plrd and your Klipper version — file a bug with the message. (This exact symptom — `invalid value: integer -40, expected u64` on every `dump_stepper` batch — was the field bug fixed by the signed-stepper change; upgrade if you see it) |
+| `initial status unparseable: <err>` | The first status snapshot after subscribing failed to parse; subsequent notifications still record |
+| `WAL record skipped: <err>` | A record was rejected at the writer (non-finite float from a confused Klipper, oversized payload). The log stays intact; the record is dropped loudly |
+| `unclassifiable frame: <err>` / `oversized frame discarded (<n> bytes)` | Protocol garbage on the socket; the frame is skipped |
+| `klipper error for request <id>: <err>` | Klipper returned an error to one of plrd's requests (e.g. a subscription to an object this printer lacks that errors instead of returning empty) |
+
+**Startup / fatal** (systemd restarts the service on every exit,
+`Restart=always`):
+
+| Message | Meaning / action |
+| --- | --- |
+| `cannot read config <path>` / `line <n>: <error>` | Config missing or invalid — unknown keys, duplicate keys, and out-of-range values are hard errors by design; the line number points at the offender. Exit 1 |
+| `sd_notify failed (continuing): <err>` | Not running under systemd (e.g. started by hand); harmless |
+| `client stopped: <err>` / `WAL service failed: <err>` / `WAL thread panicked` | Fatal runtime failure (a WAL I/O error lands here). Exit 1 → prompt restart; investigate the underlying disk error in the surrounding journal lines |
+
+The *durable* counterpart of the log is the WAL itself: lifecycle markers
+(`SocketLost`, `Resubscribed`, `SubscriptionGap`, `CleanShutdown`) are
+journal entries that survive power loss and are what reconstruction actually
+consumes — see [What markers mean](#what-markers-mean). The scan report is
+the tool for reading those.
 
 ## Reading `plrd scan` reports
 
@@ -243,6 +292,16 @@ without the mesh (first layers of the resumed region rely on the true-Z
 probe datum instead). If you want meshes restored after recovery, print
 with a named, saved mesh profile. Similarly, `SkewProfileUnknown` means
 skew was active but unnamed and is not restored.
+
+**Scan (or reconstruction) from an older build rejects records from a
+newer recorder's WAL.**
+Version skew across the stepper-signedness fix: newer WALs can contain
+negative step-chunk values (any Z lift emits negative counts) that a
+pre-fix reader refuses (symptom shape: `invalid value: integer -40,
+expected u64`). Older WALs remain readable by newer builds, but not the
+other way around — use a `plrd` at least as new as the recorder that wrote
+the WAL. See the
+[format compatibility note](architecture.md#stage-1--record).
 
 **Heartbeat reported `unrecoverable` by scan.**
 Both slots failed validation — the file is not a heartbeat file (wrong

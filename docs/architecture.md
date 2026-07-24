@@ -47,7 +47,7 @@ status subscription) and appends five record kinds to the WAL
 | Kind (tag) | Contents | Durability |
 | --- | --- | --- |
 | `TrapqSegment` (1) | One trapezoidal move segment per `dump_trapq` row: start position, direction ratios, velocity, acceleration, print-time span. Mirrors Klipper's `pull_move` exactly | batched |
-| `StepperRange` (2) | One `dump_stepper` batch per configured Z stepper: committed step chunks with raw MCU clocks — the source of the committed-motion boundary `t_b` | batched |
+| `StepperRange` (2) | One `dump_stepper` batch per configured Z stepper: committed step chunks with raw MCU clocks — the source of the committed-motion boundary `t_b`. Chunks are Klipper's *host-side* step-history rows (`struct pull_history_steps`), whose `interval`/`count`/`add` are all **signed** C `int`: the sign of `count` encodes step direction (negative = reverse; `0` marks a `set_position` row), and `interval` appears negative when a ≥ 2³¹-tick idle gap wraps — `plr-klipper`'s `StepperStep::interval_ticks()` / `steps()` / `is_set_position_marker()` recover the semantics | batched |
 | `Context` (3) | Print-context snapshot: `virtual_sdcard` file/offset, full `gcode_move` interpreter state, transform observations (bed mesh, `z_thermal_adjust`, skew), heater/fan targets | **immediate** |
 | `Marker` (4) | Lifecycle events: `CleanShutdown`, `SocketLost`, `Resubscribed`, `SubscriptionGap` | **immediate** |
 | `Heartbeat` (5) | Liveness + clock correlation: monotonic/wall time, latest print time, an (`est_sample_mono_ns`, `est_sample_print_time`) pair anchoring the print-time ↔ host-time correlation, and the WAL append offset | batched (1 Hz into the WAL; 10 Hz into the heartbeat file) |
@@ -55,6 +55,15 @@ status subscription) and appends five record kinds to the WAL
 Every record carries a host-monotonic capture timestamp. Records containing
 NaN or infinity are refused at the writer (JSON cannot round-trip them);
 finite floats round-trip bit-exactly (`serde_json` with `float_roundtrip`).
+
+**Format compatibility note (stepper signedness).** Step-chunk fields were
+originally typed as the unsigned MCU wire widths and are now the signed
+`i32` the dump actually emits. Chunks serialize as JSON integers, so WALs
+written by older recorders remain readable by current builds. The reverse
+is **not** true: WALs written by current recorders can contain negative
+`interval`/`count` values (any Z lift produces negative counts) that a
+pre-fix reader rejects — upgrade `plrd scan` binaries together with the
+recorder.
 
 ### WAL segment format (`plr-wal::frame`)
 

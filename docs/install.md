@@ -37,7 +37,8 @@ not just the first); walk the list **before** you rely on this system:
   (`;TYPE:Inner wall`, `;TYPE:WALL-INNER`, `;TYPE:Sparse infill`, …).
 - [ ] **Exactly one Tap-style `[probe]` or `[load_cell_probe]`.** The probe
   must trigger on nozzle contact (Voron Tap, load cell). Inductive-only
-  probes cannot reference the printed part and do not qualify.
+  probes cannot reference the printed part and do not qualify, and ADXL
+  "drag probing" is not supported yet (explicitly deferred).
 - [ ] **Probe `activate_gcode` / `deactivate_gcode` are empty or verified
   move-free.** A moving activate G-code would break the halt-position
   arithmetic.
@@ -87,7 +88,7 @@ the right toolchain automatically on first build.
 ### On the printer host (tested path)
 
 ```sh
-git clone https://github.com/zsmerritt/dead-reckoning.git
+git clone https://github.com/Zsmerritt/dead-reckoning.git
 cd dead-reckoning
 cargo build --release -p plrd
 ```

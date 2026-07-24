@@ -1,32 +1,120 @@
 # dead-reckoning
 
-Power-loss recovery (PLR) for Klipper 3D printers. When a printer loses power
-mid-print, dead-reckoning's daemon has already journaled the motion state to a
-durable write-ahead log; on restart it reconstructs the last known toolhead
-position, temperatures, and G-code file offset, and builds a plan to resume
-the print in place instead of scrapping it.
+**Power-loss recovery for Klipper 3D printers.** If your printer loses power
+twenty hours into a twenty-four-hour print, dead-reckoning lets you resume
+the print in place instead of throwing the part away.
 
-Two ideas anchor the design. First, a **motion WAL**: print progress is
-recorded append-only with real durability guarantees (`fdatasync` / `O_DSYNC`),
-so recovery works from what actually reached the disk, not from optimistic
-state. Second, **part-referenced Z probing**: after a power loss the true Z
-height is re-established by probing the printed part itself, so resume height
-does not depend on steppers that lost their reference. All of this works
-against Klipper's existing APIs — **no Klipper patches**.
+It works like a flight recorder. While you print, a small background service
+(`plrd`) runs on your printer's Linux host next to Klipper and continuously
+journals what the printer is doing — position, file progress, temperatures —
+to disk, in a way that survives having the power yanked mid-write. After a
+power loss, its tools read that journal back, work out where the print
+stopped, and build a step-by-step, checked recovery plan: re-find true Z by
+gently touching the *printed part itself* with the nozzle (so recovery does
+not depend on motors that lost their reference), re-heat, and resume from
+the right line of G-code. No Klipper patches, no custom firmware — it talks
+to Klipper's existing API socket.
 
-- **[docs/install.md](docs/install.md)** — commissioning checklist, building
-  and installing `plrd` on a Klipper host, first-run verification.
-- **[docs/architecture.md](docs/architecture.md)** — the WAL formats, the
-  reconstruction math, the possible-stop-set guarantee, the probe envelope,
-  and the recovery-plan trust model.
-- **[docs/operations.md](docs/operations.md)** — reading `plrd scan` reports,
-  disk sizing, what to do after a real power loss, troubleshooting.
-- **[examples/](examples/)** — a commented config for a Voron-style
-  moving-bed-Z printer, a systemd override, and an end-to-end
-  [recovery walkthrough](examples/recovery-walkthrough.md) with real tool
-  output.
+**Honest status (v1):** the recorder, the reconstruction, and the plan
+generator are implemented and tested. Automatic *execution* of a plan is
+deliberately not enabled yet — you inspect the generated plan and drive the
+recovery yourself. See [Project status](#project-status-v1).
 
-## How it works
+## Quick install
+
+Prerequisites: a moving-bed-Z printer that meets the
+[project requirements](#project-requirements), and a Linux host (e.g.
+Raspberry Pi) running Klipper.
+
+```sh
+git clone https://github.com/Zsmerritt/dead-reckoning.git
+cd dead-reckoning
+cargo build --release -p plrd
+sudo cp target/release/plrd /usr/local/bin/plrd
+sudo cp deploy/plrd.conf.example /etc/plrd.conf     # then edit — at minimum klipper_socket
+sudo cp deploy/plrd.service /etc/systemd/system/plrd.service
+sudo systemctl daemon-reload && sudo systemctl enable --now plrd
+```
+
+Then check it is recording (`systemctl status plrd`, WAL files appearing
+under `/var/lib/plrd/wal`) and, after any unclean stop, inspect what the
+journal knows:
+
+```sh
+plrd scan --wal /var/lib/plrd/wal
+```
+
+**The full guide — commissioning checklist, config editing, first-run
+verification, cross-compiling — is [docs/install.md](docs/install.md).**
+A complete worked example (record → power cut → scan → recovery plan) is
+[examples/recovery-walkthrough.md](examples/recovery-walkthrough.md).
+
+## Project requirements
+
+dead-reckoning targets a specific machine class and refuses to plan a
+recovery for anything else (`plr-recovery` validates all of this and reports
+every failed check). You need:
+
+- **A moving-bed-Z printer** (bed rises into a fixed gantry — Voron
+  2.4/Trident class). Recovery **never re-homes Z**; the whole safety story
+  is built around that.
+- **A nozzle-contact probe: a Tap-style `[probe]` or a
+  `[load_cell_probe]`** — required in v1. The probe must trigger on nozzle
+  contact so it can reference the printed part; inductive-only probes do not
+  qualify. **ADXL "drag probing" is NOT supported yet** (explicitly
+  deferred). Probe `activate_gcode`/`deactivate_gcode` must be empty or
+  verified move-free.
+- **`[force_move]` with `enable_force_move: True`** in `printer.cfg`.
+- **Self-locking Z leadscrews** (the bed must hold position unpowered) —
+  an operator attestation; software cannot check this.
+- **All Z steppers on the primary MCU** (multi-MCU Z is refused).
+- **Slicer `;TYPE:` feature annotations** in your G-code — OrcaSlicer and
+  PrusaSlicer (and SuperSlicer/Cura) emit them by default; recovery refuses
+  to pick a probe point without them.
+- **A known Z `position_min`** (or `[printer] minimum_z_position`) — it
+  anchors the probe envelope.
+- A Linux host for the daemon (the offline analysis tools run anywhere).
+
+Out of scope in v1: multi-extruder machines.
+
+## Configuration
+
+Two configs matter — the daemon's and Klipper's:
+
+- **`/etc/plrd.conf`** (flat `key = value`): every key, default, and valid
+  range is tabulated in
+  [docs/install.md → Editing /etc/plrd.conf](docs/install.md#editing-etcplrdconf).
+  A fully commented example for a Voron-style multi-Z machine:
+  [examples/plrd.conf](examples/plrd.conf). Most installs change only
+  `klipper_socket` and (multi-Z) `z_steppers`.
+- **`printer.cfg` prerequisites**: what each requirement above looks like in
+  your Klipper config, and where to find it —
+  [docs/install.md → Where each prerequisite lives](docs/install.md#where-each-prerequisite-lives).
+
+## Understanding the logs
+
+Two kinds of output tell you what the system is doing:
+
+- **Daemon logs** — `plrd` logs to stderr, which systemd routes to journald
+  (`journalctl -u plrd -f`). Every message the daemon emits (connect/backoff
+  lines, klippy state changes, unparseable-payload warnings, skipped
+  records) is cataloged in
+  [docs/operations.md → Understanding plrd's logs](docs/operations.md#understanding-plrds-logs).
+- **Scan reports** — `plrd scan` prints the post-mortem analysis; the
+  line-by-line field guide is
+  [docs/operations.md → Reading plrd scan reports](docs/operations.md#reading-plrd-scan-reports).
+
+---
+
+## How it works (the deeper detail)
+
+Two ideas anchor the design. First, a **motion WAL** (write-ahead log):
+print progress is recorded append-only with real durability guarantees
+(`fdatasync` / `O_DSYNC`), so recovery works from what actually reached the
+disk, not from optimistic state. Second, **part-referenced Z probing**:
+after a power loss the true Z height is re-established by probing the
+printed part itself, so resume height does not depend on steppers that lost
+their reference.
 
 ```mermaid
 flowchart LR
@@ -49,76 +137,15 @@ flowchart LR
     end
 ```
 
-While a print runs, `plrd` subscribes to Klipper's API socket and journals
-trapezoid-queue motion, committed Z-stepper steps, print-context snapshots
-(file offset, G-code interpreter state, transforms, heater/fan targets), and
-liveness heartbeats. Everything hits the disk under explicit durability rules
-(see [docs/architecture.md](docs/architecture.md#durability-rules)).
-
-After an unclean stop, the offline pipeline reconstructs not a point estimate
-but a **possible-stop set** — every state the machine can plausibly have
-stopped in — because Klipper's motion dumps batch at ~0.5 s and step
-generation runs ahead of execution, so the durable log can end before the
-machine actually stopped. The Z projection of that set is exact and
-enumerable; it sizes the **probe envelope** for a single, structurally
+After an unclean stop, the offline pipeline reconstructs not a point
+estimate but a **possible-stop set** — every state the machine can
+plausibly have stopped in — because Klipper's motion dumps batch at ~0.5 s
+and step generation runs ahead of execution, so the durable log can end
+before the machine actually stopped. The Z projection of that set is exact
+and enumerable; it sizes the **probe envelope** for a single, structurally
 bounded probe of the printed part that re-establishes true Z without ever
-re-homing Z.
-
-## Crate map
-
-| Crate | Kind | Purpose |
-| --- | --- | --- |
-| `plr-wal` | library, pure logic | Motion write-ahead log record formats, encoding/decoding, integrity checks |
-| `plr-klipper` | library, pure logic | Klipper API-socket object model and protocol message parsing (no sockets) |
-| `plr-gcode` | library, pure logic | G-code parsing, `gcode_move` state simulation, forward motion simulation |
-| `plr-reconstruct` | library, pure logic | Possible-stop-set reconstruction from a recovered WAL |
-| `plr-analyzer` | library, pure logic | Layer modeling, stop-point matching, contact-zone selection for the Z probe |
-| `plr-recovery` | library, pure logic | Machine-prerequisite validation, probe-envelope arithmetic, recovery-plan generation |
-| `plrd` | binary, Linux-only | The daemon: tokio, Unix sockets, durable WAL writes via rustix, systemd |
-
-The pure-logic crates are the workspace `default-members`, so a bare
-`cargo test` builds and tests exactly them on any OS. `plrd` compiles
-everywhere (`cargo check -p plrd`), but on non-Linux targets the daemon is a
-stub that prints an error and exits with code 3; the offline subcommands
-(`plrd scan`, `plrd version`) work on every platform.
-
-## Quick start
-
-Full install instructions (systemd, config, commissioning checklist):
-[docs/install.md](docs/install.md). The short version:
-
-```sh
-cargo build --release -p plrd
-sudo cp target/release/plrd /usr/local/bin/plrd
-sudo cp deploy/plrd.conf.example /etc/plrd.conf     # then edit
-sudo cp deploy/plrd.service /etc/systemd/system/plrd.service
-sudo systemctl daemon-reload && sudo systemctl enable --now plrd
-```
-
-After any unclean stop, inspect what the WAL knows (works on the printer or
-on any machine you copy the WAL directory to):
-
-```sh
-plrd scan --wal /var/lib/plrd/wal
-```
-
-```text
-plrd scan: /var/lib/plrd/wal
-segment 7 (/var/lib/plrd/wal/wal-000007.plr): 16 records (trapq 8, stepper 1, context 2, marker 0, heartbeat 5)
-  valid prefix ends at byte 4438: torn frame payload at end of log (expected after power loss: yes)
-heartbeat /var/lib/plrd/wal/heartbeat.bin: slot A seq 212 print_time 21.2000s wal_offset 4630
-...
-reconstruction: RECOVERY
-  crash class: host death or power loss (torn WAL tail: true)
-  stop window: t_a 21.2000s .. t_b 21.9500s (t_b source: ReceiveSeq)
-  Z candidates: 2
-    z [0.4000, 0.4000] mm  kind Plateau  provenance Wal  known true
-    ...
-```
-
-See [examples/recovery-walkthrough.md](examples/recovery-walkthrough.md) for
-the full report, line-by-line, and the recovery plan generated from a
-scenario like it.
+re-homing Z. The full story, including the on-disk formats and the math:
+[docs/architecture.md](docs/architecture.md).
 
 ## Safety guarantees — and their limits
 
@@ -155,6 +182,29 @@ summary, stated as honestly as the code states it:
   fallback** (vase mode, single wall, layer-only match…) rather than an
   unsafe automatic attempt.
 
+## Crate map
+
+The codebase is a Rust workspace split by *platform shape*, not by trait
+abstraction: pure-logic crates are cross-platform by construction, and all
+syscalls and I/O live in one Linux-only daemon crate. Durability code is
+**never mocked** — that is a hard project rule.
+
+| Crate | Kind | Purpose |
+| --- | --- | --- |
+| `plr-wal` | library, pure logic | Motion write-ahead log record formats, encoding/decoding, integrity checks |
+| `plr-klipper` | library, pure logic | Klipper API-socket object model and protocol message parsing (no sockets) |
+| `plr-gcode` | library, pure logic | G-code parsing, `gcode_move` state simulation, forward motion simulation |
+| `plr-reconstruct` | library, pure logic | Possible-stop-set reconstruction from a recovered WAL |
+| `plr-analyzer` | library, pure logic | Layer modeling, stop-point matching, contact-zone selection for the Z probe |
+| `plr-recovery` | library, pure logic | Machine-prerequisite validation, probe-envelope arithmetic, recovery-plan generation |
+| `plrd` | binary, Linux-only | The daemon: tokio, Unix sockets, durable WAL writes via rustix, systemd |
+
+The pure-logic crates are the workspace `default-members`, so a bare
+`cargo test` builds and tests exactly them on any OS. `plrd` compiles
+everywhere (`cargo check -p plrd`), but on non-Linux targets the daemon is a
+stub that prints an error and exits with code 3; the offline subcommands
+(`plrd scan`, `plrd version`) work on every platform.
+
 ## Project status (v1)
 
 Implemented and tested:
@@ -181,10 +231,12 @@ Deliberately **not** in v1:
   the recommended commissioning steps for any machine that intends to trust
   a recovery: see [docs/install.md](docs/install.md#commissioning-checklist).
 
-## Development setup
+## Local development setup
 
 Toolchain is pinned by `rust-toolchain.toml` (rustup installs it, plus
 rustfmt/clippy/llvm-tools, automatically on first `cargo` invocation).
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the contribution workflow and
+quality bar.
 
 ### Windows (native) — logic crates
 
@@ -218,7 +270,7 @@ order and fail-fast: `cargo fmt --all --check`, clippy with `-D warnings`
 (full workspace on Linux; `--exclude plrd` elsewhere), `cargo test`, and the
 coverage gate.
 
-## Tests, coverage, lints
+### Tests, coverage, lints
 
 ```sh
 cargo test                               # pure-logic crates (any OS)
@@ -239,5 +291,23 @@ Test fixtures live in `fixtures/synthetic/` (checked in, exercised by the
 sliced `.gcode` files there; the fixture tests auto-discover them and run the
 full parse + simulate + Z-scan pipeline over each).
 
-CI (`.github/workflows/ci.yml`) runs on push/PR: full-workspace lint and
-tests on Linux, default-member tests on Windows, and the coverage gate.
+CI ([`.github/workflows/ci.yml`](.github/workflows/ci.yml),
+[runs](https://github.com/Zsmerritt/dead-reckoning/actions)) executes on
+push/PR: full-workspace lint and tests on Linux, default-member tests on
+Windows, and the coverage gate.
+
+## License
+
+Licensed under either of
+
+- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE) or
+  <http://www.apache.org/licenses/LICENSE-2.0>)
+- MIT license ([LICENSE-MIT](LICENSE-MIT) or
+  <http://opensource.org/licenses/MIT>)
+
+at your option.
+
+Unless you explicitly state otherwise, any contribution intentionally
+submitted for inclusion in the work by you, as defined in the Apache-2.0
+license, shall be dual licensed as above, without any additional terms or
+conditions.
