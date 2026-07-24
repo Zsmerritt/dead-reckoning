@@ -100,7 +100,8 @@ pub use error::{ContextDefect, ReconstructError};
 pub use exclude::{
     parse_object_definitions, point_in_polygon, resolve_exclusions, ExclusionConfirmation,
     ExclusionDiagnostic, ExclusionFreshness, ExclusionInputs, ExclusionProvenance, ExclusionReport,
-    FileObjectScan, ObjectKnowledge, ObjectState, UncertaintyCause, EDGE_TOLERANCE_MM,
+    FileObjectScan, HeartbeatCoverage, ObjectKnowledge, ObjectState, UncertaintyCause,
+    EDGE_TOLERANCE_MM,
 };
 pub use reconstruct::{reconstruct, ReconstructInputs, Reconstruction, RecoveryReconstruction};
 pub use stopset::{

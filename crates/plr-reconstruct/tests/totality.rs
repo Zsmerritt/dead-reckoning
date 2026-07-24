@@ -267,6 +267,11 @@ fn any_config() -> impl Strategy<Value = ReconstructConfig> {
             max_processing_lead: lead,
             extension_horizon: horizon,
             exclusion_freshness_horizon: horizon,
+            // Hostile but in-domain: 0 would fail validation, so the
+            // period is any positive tick count and the tolerance any
+            // multiplier >= 1.
+            heartbeat_period_ns: 1,
+            heartbeat_gap_tolerance: 1.0,
             z_merge_tolerance: tol,
             sim: SimConfig {
                 max_velocity: sim[0],

@@ -35,8 +35,50 @@
 //! subscription gap, socket loss, resubscribe, or
 //! [`plr_wal::MarkerKind::ExclusionUpdateLost`] marker postdates the
 //! newest exclude-bearing context, when the log's durable tail did not
-//! end cleanly, or when the freshness gap exceeds
-//! [`ReconstructConfig::exclusion_freshness_horizon`].
+//! end cleanly, or when the knowledge is stale by the rule below.
+//!
+//! # Freshness: heartbeats separate a dwell from a stall
+//!
+//! Age alone is the wrong test. While the printer *dwells* — heating,
+//! waiting, a long `G4` — no context is written at all, so the raw gap
+//! grows without anything having gone unrecorded. Judging on the gap
+//! would prompt on every long dwell; judging on "the newest context of
+//! any kind" would let a genuinely stalled recorder pass.
+//!
+//! The discriminator is the **heartbeat**, written at a fixed cadence
+//! (~10 Hz) independently of every other record and already the liveness
+//! proof behind `t_a`. Because a cancellation *always* forces an
+//! immediate context:
+//!
+//! * continuous heartbeats across the silent span ⇒ the recorder was
+//!   demonstrably alive and journaled no cancellation, so the silence is
+//!   **evidence of absence**. Fresh, however long the dwell.
+//! * a hole in the heartbeat stream ⇒ the recorder was stalled or dead
+//!   there and a cancellation could have been missed:
+//!   [`UncertaintyCause::HeartbeatGap`] with the hole's span.
+//! * no heartbeat evidence at all ⇒ liveness is unestablished; fall back
+//!   to raw age against
+//!   [`ReconstructConfig::exclusion_freshness_horizon`]
+//!   ([`UncertaintyCause::Stale`]).
+//!
+//! A gap inside the horizon skips the check entirely — the recorder's
+//! own cadence explains it. Holes are measured against
+//! `heartbeat_period_ns * heartbeat_gap_tolerance`, both configured, so
+//! nothing here assumes 10 Hz. The same "later knowledge supersedes an
+//! earlier event" rule applies as for markers: a heartbeat hole that
+//! predates the exclusion observation is irrelevant.
+//!
+//! # Sizing a torn tail
+//!
+//! A torn tail is the *normal* shape of a power-loss log, so
+//! [`UncertaintyCause::LogTailIncomplete`] would prompt on every real
+//! recovery of a plate with objects. It therefore carries
+//! `lost_window_s`: the print-time span between the newest durable
+//! record and the end of the evaluation window — the interval in which a
+//! cancellation would not have been journaled. A consumer can tier on it
+//! (0.2 s is an advisory; several seconds is not). This crate reports
+//! the number and takes no position on the threshold; the policy belongs
+//! to the consumer.
 //!
 //! # Confirmation is per-object, structurally
 //!
@@ -75,7 +117,7 @@
 //! including NaN coordinates and degenerate rings (property-tested).
 
 use plr_gcode::{parse_line, ByteSpan};
-use plr_wal::{ExcludeObjectDef, MarkerKind, PolygonFidelity, ScanEnd};
+use plr_wal::{ExcludeObjectDef, Heartbeat, MarkerKind, PolygonFidelity, ScanEnd};
 
 use crate::config::ReconstructConfig;
 use crate::stopset::FileTail;
@@ -114,21 +156,66 @@ pub enum ExclusionProvenance {
     Unknown,
 }
 
+/// Whether the recorder proved itself alive across the span between the
+/// newest exclusion observation and the end of the stop window.
+///
+/// This is the discriminator that separates the two silences: a
+/// cancellation always forces an immediate context, so if the daemon was
+/// demonstrably alive across a silent span, the absence of an exclusion
+/// context is *evidence of absence* — nothing was cancelled — no matter
+/// how long the span. If the heartbeats stop too, the recorder was
+/// stalled or dead and we genuinely do not know.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HeartbeatCoverage {
+    /// Heartbeats span the whole gap with no hole longer than
+    /// `heartbeat_period_ns * heartbeat_gap_tolerance`: the recorder was
+    /// continuously alive and journaled no cancellation.
+    Continuous,
+    /// Coverage breaks here — the largest hole found in the span. The
+    /// recorder may have missed a cancellation inside it.
+    Interrupted {
+        /// Host-monotonic start of the hole (ns).
+        start_mono_ns: u64,
+        /// Host-monotonic end of the hole (ns).
+        end_mono_ns: u64,
+    },
+    /// No heartbeat evidence covers the span at all, so liveness cannot
+    /// be established either way.
+    Absent,
+    /// The span could not be placed on the host-monotonic axis (the
+    /// clock correlation could not map the window end), so coverage was
+    /// not evaluated.
+    Unevaluated,
+}
+
+impl HeartbeatCoverage {
+    /// `true` only for [`Continuous`](Self::Continuous) — the one state
+    /// that turns a long silence into evidence of absence.
+    #[must_use]
+    pub const fn proves_liveness(self) -> bool {
+        matches!(self, Self::Continuous)
+    }
+}
+
 /// How current the journaled exclusion knowledge is, relative to the end
 /// of the reconstruction's stop window.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ExclusionFreshness {
     /// Exclusion state was durable `gap_s` seconds of print time before
-    /// the end of the stop window. A healthy recovery shows a small
-    /// positive number: contexts refresh at most once per
-    /// `POSITION_CONTEXT_MIN_NS` (1 s) while printing, dump batching
-    /// adds ~0.5 s, and the stop window deliberately extends past the
-    /// last context by the planning/extension lead.
+    /// the end of the stop window, with the given liveness coverage over
+    /// that span. A healthy recovery shows a small positive `gap_s`:
+    /// contexts refresh at most once per `POSITION_CONTEXT_MIN_NS` (1 s)
+    /// while printing, dump batching adds ~0.5 s, and the stop window
+    /// deliberately extends past the last context by the
+    /// planning/extension lead. A *large* `gap_s` is only a problem when
+    /// `coverage` fails to prove the recorder was alive through it.
     Known {
         /// Print-time seconds between the newest journaled exclusion
         /// state and the end of the stop window. Negative values (the
         /// observation postdates the window) are clamped to `0.0`.
         gap_s: f64,
+        /// Whether the recorder proved itself alive across that span.
+        coverage: HeartbeatCoverage,
     },
     /// An observation exists but could not be placed on the print-time
     /// axis (no stop window supplied, or the clock correlation could not
@@ -178,12 +265,35 @@ pub enum UncertaintyCause {
     /// The WAL's durable tail did not end cleanly, which is the normal
     /// shape of a power-loss log: records after the truncation point —
     /// possibly including a cancellation — never became durable.
+    ///
+    /// `lost_window_s` sizes the exposure so a consumer can **tier** it:
+    /// "a cancellation in the final 0.2 s would not have been recorded"
+    /// is an advisory, a multi-second hole is not. This crate
+    /// deliberately does not pick the threshold — it reports the number
+    /// and the consumer owns the policy.
     LogTailIncomplete {
         /// How the recovery scan stopped.
         scan_end: ScanEnd,
+        /// Print-time seconds between the newest durable record of any
+        /// kind and the end of the reconstruction's evaluation span —
+        /// the interval in which a cancellation would not have been
+        /// journaled. `None` when the span could not be placed on the
+        /// print-time axis. Clamped at `0.0`.
+        lost_window_s: Option<f64>,
     },
-    /// Exclusion knowledge is older than the configured horizon, so a
-    /// cancellation in the unrecorded interval cannot be ruled out.
+    /// The recorder's liveness proof breaks between the newest exclusion
+    /// observation and the end of the window: heartbeats stop, so the
+    /// silence is a stalled recorder rather than evidence that nothing
+    /// was cancelled.
+    HeartbeatGap {
+        /// Host-monotonic start of the hole (ns).
+        start_mono_ns: u64,
+        /// Host-monotonic end of the hole (ns).
+        end_mono_ns: u64,
+    },
+    /// Exclusion knowledge is older than the configured horizon **and**
+    /// no heartbeat evidence covers the interval, so a cancellation in
+    /// it cannot be ruled out.
     Stale {
         /// The measured freshness gap, print-time seconds.
         gap_s: f64,
@@ -626,7 +736,7 @@ pub fn resolve_exclusions(
         .map(|tail| parse_object_definitions(tail.bytes));
 
     let mut report = match journaled {
-        Some(state) => journaled_report(state, file_scan.as_ref(), inputs),
+        Some(state) => journaled_report(state, file_scan.as_ref(), timeline, inputs, config),
         None => match file_scan {
             // Diagnostics are appended uniformly below; the standalone
             // `unknown()` constructor carries its own for callers that
@@ -673,13 +783,14 @@ pub fn resolve_exclusions(
     // Uncertainty first — it decides whether a prompt is needed — then
     // the geometry notes gathered while assembling the report.
     let at_risk = report.at_risk();
-    let mut diagnostics: Vec<ExclusionDiagnostic> = uncertainty_causes(&report, timeline, config)
-        .into_iter()
-        .map(|cause| ExclusionDiagnostic::ExclusionStateUncertain {
-            cause,
-            at_risk: at_risk.clone(),
-        })
-        .collect();
+    let mut diagnostics: Vec<ExclusionDiagnostic> =
+        uncertainty_causes(&report, timeline, inputs, config)
+            .into_iter()
+            .map(|cause| ExclusionDiagnostic::ExclusionStateUncertain {
+                cause,
+                at_risk: at_risk.clone(),
+            })
+            .collect();
     diagnostics.append(&mut report.diagnostics);
     report.diagnostics = diagnostics;
     report
@@ -689,6 +800,7 @@ pub fn resolve_exclusions(
 fn uncertainty_causes(
     report: &ExclusionReport,
     timeline: &WalTimeline,
+    inputs: &ExclusionInputs<'_>,
     config: &ReconstructConfig,
 ) -> Vec<UncertaintyCause> {
     let mut causes = Vec::new();
@@ -755,22 +867,169 @@ fn uncertainty_causes(
     if timeline.scan_end != ScanEnd::CleanEof {
         causes.push(UncertaintyCause::LogTailIncomplete {
             scan_end: timeline.scan_end.clone(),
+            lost_window_s: lost_tail_window_s(timeline, inputs),
         });
     }
 
     match report.freshness {
-        ExclusionFreshness::Known { gap_s } if gap_s > config.exclusion_freshness_horizon => {
-            causes.push(UncertaintyCause::Stale {
-                gap_s,
-                horizon_s: config.exclusion_freshness_horizon,
-            });
-        }
-        ExclusionFreshness::Known { .. } => {}
+        // A gap inside the horizon needs no liveness proof: the
+        // recorder's own cadence explains it.
+        ExclusionFreshness::Known { gap_s, .. } if gap_s <= config.exclusion_freshness_horizon => {}
+        // Beyond the horizon, continuous heartbeats turn the silence
+        // into evidence of absence — a cancellation would have forced an
+        // immediate context, and the daemon was demonstrably alive and
+        // wrote none. A long dwell lands here.
+        ExclusionFreshness::Known { coverage, .. } if coverage.proves_liveness() => {}
+        ExclusionFreshness::Known {
+            coverage:
+                HeartbeatCoverage::Interrupted {
+                    start_mono_ns,
+                    end_mono_ns,
+                },
+            ..
+        } => causes.push(UncertaintyCause::HeartbeatGap {
+            start_mono_ns,
+            end_mono_ns,
+        }),
+        // Coverage missing or unevaluable: fall back to the raw age.
+        ExclusionFreshness::Known { gap_s, .. } => causes.push(UncertaintyCause::Stale {
+            gap_s,
+            horizon_s: config.exclusion_freshness_horizon,
+        }),
         ExclusionFreshness::Unknown | ExclusionFreshness::NoObservation => {
             causes.push(UncertaintyCause::FreshnessUnknown);
         }
     }
     causes
+}
+
+/// Print-time seconds between the newest durable record of any kind and
+/// the end of the evaluation span — the interval a torn tail cost us.
+fn lost_tail_window_s(timeline: &WalTimeline, inputs: &ExclusionInputs<'_>) -> Option<f64> {
+    let last_durable = last_durable_mono_ns(timeline)?;
+    let window = inputs.window?;
+    let end = inputs.stop_end_print_time.filter(|pt| pt.is_finite())?;
+    let last = window
+        .mono_ns_to_print_time(last_durable)
+        .filter(|pt| pt.is_finite())?;
+    Some((end - last).max(0.0))
+}
+
+/// Host-monotonic timestamp of the newest record of any kind the durable
+/// prefix contains.
+fn last_durable_mono_ns(timeline: &WalTimeline) -> Option<u64> {
+    [
+        timeline.last_motion_mono_ns,
+        timeline.contexts.last().map(|c| c.mono_ns),
+        timeline.markers.last().map(|m| m.mono_ns),
+        timeline.heartbeats.last().map(|hb| hb.mono_ns),
+    ]
+    .into_iter()
+    .flatten()
+    .max()
+}
+
+/// Liveness coverage from the exclusion observation to the end of the
+/// evaluation span, mapped back onto the host-monotonic axis.
+fn coverage_to_window_end(
+    timeline: &WalTimeline,
+    inputs: &ExclusionInputs<'_>,
+    config: &ReconstructConfig,
+    observed_mono_ns: u64,
+    stop_end_print_time: f64,
+) -> HeartbeatCoverage {
+    let Some(window) = inputs.window else {
+        return HeartbeatCoverage::Unevaluated;
+    };
+    let Some(end_ns) = window
+        .correlation
+        .print_time_to_eventtime(stop_end_print_time)
+        .and_then(seconds_to_ns)
+    else {
+        return HeartbeatCoverage::Unevaluated;
+    };
+    #[allow(
+        clippy::cast_precision_loss,
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss
+    )]
+    let max_gap_ns = (config.heartbeat_period_ns as f64 * config.heartbeat_gap_tolerance)
+        .clamp(0.0, u64::MAX as f64) as u64;
+    heartbeat_coverage(&timeline.heartbeats, observed_mono_ns, end_ns, max_gap_ns)
+}
+
+/// Host-monotonic seconds to nanoseconds; `None` outside the
+/// representable range (the same guard the recorder applies).
+fn seconds_to_ns(seconds: f64) -> Option<u64> {
+    if !seconds.is_finite() || seconds < 0.0 {
+        return None;
+    }
+    let ns = seconds * 1e9;
+    #[allow(clippy::cast_precision_loss)]
+    let limit = (1_u64 << 63) as f64;
+    if ns >= limit {
+        return None;
+    }
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    Some(ns as u64)
+}
+
+/// Classifies the recorder's liveness across `[from_mono_ns, to_mono_ns]`
+/// from the heartbeat stream.
+///
+/// Heartbeats are emitted on a fixed cadence independently of any other
+/// record, so a hole longer than `max_gap_ns` means the recorder was not
+/// running — the only state in which a cancellation could have happened
+/// without leaving a context behind.
+fn heartbeat_coverage(
+    heartbeats: &[Heartbeat],
+    from_mono_ns: u64,
+    to_mono_ns: u64,
+    max_gap_ns: u64,
+) -> HeartbeatCoverage {
+    if to_mono_ns <= from_mono_ns {
+        return HeartbeatCoverage::Continuous;
+    }
+    // Samples bounding the span: the last one at or before the start
+    // anchors coverage, everything up to the end extends it.
+    let anchor = heartbeats
+        .iter()
+        .rev()
+        .find(|hb| hb.mono_ns <= from_mono_ns)
+        .map(|hb| hb.mono_ns);
+    let inside: Vec<u64> = heartbeats
+        .iter()
+        .map(|hb| hb.mono_ns)
+        .filter(|mono| *mono > from_mono_ns && *mono <= to_mono_ns)
+        .collect();
+    if anchor.is_none() && inside.is_empty() {
+        return HeartbeatCoverage::Absent;
+    }
+    // Walk the span, tracking the largest hole; `cursor` is the last
+    // instant liveness is proven to.
+    let mut cursor = anchor.unwrap_or(from_mono_ns);
+    let mut worst: Option<(u64, u64)> = None;
+    for mono in inside {
+        note_hole(cursor, mono, max_gap_ns, &mut worst);
+        cursor = mono;
+    }
+    note_hole(cursor, to_mono_ns, max_gap_ns, &mut worst);
+    match worst {
+        None => HeartbeatCoverage::Continuous,
+        Some((start_mono_ns, end_mono_ns)) => HeartbeatCoverage::Interrupted {
+            start_mono_ns,
+            end_mono_ns,
+        },
+    }
+}
+
+/// Records `[start, end]` as the worst coverage hole when it exceeds the
+/// tolerance and beats the incumbent.
+fn note_hole(start: u64, end: u64, max_gap_ns: u64, worst: &mut Option<(u64, u64)>) {
+    let hole = end.saturating_sub(start);
+    if hole > max_gap_ns && worst.is_none_or(|(ws, we)| hole > we.saturating_sub(ws)) {
+        *worst = Some((start, end));
+    }
 }
 
 /// The merged exclude state carried by the WAL's contexts.
@@ -818,7 +1077,9 @@ fn journaled_state(timeline: &WalTimeline) -> Option<JournaledState> {
 fn journaled_report(
     state: JournaledState,
     file_scan: Option<&FileObjectScan>,
+    timeline: &WalTimeline,
     inputs: &ExclusionInputs<'_>,
+    config: &ReconstructConfig,
 ) -> ExclusionReport {
     let observed_print_time = inputs
         .window
@@ -827,6 +1088,7 @@ fn journaled_report(
     let freshness = match (observed_print_time, inputs.stop_end_print_time) {
         (Some(observed), Some(end)) if end.is_finite() => ExclusionFreshness::Known {
             gap_s: (end - observed).max(0.0),
+            coverage: coverage_to_window_end(timeline, inputs, config, state.observed_mono_ns, end),
         },
         _ => ExclusionFreshness::Unknown,
     };
@@ -1157,9 +1419,9 @@ mod tests {
     };
 
     use super::{
-        parse_object_definitions, point_in_polygon, resolve_exclusions, ExcludeObjectDef,
-        ExclusionDiagnostic, ExclusionFreshness, ExclusionInputs, ExclusionProvenance,
-        ExclusionReport, ObjectKnowledge, UncertaintyCause,
+        heartbeat_coverage, parse_object_definitions, point_in_polygon, resolve_exclusions,
+        ExcludeObjectDef, ExclusionDiagnostic, ExclusionFreshness, ExclusionInputs,
+        ExclusionProvenance, ExclusionReport, HeartbeatCoverage, ObjectKnowledge, UncertaintyCause,
     };
     use crate::config::ReconstructConfig;
     use crate::stopset::FileTail;
@@ -1206,6 +1468,18 @@ mod tests {
         markers: &[(u64, MarkerKind)],
         end: ScanEnd,
     ) -> WalTimeline {
+        timeline_with_beats(context_mono_ns, exclude, markers, end, &[])
+    }
+
+    /// As [`timeline_with_markers`], plus explicit heartbeat instants
+    /// (host-monotonic ns) proving the recorder was alive at each.
+    fn timeline_with_beats(
+        context_mono_ns: u64,
+        exclude: ExcludeState,
+        markers: &[(u64, MarkerKind)],
+        end: ScanEnd,
+        beats_mono_ns: &[u64],
+    ) -> WalTimeline {
         let mut context = context_at(context_mono_ns, 0);
         context.exclude = Some(Box::new(exclude));
         let mut records = vec![WalRecord::Context(context)];
@@ -1215,9 +1489,22 @@ mod tests {
                 kind: kind.clone(),
             }));
         }
+        for mono_ns in beats_mono_ns {
+            // 1 s of print time per 1 s of mono time (see `heartbeat_at`),
+            // so a mono instant maps to the same number in seconds.
+            #[allow(clippy::cast_precision_loss)]
+            let print_time = *mono_ns as f64 / 1e9;
+            records.push(WalRecord::Heartbeat(heartbeat_at(*mono_ns, print_time)));
+        }
         let mut scan = scan_of(records);
         scan.end = end;
         ingest(&scan, None)
+    }
+
+    /// Heartbeat instants every 100 ms across `[from_ns, to_ns]`.
+    fn beats(from_ns: u64, to_ns: u64) -> Vec<u64> {
+        const PERIOD_NS: usize = 100_000_000;
+        (from_ns..=to_ns).step_by(PERIOD_NS).collect()
     }
 
     fn tail(bytes: &[u8]) -> FileTail<'_> {
@@ -1294,7 +1581,13 @@ EXCLUDE_OBJECT_END NAME=Cube_id_0_copy_0\n";
         assert_eq!(report.provenance(), ExclusionProvenance::Journaled);
         assert_eq!(report.excluded(), ["A".to_owned()]);
         assert_eq!(report.observed_mono_ns(), Some(1_000_000_000));
-        assert_eq!(report.freshness(), ExclusionFreshness::Known { gap_s: 0.5 });
+        assert_eq!(
+            report.freshness(),
+            ExclusionFreshness::Known {
+                gap_s: 0.5,
+                coverage: HeartbeatCoverage::Absent,
+            }
+        );
         assert!(report.is_conclusive());
         assert!(!report.requires_operator_confirmation());
         assert_eq!(report.uncertainty_causes(), Vec::<&UncertaintyCause>::new());
@@ -1511,10 +1804,13 @@ G1 X10 Y10 F3000
             let window = window_for(1_000_000_000, 10.0);
             let report = resolve(&timeline, &window, 10.5, None);
             assert!(!report.is_conclusive(), "{end:?} must not be conclusive");
-            assert_eq!(
-                report.uncertainty_causes(),
-                vec![&UncertaintyCause::LogTailIncomplete { scan_end: end }]
-            );
+            assert!(matches!(
+                report.uncertainty_causes().as_slice(),
+                [UncertaintyCause::LogTailIncomplete {
+                    scan_end: reported,
+                    lost_window_s: Some(_),
+                }] if *reported == end
+            ));
         }
     }
 
@@ -1526,7 +1822,10 @@ G1 X10 Y10 F3000
         let report = resolve(&timeline, &window, 40.0, None);
         assert_eq!(
             report.freshness(),
-            ExclusionFreshness::Known { gap_s: 30.0 }
+            ExclusionFreshness::Known {
+                gap_s: 30.0,
+                coverage: HeartbeatCoverage::Absent,
+            }
         );
         assert!(!report.is_conclusive());
         assert_eq!(
@@ -1569,10 +1868,19 @@ G1 X10 Y10 F3000
             report.uncertainty_causes(),
             vec![&UncertaintyCause::FreshnessUnknown]
         );
-        // A negative gap (observation after the window end) clamps.
+        // A negative gap (observation after the window end) clamps, and
+        // a window end that cannot be mapped back onto the monotonic
+        // axis leaves coverage unevaluated rather than assumed.
         let window = window_for(1_000, 10.0);
         let report = resolve(&timeline, &window, -100.0, None);
-        assert_eq!(report.freshness(), ExclusionFreshness::Known { gap_s: 0.0 });
+        assert_eq!(
+            report.freshness(),
+            ExclusionFreshness::Known {
+                gap_s: 0.0,
+                coverage: HeartbeatCoverage::Unevaluated,
+            }
+        );
+        assert!(report.is_conclusive(), "a zero gap needs no liveness proof");
     }
 
     #[test]
@@ -1600,6 +1908,270 @@ G1 X10 Y10 F3000
             UncertaintyCause::LogTailIncomplete { .. }
         ));
         assert!(matches!(causes[3], UncertaintyCause::Stale { .. }));
+    }
+
+    // --- freshness: dwell vs stall ----------------------------------
+
+    #[test]
+    fn a_long_dwell_with_continuous_heartbeats_stays_conclusive() {
+        // Heating, waiting, a long G4: no context is written for a full
+        // minute, so the raw gap dwarfs the 5 s horizon. But a
+        // cancellation would have forced an immediate context, and the
+        // recorder proved itself alive at 10 Hz throughout — so the
+        // silence is evidence of absence, not ignorance.
+        let observed = 1_000_000_000;
+        let end = 61_000_000_000;
+        let timeline = timeline_with_beats(
+            observed,
+            exclude_state(Some(vec![square("A", 100.0, 100.0)]), &[]),
+            &[],
+            ScanEnd::CleanEof,
+            &beats(observed, end),
+        );
+        let window = window_for(observed, 1.0);
+        let report = resolve(&timeline, &window, 61.0, None);
+        assert_eq!(
+            report.freshness(),
+            ExclusionFreshness::Known {
+                gap_s: 60.0,
+                coverage: HeartbeatCoverage::Continuous,
+            }
+        );
+        assert!(
+            report.is_conclusive(),
+            "a 60 s dwell with unbroken liveness must not prompt: {:?}",
+            report.uncertainty_causes()
+        );
+    }
+
+    #[test]
+    fn a_recorder_stall_names_the_heartbeat_hole() {
+        // Same 60 s silence, but the heartbeats stop for 30 s in the
+        // middle: the recorder was not running, so a cancellation could
+        // have happened without leaving a context.
+        let observed = 1_000_000_000;
+        let end = 61_000_000_000;
+        let mut instants = beats(observed, 20_000_000_000);
+        instants.extend(beats(50_000_000_000, end));
+        let timeline = timeline_with_beats(
+            observed,
+            exclude_state(Some(vec![square("A", 100.0, 100.0)]), &[]),
+            &[],
+            ScanEnd::CleanEof,
+            &instants,
+        );
+        let window = window_for(observed, 1.0);
+        let report = resolve(&timeline, &window, 61.0, None);
+        assert!(!report.is_conclusive());
+        assert_eq!(
+            report.uncertainty_causes(),
+            vec![&UncertaintyCause::HeartbeatGap {
+                start_mono_ns: 20_000_000_000,
+                end_mono_ns: 50_000_000_000,
+            }]
+        );
+        assert!(matches!(
+            report.freshness(),
+            ExclusionFreshness::Known {
+                coverage: HeartbeatCoverage::Interrupted { .. },
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn a_heartbeat_hole_before_the_observation_is_irrelevant() {
+        // Later knowledge supersedes an earlier hole — the same rule
+        // already applied to markers.
+        let observed = 40_000_000_000;
+        let end = 100_000_000_000;
+        let mut instants = beats(1_000_000_000, 5_000_000_000);
+        // 35 s of silence, then the exclusion observation, then
+        // unbroken coverage to the end of the window.
+        instants.extend(beats(observed, end));
+        let timeline = timeline_with_beats(
+            observed,
+            exclude_state(Some(vec![square("A", 100.0, 100.0)]), &[]),
+            &[],
+            ScanEnd::CleanEof,
+            &instants,
+        );
+        let window = window_for(observed, 40.0);
+        let report = resolve(&timeline, &window, 100.0, None);
+        assert!(report.is_conclusive(), "{:?}", report.uncertainty_causes());
+    }
+
+    #[test]
+    fn missing_heartbeat_evidence_falls_back_to_raw_age() {
+        // No heartbeats at all across the span: liveness is
+        // unestablished, so the horizon is the only thing left.
+        let (timeline, window) = conclusive_case();
+        let report = resolve(&timeline, &window, 40.0, None);
+        assert!(matches!(
+            report.freshness(),
+            ExclusionFreshness::Known {
+                coverage: HeartbeatCoverage::Absent,
+                ..
+            }
+        ));
+        assert_eq!(
+            report.uncertainty_causes(),
+            vec![&UncertaintyCause::Stale {
+                gap_s: 30.0,
+                horizon_s: 5.0,
+            }]
+        );
+    }
+
+    #[test]
+    fn heartbeat_coverage_classifies_every_shape() {
+        let hb = |mono_ns: u64| heartbeat_at(mono_ns, 0.0);
+        let period = 100_000_000_u64;
+        let tolerance = 3 * period;
+
+        // Empty stream over a real span: nothing to prove liveness with.
+        assert_eq!(
+            heartbeat_coverage(&[], 0, 10 * period, tolerance),
+            HeartbeatCoverage::Absent
+        );
+        // A degenerate span needs no evidence.
+        assert_eq!(
+            heartbeat_coverage(&[], 500, 500, tolerance),
+            HeartbeatCoverage::Continuous
+        );
+        assert_eq!(
+            heartbeat_coverage(&[], 500, 400, tolerance),
+            HeartbeatCoverage::Continuous
+        );
+        // Regular cadence covers the span.
+        let regular: Vec<_> = (0..=10).map(|i| hb(i * period)).collect();
+        assert_eq!(
+            heartbeat_coverage(&regular, 0, 10 * period, tolerance),
+            HeartbeatCoverage::Continuous
+        );
+        // A single missed beat is inside the tolerance.
+        let one_missed: Vec<_> = (0..=10)
+            .filter(|i| *i != 5)
+            .map(|i| hb(i * period))
+            .collect();
+        assert_eq!(
+            heartbeat_coverage(&one_missed, 0, 10 * period, tolerance),
+            HeartbeatCoverage::Continuous
+        );
+        // Four missed beats are not.
+        let stalled: Vec<_> = (0..=10)
+            .filter(|i| !(3..=7).contains(i))
+            .map(|i| hb(i * period))
+            .collect();
+        assert_eq!(
+            heartbeat_coverage(&stalled, 0, 10 * period, tolerance),
+            HeartbeatCoverage::Interrupted {
+                start_mono_ns: 2 * period,
+                end_mono_ns: 8 * period,
+            }
+        );
+        // The *largest* hole wins when there are several.
+        let two_holes = [hb(0), hb(5 * period), hb(20 * period)];
+        assert_eq!(
+            heartbeat_coverage(&two_holes, 0, 20 * period, tolerance),
+            HeartbeatCoverage::Interrupted {
+                start_mono_ns: 5 * period,
+                end_mono_ns: 20 * period,
+            }
+        );
+        // A stream that stops before the end leaves a trailing hole.
+        assert_eq!(
+            heartbeat_coverage(&regular, 0, 30 * period, tolerance),
+            HeartbeatCoverage::Interrupted {
+                start_mono_ns: 10 * period,
+                end_mono_ns: 30 * period,
+            }
+        );
+        // An anchor before the span start still proves the head of it.
+        assert_eq!(
+            heartbeat_coverage(&[hb(0)], period, 2 * period, tolerance),
+            HeartbeatCoverage::Continuous
+        );
+        assert!(HeartbeatCoverage::Continuous.proves_liveness());
+        assert!(!HeartbeatCoverage::Absent.proves_liveness());
+        assert!(!HeartbeatCoverage::Unevaluated.proves_liveness());
+    }
+
+    #[test]
+    fn coverage_is_unevaluated_without_a_placeable_window() {
+        // `bare()` supplies no window at all, so freshness itself is
+        // Unknown and coverage is never reached.
+        let timeline = timeline_with(Some(exclude_state(
+            Some(vec![square("A", 100.0, 100.0)]),
+            &[],
+        )));
+        assert_eq!(
+            resolve_exclusions(&timeline, &bare(), &cfg()).freshness(),
+            ExclusionFreshness::Unknown
+        );
+    }
+
+    // --- torn tail sizing -------------------------------------------
+
+    #[test]
+    fn a_torn_tail_reports_the_size_of_the_lost_window() {
+        // The consumer tiers on this number; we only have to be honest
+        // about it. Here the newest durable record is the heartbeat at
+        // 10.0 s and the window runs to 10.25 s.
+        let observed = 10_000_000_000;
+        let timeline = timeline_with_beats(
+            observed,
+            exclude_state(Some(vec![square("A", 100.0, 100.0)]), &[]),
+            &[],
+            ScanEnd::TruncatedPayload,
+            &[observed],
+        );
+        let window = window_for(observed, 10.0);
+        let report = resolve(&timeline, &window, 10.25, None);
+        let lost = report
+            .uncertainty_causes()
+            .into_iter()
+            .find_map(|cause| match cause {
+                UncertaintyCause::LogTailIncomplete { lost_window_s, .. } => *lost_window_s,
+                _ => None,
+            })
+            .expect("a torn tail must be sized");
+        assert!(
+            (lost - 0.25).abs() < 1e-9,
+            "expected ~0.25 s of exposure, got {lost}"
+        );
+
+        // A wider window reports proportionally more exposure.
+        let report = resolve(&timeline, &window, 14.0, None);
+        let lost = report
+            .uncertainty_causes()
+            .into_iter()
+            .find_map(|cause| match cause {
+                UncertaintyCause::LogTailIncomplete { lost_window_s, .. } => *lost_window_s,
+                _ => None,
+            })
+            .expect("sized");
+        assert!((lost - 4.0).abs() < 1e-9, "got {lost}");
+    }
+
+    #[test]
+    fn torn_tail_size_is_none_when_it_cannot_be_placed() {
+        // No window: the span cannot be mapped onto the print-time axis,
+        // and we say so rather than inventing a number.
+        let timeline = timeline_with_markers(
+            1_000,
+            exclude_state(Some(vec![square("A", 100.0, 100.0)]), &[]),
+            &[],
+            ScanEnd::BadFrameMagic,
+        );
+        let report = resolve_exclusions(&timeline, &bare(), &cfg());
+        assert!(report.uncertainty_causes().iter().any(|cause| matches!(
+            cause,
+            UncertaintyCause::LogTailIncomplete {
+                lost_window_s: None,
+                ..
+            }
+        )));
     }
 
     // --- provenance -------------------------------------------------
@@ -1768,7 +2340,10 @@ G1 X10 Y10 F3000
         assert_eq!(confirmation.observed_mono_ns, Some(1_000_000_000));
         assert_eq!(
             confirmation.freshness,
-            ExclusionFreshness::Known { gap_s: 0.5 }
+            ExclusionFreshness::Known {
+                gap_s: 0.5,
+                coverage: HeartbeatCoverage::Absent,
+            }
         );
         // Every object appears, not just the excluded or the at-risk.
         let rows: Vec<(&str, ObjectKnowledge, bool)> = confirmation

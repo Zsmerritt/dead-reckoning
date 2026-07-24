@@ -84,6 +84,27 @@ pub struct ReconstructConfig {
     /// Prompting there is a false positive we accept, because the
     /// alternative is trusting a stale set.
     pub exclusion_freshness_horizon: f64,
+    /// The daemon's heartbeat period in nanoseconds — the cadence at
+    /// which it proves itself alive independently of any record it
+    /// journals. Set this from the recorder's configured rate
+    /// (`plrd`'s `heartbeat_hz`, default 10 Hz ⇒ 100 ms); the default
+    /// here mirrors that default, it is not an assumption about the
+    /// running daemon.
+    ///
+    /// [`crate::exclude`] uses heartbeat *continuity* to decide whether
+    /// a long silence between the last exclusion observation and the
+    /// stop window is evidence of absence (the recorder was alive and
+    /// journaled no cancellation) or merely silence (it was stalled).
+    pub heartbeat_period_ns: u64,
+    /// How many heartbeat periods may elapse between consecutive
+    /// heartbeats before liveness coverage counts as broken.
+    ///
+    /// The writer re-arms its timer from the previous deadline and
+    /// resynchronizes when it falls behind, so ordinary scheduling
+    /// jitter costs well under one period; 3 tolerates a missed beat
+    /// plus jitter without tolerating a real stall. A break is reported
+    /// as [`crate::UncertaintyCause::HeartbeatGap`] with its span.
+    pub heartbeat_gap_tolerance: f64,
     /// Two Z candidates closer than this (mm) with identical
     /// kind/provenance/knowledge merge into one. Covers float noise
     /// between independently-computed copies of the same layer height;
@@ -101,6 +122,8 @@ impl Default for ReconstructConfig {
             max_processing_lead: 3.0,
             extension_horizon: 2.0,
             exclusion_freshness_horizon: 5.0,
+            heartbeat_period_ns: 100_000_000,
+            heartbeat_gap_tolerance: 3.0,
             sim: SimConfig::default(),
             z_merge_tolerance: 1e-6,
         }
@@ -134,6 +157,12 @@ impl ReconstructConfig {
         }
         if !self.exclusion_freshness_horizon.is_finite() || self.exclusion_freshness_horizon < 0.0 {
             return err("exclusion_freshness_horizon must be finite and >= 0");
+        }
+        if self.heartbeat_period_ns == 0 {
+            return err("heartbeat_period_ns must be > 0");
+        }
+        if !self.heartbeat_gap_tolerance.is_finite() || self.heartbeat_gap_tolerance < 1.0 {
+            return err("heartbeat_gap_tolerance must be finite and >= 1");
         }
         if !self.sim.max_velocity.is_finite() || self.sim.max_velocity <= 0.0 {
             return err("sim.max_velocity must be finite and > 0");

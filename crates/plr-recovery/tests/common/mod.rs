@@ -145,6 +145,7 @@ pub fn timeline(context: Context, clean_shutdown: bool) -> WalTimeline {
         contexts: vec![context],
         markers: vec![],
         heartbeat: None,
+        heartbeats: vec![],
         clean_shutdown,
         socket_lost_tail: None,
         last_motion_mono_ns: None,

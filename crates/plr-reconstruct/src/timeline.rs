@@ -30,6 +30,11 @@
 //!   degradation. Markers are kept in append order in
 //!   [`WalTimeline::markers`] so later stages can ask *when* an event
 //!   happened relative to other records.
+//! * Every finite heartbeat is kept, sorted, in
+//!   [`WalTimeline::heartbeats`] — not just the newest — because the
+//!   *continuity* of the ~10 Hz heartbeat stream is the only proof the
+//!   recorder was alive across a span in which it journaled nothing
+//!   else.
 
 use plr_wal::{
     Context, Heartbeat, HeartbeatRecovery, Marker, MarkerKind, RecoveryScan, ScanEnd, StepperRange,
@@ -125,6 +130,16 @@ pub struct WalTimeline {
     /// WAL heartbeat record (by `mono_ns`). `None` when no finite
     /// heartbeat exists anywhere.
     pub heartbeat: Option<Heartbeat>,
+    /// Every finite heartbeat sample (heartbeat file plus WAL records),
+    /// sorted ascending by `mono_ns` and deduplicated on that key.
+    ///
+    /// Heartbeats are written on their own cadence (~10 Hz), completely
+    /// independently of context records, which makes them the only
+    /// evidence that the recorder was *alive* across a span in which it
+    /// wrote nothing else. [`crate::exclude`] uses that to tell a long
+    /// dwell (alive, nothing happened) from a stalled recorder (we
+    /// simply do not know).
+    pub heartbeats: Vec<Heartbeat>,
     /// `true` when a [`MarkerKind::CleanShutdown`] marker ends the log
     /// (no motion records after it): the print ended on purpose and no
     /// recovery is needed.
@@ -279,12 +294,15 @@ pub fn ingest(scan: &RecoveryScan, heartbeat: Option<&HeartbeatRecovery>) -> Wal
         notes.push(IngestNote::TornHeartbeatSlot);
     }
 
-    let best_heartbeat = heartbeat
+    let mut all_heartbeats: Vec<Heartbeat> = heartbeat
         .map(|recovery| recovery.heartbeat)
         .into_iter()
         .chain(wal_heartbeats)
         .filter(Heartbeat::values_are_finite)
-        .max_by_key(|hb| hb.mono_ns);
+        .collect();
+    all_heartbeats.sort_by_key(|hb| hb.mono_ns);
+    all_heartbeats.dedup_by_key(|hb| hb.mono_ns);
+    let best_heartbeat = all_heartbeats.last().copied();
 
     WalTimeline {
         toolhead_segments: toolhead,
@@ -294,6 +312,7 @@ pub fn ingest(scan: &RecoveryScan, heartbeat: Option<&HeartbeatRecovery>) -> Wal
         contexts,
         markers,
         heartbeat: best_heartbeat,
+        heartbeats: all_heartbeats,
         clean_shutdown,
         socket_lost_tail,
         last_motion_mono_ns: last_motion_mono,
