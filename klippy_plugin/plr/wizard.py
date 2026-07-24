@@ -46,6 +46,7 @@ commands (each of which owns its own consent + gates).  This module calls
 """
 
 import collections
+import posixpath
 
 from . import daemon_link, setup_checks
 
@@ -110,47 +111,90 @@ def action_prompt_end():
 # --- defensive readers over the daemon response data ----------------
 
 
-def _recovery_pending(data):
-    """True when the daemon reports a pending recovery.
+def _pending_recovery(data):
+    """The pending-recovery object from a ``status`` response, else None.
 
-    COORDINATION POINT (Rust): the daemon's ``status`` response advertises
-    a pending recovery via ``data["recovery_pending"]`` (bool).  Read
-    defensively — a daemon predating this field is treated as "nothing
-    pending" so the wizard never invents a recovery.
+    CONTRACT SOURCE — crates/plrd/src/ctrlsock.rs ``build_status``: the
+    daemon inserts ``data["pending"]`` on EVERY status response.  It is
+    an explicit JSON ``null`` when no pending-recovery file exists or
+    parses, otherwise the serialized ``PendingRecovery``
+    (crates/plrd/src/detect.rs).  "Nothing pending" is therefore a null
+    VALUE, not an absent key — and anything that is not a JSON object
+    (null, a renamed/re-typed field, a daemon predating the key) reads as
+    nothing pending, so the wizard can never invent a recovery.
     """
-    return bool(data.get("recovery_pending", False))
+    pending = data.get("pending")
+    if isinstance(pending, dict):
+        return pending
+    return None
 
 
 def _requires_clean(data):
-    """Plan-level clean-nozzle-confirmation flag; absent → False.
+    """Plan-level clean-nozzle-confirmation flag; absent everywhere → False.
 
-    FROZEN contract: ``recover_dryrun``/``status`` carry
-    ``requires_clean_nozzle_confirmation`` in ``data`` for daemons that
-    implement it; older daemons omit it, which reads as "no confirmation
-    required" (the auto-clean / no-clean path).
+    CONTRACT SOURCE — crates/plrd/src/ctrlsock.rs ``cmd_recover_dryrun``
+    returns ``data: {"outcome": <tag>}`` today; the frozen
+    ``requires_clean_nozzle_confirmation`` flag is being added by the
+    Rust side and may land either at the top level of ``data`` or nested
+    under a ``plan`` object.  Both spellings are accepted (top level
+    first); absent in both — any daemon predating the flag — reads as
+    "no confirmation required" (the auto-clean / no-clean path).
     """
-    return bool(data.get("requires_clean_nozzle_confirmation", False))
+    if "requires_clean_nozzle_confirmation" in data:
+        return bool(data.get("requires_clean_nozzle_confirmation"))
+    plan = data.get("plan")
+    if isinstance(plan, dict):
+        return bool(plan.get("requires_clean_nozzle_confirmation"))
+    return False
 
 
-def _format_progress(progress):
-    """Best-effort human progress string from a loosely-typed field."""
-    if isinstance(progress, bool):
-        return str(progress)
-    if isinstance(progress, (int, float)):
-        pct = progress * 100.0 if 0.0 <= progress <= 1.0 else progress
-        return "%.1f%%" % (pct,)
-    return str(progress)
+def _is_number(value):
+    """True for a real JSON number (bool is not a number here)."""
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
 
 
-def _summarize(data):
-    """Print file/progress summary lines for the offer prompt."""
+def _print_name(path):
+    """Basename of the interrupted print file, or None.
+
+    plrd is Linux-only (see :mod:`plr.daemon_link`), so ``file`` is an
+    absolute POSIX path; ``posixpath`` splits it identically on every
+    host running these tests.  A path with no separator is returned
+    unchanged.
+    """
+    if not isinstance(path, str) or not path:
+        return None
+    return posixpath.basename(path) or path
+
+
+def _summarize(pending):
+    """Offer-prompt summary lines built from a ``PendingRecovery``.
+
+    CONTRACT SOURCE — crates/plrd/src/detect.rs ``PendingRecovery``
+    (plain serde derive, so the JSON names are the struct's own):
+    ``detected_wall_ns`` (int), ``file`` (absolute path string),
+    ``file_position`` (int bytes), ``file_size`` (int|null), ``percent``
+    (float|null, already a 0-100 percentage — ctrlsock.rs renders it
+    ``(~{p:.0}%)``), ``crash_class`` (string, which may carry a trailing
+    frame-invalid note).
+
+    Every field is read defensively: a missing, null, or wrongly-typed
+    field simply omits its clause — never a crash, never a fabricated
+    number.  If nothing at all is readable the prompt still says
+    something honest.
+    """
     lines = []
-    print_file = data.get("print_file")
-    if print_file:
-        lines.append("Interrupted print: %s" % (print_file,))
-    progress = data.get("progress")
-    if progress is not None:
-        lines.append("Progress at power loss: %s" % (_format_progress(progress),))
+    name = _print_name(pending.get("file"))
+    if name:
+        lines.append("Interrupted print: %s" % (name,))
+    percent = pending.get("percent")
+    if _is_number(percent):
+        lines.append("Progress at power loss: ~%.0f%%" % (percent,))
+    position = pending.get("file_position")
+    if _is_number(position):
+        lines.append("Resume point: byte %d" % (position,))
+    crash_class = pending.get("crash_class")
+    if isinstance(crash_class, str) and crash_class:
+        lines.append("Crash classification: %s" % (crash_class,))
     if not lines:
         lines.append("An interrupted print is ready to resume.")
     return lines
@@ -241,7 +285,10 @@ class RecoveryWizard:
         except daemon_link.DaemonError as e:
             self._fail_daemon(gcmd, "PLR_WIZARD_START", e)
         data = resp.get("data", {})
-        if not _recovery_pending(data):
+        # ctrlsock.rs build_status: data["pending"] is null when nothing
+        # is pending, else the serialized detect.rs PendingRecovery.
+        pending = _pending_recovery(data)
+        if pending is None:
             gcmd.respond_info(
                 "PLR wizard: no power-loss recovery is pending — nothing to do.\n"
                 "If you believe a print was interrupted, check PLR_STATUS."
@@ -249,7 +296,7 @@ class RecoveryWizard:
             return
         prompt = _Prompt(
             title=_TITLE,
-            texts=_summarize(data) + ["Attempt recovery, or dismiss this prompt."],
+            texts=_summarize(pending) + ["Attempt recovery, or dismiss this prompt."],
             buttons=[("Attempt recovery", "PLR_WIZARD_DRYRUN", "primary")],
             footers=[("Dismiss", "PLR_WIZARD_CANCEL", "error")],
             fallbacks=[
@@ -283,6 +330,9 @@ class RecoveryWizard:
                 "PLR_WIZARD_START again."
             )
         data = resp.get("data", {})
+        # ctrlsock.rs cmd_recover_dryrun: data carries {"outcome": <tag>}
+        # today; the frozen clean-nozzle flag may arrive top level or
+        # nested under "plan" (see _requires_clean).
         if _requires_clean(data):
             self._show_clean_check(gcmd)
         else:

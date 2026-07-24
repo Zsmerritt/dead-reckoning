@@ -271,8 +271,11 @@ plain-text line naming the exact console command that advances it, so
 you are never stuck on a client without prompt support.
 
 **`PLR_WIZARD_START`** opens the guided power-loss recovery flow. It asks
-plrd whether a recovery is pending; if so it offers a dialog summarizing
-the interrupted print with two choices:
+plrd whether a recovery is pending (the `status` response's `pending`
+field: `null` for none, otherwise the pending-recovery record) and, if so,
+offers a dialog summarizing the interrupted print — file name, approximate
+progress, resume byte and crash classification, each shown only when the
+daemon actually reports it — with two choices:
 
 - **Attempt recovery** → `PLR_WIZARD_DRYRUN`: fetches and prints the full
   recovery plan (no motion), then prompts the next step:

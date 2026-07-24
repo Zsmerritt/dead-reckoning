@@ -37,14 +37,79 @@ class FakeDaemon:
         return self.responses.get(cmd, {"ok": True, "text": "", "data": {}})
 
 
-def _status(pending=True, **data):
-    d = {"recovery_pending": pending}
-    d.update(data)
-    return {"ok": True, "text": "plrd armed", "data": d}
+def pending_recovery(
+    file="/home/pi/printer_data/gcodes/bench.gcode",
+    file_position=1048576,
+    file_size=4194304,
+    percent=25.0,
+    crash_class="HardPowerLoss { residual_ms: 12 }",
+    **overrides,
+):
+    """A serialized ``PendingRecovery`` exactly as the daemon emits it.
+
+    MIRRORS THE PRODUCER: crates/plrd/src/detect.rs ``PendingRecovery``
+    has a plain serde derive (no rename_all), so the JSON keys are the
+    struct field names verbatim.  ``percent`` is a 0-100 percentage
+    (ctrlsock.rs renders it ``(~{p:.0}%)``), ``file`` an absolute path.
+    ``overrides`` lets a test null/drop a field to prove the defensive
+    reads.
+    """
+    obj = {
+        "detected_wall_ns": 1737000000000000000,
+        "file": file,
+        "file_position": file_position,
+        "file_size": file_size,
+        "percent": percent,
+        "crash_class": crash_class,
+    }
+    obj.update(overrides)
+    return obj
+
+
+def status_data(pending=None):
+    """The full ``status`` data map as the daemon builds it.
+
+    MIRRORS THE PRODUCER: crates/plrd/src/ctrlsock.rs ``build_status``
+    inserts exactly these keys — ``wal_dir``, ``segments`` (int|null),
+    ``wal_bytes``, ``heartbeat_age_s`` (float|null), ``pending``
+    (**explicit null** when nothing is pending, else the serialized
+    PendingRecovery), ``machine_mode``, ``machine_validation``.
+    """
+    return {
+        "wal_dir": "/var/lib/plrd/wal",
+        "segments": 3,
+        "wal_bytes": 40960,
+        "heartbeat_age_s": 0.4,
+        "pending": pending,
+        "machine_mode": "plr",
+        "machine_validation": "OK (;TYPE: annotation check deferred to recover time)",
+    }
+
+
+def _status(pending=None, text="plrd armed", data=None):
+    """A ``status`` response; ``pending`` defaults to null (nothing pending)."""
+    return {
+        "ok": True,
+        "text": text,
+        "data": status_data(pending) if data is None else data,
+    }
+
+
+def _status_pending(**kwargs):
+    """A ``status`` response carrying a pending recovery."""
+    return _status(pending=pending_recovery(**kwargs))
 
 
 def _dryrun(ok=True, text="PLAN: resume bench.gcode at layer 42", **data):
-    return {"ok": ok, "text": text, "data": dict(data)}
+    """A ``recover_dryrun`` response.
+
+    MIRRORS THE PRODUCER: crates/plrd/src/ctrlsock.rs
+    ``cmd_recover_dryrun`` returns ``data: {"outcome": <tag>}``; the
+    clean-nozzle flag is added on top by the tests that exercise it.
+    """
+    payload = {"outcome": "pending-recovery"}
+    payload.update(data)
+    return {"ok": ok, "text": text, "data": payload}
 
 
 def _new_responses(gcode):
@@ -83,20 +148,44 @@ def test_action_string_literals():
     ) == ("action:prompt_footer_button Cancel|PLR_WIZARD_CANCEL|error")
 
 
-def test_format_progress_variants():
-    assert wizard._format_progress(0.42) == "42.0%"  # fraction
-    assert wizard._format_progress(73.5) == "73.5%"  # already a percent
-    assert wizard._format_progress("layer 42/100") == "layer 42/100"  # opaque str
-    assert wizard._format_progress(True) == "True"  # bool is not a percentage
+def test_summarize_reads_real_pending_recovery_fields():
+    # detect.rs PendingRecovery: file (abs path), file_position, percent
+    # (already 0-100), crash_class.  The basename is shown, not the path.
+    assert wizard._summarize(pending_recovery()) == [
+        "Interrupted print: bench.gcode",
+        "Progress at power loss: ~25%",
+        "Resume point: byte 1048576",
+        "Crash classification: HardPowerLoss { residual_ms: 12 }",
+    ]
+
+
+def test_summarize_omits_null_percent_without_fabricating():
+    # percent is Option<f64> in detect.rs — null must omit the clause.
+    lines = wizard._summarize(pending_recovery(percent=None))
+    assert not any("Progress" in line for line in lines)
+    assert "Interrupted print: bench.gcode" in lines
+
+
+def test_summarize_tolerates_missing_and_retyped_fields():
+    # A renamed/dropped field must omit its clause, never crash.
+    assert wizard._summarize({}) == ["An interrupted print is ready to resume."]
+    lines = wizard._summarize(
+        {"file": 42, "percent": "lots", "file_position": None, "crash_class": ""}
+    )
+    assert lines == ["An interrupted print is ready to resume."]
+
+
+def test_summarize_keeps_pathless_file_name():
+    assert "Interrupted print: bench.gcode" in wizard._summarize(
+        pending_recovery(file="bench.gcode")
+    )
 
 
 # --- START ------------------------------------------------------------
 
 
 def test_start_offers_recovery_with_ordered_prompt(plugin, run_cmd, fake_printer):
-    plugin.daemon = FakeDaemon(
-        responses={"status": _status(print_file="bench.gcode", progress=0.42)}
-    )
+    plugin.daemon = FakeDaemon(responses={"status": _status_pending()})
     gcode = fake_printer.lookup_object("gcode")
     since = _new_responses(gcode)
     run_cmd("PLR_WIZARD_START")
@@ -104,7 +193,9 @@ def test_start_offers_recovery_with_ordered_prompt(plugin, run_cmd, fake_printer
         "Power-loss recovery available.",
         "action:prompt_begin Power-loss recovery",
         "action:prompt_text Interrupted print: bench.gcode",
-        "action:prompt_text Progress at power loss: 42.0%",
+        "action:prompt_text Progress at power loss: ~25%",
+        "action:prompt_text Resume point: byte 1048576",
+        "action:prompt_text Crash classification: HardPowerLoss { residual_ms: 12 }",
         "action:prompt_text Attempt recovery, or dismiss this prompt.",
         "action:prompt_button Attempt recovery|PLR_WIZARD_DRYRUN|primary",
         "action:prompt_footer_button Dismiss|PLR_WIZARD_CANCEL|error",
@@ -117,8 +208,12 @@ def test_start_offers_recovery_with_ordered_prompt(plugin, run_cmd, fake_printer
     assert plugin.daemon.calls == [("status", None, daemon_link.STATUS_TIMEOUT)]
 
 
-def test_start_no_pending_recovery_stays_idle(plugin, run_cmd, fake_printer):
-    plugin.daemon = FakeDaemon(responses={"status": _status(pending=False)})
+def test_start_no_pending_recovery_uses_explicit_null(plugin, run_cmd, fake_printer):
+    # build_status ALWAYS inserts "pending"; nothing-pending is a JSON
+    # null VALUE, not an absent key.  Pin that exact shape.
+    response = _status()
+    assert "pending" in response["data"] and response["data"]["pending"] is None
+    plugin.daemon = FakeDaemon(responses={"status": response})
     gcode = fake_printer.lookup_object("gcode")
     since = _new_responses(gcode)
     run_cmd("PLR_WIZARD_START")
@@ -128,8 +223,9 @@ def test_start_no_pending_recovery_stays_idle(plugin, run_cmd, fake_printer):
     assert plugin.wizard.is_active() is False
 
 
-def test_start_missing_pending_field_treated_as_none(plugin, run_cmd, fake_printer):
-    # An older daemon omits recovery_pending entirely -> nothing offered.
+def test_start_absent_pending_key_treated_as_nothing(plugin, run_cmd, fake_printer):
+    # Belt-and-braces: a daemon that omits the key entirely (or renames
+    # it) must not be read as a pending recovery either.
     plugin.daemon = FakeDaemon(
         responses={"status": {"ok": True, "text": "", "data": {}}}
     )
@@ -140,16 +236,30 @@ def test_start_missing_pending_field_treated_as_none(plugin, run_cmd, fake_print
     assert plugin.wizard.is_active() is False
 
 
-def test_start_no_summary_uses_generic_line(plugin, run_cmd, fake_printer):
-    plugin.daemon = FakeDaemon(responses={"status": _status()})
+def test_start_non_object_pending_treated_as_nothing(plugin, run_cmd, fake_printer):
+    plugin.daemon = FakeDaemon(responses={"status": _status(pending="yes")})
+    gcode = fake_printer.lookup_object("gcode")
+    since = _new_responses(gcode)
+    run_cmd("PLR_WIZARD_START")
+    assert "no power-loss recovery is pending" in "\n".join(since())
+    assert plugin.wizard.is_active() is False
+
+
+def test_start_empty_pending_object_still_offers_recovery(
+    plugin, run_cmd, fake_printer
+):
+    # A pending object whose fields are all unreadable is STILL a pending
+    # recovery — offer it with the honest generic summary.
+    plugin.daemon = FakeDaemon(responses={"status": _status(pending={})})
     gcode = fake_printer.lookup_object("gcode")
     since = _new_responses(gcode)
     run_cmd("PLR_WIZARD_START")
     assert "action:prompt_text An interrupted print is ready to resume." in since()
+    assert plugin.wizard.is_active() is True
 
 
 def test_double_start_reshows_current_prompt(plugin, run_cmd, fake_printer):
-    plugin.daemon = FakeDaemon(responses={"status": _status(print_file="a.gcode")})
+    plugin.daemon = FakeDaemon(responses={"status": _status_pending()})
     run_cmd("PLR_WIZARD_START")
     gcode = fake_printer.lookup_object("gcode")
     since = _new_responses(gcode)
@@ -168,7 +278,7 @@ def test_double_start_reshows_current_prompt(plugin, run_cmd, fake_printer):
 def test_dryrun_requires_clean_shows_clean_prompt(plugin, run_cmd, fake_printer):
     plugin.daemon = FakeDaemon(
         responses={
-            "status": _status(),
+            "status": _status_pending(),
             "recover_dryrun": _dryrun(requires_clean_nozzle_confirmation=True),
         }
     )
@@ -197,10 +307,69 @@ def test_dryrun_requires_clean_shows_clean_prompt(plugin, run_cmd, fake_printer)
     )
 
 
-@pytest.mark.parametrize("data", [{"requires_clean_nozzle_confirmation": False}, {}])
+def test_requires_clean_read_at_both_contract_locations():
+    # The Rust side may land the flag top level in `data` or nested under
+    # a `plan` object; both must be honoured, absent in both -> False.
+    assert wizard._requires_clean({"requires_clean_nozzle_confirmation": True}) is True
+    assert (
+        wizard._requires_clean({"plan": {"requires_clean_nozzle_confirmation": True}})
+        is True
+    )
+    assert (
+        wizard._requires_clean({"requires_clean_nozzle_confirmation": False}) is False
+    )
+    assert (
+        wizard._requires_clean({"plan": {"requires_clean_nozzle_confirmation": False}})
+        is False
+    )
+    # Top level wins when both are present and disagree.
+    assert (
+        wizard._requires_clean(
+            {
+                "requires_clean_nozzle_confirmation": False,
+                "plan": {"requires_clean_nozzle_confirmation": True},
+            }
+        )
+        is False
+    )
+    # Absent in both, and a non-object plan, read as False.
+    assert wizard._requires_clean({"outcome": "pending-recovery"}) is False
+    assert wizard._requires_clean({"plan": "nope"}) is False
+
+
+def test_dryrun_nested_plan_clean_flag_shows_clean_prompt(
+    plugin, run_cmd, fake_printer
+):
+    # The in-flight Rust change may nest the flag under `plan`.
+    plugin.daemon = FakeDaemon(
+        responses={
+            "status": _status_pending(),
+            "recover_dryrun": _dryrun(
+                plan={"requires_clean_nozzle_confirmation": True}
+            ),
+        }
+    )
+    run_cmd("PLR_WIZARD_START")
+    gcode = fake_printer.lookup_object("gcode")
+    since = _new_responses(gcode)
+    run_cmd("PLR_WIZARD_DRYRUN")
+    lines = since()
+    assert "action:prompt_button Nozzle is clean|PLR_WIZARD_CONFIRM_CLEAN|primary" in (
+        lines
+    )
+
+
+@pytest.mark.parametrize(
+    "data",
+    [
+        {"requires_clean_nozzle_confirmation": False},
+        {"plan": {"requires_clean_nozzle_confirmation": False}},
+        {},
+    ],
+)
 def test_dryrun_no_clean_skips_to_execute(plugin, run_cmd, fake_printer, data):
     plugin.daemon = FakeDaemon(
-        responses={"status": _status(), "recover_dryrun": _dryrun(**data)}
+        responses={"status": _status_pending(), "recover_dryrun": _dryrun(**data)}
     )
     run_cmd("PLR_WIZARD_START")
     gcode = fake_printer.lookup_object("gcode")
@@ -228,7 +397,7 @@ def test_dryrun_before_start_is_error(plugin, run_cmd):
 def test_dryrun_failure_resets_and_ends_prompt(plugin, run_cmd, fake_printer):
     plugin.daemon = FakeDaemon(
         responses={
-            "status": _status(),
+            "status": _status_pending(),
             "recover_dryrun": _dryrun(ok=False, text="machine validation failed"),
         }
     )
@@ -249,7 +418,7 @@ def test_dryrun_failure_resets_and_ends_prompt(plugin, run_cmd, fake_printer):
 def test_full_happy_path_with_clean_confirm(plugin, run_cmd, fake_printer):
     plugin.daemon = FakeDaemon(
         responses={
-            "status": _status(print_file="bench.gcode"),
+            "status": _status_pending(),
             "recover_dryrun": _dryrun(requires_clean_nozzle_confirmation=True),
             "recover_execute": {"ok": True, "text": "recovery complete", "data": {}},
         }
@@ -287,7 +456,7 @@ def test_full_happy_path_with_clean_confirm(plugin, run_cmd, fake_printer):
 def test_execute_typed_failure_reports_remediation(plugin, run_cmd, fake_printer):
     plugin.daemon = FakeDaemon(
         responses={
-            "status": _status(),
+            "status": _status_pending(),
             "recover_dryrun": _dryrun(),
             "recover_execute": {
                 "ok": False,
@@ -312,14 +481,14 @@ def test_execute_typed_failure_reports_remediation(plugin, run_cmd, fake_printer
 
 
 def test_confirm_clean_out_of_order_is_error(plugin, run_cmd):
-    plugin.daemon = FakeDaemon(responses={"status": _status()})
+    plugin.daemon = FakeDaemon(responses={"status": _status_pending()})
     run_cmd("PLR_WIZARD_START")  # state OFFERED, not CLEAN_CHECK
     with pytest.raises(fake_klippy.FakeCommandError, match="not awaiting"):
         run_cmd("PLR_WIZARD_CONFIRM_CLEAN")
 
 
 def test_execute_out_of_order_is_error(plugin, run_cmd):
-    plugin.daemon = FakeDaemon(responses={"status": _status()})
+    plugin.daemon = FakeDaemon(responses={"status": _status_pending()})
     run_cmd("PLR_WIZARD_START")  # state OFFERED, not EXECUTE
     with pytest.raises(fake_klippy.FakeCommandError, match="not ready to execute"):
         run_cmd("PLR_WIZARD_EXECUTE")
@@ -330,7 +499,7 @@ def test_execute_out_of_order_is_error(plugin, run_cmd):
 
 
 def test_cancel_active_ends_prompt_and_resets(plugin, run_cmd, fake_printer):
-    plugin.daemon = FakeDaemon(responses={"status": _status()})
+    plugin.daemon = FakeDaemon(responses={"status": _status_pending()})
     run_cmd("PLR_WIZARD_START")
     gcode = fake_printer.lookup_object("gcode")
     since = _new_responses(gcode)
@@ -368,7 +537,7 @@ def test_daemon_down_at_start(plugin, run_cmd, fake_printer):
 
 def test_daemon_down_at_dryrun(plugin, run_cmd, fake_printer):
     plugin.daemon = FakeDaemon(
-        responses={"status": _status()},
+        responses={"status": _status_pending()},
         errors={"recover_dryrun": daemon_link.DaemonError("plrd timed out")},
     )
     run_cmd("PLR_WIZARD_START")
@@ -382,7 +551,7 @@ def test_daemon_down_at_dryrun(plugin, run_cmd, fake_printer):
 
 def test_daemon_down_at_execute(plugin, run_cmd, fake_printer):
     plugin.daemon = FakeDaemon(
-        responses={"status": _status(), "recover_dryrun": _dryrun()},
+        responses={"status": _status_pending(), "recover_dryrun": _dryrun()},
         errors={"recover_execute": daemon_link.DaemonError("plrd closed connection")},
     )
     run_cmd("PLR_WIZARD_START")
@@ -401,7 +570,7 @@ def test_daemon_down_at_execute(plugin, run_cmd, fake_printer):
 def test_every_prompt_fallback_names_next_command(plugin, run_cmd, fake_printer):
     plugin.daemon = FakeDaemon(
         responses={
-            "status": _status(),
+            "status": _status_pending(),
             "recover_dryrun": _dryrun(requires_clean_nozzle_confirmation=True),
             "recover_execute": {"ok": True, "text": "done", "data": {}},
         }
