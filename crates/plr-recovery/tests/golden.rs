@@ -71,7 +71,9 @@ fn clean_shutdown_produces_no_plan() {
 fn normal_tap_recovery_matches_the_golden_plan() {
     let plan = build_plan(&machine_tap(), plain_transforms());
 
-    // §8 phase order, exact (no z_thermal_adjust, no mesh here).
+    // §8 phase order, exact (no z_thermal_adjust, no mesh here). The
+    // default config uses the consensus PLR_TOUCH path, so the accel
+    // clamp/restore wrap the probe.
     let phases: Vec<Phase> = plan.steps.iter().map(|s| s.phase).collect();
     assert_eq!(
         phases,
@@ -82,7 +84,9 @@ fn normal_tap_recovery_matches_the_golden_plan() {
             Phase::HomeXy,
             Phase::ShiftedFrame,
             Phase::ProbeApproach,
+            Phase::AccelClamp,
             Phase::Probe,
+            Phase::AccelRestore,
             Phase::TrueZDeclare,
             Phase::FinalDeclare,
             Phase::RestoreFrame,
@@ -95,6 +99,24 @@ fn normal_tap_recovery_matches_the_golden_plan() {
     for (index, step) in plan.steps.iter().enumerate() {
         assert_eq!(step.id as usize, index + 1);
     }
+
+    // Accel clamp precedes the probe; restore follows on success; the
+    // clamp declares an abort cleanup.
+    assert!(plan.accel_clamp_precedes_probe());
+    assert!(plan.accel_restore_follows_probe());
+    assert!(plan.accel_clamp_declares_cleanup());
+    // The consensus touch command carries every tunable explicitly.
+    let probe = plan.steps_in_phase(Phase::Probe).next().expect("probe");
+    assert_eq!(
+        probe.commands,
+        vec!["PLR_TOUCH SAMPLES=3 SAMPLE_RANGE=0.01 SPEED=1 RETRACT=2 TOUCH_ACCEL=100"]
+    );
+    // The extruder-target interlock is present alongside the current
+    // temperature band.
+    assert!(probe
+        .pre_verify
+        .iter()
+        .any(|v| v.object == "extruder" && v.field == "target"));
     // Envelope: gap (0 span + 0.2 sag) + 0.15*1.0 + 0.5 margin = 0.85,
     // anchored at position_min -2.0.
     assert!((plan.envelope.envelope - 0.85).abs() < 1e-12);
@@ -132,7 +154,7 @@ fn normal_tap_recovery_matches_the_golden_plan() {
         "lift must precede print-temperature restore"
     );
 
-    // The Tap probe uses the raw trigger Z.
+    // The consensus Tap probe reads the plugin's consensus median.
     let probe_declare = plan
         .steps_in_phase(Phase::TrueZDeclare)
         .next()
@@ -140,7 +162,13 @@ fn normal_tap_recovery_matches_the_golden_plan() {
     let Some(RuntimeComputation::TrueZ(formula)) = probe_declare.compute else {
         panic!("true-z step must carry the formula");
     };
-    assert_eq!(formula.trigger_source, TriggerSource::RawLastZResult);
+    // Consensus median is in the z_offset-subtracted bed frame; the
+    // formula carries the machine's probe z_offset (-0.1 for the tap
+    // fixture) to add back.
+    assert_eq!(
+        formula.trigger_source,
+        TriggerSource::TouchResult { z_offset: -0.1 }
+    );
     assert!((formula.z_prev_top - 0.4).abs() < 1e-12);
 
     // Golden snapshot of the rendered form. Regenerate with
@@ -200,8 +228,16 @@ fn adxl_drag_recovery_matches_the_golden_plan() {
         .verify
         .iter()
         .any(|v| v.object == "plr" && v.field == "last_drag_result.trigger_z"));
-    // The temperature interlock is method-independent.
+    // The temperature interlock (current AND target) is
+    // method-independent; the drag path gets no accel-clamp steps.
     assert!(plan.temp_verify_precedes_probe());
+    assert!(probe
+        .pre_verify
+        .iter()
+        .any(|v| v.object == "extruder" && v.field == "target"));
+    assert!(plan.first_index(Phase::AccelClamp).is_none());
+    assert!(plan.accel_clamp_precedes_probe());
+    assert!(plan.accel_restore_follows_probe());
 
     // The true-Z formula reads the drag trigger source.
     let declare = plan
@@ -333,7 +369,11 @@ fn drag_without_noise_floor_is_rejected_with_the_calibration_hint() {
 }
 
 #[test]
-fn load_cell_probe_adds_z_offset_back() {
+fn consensus_load_cell_reads_the_touch_median() {
+    // Default config: the load-cell machine goes through PLR_TOUCH just
+    // like tap (a load cell natively supports repeated cheap touches —
+    // repeated force sampling with a retract between is its native
+    // calibration mode), so it reads the consensus median.
     let plan = build_plan(&machine_load_cell(), plain_transforms());
     let declare = plan
         .steps_in_phase(Phase::TrueZDeclare)
@@ -342,24 +382,77 @@ fn load_cell_probe_adds_z_offset_back() {
     let Some(RuntimeComputation::TrueZ(formula)) = declare.compute else {
         panic!("true-z step must carry the formula");
     };
+    // Load-cell fixture z_offset is -0.15; the consensus median needs
+    // it added back too.
+    assert_eq!(
+        formula.trigger_source,
+        TriggerSource::TouchResult { z_offset: -0.15 }
+    );
+    let probe = plan.steps_in_phase(Phase::Probe).next().expect("probe");
+    assert!(probe.commands[0].starts_with("PLR_TOUCH "));
+    assert!(probe
+        .verify
+        .iter()
+        .any(|v| v.object == "plr" && v.field == "last_touch_result.median_z"));
+}
+
+#[test]
+fn legacy_single_probe_preserves_the_per_probe_readback() {
+    // The legacy single-PROBE path (plugin/PLR_TOUCH may be absent)
+    // keeps the stock per-probe-type readback and z_offset arithmetic,
+    // and emits no accel-clamp steps.
+    let legacy = PlanConfig {
+        legacy_single_probe: true,
+        ..PlanConfig::default()
+    };
+    let build = |machine: &plr_recovery::MachineConfig| {
+        let reconstruction = recovery(stop_set(&[0.4]), wal_context(plain_transforms()));
+        let contact = contact_at(0.4);
+        let match_result = match_at(resume_offset());
+        let model = model();
+        let inputs = PlanInputs {
+            machine,
+            reconstruction: &reconstruction,
+            contact: &contact,
+            match_result: &match_result,
+            model: &model,
+            file_temps: FileTemps::default(),
+            exclude_objects: &[],
+        };
+        match plan_recovery(&inputs, &legacy) {
+            Ok(PlanOutcome::Plan(plan)) => *plan,
+            other => panic!("expected a plan, got {other:?}"),
+        }
+    };
+    // Load cell: bed_z + z_offset, PROBE, no accel clamp.
+    let lc = build(&machine_load_cell());
+    assert!(lc.first_index(Phase::AccelClamp).is_none());
+    let lc_declare = lc.steps_in_phase(Phase::TrueZDeclare).next().unwrap();
+    let Some(RuntimeComputation::TrueZ(formula)) = lc_declare.compute else {
+        panic!("formula");
+    };
     assert_eq!(
         formula.trigger_source,
         TriggerSource::BedZPlusOffset { z_offset: -0.15 }
     );
-    // The probe verification reads the bed_z field for this probe type.
-    let probe = plan.steps_in_phase(Phase::Probe).next().expect("probe");
-    assert!(probe
+    let lc_probe = lc.steps_in_phase(Phase::Probe).next().unwrap();
+    assert_eq!(lc_probe.commands, vec!["PROBE PROBE_SPEED=1 SAMPLES=1"]);
+    assert!(lc_probe
         .verify
         .iter()
         .any(|v| v.object == "probe" && v.field == "last_probe_position.2"));
-
-    // The tap plan reads the raw field instead.
-    let tap_plan = build_plan(&machine_tap(), plain_transforms());
-    let tap_probe = tap_plan.steps_in_phase(Phase::Probe).next().expect("probe");
+    // Tap: raw last_z_result, PROBE.
+    let tap = build(&machine_tap());
+    let tap_probe = tap.steps_in_phase(Phase::Probe).next().unwrap();
     assert!(tap_probe
         .verify
         .iter()
         .any(|v| v.object == "probe" && v.field == "last_z_result"));
+    // The target interlock is method- and path-independent.
+    assert!(tap_probe
+        .pre_verify
+        .iter()
+        .any(|v| v.object == "extruder" && v.field == "target"));
 }
 
 #[test]
@@ -609,6 +702,42 @@ fn resume_target_is_the_layer_1_infill_line() {
     };
     let target = select_resume_target(&model, &ambiguous).unwrap();
     assert_eq!(target.offset, resume_offset());
+}
+
+#[test]
+fn itinerary_preflight_catches_a_corrupted_probe_site() {
+    use plr_recovery::{preflight_itinerary, ItineraryBounds, PlanRejection, ViolationKind};
+    let mut plan = build_plan(&machine_tap(), plain_transforms());
+    // The contact point the analyzer selected (common::contact_at).
+    let bounds = ItineraryBounds {
+        x: Some((0.0, 200.0)),
+        y: Some((0.0, 200.0)),
+        z_max: Some(250.0),
+        position_min: plan.envelope.position_min,
+        contact_point: [20.0, 10.0],
+    };
+    // A clean plan passes.
+    assert!(preflight_itinerary(&plan, &bounds).is_ok());
+    // Corrupt the probe-approach travel target to a different, and
+    // out-of-limits, coordinate.
+    let approach = plan
+        .steps
+        .iter_mut()
+        .find(|s| s.phase == Phase::ProbeApproach)
+        .expect("approach");
+    approach.commands = vec!["G90".to_owned(), "G0 X999 Y10 F6000".to_owned()];
+    let Err(PlanRejection::ItineraryOutOfBounds { violations }) =
+        preflight_itinerary(&plan, &bounds)
+    else {
+        panic!("expected rejection");
+    };
+    // Both the contact mismatch and the axis-limit breach are reported.
+    assert!(violations
+        .iter()
+        .any(|v| v.kind == ViolationKind::ContactMismatch && v.axis == 'X'));
+    assert!(violations
+        .iter()
+        .any(|v| v.kind == ViolationKind::AxisLimit && v.axis == 'X'));
 }
 
 #[test]

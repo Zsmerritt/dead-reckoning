@@ -29,8 +29,8 @@
 use std::time::Duration;
 
 use plr_recovery::{
-    fmt_num, true_z_at_halt, FailureAction, Predicate, RecoveryPlan, RecoveryStep,
-    RuntimeComputation, TriggerSource, Verification, TRUE_Z_PLACEHOLDER,
+    fmt_num, true_z_at_halt, FailureAction, Phase, Predicate, RecoveryPlan, RecoveryStep,
+    RuntimeComputation, TriggerSource, Verification, RESTORE_ACCEL_PLACEHOLDER, TRUE_Z_PLACEHOLDER,
 };
 use serde_json::{json, Value};
 
@@ -89,6 +89,71 @@ impl Default for ExecOptions {
     }
 }
 
+/// The exact Klipper error string a probe-triggered-early failure
+/// carries (Cartographer keys off this literal,
+/// `adapters/klipper_like/utils.py:63-84`,
+/// `PROBE_TRIGGERED_BEFORE_MOVEMENT`).
+pub const PROBE_TRIGGERED_EARLY: &str = "Probe triggered prior to movement";
+
+/// The exact Klipper error string for a probe that never triggered.
+pub const NO_TRIGGER_FULL_MOVEMENT: &str = "No trigger on probe after full movement";
+
+/// The `PLR_TOUCH` consensus-failure message prefix (mirrors
+/// Cartographer's `TouchError`, `probe/touch_mode.py:131-137`,
+/// "Unable to find N samples within ..."): the multi-touch sequence
+/// could not assemble an agreeing subset. Treated as a no-trigger.
+pub const TOUCH_CONSENSUS_FAILURE_PREFIX: &str = "Unable to find";
+
+/// The exact Klipper error string for an out-of-range move.
+pub const MOVE_OUT_OF_RANGE: &str = "Move out of range";
+
+/// Typed classification of a Klipper gcode-script failure string
+/// (Cartographer promotes exact Klipper `CommandError` strings to typed
+/// errors, `adapters/klipper_like/utils.py:63-84`). All still abort in
+/// this wave — the type only enriches the transcript and abort record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StepFailure {
+    /// "Probe triggered prior to movement".
+    ProbeTriggeredEarly,
+    /// "No trigger on probe after full movement", or the `PLR_TOUCH`
+    /// consensus-failure prefix.
+    NoTrigger,
+    /// "Move out of range".
+    MoveOutOfRange,
+    /// Any other command error.
+    Unknown,
+}
+
+impl StepFailure {
+    /// Classifies a Klipper gcode-script error message by exact string
+    /// (substring for the consensus-failure prefix).
+    #[must_use]
+    pub fn classify(message: &str) -> Self {
+        if message.contains(PROBE_TRIGGERED_EARLY) {
+            StepFailure::ProbeTriggeredEarly
+        } else if message.contains(NO_TRIGGER_FULL_MOVEMENT)
+            || message.contains(TOUCH_CONSENSUS_FAILURE_PREFIX)
+        {
+            StepFailure::NoTrigger
+        } else if message.contains(MOVE_OUT_OF_RANGE) {
+            StepFailure::MoveOutOfRange
+        } else {
+            StepFailure::Unknown
+        }
+    }
+
+    /// Stable tag string carried in the transcript and abort record.
+    #[must_use]
+    pub fn code(self) -> &'static str {
+        match self {
+            StepFailure::ProbeTriggeredEarly => "probe-triggered-early",
+            StepFailure::NoTrigger => "no-trigger",
+            StepFailure::MoveOutOfRange => "move-out-of-range",
+            StepFailure::Unknown => "unknown",
+        }
+    }
+}
+
 /// Why execution stopped before the plan completed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StopCause {
@@ -100,13 +165,34 @@ pub enum StopCause {
         /// The last observed value, rendered.
         observed: String,
     },
-    /// Moonraker rejected or failed a command/query.
+    /// Moonraker rejected or failed a query/connection (not a
+    /// gcode-script command — those are [`StopCause::CommandFailed`]).
     Transport(String),
+    /// A gcode-script command failed; the Klipper error string is
+    /// promoted to a typed [`StepFailure`].
+    CommandFailed {
+        /// The typed classification.
+        failure: StepFailure,
+        /// The raw Klipper error string.
+        message: String,
+    },
     /// The runtime computation was invalid (non-finite inputs, missing
     /// values, or a placeholder without a computation).
     ComputeFailed(String),
     /// The operator declined at a `--step` gate.
     OperatorDeclined,
+}
+
+impl StopCause {
+    /// The typed step failure, when this stop was a classified command
+    /// error.
+    #[must_use]
+    pub fn step_failure(&self) -> Option<StepFailure> {
+        match self {
+            StopCause::CommandFailed { failure, .. } => Some(*failure),
+            _ => None,
+        }
+    }
 }
 
 /// Result of [`execute`].
@@ -127,6 +213,13 @@ pub enum ExecOutcome {
         reason: String,
         /// What actually went wrong.
         cause: StopCause,
+        /// `true` when the abort landed at or after the shifted-frame
+        /// declaration: Klipper's Z frame is now in an unknown state
+        /// (a `SET_KINEMATIC_POSITION` was declared and execution died
+        /// before the plan re-established a trusted frame), so the
+        /// caller must invalidate the pending recovery and refuse a
+        /// re-execute until a fresh plan is generated.
+        frame_invalid: bool,
     },
 }
 
@@ -165,12 +258,31 @@ pub async fn execute(
         "resume_file": plan.resume_file,
         "resume_offset": plan.resume_offset,
     }));
+    // The step id at (and after) which an abort leaves Klipper's Z frame
+    // in an unknown state (see `ExecOutcome::Aborted::frame_invalid`).
+    let shifted_id = plan
+        .first_index(Phase::ShiftedFrame)
+        .map(|i| plan.steps[i].id);
+    // Execution state that persists across steps: the pre-clamp accel
+    // recorded by the accel-clamp step (reused by the restore step and
+    // the abort cleanups) and the registered abort cleanups.
+    let mut recorded_accel: Option<f64> = None;
+    let mut cleanups: Vec<(u32, Vec<String>)> = Vec::new();
     for step in &plan.steps {
         if !gate(step) {
             transcript.entry(&json!({
                 "event": "operator-declined", "step": step.id,
             }));
-            return abort(step, StopCause::OperatorDeclined, transcript);
+            return finish_abort(
+                client,
+                step,
+                StopCause::OperatorDeclined,
+                &cleanups,
+                recorded_accel,
+                shifted_id,
+                transcript,
+            )
+            .await;
         }
         transcript.entry(&json!({
             "event": "step-start",
@@ -178,31 +290,26 @@ pub async fn execute(
             "phase": step.phase.name(),
             "summary": step.summary,
         }));
-        // Pre-verifications: must hold before anything is sent.
-        for verification in &step.pre_verify {
-            if let Err(cause) =
-                poll_verification(client, verification, None, options, transcript, "pre").await
-            {
-                return abort(step, cause, transcript);
-            }
-        }
-        // Runtime computation (true-Z): reads live values, evaluates
-        // the typed formula, feeds the single defined placeholder.
-        let computed = match runtime_compute(client, step, transcript).await {
-            Ok(computed) => computed,
-            Err(cause) => return abort(step, cause, transcript),
-        };
-        // Commands: the only send path in the crate (invariant 2).
-        if let Err(cause) = send_step_commands(client, step, computed, transcript).await {
-            return abort(step, cause, transcript);
-        }
-        // Post-verifications.
-        for verification in &step.verify {
-            if let Err(cause) =
-                poll_verification(client, verification, computed, options, transcript, "post").await
-            {
-                return abort(step, cause, transcript);
-            }
+        if let Err(cause) = run_step(
+            client,
+            step,
+            options,
+            &mut recorded_accel,
+            &mut cleanups,
+            transcript,
+        )
+        .await
+        {
+            return finish_abort(
+                client,
+                step,
+                cause,
+                &cleanups,
+                recorded_accel,
+                shifted_id,
+                transcript,
+            )
+            .await;
         }
         transcript.entry(&json!({"event": "step-ok", "step": step.id}));
     }
@@ -212,25 +319,114 @@ pub async fn execute(
     }
 }
 
-fn abort(step: &RecoveryStep, cause: StopCause, transcript: &mut Transcript<'_>) -> ExecOutcome {
+/// Runs one step's pre-verify, compute, send, and post-verify. Registers
+/// the step's abort cleanup once its commands are about to take effect.
+async fn run_step(
+    client: &mut MoonrakerClient,
+    step: &RecoveryStep,
+    options: &ExecOptions,
+    recorded_accel: &mut Option<f64>,
+    cleanups: &mut Vec<(u32, Vec<String>)>,
+    transcript: &mut Transcript<'_>,
+) -> Result<(), StopCause> {
+    // Pre-verifications: must hold before anything is sent.
+    for verification in &step.pre_verify {
+        poll_verification(client, verification, None, options, transcript, "pre").await?;
+    }
+    // Runtime computation: the true-Z formula, or the max-accel record;
+    // for a plain step the resolved value is the persisted recorded
+    // accel (so the restore step's `{restore_accel}` / NumWithinComputed
+    // resolve).
+    let computed = resolve_compute(client, step, recorded_accel, transcript).await?;
+    // Register this step's abort cleanup BEFORE its commands run: its
+    // side effect (the accel clamp) is about to be in force, so any
+    // subsequent abort must undo it.
+    if !step.cleanup_commands.is_empty() {
+        cleanups.push((step.id, step.cleanup_commands.clone()));
+    }
+    // Commands: the only send path in the crate (invariant 2).
+    send_step_commands(client, step, computed, transcript).await?;
+    // Post-verifications.
+    for verification in &step.verify {
+        poll_verification(client, verification, computed, options, transcript, "post").await?;
+    }
+    Ok(())
+}
+
+/// Runs the registered abort cleanups (in reverse registration order —
+/// the plan-level `finally`), then records the abort. A cleanup failure
+/// is transcribed but NEVER masks or replaces the original abort reason
+/// (Cartographer's `finally` cleanup likewise cannot swallow the raising
+/// error).
+async fn finish_abort(
+    client: &mut MoonrakerClient,
+    step: &RecoveryStep,
+    cause: StopCause,
+    cleanups: &[(u32, Vec<String>)],
+    recorded_accel: Option<f64>,
+    shifted_id: Option<u32>,
+    transcript: &mut Transcript<'_>,
+) -> ExecOutcome {
+    for (sid, commands) in cleanups.iter().rev() {
+        for command in commands {
+            let resolved = if command.contains(RESTORE_ACCEL_PLACEHOLDER) {
+                let Some(value) = recorded_accel else {
+                    transcript.entry(&json!({
+                        "event": "cleanup-skip", "step": sid, "command": command,
+                        "reason": "no recorded accel to substitute",
+                    }));
+                    continue;
+                };
+                command.replace(RESTORE_ACCEL_PLACEHOLDER, &fmt_num(value))
+            } else {
+                command.clone()
+            };
+            transcript.entry(&json!({
+                "event": "cleanup", "step": sid, "command": resolved,
+            }));
+            match client.gcode_script(&resolved).await {
+                Ok(()) => transcript.entry(&json!({
+                    "event": "cleanup-ok", "step": sid,
+                })),
+                // Logged, never fatal, never mutates `cause`.
+                Err(e) => transcript.entry(&json!({
+                    "event": "cleanup-error", "step": sid, "error": e.to_string(),
+                })),
+            }
+        }
+    }
+    abort(step, cause, shifted_id, transcript)
+}
+
+fn abort(
+    step: &RecoveryStep,
+    cause: StopCause,
+    shifted_id: Option<u32>,
+    transcript: &mut Transcript<'_>,
+) -> ExecOutcome {
     let FailureAction::Abort { reason } = step.on_failure;
+    let frame_invalid = shifted_id.is_some_and(|sid| step.id >= sid);
     transcript.entry(&json!({
         "event": "abort",
         "step": step.id,
         "phase": step.phase.name(),
         "reason": reason.code(),
         "cause": format!("{cause:?}"),
+        "failure": cause.step_failure().map(StepFailure::code),
+        "frame_invalid": frame_invalid,
     }));
     ExecOutcome::Aborted {
         step_id: step.id,
         phase: step.phase.name().to_owned(),
         reason: reason.code().to_owned(),
         cause,
+        frame_invalid,
     }
 }
 
 /// Sends every command of one step, in order, substituting the computed
-/// true-Z when present. This is the crate's only G-code send site.
+/// value for the true-Z / restore-accel placeholder when present. This
+/// is the crate's only G-code send site.
 async fn send_step_commands(
     client: &mut MoonrakerClient,
     step: &RecoveryStep,
@@ -238,15 +434,20 @@ async fn send_step_commands(
     transcript: &mut Transcript<'_>,
 ) -> Result<(), StopCause> {
     for command in &step.commands {
-        let resolved = if command.contains(TRUE_Z_PLACEHOLDER) {
-            let Some(true_z) = computed else {
-                // A placeholder without a computation cannot be sent;
+        let has_placeholder =
+            command.contains(TRUE_Z_PLACEHOLDER) || command.contains(RESTORE_ACCEL_PLACEHOLDER);
+        let resolved = if has_placeholder {
+            let Some(value) = computed else {
+                // A placeholder without a computed value cannot be sent;
                 // plan construction forbids it, and so does this.
                 return Err(StopCause::ComputeFailed(
-                    "command carries {true_z} but the step has no computation".to_owned(),
+                    "command carries a runtime placeholder but the step has no computed value"
+                        .to_owned(),
                 ));
             };
-            command.replace(TRUE_Z_PLACEHOLDER, &fmt_num(true_z))
+            command
+                .replace(TRUE_Z_PLACEHOLDER, &fmt_num(value))
+                .replace(RESTORE_ACCEL_PLACEHOLDER, &fmt_num(value))
         } else {
             command.clone()
         };
@@ -258,49 +459,70 @@ async fn send_step_commands(
                 "event": "response", "step": step.id, "result": "ok",
             })),
             Err(e) => {
+                let message = e.to_string();
+                let failure = StepFailure::classify(&message);
                 transcript.entry(&json!({
-                    "event": "response", "step": step.id, "error": e.to_string(),
+                    "event": "response", "step": step.id,
+                    "error": message, "failure": failure.code(),
                 }));
-                return Err(StopCause::Transport(e.to_string()));
+                return Err(StopCause::CommandFailed { failure, message });
             }
         }
     }
     Ok(())
 }
 
-/// Evaluates the step's runtime computation, if any.
-async fn runtime_compute(
+/// Resolves a step's runtime value: the true-Z formula, the recorded
+/// pre-clamp accel, or — for a plain step — the persisted recorded accel
+/// (so the restore step's placeholder and comparison resolve).
+async fn resolve_compute(
     client: &mut MoonrakerClient,
     step: &RecoveryStep,
+    recorded_accel: &mut Option<f64>,
     transcript: &mut Transcript<'_>,
 ) -> Result<Option<f64>, StopCause> {
-    let Some(RuntimeComputation::TrueZ(formula)) = step.compute else {
-        return Ok(None);
-    };
-    // Trigger reading, per probe type (plr-recovery documents the
-    // Klipper field semantics behind each source). The drag result is
-    // read off the plugin's own `plr` status object exactly like the
-    // stock probe status.
-    let (object, field) = match formula.trigger_source {
-        TriggerSource::RawLastZResult => ("probe", "last_z_result"),
-        TriggerSource::BedZPlusOffset { .. } => ("probe", "last_probe_position.2"),
-        TriggerSource::DragResult => ("plr", "last_drag_result.trigger_z"),
-    };
-    let trigger_reading = query_number(client, object, field).await?;
-    let halt_z = query_number(client, "toolhead", "position.2").await?;
-    match true_z_at_halt(&formula, trigger_reading, halt_z) {
-        Ok(true_z) => {
-            transcript.entry(&json!({
-                "event": "compute",
-                "step": step.id,
-                "trigger_reading": trigger_reading,
-                "halt_z": halt_z,
-                "true_z": true_z,
-            }));
-            Ok(Some(true_z))
+    match step.compute {
+        Some(RuntimeComputation::TrueZ(formula)) => {
+            // Trigger reading, per probe type (plr-recovery documents
+            // the Klipper field semantics). The drag and consensus
+            // results live on the plugin's own `plr` status object.
+            let (object, field) = match formula.trigger_source {
+                TriggerSource::RawLastZResult => ("probe", "last_z_result"),
+                TriggerSource::BedZPlusOffset { .. } => ("probe", "last_probe_position.2"),
+                TriggerSource::DragResult => ("plr", "last_drag_result.trigger_z"),
+                TriggerSource::TouchResult { .. } => ("plr", "last_touch_result.median_z"),
+            };
+            let trigger_reading = query_number(client, object, field).await?;
+            let halt_z = query_number(client, "toolhead", "position.2").await?;
+            match true_z_at_halt(&formula, trigger_reading, halt_z) {
+                Ok(true_z) => {
+                    transcript.entry(&json!({
+                        "event": "compute",
+                        "step": step.id,
+                        "trigger_reading": trigger_reading,
+                        "halt_z": halt_z,
+                        "true_z": true_z,
+                    }));
+                    Ok(Some(true_z))
+                }
+                // Never substitute on error (plr-recovery contract).
+                Err(e) => Err(StopCause::ComputeFailed(e.to_string())),
+            }
         }
-        // Never substitute on error (plr-recovery contract).
-        Err(e) => Err(StopCause::ComputeFailed(e.to_string())),
+        Some(RuntimeComputation::RecordMaxAccel) => {
+            // Read BEFORE the step's SET_VELOCITY_LIMIT clamps it, and
+            // persist for the restore step / abort cleanup.
+            let accel = query_number(client, "toolhead", "max_accel").await?;
+            *recorded_accel = Some(accel);
+            transcript.entry(&json!({
+                "event": "record-accel", "step": step.id, "max_accel": accel,
+            }));
+            Ok(Some(accel))
+        }
+        // A plain step resolves to the persisted recorded accel: this is
+        // what the accel-restore step's `{restore_accel}` substitution
+        // and NumWithinComputed check read.
+        None => Ok(*recorded_accel),
     }
 }
 
@@ -395,6 +617,7 @@ fn evaluate(predicate: &Predicate, value: Option<&Value>, computed: Option<f64>)
             num.is_some_and(|v| (v - expected).abs() <= *epsilon)
         }
         Predicate::NumAtLeast { min } => num.is_some_and(|v| v >= *min),
+        Predicate::NumAtMost { max } => num.is_some_and(|v| v <= *max),
         Predicate::TempWithin { min, max } => num.is_some_and(|v| v >= *min && v <= *max),
         Predicate::Contains { needle } => value.as_str().is_some_and(|s| s.contains(needle)),
         Predicate::Equals { value: expected } => value.as_str().is_some_and(|s| s == expected),
@@ -419,7 +642,8 @@ fn evaluate(predicate: &Predicate, value: Option<&Value>, computed: Option<f64>)
 #[cfg(test)]
 pub(crate) mod tests {
     use super::{
-        dry_run, evaluate, execute, lookup, ExecOptions, ExecOutcome, StopCause, Transcript,
+        dry_run, evaluate, execute, lookup, ExecOptions, ExecOutcome, StepFailure, StopCause,
+        Transcript,
     };
     use crate::moonraker::MoonrakerClient;
     use crate::testmoon::FakeMoonraker;
@@ -451,6 +675,7 @@ pub(crate) mod tests {
                     },
                 )],
                 compute: None,
+                cleanup_commands: vec![],
                 on_failure: FailureAction::Abort {
                     reason: AbortReason::IdleTimeoutNotApplied,
                 },
@@ -474,6 +699,7 @@ pub(crate) mod tests {
                     Predicate::FinitePresent,
                 )],
                 compute: None,
+                cleanup_commands: vec![],
                 on_failure: FailureAction::Abort {
                     reason: AbortReason::ProbeNoTrigger,
                 },
@@ -490,6 +716,7 @@ pub(crate) mod tests {
                     trigger_source: TriggerSource::RawLastZResult,
                     frozen_z_adjust: None,
                 })),
+                cleanup_commands: vec![],
                 on_failure: FailureAction::Abort {
                     reason: AbortReason::TrueZDeclareFailed,
                 },
@@ -656,7 +883,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn transport_error_aborts_immediately() {
+    async fn command_error_aborts_immediately_and_is_typed_unknown() {
         let plan = test_plan();
         let fake = FakeMoonraker::spawn(|method, params| {
             if method == "printer.gcode.script" {
@@ -666,13 +893,77 @@ pub(crate) mod tests {
             }
         })
         .await;
-        let (outcome, _) = run(&plan, &fake, &mut |_| true).await;
+        let (outcome, transcript) = run(&plan, &fake, &mut |_| true).await;
         let ExecOutcome::Aborted { step_id, cause, .. } = outcome else {
             panic!("expected abort");
         };
         assert_eq!(step_id, 1);
-        assert!(matches!(cause, StopCause::Transport(_)));
+        // A gcode-script error that matches no known string is a typed
+        // Unknown command failure (not a transport error).
+        assert!(matches!(
+            cause,
+            StopCause::CommandFailed {
+                failure: StepFailure::Unknown,
+                ..
+            }
+        ));
+        assert!(
+            transcript.contains("\"failure\":\"unknown\""),
+            "{transcript}"
+        );
         assert_eq!(fake.gcode_sent().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn klipper_error_strings_promote_to_typed_step_failures() {
+        // Each exact Klipper error string (and the PLR_TOUCH consensus
+        // prefix) maps to its typed StepFailure; all still abort.
+        for (message, expected, code) in [
+            (
+                "Probe triggered prior to movement",
+                StepFailure::ProbeTriggeredEarly,
+                "probe-triggered-early",
+            ),
+            (
+                "No trigger on probe after full movement",
+                StepFailure::NoTrigger,
+                "no-trigger",
+            ),
+            (
+                "Unable to find 3 samples within 0.010mm in a window of 5 after 7 touches",
+                StepFailure::NoTrigger,
+                "no-trigger",
+            ),
+            (
+                "Move out of range: 5.0 250.0 0.0 [250.0]",
+                StepFailure::MoveOutOfRange,
+                "move-out-of-range",
+            ),
+            ("some other klippy failure", StepFailure::Unknown, "unknown"),
+        ] {
+            assert_eq!(StepFailure::classify(message), expected, "{message}");
+            let msg = message.to_owned();
+            let fake = FakeMoonraker::spawn(move |method, params| {
+                if method == "printer.gcode.script" {
+                    Err((400, msg.clone()))
+                } else {
+                    happy_handler(method, params)
+                }
+            })
+            .await;
+            let (outcome, transcript) = run(&test_plan(), &fake, &mut |_| true).await;
+            let ExecOutcome::Aborted { cause, .. } = outcome else {
+                panic!("expected abort for {message}");
+            };
+            assert!(
+                matches!(cause, StopCause::CommandFailed { failure, .. } if failure == expected),
+                "{message}: {cause:?}"
+            );
+            assert!(
+                transcript.contains(&format!("\"failure\":\"{code}\"")),
+                "{message}: {transcript}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -780,6 +1071,286 @@ pub(crate) mod tests {
         assert_eq!(step_id, 3);
         assert!(matches!(cause, StopCause::ComputeFailed(_)));
         assert!(!fake.gcode_sent().iter().any(|c| c.contains("{true_z}")));
+    }
+
+    /// A three-step accel-clamp plan: clamp (records `max_accel`,
+    /// declares the abort cleanup), a probe, then the success restore.
+    fn accel_plan() -> RecoveryPlan {
+        use plr_recovery::RESTORE_ACCEL_PLACEHOLDER;
+        let mut plan = test_plan();
+        plan.steps = vec![
+            RecoveryStep {
+                id: 1,
+                phase: Phase::AccelClamp,
+                summary: "clamp".to_owned(),
+                commands: vec!["SET_VELOCITY_LIMIT ACCEL=100".to_owned()],
+                pre_verify: vec![],
+                verify: vec![],
+                compute: Some(RuntimeComputation::RecordMaxAccel),
+                cleanup_commands: vec![format!(
+                    "SET_VELOCITY_LIMIT ACCEL={RESTORE_ACCEL_PLACEHOLDER}"
+                )],
+                on_failure: FailureAction::Abort {
+                    reason: AbortReason::AccelClampFailed,
+                },
+            },
+            RecoveryStep {
+                id: 2,
+                phase: Phase::Probe,
+                summary: "touch".to_owned(),
+                commands: vec![
+                    "PLR_TOUCH SAMPLES=3 SAMPLE_RANGE=0.01 SPEED=1 RETRACT=2 TOUCH_ACCEL=100"
+                        .to_owned(),
+                ],
+                pre_verify: vec![],
+                verify: vec![Verification::new(
+                    "plr",
+                    "last_touch_result.median_z",
+                    Predicate::FinitePresent,
+                )],
+                compute: None,
+                cleanup_commands: vec![],
+                on_failure: FailureAction::Abort {
+                    reason: AbortReason::ProbeNoTrigger,
+                },
+            },
+            RecoveryStep {
+                id: 3,
+                phase: Phase::AccelRestore,
+                summary: "restore".to_owned(),
+                commands: vec![format!(
+                    "SET_VELOCITY_LIMIT ACCEL={RESTORE_ACCEL_PLACEHOLDER}"
+                )],
+                pre_verify: vec![],
+                verify: vec![Verification::new(
+                    "toolhead",
+                    "max_accel",
+                    Predicate::NumWithinComputed { epsilon: 1.0 },
+                )],
+                compute: None,
+                cleanup_commands: vec![],
+                on_failure: FailureAction::Abort {
+                    reason: AbortReason::AccelRestoreFailed,
+                },
+            },
+        ];
+        plan
+    }
+
+    /// A stateful fake whose `toolhead.max_accel` tracks the last
+    /// `SET_VELOCITY_LIMIT ACCEL=`, and whose touch median is
+    /// controllable.
+    fn accel_fake_handler(
+        median: Option<f64>,
+        fail_restore: bool,
+    ) -> impl Fn(&str, &Value) -> Result<Value, (i64, String)> + Send + Sync + 'static {
+        let accel = Arc::new(Mutex::new(3000.0_f64));
+        move |method, params| {
+            let mut accel = accel.lock().expect("accel");
+            match method {
+                "printer.gcode.script" => {
+                    let script = params["script"].as_str().unwrap_or("");
+                    if let Some(rest) = script.strip_prefix("SET_VELOCITY_LIMIT ACCEL=") {
+                        if let Ok(v) = rest.trim().parse::<f64>() {
+                            // Restoring (to the >200 pre-clamp value) fails
+                            // when the test asked for a failing restore.
+                            if fail_restore && v > 200.0 {
+                                return Err((400, "Move out of range".to_owned()));
+                            }
+                            *accel = v;
+                        }
+                    }
+                    Ok(json!("ok"))
+                }
+                "printer.objects.query" => {
+                    let objects = params["objects"].as_object().expect("objects");
+                    let mut status = serde_json::Map::new();
+                    for name in objects.keys() {
+                        let value = match name.as_str() {
+                            "toolhead" => {
+                                json!({"position": [10.0, 20.0, 0.75, 0.0], "max_accel": *accel})
+                            }
+                            "plr" => json!({"last_touch_result": {"median_z": median}}),
+                            other => json!({"unknown": other}),
+                        };
+                        status.insert(name.clone(), value);
+                    }
+                    Ok(json!({"eventtime": 1.0, "status": status}))
+                }
+                other => Err((-32601, format!("Method not found: {other}"))),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn frame_invalid_is_set_only_at_or_after_the_shifted_frame() {
+        // A plan whose shifted-frame declare is step 2; the probe (step
+        // 3) aborts, so the frame is invalidated.
+        // A clean 3-step plan: idle(1), shifted-frame(2), probe(3).
+        let mut plan = test_plan();
+        plan.steps = vec![
+            RecoveryStep {
+                id: 1,
+                phase: Phase::IdleTimeout,
+                summary: "idle".to_owned(),
+                commands: vec!["SET_IDLE_TIMEOUT TIMEOUT=86400".to_owned()],
+                pre_verify: vec![],
+                verify: vec![],
+                compute: None,
+                cleanup_commands: vec![],
+                on_failure: FailureAction::Abort {
+                    reason: AbortReason::IdleTimeoutNotApplied,
+                },
+            },
+            RecoveryStep {
+                id: 2,
+                phase: Phase::ShiftedFrame,
+                summary: "declare shifted frame".to_owned(),
+                commands: vec!["SET_KINEMATIC_POSITION Z=-1.15".to_owned()],
+                pre_verify: vec![],
+                verify: vec![],
+                compute: None,
+                cleanup_commands: vec![],
+                on_failure: FailureAction::Abort {
+                    reason: AbortReason::ShiftedFrameNotDeclared,
+                },
+            },
+            RecoveryStep {
+                id: 3,
+                phase: Phase::Probe,
+                summary: "probe".to_owned(),
+                commands: vec!["PROBE PROBE_SPEED=1 SAMPLES=1".to_owned()],
+                pre_verify: vec![],
+                verify: vec![Verification::new(
+                    "probe",
+                    "last_z_result",
+                    Predicate::FinitePresent,
+                )],
+                compute: None,
+                cleanup_commands: vec![],
+                on_failure: FailureAction::Abort {
+                    reason: AbortReason::ProbeNoTrigger,
+                },
+            },
+        ];
+        // Probe verify fails (last_z_result null): abort at step 3.
+        let fake = FakeMoonraker::spawn(|method, params| {
+            let mut v = happy_handler(method, params)?;
+            if method == "printer.objects.query" {
+                if let Some(p) = v.get_mut("status").and_then(|s| s.get_mut("probe")) {
+                    *p = json!({ "last_z_result": null });
+                }
+            }
+            Ok(v)
+        })
+        .await;
+        let (outcome, transcript) = run(&plan, &fake, &mut |_| true).await;
+        let ExecOutcome::Aborted {
+            step_id,
+            frame_invalid,
+            ..
+        } = outcome
+        else {
+            panic!("expected abort");
+        };
+        assert_eq!(step_id, 3);
+        assert!(
+            frame_invalid,
+            "abort after the shifted frame invalidates it"
+        );
+        assert!(
+            transcript.contains("\"frame_invalid\":true"),
+            "{transcript}"
+        );
+    }
+
+    #[tokio::test]
+    async fn frame_invalid_is_false_before_the_shifted_frame() {
+        // test_plan() has no shifted-frame step and aborts at step 1.
+        let plan = test_plan();
+        let fake = FakeMoonraker::spawn(|method, params| {
+            let mut v = happy_handler(method, params)?;
+            if method == "printer.objects.query" {
+                if let Some(it) = v.get_mut("status").and_then(|s| s.get_mut("idle_timeout")) {
+                    *it = json!({"idle_timeout": 600.0});
+                }
+            }
+            Ok(v)
+        })
+        .await;
+        let (outcome, _) = run(&plan, &fake, &mut |_| true).await;
+        let ExecOutcome::Aborted { frame_invalid, .. } = outcome else {
+            panic!("expected abort");
+        };
+        assert!(!frame_invalid);
+    }
+
+    #[tokio::test]
+    async fn accel_clamp_records_restores_on_success() {
+        let plan = accel_plan();
+        let fake = FakeMoonraker::spawn(accel_fake_handler(Some(0.75), false)).await;
+        let (outcome, transcript) = run(&plan, &fake, &mut |_| true).await;
+        assert_eq!(outcome, ExecOutcome::Completed { steps: 3 }, "{transcript}");
+        // Clamp to 100, then restore to the recorded 3000 on success.
+        assert_eq!(
+            fake.gcode_sent(),
+            vec![
+                "SET_VELOCITY_LIMIT ACCEL=100",
+                "PLR_TOUCH SAMPLES=3 SAMPLE_RANGE=0.01 SPEED=1 RETRACT=2 TOUCH_ACCEL=100",
+                "SET_VELOCITY_LIMIT ACCEL=3000",
+            ]
+        );
+        assert!(transcript.contains("record-accel"), "{transcript}");
+        // No abort cleanup ran on the success path.
+        assert!(
+            !transcript.contains("\"event\":\"cleanup\""),
+            "{transcript}"
+        );
+    }
+
+    #[tokio::test]
+    async fn accel_cleanup_runs_on_abort_and_cannot_mask_the_reason() {
+        // The touch median is null → the probe post-verify fails → abort
+        // at step 2. The clamp step's cleanup must restore the accel, and
+        // the abort reason must remain the probe's, not the clamp's.
+        let plan = accel_plan();
+        let fake = FakeMoonraker::spawn(accel_fake_handler(None, false)).await;
+        let (outcome, transcript) = run(&plan, &fake, &mut |_| true).await;
+        let ExecOutcome::Aborted {
+            step_id,
+            reason,
+            cause,
+            ..
+        } = outcome
+        else {
+            panic!("expected abort, got {outcome:?}");
+        };
+        assert_eq!(step_id, 2);
+        // The ORIGINAL reason (probe), not accel-restore/clamp.
+        assert_eq!(reason, "probe-no-trigger");
+        assert!(matches!(cause, StopCause::VerificationFailed { .. }));
+        // The abort cleanup restored the recorded accel (3000).
+        assert!(
+            fake.gcode_sent()
+                .contains(&"SET_VELOCITY_LIMIT ACCEL=3000".to_owned()),
+            "{:?}",
+            fake.gcode_sent()
+        );
+        assert!(transcript.contains("\"event\":\"cleanup\""), "{transcript}");
+    }
+
+    #[tokio::test]
+    async fn accel_cleanup_failure_is_logged_but_never_masks_the_reason() {
+        // The restore command itself fails (Move out of range). The abort
+        // reason must STILL be the probe's; the cleanup error is logged.
+        let plan = accel_plan();
+        let fake = FakeMoonraker::spawn(accel_fake_handler(None, true)).await;
+        let (outcome, transcript) = run(&plan, &fake, &mut |_| true).await;
+        let ExecOutcome::Aborted { reason, .. } = outcome else {
+            panic!("expected abort");
+        };
+        assert_eq!(reason, "probe-no-trigger", "cleanup must not mask reason");
+        assert!(transcript.contains("cleanup-error"), "{transcript}");
     }
 
     #[test]

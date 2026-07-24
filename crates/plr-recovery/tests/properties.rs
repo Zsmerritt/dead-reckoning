@@ -405,6 +405,17 @@ proptest! {
         prop_assert!(plan.probe_step_precedes_mesh_load());
         prop_assert!(plan.mesh_load_precedes_final_declare());
         prop_assert!(plan.no_g28_after_shifted_declare());
+        // Accel clamp precedes the probe, restore follows on success,
+        // and the clamp declares an abort cleanup — for every valid
+        // plan (vacuously so on the drag path, which has no clamp).
+        prop_assert!(plan.accel_clamp_precedes_probe());
+        prop_assert!(plan.accel_restore_follows_probe());
+        prop_assert!(plan.accel_clamp_declares_cleanup());
+        // The accel-clamp steps exist exactly on the consensus-touch
+        // (tap/load-cell, non-legacy) path: present for tap, absent for
+        // drag.
+        prop_assert_eq!(plan.first_index(Phase::AccelClamp).is_some(), !s.drag);
+        prop_assert_eq!(plan.first_index(Phase::AccelRestore).is_some(), !s.drag);
 
         // z_thermal step present exactly when the module is configured.
         prop_assert_eq!(
@@ -464,15 +475,22 @@ proptest! {
                 OvershootTerm::DragStep { drag_z_step: s.drag_z_step }
             );
         } else {
-            prop_assert!(probe.commands[0].starts_with("PROBE PROBE_SPEED="));
+            // Tap consensus path: PLR_TOUCH, reading the consensus
+            // median off the plr status object.
+            prop_assert!(probe.commands[0].starts_with("PLR_TOUCH SAMPLES="));
             prop_assert!(probe.verify.iter().any(
-                |v| v.object == "probe" && v.field == "last_z_result"
+                |v| v.object == "plr" && v.field == "last_touch_result.median_z"
             ));
             prop_assert_eq!(
                 plan.envelope.params.overshoot,
                 OvershootTerm::PostTriggerTravel { probe_speed: s.probe_speed }
             );
         }
+        // The extruder-target temperature interlock is on every probe
+        // step (method-independent).
+        prop_assert!(probe.pre_verify.iter().any(
+            |v| v.object == "extruder" && v.field == "target"
+        ));
     }
 
     /// Hostile numbers anywhere produce a typed error or a typed

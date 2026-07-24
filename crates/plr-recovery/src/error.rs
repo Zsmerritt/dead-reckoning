@@ -8,6 +8,7 @@ use serde::Serialize;
 
 use crate::envelope::{PROBE_SPEED_MAX, PROBE_SPEED_MIN};
 use crate::machine::PrereqFailure;
+use crate::preflight::PlanRejection;
 
 /// Failures of recovery planning.
 ///
@@ -95,6 +96,12 @@ pub enum RecoveryError {
         /// The offending name.
         name: String,
     },
+    /// The whole-itinerary pre-flight ([`crate::preflight`]) found one
+    /// or more commanded coordinates outside the machine's bounds or
+    /// disagreeing with the selected contact zone. Every violation is
+    /// listed.
+    #[error(transparent)]
+    ItineraryRejected(#[from] PlanRejection),
 }
 
 #[cfg(test)]

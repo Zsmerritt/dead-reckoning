@@ -36,6 +36,7 @@
       fail: abort (approach-failed)
  7. [probe] ADXL drag probe (bounded fixed-Z staircase; the accelerometer hears the contact)
       pre:  extruder.temperature in [140, 160] C
+      pre:  extruder.target <= 160
       pre:  toolhead.homed_axes contains "x"
       pre:  toolhead.homed_axes contains "y"
       pre:  toolhead.homed_axes contains "z"
@@ -44,12 +45,12 @@
       fail: abort (probe-no-trigger)
  8. [true-z-declare] true-Z arithmetic and kinematic re-declaration (never a gcode offset)
       send: SET_KINEMATIC_POSITION Z={true_z}
-      ok?:  toolhead.position.2 within 0.05 of the computed true Z
+      ok?:  toolhead.position.2 within 0.05 of the step's computed value
       fail: abort (true-z-declare-failed)
  9. [final-declare] final true-frame declaration after all transforms are in place
       send: SET_KINEMATIC_POSITION Z={true_z}
       ok?:  toolhead.homed_axes contains "z"
-      ok?:  toolhead.position.2 within 0.05 of the computed true Z
+      ok?:  toolhead.position.2 within 0.05 of the step's computed value
       fail: abort (final-declare-failed)
 10. [restore-frame] lift off the part, then replay offsets, factors, skew, print temperatures, fans, feedrate
       send: G91

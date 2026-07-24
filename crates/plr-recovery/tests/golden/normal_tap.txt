@@ -34,24 +34,36 @@
       ok?:  toolhead.position.0 within 0.25 of 20
       ok?:  toolhead.position.1 within 0.25 of 10
       fail: abort (approach-failed)
- 7. [probe] single-sample probe (SAMPLES=1: the toolhead rests exactly at the halt position)
+ 7. [accel-clamp] clamp max_accel to the touch accel around the consensus touch (restored after / on abort)
+      send: SET_VELOCITY_LIMIT ACCEL=100
+      ok?:  toolhead.max_accel within 1 of 100
+      undo: SET_VELOCITY_LIMIT ACCEL={restore_accel}
+      fail: abort (accel-clamp-failed)
+ 8. [probe] consensus multi-touch (PLR_TOUCH: sliding-window best subset; median is the trigger Z)
       pre:  extruder.temperature in [140, 160] C
+      pre:  extruder.target <= 160
       pre:  toolhead.homed_axes contains "x"
       pre:  toolhead.homed_axes contains "y"
       pre:  toolhead.homed_axes contains "z"
-      send: PROBE PROBE_SPEED=1 SAMPLES=1
-      ok?:  probe.last_z_result present and finite
+      send: PLR_TOUCH SAMPLES=3 SAMPLE_RANGE=0.01 SPEED=1 RETRACT=2 TOUCH_ACCEL=100
+      ok?:  plr.last_touch_result.range <= 0.01
+      ok?:  plr.last_touch_result.samples_used >= 3
+      ok?:  plr.last_touch_result.median_z present and finite
       fail: abort (probe-no-trigger)
- 8. [true-z-declare] true-Z arithmetic and kinematic re-declaration (never a gcode offset)
+ 9. [accel-restore] restore the pre-clamp max_accel on the success path
+      send: SET_VELOCITY_LIMIT ACCEL={restore_accel}
+      ok?:  toolhead.max_accel within 1 of the step's computed value
+      fail: abort (accel-restore-failed)
+10. [true-z-declare] true-Z arithmetic and kinematic re-declaration (never a gcode offset)
       send: SET_KINEMATIC_POSITION Z={true_z}
-      ok?:  toolhead.position.2 within 0.05 of the computed true Z
+      ok?:  toolhead.position.2 within 0.05 of the step's computed value
       fail: abort (true-z-declare-failed)
- 9. [final-declare] final true-frame declaration after all transforms are in place
+11. [final-declare] final true-frame declaration after all transforms are in place
       send: SET_KINEMATIC_POSITION Z={true_z}
       ok?:  toolhead.homed_axes contains "z"
-      ok?:  toolhead.position.2 within 0.05 of the computed true Z
+      ok?:  toolhead.position.2 within 0.05 of the step's computed value
       fail: abort (final-declare-failed)
-10. [restore-frame] lift off the part, then replay offsets, factors, skew, print temperatures, fans, feedrate
+12. [restore-frame] lift off the part, then replay offsets, factors, skew, print temperatures, fans, feedrate
       send: G91
       send: G1 Z1 F1200
       send: G90
@@ -67,7 +79,7 @@
       ok?:  extruder.temperature in [207, 213] C
       ok?:  heater_bed.temperature >= 57
       fail: abort (restore-failed)
-11. [entry] enter from above the part interior, speed-limited; prime; final E frame and modes
+13. [entry] enter from above the part interior, speed-limited; prime; final E frame and modes
       send: G90
       send: M83
       send: G0 Z1.35 F1200
@@ -81,13 +93,13 @@
       ok?:  toolhead.position.0 within 0.25 of 30
       ok?:  toolhead.position.1 within 0.25 of 30
       fail: abort (entry-failed)
-12. [file-select] select the file (top level only), restore exclude-object state, seek to the line boundary
+14. [file-select] select the file (top level only), restore exclude-object state, seek to the line boundary
       send: M23 part.gcode
       send: M26 S128
       ok?:  virtual_sdcard.file_path equals "/tmp/part.gcode"
       ok?:  virtual_sdcard.file_position within 0.5 of 128
       fail: abort (file-select-failed)
-13. [resume-start] start playback
+15. [resume-start] start playback
       send: M24
       ok?:  virtual_sdcard.is_active is true
       ok?:  idle_timeout.state equals "Printing"

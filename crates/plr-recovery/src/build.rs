@@ -40,8 +40,10 @@ use crate::error::RecoveryError;
 use crate::machine::{validate_machine, MachineConfig, ProbeKind, ValidatedMachine};
 use crate::plan::{
     fmt_num, AbortReason, FailureAction, Phase, PlanWarning, Predicate, RecoveryPlan, RecoveryStep,
-    RuntimeComputation, TriggerSource, TrueZFormula, Verification, TRUE_Z_PLACEHOLDER,
+    RuntimeComputation, TriggerSource, TrueZFormula, Verification, RESTORE_ACCEL_PLACEHOLDER,
+    TRUE_Z_PLACEHOLDER,
 };
+use crate::preflight::{preflight_itinerary, ItineraryBounds};
 use crate::preheat::{derive_preheat, FileTemps};
 
 /// Tunables of the plan builder. [`PlanConfig::default`] is the
@@ -113,6 +115,43 @@ pub struct PlanConfig {
     /// mapping is the plugin's contract, the descent bound never
     /// depends on it (the shifted frame limits travel structurally).
     pub drag_sensitivity: f64,
+    /// Consensus touch: number of agreeing samples the median is taken
+    /// over (`PLR_TOUCH SAMPLES=`). Hard band `[3, 7]`, integral: fewer
+    /// than three cannot form a consensus, more than seven wears the
+    /// part for no statistical gain (Cartographer's touch default is 3,
+    /// `interfaces/configuration.py`). Tap / load-cell only; ignored on
+    /// the drag path, but always validated.
+    pub touch_samples: f64,
+    /// Consensus touch: the acceptable spread (max − min, mm) of the
+    /// agreeing subset (`PLR_TOUCH SAMPLE_RANGE=`). Default 0.010; a
+    /// **hard cap of 0.015 mm** — values above it are REFUSED, never
+    /// clamped, mirroring Cartographer's `sample_range` option ceiling
+    /// (`interfaces/configuration.py:248`,
+    /// `default=0.010, min=0.001, max=0.015`): a wider consensus band
+    /// admits touches too noisy to trust as a Z datum.
+    pub touch_sample_range: f64,
+    /// Consensus touch: retract distance between/after touches
+    /// (`PLR_TOUCH RETRACT=`, mm). Minimum 1.0 — the nozzle must clear
+    /// the surface between touches so each descent starts clean
+    /// (Cartographer retracts to `retract_distance` before and after
+    /// each probe, `touch_mode.py:257-279`). Tap / load-cell only.
+    pub touch_retract: f64,
+    /// Consensus touch: the `max_accel` clamp applied around the touch
+    /// phase (`PLR_TOUCH TOUCH_ACCEL=` and the plan-level
+    /// `SET_VELOCITY_LIMIT` clamp). Hard band `[50, 1000]` mm/s²;
+    /// Cartographer's `TOUCH_ACCEL` is 100 (`touch_mode.py:31`). A
+    /// gentle accel keeps the tap from over-driving the nozzle into the
+    /// part before the trigger is observed.
+    pub touch_accel: f64,
+    /// Use the legacy single-sample `PROBE SAMPLES=1` step instead of
+    /// the consensus `PLR_TOUCH` sequence on Tap / load-cell machines.
+    /// Set by the legacy `/etc/plrd.conf [machine]` path, where the
+    /// Klipper plugin (and therefore its `PLR_TOUCH` command) may not
+    /// be loaded — the stock `PROBE` is all that can be assumed. The
+    /// `[plr]` path leaves it `false` (plugin present ⇒ consensus
+    /// touch). Ignored on the drag path (drag always uses
+    /// `PLR_DRAG_PROBE`).
+    pub legacy_single_probe: bool,
 }
 
 impl Default for PlanConfig {
@@ -137,6 +176,13 @@ impl Default for PlanConfig {
             drag_speed: 20.0,
             drag_z_step: 0.05,
             drag_sensitivity: 30.0,
+            // Consensus-touch defaults (mirror Cartographer's touch
+            // config; see the field docs).
+            touch_samples: 3.0,
+            touch_sample_range: 0.010,
+            touch_retract: 2.0,
+            touch_accel: 100.0,
+            legacy_single_probe: false,
         }
     }
 }
@@ -150,7 +196,7 @@ impl PlanConfig {
     /// field. The probe speed band is enforced later by
     /// [`compute_envelope`].
     pub fn validate(&self) -> Result<(), RecoveryError> {
-        let checks: [(&'static str, f64, bool); 17] = [
+        let checks: [(&'static str, f64, bool); 21] = [
             ("margin", self.margin, self.margin >= 0.0),
             (
                 "sag_allowance",
@@ -206,6 +252,31 @@ impl PlanConfig {
                 "drag_sensitivity",
                 self.drag_sensitivity,
                 self.drag_sensitivity >= 0.0 && self.drag_sensitivity <= 100.0,
+            ),
+            // Consensus-touch tunables (see the field docs).
+            (
+                "touch_samples",
+                self.touch_samples,
+                self.touch_samples >= 3.0
+                    && self.touch_samples <= 7.0
+                    && self.touch_samples.fract() == 0.0,
+            ),
+            (
+                // Hard cap 0.015 (Cartographer configuration.py:248);
+                // above it is REFUSED, not clamped.
+                "touch_sample_range",
+                self.touch_sample_range,
+                self.touch_sample_range > 0.0 && self.touch_sample_range <= 0.015,
+            ),
+            (
+                "touch_retract",
+                self.touch_retract,
+                self.touch_retract >= 1.0,
+            ),
+            (
+                "touch_accel",
+                self.touch_accel,
+                self.touch_accel >= 50.0 && self.touch_accel <= 1000.0,
             ),
         ];
         for (field, value, in_range) in checks {
@@ -520,6 +591,7 @@ fn step(
         pre_verify,
         verify,
         compute,
+        cleanup_commands: Vec::new(),
         on_failure: FailureAction::Abort { reason },
     }
 }
@@ -721,24 +793,115 @@ fn step_probe_approach(ctx: &Ctx<'_>) -> RecoveryStep {
     )
 }
 
+/// `true` when this plan probes Tap / load-cell machines with the
+/// consensus `PLR_TOUCH` sequence rather than the legacy single `PROBE`.
+/// Drag machines are never touch-consensus (they run `PLR_DRAG_PROBE`).
+fn uses_consensus_touch(machine: &ValidatedMachine, cfg: &PlanConfig) -> bool {
+    matches!(machine.probe.kind, ProbeKind::Tap | ProbeKind::LoadCell) && !cfg.legacy_single_probe
+}
+
+fn step_accel_clamp(ctx: &Ctx<'_>) -> RecoveryStep {
+    // Record the pre-clamp max_accel (RecordMaxAccel reads it BEFORE the
+    // SET_VELOCITY_LIMIT below runs), clamp it to the touch accel, and
+    // declare the abort cleanup that restores it — the plan-level
+    // `finally` (Cartographer touch_mode.py:262-274). The success-path
+    // restore is the separate AccelRestore step.
+    let mut s = step(
+        Phase::AccelClamp,
+        "clamp max_accel to the touch accel around the consensus touch (restored after / on abort)",
+        vec![format!(
+            "SET_VELOCITY_LIMIT ACCEL={}",
+            fmt_num(ctx.cfg.touch_accel)
+        )],
+        vec![],
+        vec![Verification::new(
+            "toolhead",
+            "max_accel",
+            Predicate::NumWithin {
+                expected: ctx.cfg.touch_accel,
+                epsilon: 1.0,
+            },
+        )],
+        Some(RuntimeComputation::RecordMaxAccel),
+        AbortReason::AccelClampFailed,
+    );
+    s.cleanup_commands = vec![format!(
+        "SET_VELOCITY_LIMIT ACCEL={RESTORE_ACCEL_PLACEHOLDER}"
+    )];
+    s
+}
+
+fn step_accel_restore() -> RecoveryStep {
+    step(
+        Phase::AccelRestore,
+        "restore the pre-clamp max_accel on the success path",
+        vec![format!(
+            "SET_VELOCITY_LIMIT ACCEL={RESTORE_ACCEL_PLACEHOLDER}"
+        )],
+        vec![],
+        vec![Verification::new(
+            "toolhead",
+            "max_accel",
+            Predicate::NumWithinComputed { epsilon: 1.0 },
+        )],
+        // No compute: the daemon reuses the pre-clamp accel the
+        // accel-clamp step already recorded (it must NOT re-read
+        // max_accel here — that would read the clamped value). Both the
+        // {restore_accel} substitution and the NumWithinComputed check
+        // resolve against that stored value.
+        None,
+        AbortReason::AccelRestoreFailed,
+    )
+}
+
 fn step_probe(ctx: &Ctx<'_>) -> RecoveryStep {
-    // Trigger readback location per probe type. The drag result lives
-    // on the plugin's own `plr` status object, not on `probe`.
+    // Trigger readback location per probe method. The consensus and
+    // drag results live on the plugin's own `plr` status object.
     let (trigger_object, trigger_field) = match ctx.formula.trigger_source {
         TriggerSource::RawLastZResult => ("probe", "last_z_result"),
         TriggerSource::BedZPlusOffset { .. } => ("probe", "last_probe_position.2"),
         TriggerSource::DragResult => ("plr", "last_drag_result.trigger_z"),
+        TriggerSource::TouchResult { .. } => ("plr", "last_touch_result.median_z"),
     };
-    // Command + summary per probe type. The drag command carries every
-    // tunable as an explicit argument so the transcript is a complete,
-    // auditable record of what the plugin was asked to do.
-    let (summary, command) = match &ctx.machine.probe.kind {
+    // Command + summary + method-specific post-verifications.
+    let consensus = uses_consensus_touch(ctx.machine, ctx.cfg);
+    let (summary, command, mut verify) = match &ctx.machine.probe.kind {
+        ProbeKind::Tap | ProbeKind::LoadCell if consensus => (
+            "consensus multi-touch (PLR_TOUCH: sliding-window best subset; median is the trigger Z)",
+            format!(
+                "PLR_TOUCH SAMPLES={} SAMPLE_RANGE={} SPEED={} RETRACT={} TOUCH_ACCEL={}",
+                fmt_num(ctx.cfg.touch_samples),
+                fmt_num(ctx.cfg.touch_sample_range),
+                fmt_num(ctx.cfg.probe_speed),
+                fmt_num(ctx.cfg.touch_retract),
+                fmt_num(ctx.cfg.touch_accel),
+            ),
+            vec![
+                // The consensus actually converged: the reported spread
+                // is inside the band and enough samples agreed.
+                Verification::new(
+                    "plr",
+                    "last_touch_result.range",
+                    Predicate::NumAtMost {
+                        max: ctx.cfg.touch_sample_range,
+                    },
+                ),
+                Verification::new(
+                    "plr",
+                    "last_touch_result.samples_used",
+                    Predicate::NumAtLeast {
+                        min: ctx.cfg.touch_samples,
+                    },
+                ),
+            ],
+        ),
         ProbeKind::Tap | ProbeKind::LoadCell => (
             "single-sample probe (SAMPLES=1: the toolhead rests exactly at the halt position)",
             format!(
                 "PROBE PROBE_SPEED={} SAMPLES=1",
                 fmt_num(ctx.cfg.probe_speed)
             ),
+            vec![],
         ),
         ProbeKind::AdxlDrag { chip } => (
             "ADXL drag probe (bounded fixed-Z staircase; the accelerometer hears the contact)",
@@ -755,53 +918,61 @@ fn step_probe(ctx: &Ctx<'_>) -> RecoveryStep {
                 fmt_num(ctx.cfg.drag_z_step),
                 fmt_num(ctx.cfg.drag_sensitivity),
             ),
+            vec![],
         ),
     };
+    // The trigger readback is present and finite for every method.
+    verify.push(Verification::new(
+        trigger_object,
+        trigger_field,
+        Predicate::FinitePresent,
+    ));
     step(
         Phase::Probe,
         summary,
         vec![command],
-        vec![
-            // Mandatory, daemon-enforced: no probe type has a
-            // temperature interlock.
-            Verification::new(
-                "extruder",
-                "temperature",
-                Predicate::TempWithin {
-                    min: ctx.cfg.probe_temp_min,
-                    max: ctx.cfg.probe_temp_max,
-                },
-            ),
-            Verification::new(
-                "toolhead",
-                "homed_axes",
-                Predicate::Contains {
-                    needle: "x".to_owned(),
-                },
-            ),
-            Verification::new(
-                "toolhead",
-                "homed_axes",
-                Predicate::Contains {
-                    needle: "y".to_owned(),
-                },
-            ),
-            Verification::new(
-                "toolhead",
-                "homed_axes",
-                Predicate::Contains {
-                    needle: "z".to_owned(),
-                },
-            ),
-        ],
-        vec![Verification::new(
-            trigger_object,
-            trigger_field,
-            Predicate::FinitePresent,
-        )],
+        probe_pre_verify(ctx),
+        verify,
         None,
         AbortReason::ProbeNoTrigger,
     )
+}
+
+/// The mandatory, daemon-enforced probe pre-verifications: the nozzle
+/// temperature interlock (both CURRENT temperature and the extruder
+/// TARGET inside the probe band — the `max(current, target)` guard from
+/// Cartographer `touch_mode.py:299-303`, so a nozzle commanded to print
+/// temperature while transiently cool still refuses) and XYZ homed.
+fn probe_pre_verify(ctx: &Ctx<'_>) -> Vec<Verification> {
+    let homed = |axis: &str| {
+        Verification::new(
+            "toolhead",
+            "homed_axes",
+            Predicate::Contains {
+                needle: axis.to_owned(),
+            },
+        )
+    };
+    vec![
+        Verification::new(
+            "extruder",
+            "temperature",
+            Predicate::TempWithin {
+                min: ctx.cfg.probe_temp_min,
+                max: ctx.cfg.probe_temp_max,
+            },
+        ),
+        Verification::new(
+            "extruder",
+            "target",
+            Predicate::NumAtMost {
+                max: ctx.cfg.probe_temp_max,
+            },
+        ),
+        homed("x"),
+        homed("y"),
+        homed("z"),
+    ]
 }
 
 fn step_true_z_declare(ctx: &Ctx<'_>) -> RecoveryStep {
@@ -1089,15 +1260,29 @@ fn step_resume_start() -> RecoveryStep {
 /// §8, step 6).
 fn true_z_formula(
     machine: &ValidatedMachine,
+    cfg: &PlanConfig,
     candidate: &ProbeCandidate,
     context: &Context,
 ) -> TrueZFormula {
-    let trigger_source = match &machine.probe.kind {
-        ProbeKind::Tap => TriggerSource::RawLastZResult,
-        ProbeKind::LoadCell => TriggerSource::BedZPlusOffset {
+    // The consensus path (both Tap and load-cell) reads the plugin's
+    // consensus median; the legacy single-`PROBE` path keeps the
+    // per-probe-type stock readback.
+    let trigger_source = if uses_consensus_touch(machine, cfg) {
+        // The plugin reports the consensus median in the
+        // z_offset-subtracted bed-probing frame (both Tap and load-cell
+        // touch through a klippy probe session), so carry the configured
+        // offset to add back.
+        TriggerSource::TouchResult {
             z_offset: machine.probe.z_offset,
-        },
-        ProbeKind::AdxlDrag { .. } => TriggerSource::DragResult,
+        }
+    } else {
+        match &machine.probe.kind {
+            ProbeKind::Tap => TriggerSource::RawLastZResult,
+            ProbeKind::LoadCell => TriggerSource::BedZPlusOffset {
+                z_offset: machine.probe.z_offset,
+            },
+            ProbeKind::AdxlDrag { .. } => TriggerSource::DragResult,
+        }
     };
     TrueZFormula {
         z_prev_top: candidate.z,
@@ -1173,7 +1358,19 @@ fn build_steps(ctx: &Ctx<'_>) -> Result<Vec<RecoveryStep>, RecoveryError> {
     }
     steps.push(step_shifted_frame(ctx));
     steps.push(step_probe_approach(ctx));
+    // The accel clamp/restore wrap only the consensus PLR_TOUCH phase
+    // (Cartographer clamps around z_probing_move). Drag passes are
+    // fixed-Z with the plugin owning its own motion profile, and the
+    // legacy single-PROBE path predates the plugin, so neither gets the
+    // plan-level clamp.
+    let clamp = uses_consensus_touch(ctx.machine, ctx.cfg);
+    if clamp {
+        steps.push(step_accel_clamp(ctx));
+    }
     steps.push(step_probe(ctx));
+    if clamp {
+        steps.push(step_accel_restore());
+    }
     steps.push(step_true_z_declare(ctx));
     if transforms.bed_mesh_active {
         if let Some(profile) = transforms
@@ -1233,27 +1430,7 @@ pub fn plan_recovery(
         .ok_or(RecoveryError::NoVirtualSd)?;
     let file_name = top_level_file_name(&vsd.file_path, &machine.sdcard_root)?;
 
-    let z_span = recovery.stop_set.z_span().ok_or(RecoveryError::NoZSpan)?;
-    // Overshoot per probe method (see `envelope` for the derivations):
-    // continuous PROBE descents overshoot by 0.15 s of drip-move travel
-    // past the trigger; the drag staircase's passes are fixed-Z, so its
-    // only overshoot is the bounded Z decrement itself.
-    let overshoot = match &machine.probe.kind {
-        ProbeKind::Tap | ProbeKind::LoadCell => OvershootTerm::PostTriggerTravel {
-            probe_speed: config.probe_speed,
-        },
-        ProbeKind::AdxlDrag { .. } => OvershootTerm::DragStep {
-            drag_z_step: config.drag_z_step,
-        },
-    };
-    let envelope = compute_envelope(
-        EnvelopeParams {
-            expected_gap: z_span.width() + config.sag_allowance,
-            overshoot,
-            margin: config.margin,
-        },
-        machine.z_position_min,
-    )?;
+    let envelope = size_envelope(&machine, config, recovery)?;
 
     let candidate = match inputs.contact {
         ContactOutcome::Declined(reason) => {
@@ -1280,7 +1457,7 @@ pub fn plan_recovery(
     let nozzle_print = preheat.nozzle.ok_or(RecoveryError::NoNozzleTarget)?;
     validate_excludes(inputs.exclude_objects)?;
 
-    let formula = true_z_formula(&machine, candidate, context);
+    let formula = true_z_formula(&machine, config, candidate, context);
     let (fan_cmds, mut warnings) = fan_commands(&preheat.fans);
     collect_warnings(
         context,
@@ -1312,13 +1489,65 @@ pub fn plan_recovery(
         excludes: inputs.exclude_objects,
     };
     let steps = build_steps(&ctx)?;
-    Ok(PlanOutcome::Plan(Box::new(RecoveryPlan {
+    let plan = RecoveryPlan {
         steps,
         envelope,
         resume_file: file_name,
         resume_offset: resume.offset,
         warnings,
-    })))
+    };
+    run_preflight(&plan, &machine, candidate.point)?;
+    Ok(PlanOutcome::Plan(Box::new(plan)))
+}
+
+/// Sizes the probe envelope for the recovery. Overshoot per probe
+/// method (see `envelope` for the derivations): continuous `PROBE`
+/// descents overshoot by 0.15 s of drip-move travel past the trigger;
+/// the drag staircase's passes are fixed-Z, so its only overshoot is the
+/// bounded Z decrement itself.
+fn size_envelope(
+    machine: &ValidatedMachine,
+    config: &PlanConfig,
+    recovery: &plr_reconstruct::RecoveryReconstruction,
+) -> Result<Envelope, RecoveryError> {
+    let z_span = recovery.stop_set.z_span().ok_or(RecoveryError::NoZSpan)?;
+    let overshoot = match &machine.probe.kind {
+        ProbeKind::Tap | ProbeKind::LoadCell => OvershootTerm::PostTriggerTravel {
+            probe_speed: config.probe_speed,
+        },
+        ProbeKind::AdxlDrag { .. } => OvershootTerm::DragStep {
+            drag_z_step: config.drag_z_step,
+        },
+    };
+    compute_envelope(
+        EnvelopeParams {
+            expected_gap: z_span.width() + config.sag_allowance,
+            overshoot,
+            margin: config.margin,
+        },
+        machine.z_position_min,
+    )
+}
+
+/// Whole-itinerary pre-flight: every commanded coordinate the plan will
+/// emit is checked against the machine's known axis limits and the
+/// analyzer's already-selected contact point BEFORE the plan is returned
+/// (Cartographer validates the whole itinerary up front,
+/// `axis_twist_compensation.py:87-111`). Aggregates every violation.
+fn run_preflight(
+    plan: &RecoveryPlan,
+    machine: &ValidatedMachine,
+    contact_point: [f64; 2],
+) -> Result<(), RecoveryError> {
+    let bounds = ItineraryBounds {
+        x: machine.axis_limits.x,
+        y: machine.axis_limits.y,
+        z_max: machine.axis_limits.z_max,
+        position_min: machine.z_position_min,
+        contact_point,
+    };
+    preflight_itinerary(plan, &bounds)?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1374,6 +1603,37 @@ mod tests {
             |c, v| c.drag_sensitivity = v,
             &[0.0, 30.0, 100.0],
             &[-0.01, 100.5, -3.0],
+        );
+    }
+
+    #[test]
+    fn touch_tunable_bands_are_hard() {
+        assert!(PlanConfig::default().validate().is_ok());
+        check(
+            "touch_samples",
+            |c, v| c.touch_samples = v,
+            &[3.0, 5.0, 7.0],
+            &[2.0, 8.0, 3.5, 0.0],
+        );
+        // The hard cap: 0.015 passes, anything above is REFUSED (never
+        // clamped), per Cartographer configuration.py:248.
+        check(
+            "touch_sample_range",
+            |c, v| c.touch_sample_range = v,
+            &[0.001, 0.010, 0.015],
+            &[0.0, -0.001, 0.0151, 0.02, 1.0],
+        );
+        check(
+            "touch_retract",
+            |c, v| c.touch_retract = v,
+            &[1.0, 2.0, 10.0],
+            &[0.999, 0.0, -1.0],
+        );
+        check(
+            "touch_accel",
+            |c, v| c.touch_accel = v,
+            &[50.0, 100.0, 1000.0],
+            &[49.0, 1000.1, 0.0, -5.0],
         );
     }
 

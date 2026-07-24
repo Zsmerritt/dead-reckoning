@@ -232,6 +232,7 @@ pub fn machine_tap() -> MachineConfig {
         virtual_sdcard_root: Some("/tmp".to_owned()),
         noise_floor: None,
         noise_floor_speed: None,
+        axis_limits: plr_recovery::AxisLimits::default(),
     }
 }
 
