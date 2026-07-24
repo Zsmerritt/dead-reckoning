@@ -49,6 +49,25 @@ pub enum RecoveryError {
         /// Name of the offending field.
         field: &'static str,
     },
+    /// An acceleration override (`recovery_accel` or one of the
+    /// per-phase `accel_*` keys) was non-finite or outside
+    /// [[`crate::build::ACCEL_MIN`], [`crate::build::ACCEL_MAX`]] mm/s².
+    ///
+    /// Kept separate from [`Self::InvalidPlanConfig`] so the diagnosis
+    /// can carry the typed measured/expected pair: these are the keys an
+    /// operator is most likely to reach for mid-recovery ("just slow it
+    /// down"), and a bare "out of range" is not an answer.
+    #[error("acceleration override {key} = {value} mm/s^2 is outside [{min}, {max}] mm/s^2")]
+    AccelOutOfRange {
+        /// The offending `[plr]` key.
+        key: &'static str,
+        /// The rejected value, mm/s².
+        value: f64,
+        /// The inclusive lower bound, mm/s².
+        min: f64,
+        /// The inclusive upper bound, mm/s².
+        max: f64,
+    },
     /// The probe temperature band is too narrow to hold
     /// [`crate::build::PROBE_TEMP_HEADROOM`] below the contact ceiling.
     /// Probing AT the ceiling is refused by the Klipper plugin on any PID
@@ -121,26 +140,17 @@ pub enum RecoveryError {
         /// The rejected purge Z, mm.
         purge_z: f64,
     },
-    /// A NONZERO `drag_nozzle_temp` below
-    /// [`crate::build::DRAG_TEMP_FLOOR`]. Such a target makes the
-    /// blocking `M109` wait for a passive cooldown, which on an enclosed
-    /// or heated-chamber machine can exceed the executor's 15-minute
-    /// timeout — or never converge, if chamber ambient is above the
-    /// target. `0` (the cold-drag opt-out, which emits no wait) is
-    /// exempt.
-    #[error(
-        "drag_nozzle_temp {drag_nozzle_temp} C is below the {floor} C floor. A nonzero drag \
-         temperature makes the plan WAIT (M109) for the nozzle to settle, and on a PID hotend \
-         that includes waiting to COOL — on an enclosed or heated-chamber printer a target at \
-         or below chamber ambient may never be reached, burning the full 15-minute step \
-         timeout on every retry. Raise it to at least {floor}, or set drag_nozzle_temp = 0 \
-         for a deliberate cold drag (no heating and no wait at all)"
-    )]
-    DragTempBelowFloor {
-        /// The rejected drag temperature, °C.
-        drag_nozzle_temp: f64,
-        /// The refusal floor, °C.
-        floor: f64,
+    /// `confirm_timeout_s` was non-finite or outside
+    /// [[`crate::build::CONFIRM_TIMEOUT_MIN_S`],
+    /// [`crate::build::CONFIRM_TIMEOUT_MAX_S`]] seconds.
+    #[error("confirm_timeout_s = {value} s is outside [{min}, {max}] s")]
+    ConfirmTimeoutOutOfRange {
+        /// The rejected value, seconds.
+        value: f64,
+        /// The inclusive lower bound, seconds.
+        min: f64,
+        /// The inclusive upper bound, seconds.
+        max: f64,
     },
     /// One or more machine prerequisites failed
     /// ([`crate::machine::validate_machine`]). Recovery must not be

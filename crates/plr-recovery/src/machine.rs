@@ -156,6 +156,16 @@ pub struct MachineConfig {
     /// the Klipper stepper sections expose.
     #[serde(default)]
     pub axis_limits: AxisLimits,
+    /// The machine's own configured `max_accel` (`[printer] max_accel`),
+    /// mm/s². `None` when unknown — the legacy `/etc/plrd.conf [machine]`
+    /// path cannot see the running Klipper config.
+    ///
+    /// Read only so the generated recovery file can RESTORE it as a
+    /// literal after clamping its entry moves to `accel_entry`: that file
+    /// has no runtime-placeholder machinery, so a clamp it cannot undo
+    /// would outlive the recovery and govern the entire remaining print.
+    #[serde(default)]
+    pub max_accel: Option<f64>,
 }
 
 /// One failed prerequisite check.
@@ -264,6 +274,10 @@ pub struct ValidatedMachine {
     /// Known axis travel limits (carried through for the
     /// whole-itinerary pre-flight; all `None` when unknown).
     pub axis_limits: AxisLimits,
+    /// The machine's own `[printer] max_accel`, mm/s², when known and
+    /// usable (finite and positive). See
+    /// [`MachineConfig::max_accel`].
+    pub max_accel: Option<f64>,
 }
 
 /// All prerequisite failures of one validation pass.
@@ -394,6 +408,10 @@ pub fn validate_machine(config: &MachineConfig) -> Result<ValidatedMachine, Mach
         z_stepper_names: config.z_steppers.iter().map(|s| s.name.clone()).collect(),
         sdcard_root: config.virtual_sdcard_root.clone().unwrap_or_default(),
         axis_limits: config.axis_limits,
+        // Carried through as-is: a missing max_accel is not a
+        // prerequisite failure, it only costs the file-level entry clamp
+        // (which the plan warns about).
+        max_accel: config.max_accel.filter(|v| v.is_finite() && *v > 0.0),
     })
 }
 
@@ -431,6 +449,7 @@ mod tests {
             noise_floor: None,
             noise_floor_speed: None,
             axis_limits: super::AxisLimits::default(),
+            max_accel: Some(3_000.0),
         }
     }
 
@@ -459,6 +478,7 @@ mod tests {
             noise_floor: None,
             noise_floor_speed: None,
             axis_limits: super::AxisLimits::default(),
+            max_accel: None,
         };
         let rejection = validate_machine(&config).unwrap_err();
         let f = &rejection.failures;

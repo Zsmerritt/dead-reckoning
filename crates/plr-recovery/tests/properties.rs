@@ -798,6 +798,7 @@ proptest! {
             name: "p_RECOVERY.gcode".to_owned(),
             source_name: "p.gcode".to_owned(),
             plan_id: "plr-1".to_owned(),
+            entry_accel: None,
             tail_offset: offset as u64,
             bed,
             nozzle,

@@ -42,6 +42,10 @@ pub const PENDING_FILE_NAME: &str = "pending_recovery.json";
 /// persists independently until a fresh dry run consciously clears it.
 pub const FRAME_INVALID_FILE_NAME: &str = "frame_invalid.json";
 
+/// Staging name [`write_frame_invalid`] renames from. Fixed, not unique
+/// — see that function for why.
+pub const FRAME_INVALID_TEMP_NAME: &str = "frame_invalid.json.tmp";
+
 /// Sentinel folded into [`PendingRecovery::crash_class`] and surfaced in
 /// the operator announcement when the marker is present, so the pending
 /// announcement notes the invalid frame without growing the pending
@@ -112,10 +116,101 @@ pub fn read_frame_invalid(wal_dir: &Path) -> Option<FrameInvalid> {
     serde_json::from_str(&text).ok()
 }
 
-/// Writes the frame-invalidation marker (overwrite).
+/// Writes the frame-invalidation marker **atomically and durably**:
+/// temp file in the same directory, `fsync` the file, `rename`, `fsync`
+/// the directory.
+///
+/// # Why this file is durable and `pending_recovery.json` is not
+///
+/// The asymmetry is deliberate, and it is about what is lost when the
+/// write does not survive.
+///
+/// `pending_recovery.json` is operator UX state: it says "a recovery is
+/// available". Losing it costs an announcement, and boot-time detection
+/// re-derives it from the WAL on the next start. A plain
+/// [`std::fs::write`] is honest there ([`write_pending`]).
+///
+/// This file is a **safety interlock**. It asserts that Klipper's Z frame
+/// is UNKNOWN because a recovery aborted at or after the shifted-frame
+/// declaration, and [`crate::recover::execute_with_gates`] refuses
+/// `--execute` for as long as it exists. Written into the page cache and
+/// no further, a power cut between the write and the flush loses the
+/// interlock silently — and the next `--execute` then drives the machine
+/// against an unknown Z frame, which is the exact state the marker exists
+/// to prevent. Losing it in a power event would be bad anywhere; losing
+/// it in a power event is unacceptable in a *power-loss recovery* tool,
+/// because that is not an unlikely coincidence here, it is the scenario.
+///
+/// So: rename-based publish (a reader sees the old marker or the new one,
+/// never a half-written one), `fsync` before the rename so the bytes are
+/// on the medium before the name points at them, and `fsync` of the
+/// directory afterwards so the rename itself survives.
+///
+/// # What the staging file guarantees, precisely
+///
+/// The PUBLISHED marker is never partial: readers only ever see the file
+/// under [`FRAME_INVALID_FILE_NAME`], and it only ever appears there by
+/// `rename`. The staging file is a different claim: every failure path
+/// *inside this process* unlinks it, but a `SIGKILL` or a power cut
+/// between `create` and `rename` can leave one behind. That is harmless
+/// — nothing reads it, and the next write truncates it — which is why
+/// the name is fixed rather than unique.
+///
+/// # Errors
+///
+/// Any I/O failure, reported rather than swallowed. The caller
+/// ([`crate::recover::MarkerFrameGuard`]) treats an error as "do not
+/// enter the danger zone at all".
 pub fn write_frame_invalid(wal_dir: &Path, marker: &FrameInvalid) -> std::io::Result<()> {
+    use std::io::Write as _;
+
     let json = serde_json::to_string_pretty(marker).map_err(std::io::Error::other)?;
-    std::fs::write(frame_invalid_path(wal_dir), json)
+    // The temp file MUST live in the same directory as the target:
+    // `rename` is only atomic within one filesystem, and a temp elsewhere
+    // (say `/tmp`) can be on a different one.
+    //
+    // The name is FIXED rather than per-process/per-attempt. Every
+    // in-process failure path unlinks it, but a SIGKILL between `create`
+    // and `rename` cannot, and a unique name would leave that debris
+    // behind forever. A fixed name is self-healing: the next write
+    // truncates whatever is there. Writes are serialized anyway — one
+    // recovery at a time, one writer.
+    let temp_path = wal_dir.join(FRAME_INVALID_TEMP_NAME);
+    let write_result = (|| -> std::io::Result<()> {
+        let mut file = std::fs::File::create(&temp_path)?;
+        file.write_all(json.as_bytes())?;
+        file.flush()?;
+        // fsync, not fdatasync: this is a fresh file, so its metadata
+        // (the size) is as load-bearing as its contents.
+        file.sync_all()
+    })();
+    if let Err(e) = write_result {
+        let _ = std::fs::remove_file(&temp_path);
+        return Err(e);
+    }
+    if let Err(e) = std::fs::rename(&temp_path, frame_invalid_path(wal_dir)) {
+        let _ = std::fs::remove_file(&temp_path);
+        return Err(e);
+    }
+    sync_dir(wal_dir)
+}
+
+/// `fsync`s a directory so a `rename` into it is durable.
+///
+/// Linux-gated the same way the rest of plrd's durability is: a directory
+/// cannot be opened as a file on Windows, and plrd is a Linux daemon —
+/// the non-Linux build exists so the cross-platform logic stays testable,
+/// not to be deployed.
+#[cfg(target_os = "linux")]
+fn sync_dir(dir: &Path) -> std::io::Result<()> {
+    std::fs::File::open(dir)?.sync_all()
+}
+
+/// See the Linux implementation. On other platforms the rename is still
+/// atomic; only the directory-entry durability is unavailable.
+#[cfg(not(target_os = "linux"))]
+fn sync_dir(_dir: &Path) -> std::io::Result<()> {
+    Ok(())
 }
 
 /// Removes any frame-invalidation marker (idempotent).
@@ -179,8 +274,14 @@ pub fn detect(wal_dir: &Path, heartbeat_path: &Path, detected_wall_ns: u64) -> D
     })
 }
 
-/// Writes the state file (overwrite; plain write — this is operator
-/// UX state, not recovery evidence).
+/// Writes the state file (overwrite; plain write — this is operator UX
+/// state, not recovery evidence).
+///
+/// Deliberately NOT durable, unlike [`write_frame_invalid`]: losing this
+/// file costs an announcement, and boot-time [`detect`] re-derives it
+/// from the WAL on the next start. Nothing refuses anything because of
+/// it, so paying for `fsync` here would buy nothing. See
+/// [`write_frame_invalid`] for the full asymmetry.
 pub fn write_pending(wal_dir: &Path, pending: &PendingRecovery) -> std::io::Result<()> {
     let json = serde_json::to_string_pretty(pending).map_err(std::io::Error::other)?;
     std::fs::write(wal_dir.join(PENDING_FILE_NAME), json)
@@ -464,5 +565,141 @@ mod tests {
             ..pending
         });
         assert!(!primary.contains('%'), "{primary}");
+    }
+
+    /// The interlock survives a write that is never explicitly flushed by
+    /// the reader's path: `write_frame_invalid` returns only after the
+    /// bytes AND the directory entry are on the medium, so a reader that
+    /// opens the file fresh — as a rebooted daemon does — sees it.
+    ///
+    /// A unit test cannot cut the power, so what is asserted here is the
+    /// observable contract: the call is synchronous through fsync, it
+    /// publishes by rename, and it leaves no temp file behind for a
+    /// later reader to trip over.
+    #[test]
+    fn the_frame_invalid_interlock_is_written_atomically_and_durably() {
+        use super::{
+            frame_invalid_path, read_frame_invalid, write_frame_invalid, FrameInvalid,
+            FRAME_INVALID_FILE_NAME,
+        };
+        let dir = temp_dir("frame-durable");
+        let marker = FrameInvalid {
+            detected_wall_ns: 42,
+            step_id: 9,
+            phase: "shifted-frame".to_owned(),
+            reason: "confirmation-timeout".to_owned(),
+        };
+        write_frame_invalid(&dir, &marker).expect("durable write");
+
+        // Readable through a completely fresh path, with no flush of our
+        // own: the write already synced.
+        assert_eq!(read_frame_invalid(&dir), Some(marker.clone()));
+        let raw = std::fs::read_to_string(frame_invalid_path(&dir)).unwrap();
+        assert!(raw.contains("confirmation-timeout"), "{raw}");
+
+        // Published by rename, and every in-process path cleans up after
+        // itself, so a successful write leaves exactly the marker.
+        // (A SIGKILL between `create` and `rename` can strand the staging
+        // file; that is documented, harmless, and covered below.)
+        let names: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, vec![FRAME_INVALID_FILE_NAME.to_owned()], "{names:?}");
+
+        // Overwriting is equally atomic and leaves the same single file.
+        let second = FrameInvalid {
+            detected_wall_ns: 43,
+            step_id: 10,
+            phase: "probe".to_owned(),
+            reason: "probe-no-trigger".to_owned(),
+        };
+        write_frame_invalid(&dir, &second).expect("durable overwrite");
+        assert_eq!(read_frame_invalid(&dir), Some(second));
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+    }
+
+    /// An interlock that fails to persist must REPORT, never look like
+    /// success — the caller has to be able to tell the operator that the
+    /// automatic refusal is not in place.
+    #[test]
+    fn a_frame_invalid_write_failure_is_reported_not_swallowed() {
+        use super::{read_frame_invalid, write_frame_invalid, FrameInvalid};
+        let marker = FrameInvalid {
+            detected_wall_ns: 1,
+            step_id: 2,
+            phase: "shifted-frame".to_owned(),
+            reason: "shifted-frame-not-declared".to_owned(),
+        };
+        let missing = std::path::Path::new("/nonexistent-plrd-dir-frame-invalid-xyzzy");
+        let error = write_frame_invalid(missing, &marker)
+            .expect_err("an unwritable directory must be an error, not a silent no-op");
+        // And nothing was left claiming success.
+        assert!(read_frame_invalid(missing).is_none(), "{error}");
+    }
+
+    /// A staging file stranded by a previous SIGKILL is self-healing:
+    /// the fixed name means the next write truncates it rather than
+    /// accumulating debris, which is why the name is not unique.
+    #[test]
+    fn a_stranded_staging_file_is_reclaimed_by_the_next_write() {
+        use super::{
+            read_frame_invalid, write_frame_invalid, FrameInvalid, FRAME_INVALID_FILE_NAME,
+            FRAME_INVALID_TEMP_NAME,
+        };
+        let dir = temp_dir("frame-stranded");
+        // As a SIGKILL between create and rename would leave it.
+        std::fs::write(dir.join(FRAME_INVALID_TEMP_NAME), b"{\"half\": written").unwrap();
+        let marker = FrameInvalid {
+            detected_wall_ns: 5,
+            step_id: 2,
+            phase: "shifted-frame".to_owned(),
+            reason: "shifted-frame-declared".to_owned(),
+        };
+        write_frame_invalid(&dir, &marker).expect("write over the stranded staging file");
+        assert_eq!(read_frame_invalid(&dir), Some(marker));
+        let names: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            names,
+            vec![FRAME_INVALID_FILE_NAME.to_owned()],
+            "the stranded staging file must be consumed, not accumulated: {names:?}"
+        );
+    }
+
+    /// The pending file's behaviour is unchanged: still a plain
+    /// overwrite, still re-derivable, still no temp/rename dance. It is
+    /// operator UX state, and paying for durability there would buy
+    /// nothing (see `write_frame_invalid`'s docs for the asymmetry).
+    #[test]
+    fn the_pending_file_stays_a_plain_write() {
+        use super::{write_pending, PendingRecovery, PENDING_FILE_NAME};
+        let dir = temp_dir("pending-plain");
+        let pending = PendingRecovery {
+            detected_wall_ns: 7,
+            file: "/g/part.gcode".to_owned(),
+            file_position: 500,
+            file_size: Some(1000),
+            percent: Some(50.0),
+            crash_class: "HostDeathOrPowerLoss".to_owned(),
+        };
+        write_pending(&dir, &pending).expect("write");
+        let names: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, vec![PENDING_FILE_NAME.to_owned()], "{names:?}");
+        let round_trip: PendingRecovery =
+            serde_json::from_str(&std::fs::read_to_string(dir.join(PENDING_FILE_NAME)).unwrap())
+                .unwrap();
+        assert_eq!(round_trip, pending);
+        // Overwrite in place, no rename step.
+        write_pending(&dir, &pending).expect("overwrite");
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
     }
 }

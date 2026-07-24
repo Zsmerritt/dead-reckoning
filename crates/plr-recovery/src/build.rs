@@ -40,8 +40,8 @@ use crate::error::RecoveryError;
 use crate::machine::{validate_machine, MachineConfig, ProbeKind, ValidatedMachine};
 use crate::plan::{
     fmt_num, AbortReason, FailureAction, Phase, PlanWarning, Predicate, RecoveryPlan, RecoveryStep,
-    RuntimeComputation, TriggerSource, TrueZFormula, Verification, PARK_Z_PLACEHOLDER,
-    RESTORE_ACCEL_PLACEHOLDER, TRUE_Z_PLACEHOLDER,
+    RuntimeComputation, TriggerSource, TrueZFormula, Verification, MACHINE_ACCEL_PLACEHOLDER,
+    PARK_Z_PLACEHOLDER, RESTORE_ACCEL_PLACEHOLDER, TRUE_Z_PLACEHOLDER,
 };
 use crate::preflight::{preflight_itinerary, ItineraryBounds};
 use crate::preheat::{derive_preheat, FileTemps};
@@ -49,7 +49,15 @@ use crate::preheat::{derive_preheat, FileTemps};
 /// Tunables of the plan builder. [`PlanConfig::default`] is the
 /// design-doc configuration; [`PlanConfig::validate`] enforces every
 /// documented bound.
+///
+/// The `struct_excessive_bools` allow is deliberate: this type is a flat
+/// mirror of the operator's `[plr]` section, one field per documented
+/// config key. The lint's usual remedy — collapsing related booleans into
+/// an enum or a sub-struct — would put a layer of translation between
+/// what the operator wrote in `printer.cfg` and what the planner reads,
+/// which is precisely the seam a config bug hides in.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct PlanConfig {
     /// Probe speed, mm/s. Hard-capped to `[1, 2]`
     /// (see [`crate::envelope`]).
@@ -252,7 +260,104 @@ pub struct PlanConfig {
     /// FROZEN `[plr]` key `purge_speed` — built-in purge extrusion
     /// feedrate, mm/min. Range `(0, 3000]`; deliberately slow by default.
     pub purge_speed: f64,
+    /// `[plr]` key `recovery_accel` — one `max_accel` value, mm/s²,
+    /// applied for the WHOLE recovery and restored on completion and on
+    /// abort alike. `None` (the default) leaves the machine's own
+    /// acceleration alone.
+    ///
+    /// Range [[`ACCEL_MIN`], [`ACCEL_MAX`]]; an out-of-band value is
+    /// refused with [`RecoveryError::AccelOutOfRange`], never clamped.
+    pub recovery_accel: Option<f64>,
+    /// `[plr]` key `accel_home` — `max_accel` for the XY homing step
+    /// ([`Phase::HomeXy`]), mm/s². `None` inherits whatever is in force.
+    pub accel_home: Option<f64>,
+    /// `[plr]` key `accel_travel` — `max_accel` for the long XY travel to
+    /// the contact point ([`Phase::ProbeApproach`]), mm/s².
+    pub accel_travel: Option<f64>,
+    /// `[plr]` key `accel_probe` — `max_accel` for the contact step
+    /// ([`Phase::Probe`]) on the ADXL-drag and legacy single-`PROBE`
+    /// paths, mm/s².
+    ///
+    /// **Ignored on the consensus-touch path**, where
+    /// [`Self::touch_accel`] owns the contact acceleration through the
+    /// existing [`Phase::AccelClamp`] step — two settings fighting over
+    /// the same number during the one motion that must not be
+    /// over-driven is not a feature. The plan says so out loud with
+    /// [`PlanWarning::AccelProbeIgnoredOnTouchPath`] rather than
+    /// swallowing the key.
+    pub accel_probe: Option<f64>,
+    /// `[plr]` key `accel_entry` — `max_accel` for the moves made in
+    /// close proximity to printed geometry: the operator Z-confirmation
+    /// standoff ([`Phase::ZConfirmStandoff`]) and the lift-and-park
+    /// before the reheat ([`Phase::ParkForReheat`]), mm/s².
+    pub accel_entry: Option<f64>,
+    /// `[plr]` key `confirm_z_before_resume` (default `false`) — after
+    /// the true-Z declaration, lift to the entry standoff and PAUSE,
+    /// reporting the believed Z and how it was derived, until the
+    /// operator confirms over the control socket.
+    ///
+    /// Adds the [`Phase::ZConfirmStandoff`] step; leaving it `false`
+    /// produces a plan byte-identical to one built before the key
+    /// existed.
+    pub confirm_z_before_resume: bool,
+    /// `[plr]` key `debug_confirm_each_step` (default `false`) — pause
+    /// before every step, reporting that step's commands and
+    /// verifications. Carried onto
+    /// [`RecoveryPlan::debug_confirm_each_step`]; changes no command.
+    pub debug_confirm_each_step: bool,
+    /// `[plr]` key `UNSAFE_allow_purge_z_below_bed` (see
+    /// [`crate::diagnosis::UNSAFE_PURGE_Z_BELOW_BED`]) — permits a
+    /// `purge_z` below the bed surface, which is otherwise a
+    /// [`crate::diagnosis::Tier::Hard`] refusal. Setting it raises
+    /// [`PlanWarning::UnsafeOverrideActive`].
+    pub unsafe_allow_purge_z_below_bed: bool,
+    /// `[plr]` key `confirm_timeout_s` — how long a confirm-point waits
+    /// for an operator's answer before aborting cleanly, seconds. `None`
+    /// leaves the daemon's [`CONFIRM_TIMEOUT_DEFAULT_S`] default.
+    ///
+    /// Range [[`CONFIRM_TIMEOUT_MIN_S`], [`CONFIRM_TIMEOUT_MAX_S`]]; an
+    /// out-of-band value is refused with
+    /// [`RecoveryError::ConfirmTimeoutOutOfRange`], never clamped.
+    pub confirm_timeout_s: Option<f64>,
 }
+
+/// Default [`PlanConfig::confirm_timeout_s`], seconds.
+///
+/// Long enough to walk to the printer, look at the nozzle, and walk back
+/// — which is exactly what a Z-height confirmation asks for.
+pub const CONFIRM_TIMEOUT_DEFAULT_S: f64 = 600.0;
+
+/// Lower bound for [`PlanConfig::confirm_timeout_s`], seconds.
+///
+/// Below half a minute a pause cannot survive the walk it exists to
+/// permit: the operator would be looking at the nozzle when the recovery
+/// gave up on them.
+pub const CONFIRM_TIMEOUT_MIN_S: f64 = 30.0;
+
+/// Upper bound for [`PlanConfig::confirm_timeout_s`], seconds.
+///
+/// An hour. Past that the bound stops being a bound: an abandoned
+/// recovery would sit paused with the heaters on and the toolhead over
+/// the part for as long as the number says.
+pub const CONFIRM_TIMEOUT_MAX_S: f64 = 3_600.0;
+
+/// Lower bound, mm/s², for every acceleration override
+/// ([`PlanConfig::recovery_accel`] and the per-phase `accel_*` keys).
+///
+/// Below this a recovery move takes longer to accelerate than the
+/// executor's own verification timeouts allow for; the recovery would
+/// abort on a timeout while the toolhead was still doing exactly what it
+/// was told. (`touch_accel` has its own, lower floor of 50: that clamp
+/// covers a single short contact motion, not the whole recovery.)
+pub const ACCEL_MIN: f64 = 50.0;
+
+/// Upper bound, mm/s², for every acceleration override.
+///
+/// Recovery moves happen next to printed geometry, in a Z frame
+/// established by one contact measurement. 20 000 mm/s² is already far
+/// beyond what any of these machines run; past it the value is not a
+/// tuning choice but a typo, and honouring a typo here means an impact.
+pub const ACCEL_MAX: f64 = 20_000.0;
 
 /// Headroom, °C, between the nozzle temperature the plan COMMANDS for
 /// probing and the hard contact ceiling it verifies against.
@@ -414,6 +519,18 @@ impl Default for PlanConfig {
             // drag and touch reference at the same thermal state.
             drag_nozzle_temp: 145.0,
             purge_speed: 300.0,
+            // Acceleration overrides and confirm-points are OFF by
+            // default: an unconfigured machine gets exactly the plan it
+            // got before these keys existed.
+            recovery_accel: None,
+            accel_home: None,
+            accel_travel: None,
+            accel_probe: None,
+            accel_entry: None,
+            confirm_z_before_resume: false,
+            debug_confirm_each_step: false,
+            unsafe_allow_purge_z_below_bed: false,
+            confirm_timeout_s: None,
         }
     }
 }
@@ -571,39 +688,69 @@ impl PlanConfig {
                 headroom: PROBE_TEMP_HEADROOM,
             });
         }
-        // The drag hold temperature obeys the SAME interlock: plrd must
-        // never command a temperature the plugin's ceiling gate would
-        // then refuse. `0` is the documented cold-drag opt-out.
+        // Finiteness is machine-independent: a NaN is wrong wherever it
+        // is read. The BAND check is not — it moved to
+        // `validate_for_probe`, because it only bites on the drag path.
         if !self.drag_nozzle_temp.is_finite() {
             return Err(RecoveryError::NonFinite {
                 field: "drag_nozzle_temp",
             });
         }
-        if self.drag_nozzle_temp < 0.0 || self.drag_nozzle_temp > clamped_max - PROBE_TEMP_HEADROOM
-        {
-            return Err(RecoveryError::DragTempOutOfRange {
-                drag_nozzle_temp: self.drag_nozzle_temp,
-                ceiling: clamped_max,
-                headroom: PROBE_TEMP_HEADROOM,
-            });
+        // Acceleration overrides: finite and inside the shared band, or
+        // absent. Refused with their own typed error so the diagnosis can
+        // carry measured/expected as numbers (see `AccelOutOfRange`).
+        for (key, value) in [
+            ("recovery_accel", self.recovery_accel),
+            ("accel_home", self.accel_home),
+            ("accel_travel", self.accel_travel),
+            ("accel_probe", self.accel_probe),
+            ("accel_entry", self.accel_entry),
+        ] {
+            if let Some(v) = value {
+                if !v.is_finite() || !(ACCEL_MIN..=ACCEL_MAX).contains(&v) {
+                    return Err(RecoveryError::AccelOutOfRange {
+                        key,
+                        value: v,
+                        min: ACCEL_MIN,
+                        max: ACCEL_MAX,
+                    });
+                }
+            }
         }
-        // A nonzero target below the floor means waiting for a passive
-        // cooldown that may never converge on a heated-chamber machine
-        // (see DRAG_TEMP_FLOOR). `0` — the cold-drag opt-out — is exempt
-        // precisely because it emits no wait at all.
-        if self.drag_nozzle_temp > 0.0 && self.drag_nozzle_temp < DRAG_TEMP_FLOOR {
-            return Err(RecoveryError::DragTempBelowFloor {
-                drag_nozzle_temp: self.drag_nozzle_temp,
-                floor: DRAG_TEMP_FLOOR,
-            });
+        // A nonzero drag target below DRAG_TEMP_FLOOR is NOT refused here.
+        // Its worst case is an M109 waiting for a cooldown that never
+        // converges, bounded by the executor's step timeout and aborting
+        // BEFORE the shifted-frame declare — wasted time and a clean
+        // abort, not damage or an unknowable frame. That is the
+        // Confirmable tier's job, so the builder raises
+        // `PlanWarning::DragTempBelowFloor` (on drag machines, where the
+        // key is actually read) and the operator gets an explanation and a
+        // button instead of a config edit.
+        //
+        // Confirm-point timeout: bounded on both sides, refused rather
+        // than clamped, for the reasons on the two constants.
+        if let Some(seconds) = self.confirm_timeout_s {
+            if !seconds.is_finite()
+                || !(CONFIRM_TIMEOUT_MIN_S..=CONFIRM_TIMEOUT_MAX_S).contains(&seconds)
+            {
+                return Err(RecoveryError::ConfirmTimeoutOutOfRange {
+                    value: seconds,
+                    min: CONFIRM_TIMEOUT_MIN_S,
+                    max: CONFIRM_TIMEOUT_MAX_S,
+                });
+            }
         }
         // purge_z is the only raw operator-chosen ABSOLUTE Z in the
         // generated file, and that file runs in the TRUE frame where zero
         // is the bed surface. The Z rail's position_min is NOT a usable
         // floor here — this design puts it below the bed on purpose (see
         // the field docs) — so negatives are refused outright.
+        //
+        // The UNSAFE_ escape hatch applies here too: the consequence is
+        // confined to the purge blob and the operator can see the geometry
+        // involved, so a deliberate printer.cfg edit may permit it.
         if let Some(z) = self.purge_z {
-            if z.is_finite() && z < 0.0 {
+            if z.is_finite() && z < 0.0 && !self.unsafe_allow_purge_z_below_bed {
                 return Err(RecoveryError::PurgeZBelowBed { purge_z: z });
             }
         }
@@ -625,6 +772,46 @@ impl PlanConfig {
         // probe_speed: non-finite values fall out of the band check in
         // compute_envelope; nothing to do here.
         Ok(())
+    }
+
+    /// The checks that only apply to a particular probe path.
+    ///
+    /// [`Self::validate`] is machine-independent by design, so it cannot
+    /// know whether `drag_nozzle_temp` will ever be commanded. On a Tap
+    /// or load-cell machine it never is — the plan emits no drag `M104`
+    /// and no drag `M109` — so refusing a recovery over its value would
+    /// be refusing over a setting this machine does not read. That is
+    /// exactly the pointless obstruction the diagnosis framework exists
+    /// to remove, and it is the same gating
+    /// [`PlanWarning::DragTempBelowFloor`] already uses.
+    ///
+    /// [`plan_recovery`] calls this immediately after
+    /// [`Self::validate`], once the machine snapshot is known.
+    ///
+    /// # Errors
+    ///
+    /// [`RecoveryError::DragTempOutOfRange`] when a drag machine's hold
+    /// temperature does not leave [`PROBE_TEMP_HEADROOM`] below the
+    /// contact ceiling — an interlock that must stay Hard, because the
+    /// plugin's own ceiling gate would refuse the drag AFTER the Z frame
+    /// is declared.
+    pub fn validate_for_probe(&self, kind: &ProbeKind) -> Result<(), RecoveryError> {
+        match kind {
+            ProbeKind::Tap | ProbeKind::LoadCell => Ok(()),
+            ProbeKind::AdxlDrag { .. } => {
+                let clamped_max = self.clamped_probe_max();
+                if self.drag_nozzle_temp < 0.0
+                    || self.drag_nozzle_temp > clamped_max - PROBE_TEMP_HEADROOM
+                {
+                    return Err(RecoveryError::DragTempOutOfRange {
+                        drag_nozzle_temp: self.drag_nozzle_temp,
+                        ceiling: clamped_max,
+                        headroom: PROBE_TEMP_HEADROOM,
+                    });
+                }
+                Ok(())
+            }
+        }
     }
 }
 
@@ -1181,11 +1368,13 @@ fn clamp_lift(lift: f64, base: f64, z_max: Option<f64>) -> f64 {
     }
 }
 
-fn step_home_xy() -> RecoveryStep {
+fn step_home_xy(ctx: &Ctx<'_>) -> RecoveryStep {
+    let mut commands = accel_prefix(ctx.cfg.accel_home);
+    commands.push("G28 X Y".to_owned());
     step(
         Phase::HomeXy,
         "home XY only (never bare G28, never Z: the bed rises into a fixed gantry)",
-        vec!["G28 X Y".to_owned()],
+        commands,
         vec![],
         vec![
             Verification::new(
@@ -1258,18 +1447,18 @@ fn step_shifted_frame(ctx: &Ctx<'_>) -> RecoveryStep {
 
 fn step_probe_approach(ctx: &Ctx<'_>) -> RecoveryStep {
     let [px, py] = ctx.candidate.point;
+    let mut commands = accel_prefix(ctx.cfg.accel_travel);
+    commands.push("G90".to_owned());
+    commands.push(format!(
+        "G0 X{} Y{} F{}",
+        fmt_num(px),
+        fmt_num(py),
+        fmt_num(ctx.cfg.travel_feed)
+    ));
     step(
         Phase::ProbeApproach,
         "XY travel to the selected contact point (no Z motion)",
-        vec![
-            "G90".to_owned(),
-            format!(
-                "G0 X{} Y{} F{}",
-                fmt_num(px),
-                fmt_num(py),
-                fmt_num(ctx.cfg.travel_feed)
-            ),
-        ],
+        commands,
         vec![],
         vec![
             Verification::new(
@@ -1428,10 +1617,19 @@ fn step_probe(ctx: &Ctx<'_>) -> RecoveryStep {
         trigger_field,
         Predicate::FinitePresent,
     ));
+    // `accel_probe` applies to the drag and legacy single-PROBE paths
+    // only; on the consensus path `touch_accel` owns the contact accel
+    // through the AccelClamp step (the plan warns rather than fights).
+    let mut commands = if consensus {
+        Vec::new()
+    } else {
+        accel_prefix(ctx.cfg.accel_probe)
+    };
+    commands.push(command);
     step(
         Phase::Probe,
         summary,
-        vec![command],
+        commands,
         probe_pre_verify(ctx),
         verify,
         None,
@@ -1509,6 +1707,128 @@ fn step_true_z_declare(ctx: &Ctx<'_>) -> RecoveryStep {
     )
 }
 
+/// `true` when any acceleration override is configured, i.e. when the
+/// [`Phase::RecoveryAccel`] / [`Phase::RecoveryAccelRestore`] pair must
+/// exist so whatever the plan sets is put back afterwards.
+fn uses_accel_overrides(cfg: &PlanConfig) -> bool {
+    cfg.recovery_accel.is_some()
+        || cfg.accel_home.is_some()
+        || cfg.accel_travel.is_some()
+        || cfg.accel_probe.is_some()
+        || cfg.accel_entry.is_some()
+}
+
+/// The `SET_VELOCITY_LIMIT` a per-phase override prepends to its step, if
+/// any. Set-and-leave: the authoritative put-back is the single
+/// [`Phase::RecoveryAccelRestore`] step (success) or the
+/// [`Phase::RecoveryAccel`] step's cleanup (abort), so no phase has to
+/// know what the next one wants.
+fn accel_prefix(value: Option<f64>) -> Vec<String> {
+    value
+        .map(|v| format!("SET_VELOCITY_LIMIT ACCEL={}", fmt_num(v)))
+        .into_iter()
+        .collect()
+}
+
+/// Records the machine's own `max_accel` and, when `recovery_accel` is
+/// set, clamps acceleration for the whole recovery. Declares the abort
+/// cleanup that puts the machine value back on ANY later failure — the
+/// same `cleanup_commands` mechanism the touch clamp already uses.
+fn step_recovery_accel(ctx: &Ctx<'_>) -> RecoveryStep {
+    let commands = accel_prefix(ctx.cfg.recovery_accel);
+    let verify = ctx
+        .cfg
+        .recovery_accel
+        .map(|v| {
+            vec![Verification::new(
+                "toolhead",
+                "max_accel",
+                Predicate::NumWithin {
+                    expected: v,
+                    epsilon: 1.0,
+                },
+            )]
+        })
+        .unwrap_or_default();
+    let summary = if ctx.cfg.recovery_accel.is_some() {
+        "record the machine's max_accel and clamp it for the whole recovery (restored after / on abort)"
+    } else {
+        "record the machine's max_accel so the per-phase overrides can be put back (restored after / on abort)"
+    };
+    let mut s = step(
+        Phase::RecoveryAccel,
+        summary,
+        commands,
+        vec![],
+        verify,
+        Some(RuntimeComputation::RecordMachineAccel),
+        AbortReason::RecoveryAccelFailed,
+    );
+    s.cleanup_commands = vec![format!(
+        "SET_VELOCITY_LIMIT ACCEL={MACHINE_ACCEL_PLACEHOLDER}"
+    )];
+    s
+}
+
+/// Puts the machine's own `max_accel` back on the success path, before
+/// the recovery file is selected — the resumed print must run at the
+/// machine's acceleration, not at a recovery override.
+fn step_recovery_accel_restore() -> RecoveryStep {
+    step(
+        Phase::RecoveryAccelRestore,
+        "restore the machine's own max_accel before the recovery file starts",
+        vec![format!(
+            "SET_VELOCITY_LIMIT ACCEL={MACHINE_ACCEL_PLACEHOLDER}"
+        )],
+        vec![],
+        // Deliberately unverified: the value being restored is the
+        // machine slot, which no Predicate can name (NumWithinComputed
+        // reads the PHASE slot). A SET_VELOCITY_LIMIT that fails is a
+        // command error and aborts anyway — and the abort then runs the
+        // RecoveryAccel cleanup, which restores the same value. The
+        // guarantee is the cleanup, not a readback.
+        vec![],
+        None,
+        AbortReason::RecoveryAccelRestoreFailed,
+    )
+}
+
+/// The operator Z-confirmation standoff (`confirm_z_before_resume`).
+///
+/// Reuses the entry-hop distance — the documented safe standoff above the
+/// resume point — through the SAME rail-clamped `ParkZ` arithmetic the
+/// reheat park uses, so the move is `min(current_Z + entry_hop, z_max)`
+/// and, because [`crate::park_z_at`] never clamps below the current Z,
+/// **cannot descend**. Driving toward the bed to "show" the operator
+/// where Z is would be a new unreviewed descent; this lifts instead and
+/// lets the daemon do the explaining.
+fn step_z_confirm_standoff(ctx: &Ctx<'_>) -> RecoveryStep {
+    let mut commands = accel_prefix(ctx.cfg.accel_entry);
+    commands.push("G90".to_owned());
+    commands.push(format!(
+        "G1 Z{PARK_Z_PLACEHOLDER} F{}",
+        fmt_num(ctx.cfg.entry_feed)
+    ));
+    step(
+        Phase::ZConfirmStandoff,
+        "lift to the entry standoff for the operator Z confirmation (never descends)",
+        commands,
+        vec![],
+        vec![Verification::new(
+            "toolhead",
+            "position.2",
+            Predicate::NumWithinComputed {
+                epsilon: ctx.cfg.z_epsilon,
+            },
+        )],
+        Some(RuntimeComputation::ParkZ {
+            delta_z: ctx.cfg.entry_hop,
+            z_max: ctx.machine.axis_limits.z_max,
+        }),
+        AbortReason::ZConfirmStandoffFailed,
+    )
+}
+
 fn step_mesh_load(profile: &str) -> RecoveryStep {
     step(
         Phase::MeshLoad,
@@ -1565,7 +1885,8 @@ fn step_park_for_reheat(ctx: &Ctx<'_>) -> RecoveryStep {
     // probe established the Z reference and force a full re-run. Then an
     // absolute travel to the reheat park XY.
     let [px, py] = ctx.park;
-    let commands = vec![
+    let mut commands = accel_prefix(ctx.cfg.accel_entry);
+    commands.extend([
         "G90".to_owned(),
         format!("G1 Z{PARK_Z_PLACEHOLDER} F{}", fmt_num(ctx.cfg.entry_feed)),
         format!(
@@ -1574,7 +1895,7 @@ fn step_park_for_reheat(ctx: &Ctx<'_>) -> RecoveryStep {
             fmt_num(py),
             fmt_num(ctx.cfg.travel_feed)
         ),
-    ];
+    ]);
     step(
         Phase::ParkForReheat,
         "lift off the part (rail-clamped) and park at the reheat XY (the file reheats to print temp here)",
@@ -1824,6 +2145,69 @@ fn noise_floor_speed_warning(
     None
 }
 
+/// Warnings about the configuration itself: an `UNSAFE_` escape hatch in
+/// force, a sub-floor drag temperature, and keys this machine's probe
+/// path or config mode cannot honour.
+///
+/// An override that fires silently is not an escape hatch, it is a booby
+/// trap: whoever set it may not be the person standing at the printer
+/// now. The `UNSAFE_` warning is
+/// [`crate::diagnosis::Tier::Advisory`] — the deliberate `printer.cfg`
+/// edit WAS the confirmation, so demanding a second one at the worst
+/// possible moment would defeat the design.
+fn config_warnings(machine: &ValidatedMachine, cfg: &PlanConfig) -> Vec<PlanWarning> {
+    let mut out = Vec::new();
+    if cfg.unsafe_allow_purge_z_below_bed && cfg.purge_z.is_some_and(|z| z.is_finite() && z < 0.0) {
+        out.push(PlanWarning::UnsafeOverrideActive {
+            key: crate::diagnosis::UNSAFE_PURGE_Z_BELOW_BED.to_owned(),
+            permitted: "purge_z_below_bed".to_owned(),
+        });
+    }
+    // Only on a machine that actually drags: on Tap / load-cell the key is
+    // never read, and pausing a recovery to ask about an inert setting is
+    // precisely the pointless obstruction this framework removes.
+    if matches!(machine.probe.kind, ProbeKind::AdxlDrag { .. })
+        && cfg.drag_nozzle_temp > 0.0
+        && cfg.drag_nozzle_temp < DRAG_TEMP_FLOOR
+    {
+        out.push(PlanWarning::DragTempBelowFloor {
+            drag_nozzle_temp: cfg.drag_nozzle_temp,
+            floor: DRAG_TEMP_FLOOR,
+        });
+    }
+    if let Some(accel_probe) = cfg.accel_probe {
+        if uses_consensus_touch(machine, cfg) {
+            out.push(PlanWarning::AccelProbeIgnoredOnTouchPath { accel_probe });
+        }
+    }
+    // The generated file can only carry an accel clamp if it can also name
+    // the value to restore afterwards (see `entry_accel_pair`).
+    if let Some(accel_entry) = cfg.accel_entry {
+        if machine.max_accel.is_none() {
+            out.push(PlanWarning::AccelEntryNotAppliedToFile { accel_entry });
+        }
+    }
+    out
+}
+
+/// The `(clamp, restore)` acceleration pair the generated recovery file
+/// wraps its entry moves in, or `None` when it must emit neither.
+///
+/// The entry moves were relocated INTO the recovery file, so they — not
+/// the plan's phases — are the motion that actually descends toward the
+/// part, and they are the single place a low acceleration matters most.
+/// The file has no runtime-placeholder machinery, so both values must be
+/// literals known now: the clamp is `accel_entry`, and the restore is the
+/// machine's own configured `max_accel`.
+///
+/// Both or neither. A clamp the file cannot undo would leave the printer
+/// at the recovery acceleration for the entire remaining print, which is
+/// a worse outcome than not clamping at all — so an unknown `max_accel`
+/// skips the pair and says so ([`PlanWarning::AccelEntryNotAppliedToFile`]).
+fn entry_accel_pair(machine: &ValidatedMachine, cfg: &PlanConfig) -> Option<(f64, f64)> {
+    Some((cfg.accel_entry?, machine.max_accel?))
+}
+
 fn collect_warnings(
     context: &Context,
     bed_unknown: bool,
@@ -1857,13 +2241,16 @@ fn build_steps(ctx: &Ctx<'_>) -> Result<Vec<RecoveryStep>, RecoveryError> {
     // 1–5: idle timeout, stepper enable, the FIRST heating action
     // (non-blocking bed + nozzle), the believed-Z declare + pre-home
     // lift, XY homing (now after the lift), and the clean-nozzle step.
-    let mut steps = vec![
-        step_idle_timeout(ctx),
-        step_stepper_enable(ctx),
-        step_immediate_bed_heat(ctx),
-        step_believed_z_declare(ctx),
-        step_home_xy(),
-    ];
+    let mut steps = vec![step_idle_timeout(ctx), step_stepper_enable(ctx)];
+    // 1c: the acceleration frame, before the first motion of any kind, so
+    // the value it records is genuinely the machine's own and so every
+    // later step (and every abort cleanup) has something to restore to.
+    if uses_accel_overrides(ctx.cfg) {
+        steps.push(step_recovery_accel(ctx));
+    }
+    steps.push(step_immediate_bed_heat(ctx));
+    steps.push(step_believed_z_declare(ctx));
+    steps.push(step_home_xy(ctx));
     // The temperature HOLD goes between homing and the clean: reaching
     // temperature first means heat-up ooze is wiped by the clean rather
     // than deposited during the probe. Absent on an opted-out cold drag.
@@ -1888,8 +2275,12 @@ fn build_steps(ctx: &Ctx<'_>) -> Result<Vec<RecoveryStep>, RecoveryError> {
     if clamp {
         steps.push(step_accel_restore());
     }
-    // 7: true-Z declare, mesh, final declare.
+    // 7: true-Z declare, the optional operator Z confirmation, mesh,
+    // final declare.
     steps.push(step_true_z_declare(ctx));
+    if ctx.cfg.confirm_z_before_resume {
+        steps.push(step_z_confirm_standoff(ctx));
+    }
     if transforms.bed_mesh_active {
         if let Some(profile) = transforms
             .bed_mesh_profile
@@ -1905,6 +2296,9 @@ fn build_steps(ctx: &Ctx<'_>) -> Result<Vec<RecoveryStep>, RecoveryError> {
     // fans). 9: select and start the generated recovery file.
     steps.push(step_park_for_reheat(ctx));
     steps.push(step_restore_frame(ctx));
+    if uses_accel_overrides(ctx.cfg) {
+        steps.push(step_recovery_accel_restore());
+    }
     steps.push(step_recovery_file_select(ctx));
     for (index, s) in steps.iter_mut().enumerate() {
         s.id = u32::try_from(index + 1).unwrap_or(u32::MAX);
@@ -1931,6 +2325,8 @@ pub fn plan_recovery(
     let machine = validate_machine(inputs.machine).map_err(|r| RecoveryError::MachineRejected {
         failures: r.failures,
     })?;
+    // Probe-path-specific config checks, now that the machine is known.
+    config.validate_for_probe(&machine.probe.kind)?;
     let recovery = match inputs.reconstruction {
         Reconstruction::CleanShutdown(_) => return Ok(PlanOutcome::NoRecoveryNeeded),
         Reconstruction::Recovery(recovery) => recovery,
@@ -1990,6 +2386,7 @@ pub fn plan_recovery(
         inputs.machine.noise_floor_speed,
         config.drag_speed,
     ));
+    warnings.extend(config_warnings(&machine, config));
 
     // The conservative believed Z: the upper bound of the possible-stop
     // set (declared before XY homing so the homing moves clear the part).
@@ -2083,6 +2480,9 @@ pub fn plan_recovery(
         // The purge descent is a near-part move: slow entry feedrate.
         descend_feed: config.entry_feed,
         entry_commands,
+        // The entry moves are the near-part descent, so `accel_entry`
+        // belongs here rather than only on the plan's phases.
+        entry_accel: entry_accel_pair(&machine, config),
         header_cap: RECOVERY_HEADER_CAP,
     };
 
@@ -2093,6 +2493,8 @@ pub fn plan_recovery(
         resume_offset: resume.offset,
         requires_clean_nozzle_confirmation: !inputs.clean_nozzle_macro_present,
         recovery_file,
+        debug_confirm_each_step: config.debug_confirm_each_step,
+        confirm_timeout_s: config.confirm_timeout_s,
         warnings,
     };
     run_preflight(&plan, &machine, candidate.point)?;

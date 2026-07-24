@@ -40,6 +40,7 @@
 //! generated plan (property-tested in `tests/properties.rs`).
 
 pub mod build;
+pub mod diagnosis;
 pub mod envelope;
 pub mod error;
 pub mod guard;
@@ -51,9 +52,11 @@ pub mod resume_file;
 
 pub use build::{
     plan_recovery, preflight_generated_file, select_resume_target, ExcludeObjectDef,
-    FallbackReason, PlanConfig, PlanInputs, PlanOutcome, ResumeTarget, DRAG_TEMP_FLOOR,
+    FallbackReason, PlanConfig, PlanInputs, PlanOutcome, ResumeTarget, ACCEL_MAX, ACCEL_MIN,
+    CONFIRM_TIMEOUT_DEFAULT_S, CONFIRM_TIMEOUT_MAX_S, CONFIRM_TIMEOUT_MIN_S, DRAG_TEMP_FLOOR,
     PROBE_HOLD_BAND, PROBE_TEMP_HEADROOM, PROBE_TEMP_MEASURED_TOLERANCE,
 };
+pub use diagnosis::{Diagnose, Diagnosis, Expected, Measured, Tier, UNSAFE_PURGE_Z_BELOW_BED};
 pub use envelope::{
     compute_envelope, Envelope, EnvelopeParams, OvershootTerm, POST_TRIGGER_TRAVEL_S,
     PROBE_SPEED_MAX, PROBE_SPEED_MIN,
@@ -69,7 +72,7 @@ pub use machine::{
 pub use plan::{
     fmt_num, park_z_at, true_z_at_halt, AbortReason, FailureAction, Phase, PlanWarning, Predicate,
     RecoveryPlan, RecoveryStep, RuntimeComputation, TriggerSource, TrueZFormula, Verification,
-    PARK_Z_PLACEHOLDER, RESTORE_ACCEL_PLACEHOLDER, TRUE_Z_PLACEHOLDER,
+    MACHINE_ACCEL_PLACEHOLDER, PARK_Z_PLACEHOLDER, RESTORE_ACCEL_PLACEHOLDER, TRUE_Z_PLACEHOLDER,
 };
 pub use preflight::{
     preflight_itinerary, preflight_recovery_file, BoundsViolation, ItineraryBounds, PlanRejection,

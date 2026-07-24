@@ -805,6 +805,11 @@ pub(crate) fn machine_config(
         type_annotations_present,
         probes,
         z_position_min: section.z_position_min,
+        // The legacy path cannot see the running Klipper config, so
+        // `[printer] max_accel` is unknown here. That costs only the
+        // recovery FILE's entry-accel clamp (the plan warns when
+        // `accel_entry` is set and cannot be honoured there).
+        max_accel: None,
         config_hash: klipper_config_hash(klipper_config),
         validated_config_hash: section.validated_config_hash.clone(),
         virtual_sdcard_root: section.virtual_sdcard_root.clone(),
@@ -1330,7 +1335,10 @@ G1 X60 Y60 E0.02
     /// its all-false defaults, which would refuse instantly in legacy
     /// mode, and the pipeline still reaches a plan.
     #[cfg(unix)]
-    fn plr_fixture(tag: &str, plr_overrides: &[(&str, serde_json::Value)]) -> (PathBuf, Config) {
+    pub(crate) fn plr_fixture(
+        tag: &str,
+        plr_overrides: &[(&str, serde_json::Value)],
+    ) -> (PathBuf, Config) {
         use crate::plrcfg::tests as fixtures;
         let (dir, mut config) = fixture(tag);
         let mut configfile = fixtures::configfile_status(plr_overrides);
