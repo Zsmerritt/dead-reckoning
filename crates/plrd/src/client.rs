@@ -631,9 +631,26 @@ mod tests {
         }
     }
 
-    /// Kinds of interest extracted from the WAL channel, in order.
-    fn interesting(rx: &Receiver<WalCmd>) -> Vec<String> {
-        let mut out = Vec::new();
+    // --- waiting on the client, deterministically ---------------------
+    //
+    // These tests drive a real client task over a real socket, so "has
+    // the client processed my notification yet?" is a question about the
+    // scheduler. Sleeping a fixed span before asserting is a race that
+    // passes on an idle machine and fails on a saturated CI runner; wait
+    // for the effect to appear on the WAL channel instead.
+
+    /// Overall budget for a polled condition. Never consumed on a
+    /// healthy machine — the effects land in milliseconds.
+    const WAIT_TIMEOUT: Duration = Duration::from_secs(10);
+    /// How often the channel is re-drained while waiting.
+    const WAIT_POLL: Duration = Duration::from_millis(2);
+    /// Pure safety net around a whole scenario: every wait inside has
+    /// its own, tighter budget and a message naming what it waited for,
+    /// so this only fires if the client hangs outright.
+    const SCENARIO_TIMEOUT: Duration = Duration::from_mins(2);
+
+    /// Drains everything currently on the channel onto `out`, in order.
+    fn drain_into(rx: &Receiver<WalCmd>, out: &mut Vec<String>) {
         while let Ok(cmd) = rx.try_recv() {
             match cmd {
                 WalCmd::Append { record, sync } => match record {
@@ -649,7 +666,27 @@ mod tests {
                 WalCmd::Shutdown => out.push("shutdown".to_owned()),
             }
         }
-        out
+    }
+
+    /// Drains the channel onto `seen` until `needle` appears, or fails
+    /// naming what it waited for and everything it did see.
+    ///
+    /// Observing an effect is what proves the client consumed the
+    /// notification that caused it — the replacement for "sleep and hope
+    /// it drained".
+    async fn wait_for_item(rx: &Receiver<WalCmd>, seen: &mut Vec<String>, needle: &str) {
+        let deadline = tokio::time::Instant::now() + WAIT_TIMEOUT;
+        loop {
+            drain_into(rx, seen);
+            if seen.iter().any(|item| item == needle) {
+                return;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "timed out after {WAIT_TIMEOUT:?} waiting for `{needle}`; saw {seen:?}"
+            );
+            tokio::time::sleep(WAIT_POLL).await;
+        }
     }
 
     fn kind_name(kind: &MarkerKind) -> &'static str {
@@ -689,6 +726,7 @@ mod tests {
             let _ = run_client(&cfg, &mut sender, &mut recorder).await;
         });
 
+        let mut seen: Vec<String> = Vec::new();
         let scenario = async {
             // --- Session 1 ---
             let (stream, _) = listener.accept().await.unwrap();
@@ -721,27 +759,36 @@ mod tests {
                 )
                 .await;
             // An unroutable notification must be ignored, not crash.
+            // Nothing observable follows from it directly; that it was
+            // survived is proved by session 2 being accepted at all.
             server
                 .send(&json!({"k": "mystery:x", "params": {"whatever": 1}}))
                 .await;
-            // Give the client time to drain, then drop the connection.
-            tokio::time::sleep(Duration::from_millis(100)).await;
+            // Drop the connection only once the client has journaled the
+            // last thing session 1 asked of it.
+            wait_for_item(&rx, &mut seen, "marker/\"CleanShutdown\"").await;
             drop(server);
 
             // --- Session 2 (reconnect) ---
             let (stream, _) = listener.accept().await.unwrap();
             let mut server = Server::new(stream);
             serve_setup(&mut server).await;
-            tokio::time::sleep(Duration::from_millis(100)).await;
+            // The reconnect is complete once the resubscription marker
+            // lands; everything the assertions need precedes it.
+            wait_for_item(&rx, &mut seen, "marker/\"Resubscribed\"").await;
             server
         };
-        let _server = tokio::time::timeout(Duration::from_secs(10), scenario)
+        // Pure safety net: every wait inside has its own, tighter budget
+        // and a message that says what it was waiting for.
+        let _server = tokio::time::timeout(SCENARIO_TIMEOUT, scenario)
             .await
             .expect("scenario timed out");
         client.abort();
         let _ = client.await;
 
-        let items = interesting(&rx);
+        // Anything the client emitted after the last wait.
+        let mut items = seen;
+        drain_into(&rx, &mut items);
         // Session 1 setup: baseline context (immediate) + receive_seq.
         let first_context = position_of(&items, "context/Immediate");
         position_of(&items, "seq/4100"); // receive_seq observation persisted
@@ -785,6 +832,7 @@ mod tests {
             let _ = run_client(&cfg, &mut sender, &mut recorder).await;
         });
 
+        let mut seen: Vec<String> = Vec::new();
         let scenario = async {
             let (stream, _) = listener.accept().await.unwrap();
             let mut server = Server::new(stream);
@@ -811,15 +859,17 @@ mod tests {
             let (id, method, _) = server.read_request().await;
             assert_eq!(method, "motion_report/dump_trapq");
             server.respond(id, json!({"header": []})).await;
-            tokio::time::sleep(Duration::from_millis(50)).await;
+            // Wait for the baseline context the assertion below needs.
+            wait_for_item(&rx, &mut seen, "context/Immediate").await;
             server
         };
-        let _server = tokio::time::timeout(Duration::from_secs(10), scenario)
+        let _server = tokio::time::timeout(SCENARIO_TIMEOUT, scenario)
             .await
             .expect("scenario timed out");
         client.abort();
         let _ = client.await;
-        let items = interesting(&rx);
+        let mut items = seen;
+        drain_into(&rx, &mut items);
         assert!(
             items.iter().any(|i| i == "context/Immediate"),
             "no baseline context after delayed ready: {items:?}"

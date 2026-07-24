@@ -444,7 +444,106 @@ mod tests {
     };
     use std::path::{Path, PathBuf};
     use std::sync::mpsc::{sync_channel, SyncSender};
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
+
+    // --- waiting on the service, deterministically --------------------
+    //
+    // These tests drive a real thread with a real timer, so "has the
+    // heartbeat fired yet?" is a question about the scheduler, not about
+    // the code under test. Sleeping a fixed span and asserting is a race:
+    // it passes on an idle laptop and fails on a saturated CI runner that
+    // starves the heartbeat thread for hundreds of milliseconds — which
+    // is exactly how these tests broke. Instead, poll for the condition
+    // with a generous budget: the assertion then means "the recorder does
+    // produce this", not "it produced it within 80 ms on this machine".
+    //
+    // The budget is never consumed on a healthy machine (the conditions
+    // land in a few periods), so this makes the suite deterministic
+    // without making it slower.
+
+    /// Overall budget for a polled condition.
+    const WAIT_TIMEOUT: Duration = Duration::from_secs(10);
+    /// How often a polled condition is re-checked.
+    const WAIT_POLL: Duration = Duration::from_millis(2);
+
+    /// Polls `probe` until it yields `Ok`, or fails the test naming what
+    /// it waited for and what it last observed.
+    ///
+    /// `probe` returns `Err(observation)` while the condition does not
+    /// hold; that observation is what the failure message reports, so a
+    /// timeout says *why* it never happened rather than just that it
+    /// did not.
+    fn wait_for<T>(what: &str, mut probe: impl FnMut() -> Result<T, String>) -> T {
+        let deadline = Instant::now() + WAIT_TIMEOUT;
+        loop {
+            let observed = match probe() {
+                Ok(value) => return value,
+                Err(observed) => observed,
+            };
+            assert!(
+                Instant::now() < deadline,
+                "timed out after {WAIT_TIMEOUT:?} waiting for {what}; last observed: {observed}"
+            );
+            std::thread::sleep(WAIT_POLL);
+        }
+    }
+
+    /// Reads the heartbeat file, or describes why it cannot be used yet.
+    fn read_heartbeat(path: &Path) -> Result<plr_wal::HeartbeatRecovery, String> {
+        let bytes = std::fs::read(path).map_err(|e| format!("heartbeat file unreadable: {e}"))?;
+        recover_heartbeat(&bytes).map_err(|e| format!("no valid heartbeat slot yet: {e}"))
+    }
+
+    /// Waits until the heartbeat file reports `sequence >= min_sequence`.
+    ///
+    /// `min_sequence` counts beats: 0 is "at least one beat landed", 1 is
+    /// "at least two" (which is also what makes both slots valid).
+    fn await_heartbeat(path: &Path, min_sequence: u64) -> plr_wal::HeartbeatRecovery {
+        wait_for(&format!("heartbeat sequence >= {min_sequence}"), || {
+            let hb = read_heartbeat(path)?;
+            if hb.heartbeat.sequence >= min_sequence {
+                Ok(hb)
+            } else {
+                Err(format!("sequence {}", hb.heartbeat.sequence))
+            }
+        })
+    }
+
+    /// Waits until both heartbeat slots are valid.
+    ///
+    /// The dual-slot protocol alternates, so an untorn recovery proves at
+    /// least two beats landed — the precondition for testing the
+    /// one-tick-older fallback.
+    fn await_both_slots_valid(path: &Path) -> plr_wal::HeartbeatRecovery {
+        wait_for("both heartbeat slots valid (>= 2 beats)", || {
+            let hb = read_heartbeat(path)?;
+            if hb.torn.is_none() {
+                Ok(hb)
+            } else {
+                Err(format!(
+                    "slot {:?} not valid yet: {:?}",
+                    hb.slot.other(),
+                    hb.torn
+                ))
+            }
+        })
+    }
+
+    /// Waits until the receive-seq sidecar holds `expected`.
+    ///
+    /// Commands are consumed from the channel in order, so observing a
+    /// `ReceiveSeq` land proves every command sent before it has already
+    /// been applied. That turns "did the service process my command?"
+    /// into an observable fact instead of a sleep.
+    fn await_receive_seq(path: &Path, expected: (u64, u64)) {
+        wait_for(&format!("receive_seq sidecar == {expected:?}"), || {
+            let bytes = std::fs::read(path).map_err(|e| format!("sidecar unreadable: {e}"))?;
+            match decode_seq(&bytes) {
+                Some(seq) if seq == expected => Ok(()),
+                other => Err(format!("sidecar holds {other:?}")),
+            }
+        });
+    }
 
     /// A unique per-test temp dir (no tempfile dep by policy).
     fn temp_dir(tag: &str) -> PathBuf {
@@ -545,8 +644,10 @@ mod tests {
                 widened: 4_242,
             },
         );
-        // Let several heartbeat periods elapse.
-        std::thread::sleep(Duration::from_millis(120));
+        // Wait for the beats the assertions below need (>= 2 file
+        // beats, which also guarantees beat 0's WAL heartbeat record was
+        // appended) instead of guessing at a duration.
+        await_heartbeat(&dir.join("heartbeat.bin"), 1);
         send(&tx, WalCmd::Shutdown);
         handle.join().unwrap().unwrap();
 
@@ -602,8 +703,9 @@ mod tests {
         let (tx, rx) = sync_channel(16);
         let handle = spawn(cfg(&dir, false, 1 << 20), rx);
         send(&tx, WalCmd::Heartbeat(Some(heartbeat_data())));
-        // Enough time for several alternating-slot rewrites.
-        std::thread::sleep(Duration::from_millis(100));
+        // The fallback can only be tested once both slots hold a beat;
+        // wait for that rather than for a duration that might cover it.
+        await_both_slots_valid(&dir.join("heartbeat.bin"));
         send(&tx, WalCmd::Shutdown);
         handle.join().unwrap().unwrap();
 
@@ -638,9 +740,10 @@ mod tests {
     fn heartbeat_o_dsync_path_produces_valid_slots() {
         let dir = temp_dir("dsync");
         let (tx, rx) = sync_channel(16);
+        // o_dsync = true: the O_DSYNC write path, not per-write fsync.
         let handle = spawn(cfg(&dir, true, 1 << 20), rx);
         send(&tx, WalCmd::Heartbeat(Some(heartbeat_data())));
-        std::thread::sleep(Duration::from_millis(80));
+        await_heartbeat(&dir.join("heartbeat.bin"), 1);
         send(&tx, WalCmd::Shutdown);
         handle.join().unwrap().unwrap();
         let hb = recover_heartbeat(&std::fs::read(dir.join("heartbeat.bin")).unwrap()).unwrap();
@@ -653,26 +756,42 @@ mod tests {
         let dir = temp_dir("pause");
         let (tx, rx) = sync_channel(16);
         let handle = spawn(cfg(&dir, false, 1 << 20), rx);
+        let hb_path = dir.join("heartbeat.bin");
+        let seq_path = dir.join("receive_seq.bin");
         // No Heartbeat command yet: no liveness claim may be written.
+        // This one waits rather than polls on purpose — absence cannot
+        // be polled for, and the wait is in the safe direction: a slower
+        // machine only gives the service *more* chances to violate the
+        // invariant. Several heartbeat periods (15 ms) is plenty.
         std::thread::sleep(Duration::from_millis(60));
         assert!(
-            recover_heartbeat(&std::fs::read(dir.join("heartbeat.bin")).unwrap()).is_err(),
+            read_heartbeat(&hb_path).is_err(),
             "a heartbeat was written without correlation data"
         );
-        // Provide data, let beats happen, then pause.
+
+        // Provide data and wait for a real beat.
         send(&tx, WalCmd::Heartbeat(Some(heartbeat_data())));
-        std::thread::sleep(Duration::from_millis(60));
+        await_heartbeat(&hb_path, 0);
+
+        // Pause, then prove the pause was *applied* by observing a
+        // command sent after it take effect: the run loop consumes the
+        // channel in order, so the sidecar landing means the pause did.
         send(&tx, WalCmd::Heartbeat(None));
-        std::thread::sleep(Duration::from_millis(30));
-        let paused = recover_heartbeat(&std::fs::read(dir.join("heartbeat.bin")).unwrap())
-            .unwrap()
-            .heartbeat
-            .sequence;
+        send(
+            &tx,
+            WalCmd::ReceiveSeq {
+                mono_ns: 1,
+                widened: 99,
+            },
+        );
+        await_receive_seq(&seq_path, (1, 99));
+        let paused = read_heartbeat(&hb_path).unwrap().heartbeat.sequence;
+
+        // Now give the service every chance to beat anyway. Again a
+        // sleep, again in the safe direction: it can only make a
+        // regression more likely to be caught.
         std::thread::sleep(Duration::from_millis(60));
-        let still = recover_heartbeat(&std::fs::read(dir.join("heartbeat.bin")).unwrap())
-            .unwrap()
-            .heartbeat
-            .sequence;
+        let still = read_heartbeat(&hb_path).unwrap().heartbeat.sequence;
         assert_eq!(paused, still, "paused heartbeat must not advance");
         send(&tx, WalCmd::Shutdown);
         handle.join().unwrap().unwrap();
@@ -682,22 +801,24 @@ mod tests {
     fn restart_resumes_heartbeat_sequence_and_starts_new_segment() {
         let dir = temp_dir("restart");
         let (tx, rx) = sync_channel(16);
+        let hb_path = dir.join("heartbeat.bin");
         let handle = spawn(cfg(&dir, false, 1 << 20), rx);
         send(&tx, WalCmd::Heartbeat(Some(heartbeat_data())));
-        std::thread::sleep(Duration::from_millis(80));
+        await_heartbeat(&hb_path, 0);
         send(&tx, WalCmd::Shutdown);
         handle.join().unwrap().unwrap();
-        let first_run =
-            recover_heartbeat(&std::fs::read(dir.join("heartbeat.bin")).unwrap()).unwrap();
+        let first_run = read_heartbeat(&hb_path).unwrap();
 
         let (tx, rx) = sync_channel(16);
         let handle = spawn(cfg(&dir, false, 1 << 20), rx);
         send(&tx, WalCmd::Heartbeat(Some(heartbeat_data())));
-        std::thread::sleep(Duration::from_millis(80));
+        // Wait for a beat that could only come from the second run: the
+        // sequence resumes past the first run's, so this is exactly the
+        // "sequence resumed" property the assertions below check.
+        await_heartbeat(&hb_path, first_run.heartbeat.sequence + 1);
         send(&tx, WalCmd::Shutdown);
         handle.join().unwrap().unwrap();
-        let second_run =
-            recover_heartbeat(&std::fs::read(dir.join("heartbeat.bin")).unwrap()).unwrap();
+        let second_run = read_heartbeat(&hb_path).unwrap();
 
         // Sequence resumed (newest-wins preserved across restarts), and
         // each run created its own segment.
@@ -716,7 +837,11 @@ mod tests {
         c.heartbeat_period = Duration::from_millis(5);
         let handle = spawn(c, rx);
         send(&tx, WalCmd::Heartbeat(Some(heartbeat_data())));
-        std::thread::sleep(Duration::from_millis(300));
+        // Enough beats for the 1-in-N ratio to be meaningful. The
+        // assertion below is self-calibrating (it derives the expected
+        // record count from the beats that actually happened), so this
+        // only has to guarantee the sample is big enough.
+        await_heartbeat(&dir.join("heartbeat.bin"), 3 * WAL_HEARTBEAT_EVERY);
         send(&tx, WalCmd::Shutdown);
         handle.join().unwrap().unwrap();
         let result = scan_segment(&dir, 1);
