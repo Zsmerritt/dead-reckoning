@@ -1,36 +1,40 @@
 """Probe repeatability diagnostic: the PLR_PROBE_TEST command.
 
-Runs N probe cycles at the current XY position and reports their
-spread, then stages the measured ``probe_resolution`` into the [plr]
-autosave section for SAVE_CONFIG.  The probing loop mirrors klippy's
-own PROBE_ACCURACY implementation
-(klippy/extras/probe.py:125-169 ``ProbeCommandHelper.cmd_PROBE_ACCURACY``):
+Two-tier verification, ported from Cartographer3D's touch-calibrate
+verifier (``src/cartographer/macros/touch/calibrate.py`` —
+``ThresholdVerifier.verify`` lines 156-223, its early-exit 205-215, the
+``format_distance`` ceiling-round 72-82, and the escalating failure hint
+398-412).  The pattern, not the code.
 
-* build a parameter dict from the live command with ``SAMPLES`` forced
-  to ``'1'`` and wrap it in a dummy gcode command via
-  ``gcode.create_gcode_command("", "", params)`` (probe.py:137-140);
-* ``probe.start_probe_session(fo_gcmd)`` /
-  ``session.run_probe(fo_gcmd)`` per sample, retracting between
-  samples with ``toolhead.manual_move`` at the probe's lift_speed
-  (probe.py:142-151);
-* ``session.pull_probed_results()`` yields result objects whose
-  ``bed_z`` is the trigger height, then ``session.end_probe_session()``
-  (probe.py:152-153).
+Where the OLD PLR_PROBE_TEST ran N single descending probes and reported
+their raw spread, the new one runs ``SEQUENCES`` FULL consensus touch
+sequences (each a :func:`plr.touch_sequence.perform_consensus_touch`, the
+same sliding-window sampler PLR_TOUCH uses) and checks that the resulting
+per-sequence medians agree:
 
-Safety gates, all client-side and all before any motion:
+* acceptance = range of the sequence medians <= ``VERIFY_RANGE``
+  (default 2x the per-sequence ``SAMPLE_RANGE``, capped at 4x; a
+  VERIFY_RANGE below SAMPLE_RANGE or above 4x is refused loudly, carto
+  calibrate.py:269-274);
+* early-exit the moment the running median range exceeds the limit —
+  no point taking more sequences once inconsistent (carto
+  calibrate.py:205-215);
+* on success, stage ``probe_resolution`` for SAVE_CONFIG (see
+  :func:`resolution_from_medians` for the formula);
+* on failure, a copy-pasteable retry with SEQUENCES escalated and
+  VERIFY_RANGE loosened (capped).
 
-* refuses while a print is active (print_stats state, falling back to
-  idle_timeout state when [virtual_sdcard] is absent);
-* refuses unless x, y and z are homed (toolhead.get_status
-  ``homed_axes``, the same signal probe.py:352-355 checks for z);
-* refuses probe_method adxl_drag (no descending probe to test);
-* does NOTHING without an explicit ``START=1`` — without it the
-  command only prints what it would do (motion consent).
+Safety gates are unchanged and all client-side, all before motion:
+refuses adxl_drag (no descending probe), refuses while a print is
+active, refuses unless xyz are homed, and does NOTHING without an
+explicit ``START=1`` (motion consent).  The per-touch retract/accel
+invariants live in :func:`plr.touch_sequence.perform_consensus_touch`.
 """
 
-MIN_SAMPLES = 3
-MAX_SAMPLES = 50
-DEFAULT_SAMPLES = 10
+# Verification tier: how many full consensus sequences to run.
+MIN_SEQUENCES = 3
+DEFAULT_SEQUENCES = 5
+MAX_SEQUENCES = 10
 
 # Floor for the persisted probe_resolution (mm).  A perfectly repeating
 # probe still cannot resolve below roughly a microstep; claiming better
@@ -38,33 +42,19 @@ DEFAULT_SAMPLES = 10
 MIN_PROBE_RESOLUTION = 0.005
 
 
-def validate_sample_count(count, minimum=MIN_SAMPLES):
-    """Validate the SAMPLES= g-code parameter; return it unchanged.
+def compute_stats(values):
+    """Range, population standard deviation, median and mean of ``values``.
 
-    Raises ValueError with a console-ready message when the count is too
-    low to compute a meaningful spread.
-    """
-    if count < minimum:
-        raise ValueError(
-            "SAMPLES=%d is too low: at least %d probe samples are needed"
-            % (count, minimum)
-        )
-    return count
-
-
-def compute_stats(heights):
-    """Range, population standard deviation, and median of trigger heights.
-
-    Same statistics PROBE_ACCURACY prints (klippy/extras/probe.py:154-164
+    The statistics PROBE_ACCURACY prints (klippy/extras/probe.py:154-164
     computes range/average/median and a population sigma).
     """
-    if not heights:
-        raise ValueError("compute_stats: no probe samples")
-    n = len(heights)
-    mean = sum(heights) / n
-    range_value = max(heights) - min(heights)
-    sigma = (sum((h - mean) ** 2 for h in heights) / n) ** 0.5
-    ordered = sorted(heights)
+    if not values:
+        raise ValueError("compute_stats: no samples")
+    n = len(values)
+    mean = sum(values) / n
+    range_value = max(values) - min(values)
+    sigma = (sum((v - mean) ** 2 for v in values) / n) ** 0.5
+    ordered = sorted(values)
     mid = n // 2
     if n % 2:
         median = ordered[mid]
@@ -73,9 +63,22 @@ def compute_stats(heights):
     return {"range": range_value, "stddev": sigma, "median": median, "mean": mean}
 
 
-def resolution_from_stddev(sigma, minimum=MIN_PROBE_RESOLUTION):
-    """probe_resolution staged for SAVE_CONFIG: max(2*sigma, floor)."""
-    return max(2.0 * sigma, minimum)
+def resolution_from_medians(median_range, stddev, minimum=MIN_PROBE_RESOLUTION):
+    """probe_resolution staged for SAVE_CONFIG from the sequence medians.
+
+    ``max(2*stddev, median_range/2, minimum)`` — the trust radius plrd
+    uses for recovery probing, taken as the loosest of three honest
+    estimates of how well the probe repeats:
+
+    * ``2*stddev`` — a two-sigma spread of the sequence medians (the same
+      2-sigma basis the old single-probe resolution used);
+    * ``median_range/2`` — half the observed peak-to-peak of the medians,
+      a floor that respects the worst swing actually seen even when a
+      small sample count makes stddev look optimistic;
+    * ``minimum`` (0.005mm) — the microstep floor: no probe resolves
+      finer than this regardless of how still the medians sat.
+    """
+    return max(2.0 * stddev, median_range / 2.0, minimum)
 
 
 def _print_active(printer):
@@ -87,6 +90,9 @@ def _print_active(printer):
     (klippy/extras/idle_timeout.py:34-40: state 'Printing' means motion
     was commanded within the last idle window — coarser, so a recent
     manual move can also read as active; documented caveat).
+
+    Shared with the drag oracle (drag_probe._print_active import) and the
+    touch commands (touch_sequence.require_touch_ready).
     """
     print_stats = printer.lookup_object("print_stats", None)
     if print_stats is not None:
@@ -99,103 +105,167 @@ def _print_active(printer):
     return False
 
 
-def cmd_PLR_PROBE_TEST(plugin, gcmd):
-    """PLR_PROBE_TEST [SAMPLES=10] START=1 — probe repeatability test."""
-    printer = plugin.printer
-    if plugin.probe_method == "adxl_drag":
-        raise gcmd.error(
-            "PLR_PROBE_TEST needs a descending probe (probe_method tap or "
-            "load_cell); probe_method is adxl_drag — the drag oracle has "
-            "its own diagnostics (PLR_NOISE_TEST / PLR_DRAG_PROBE)"
-        )
-    samples = gcmd.get_int(
-        "SAMPLES", DEFAULT_SAMPLES, minval=MIN_SAMPLES, maxval=MAX_SAMPLES
+def _verify_failure_text(ts, stats, sequences, verify_range, sample_range, params):
+    """Console message for an inconsistent-medians failure, with a retry.
+
+    Reports a PROBE_ACCURACY-style block of the sequence medians and a
+    copy-pasteable retry with SEQUENCES escalated 1.5x (cap MAX_SEQUENCES)
+    and VERIFY_RANGE loosened 1.5x (cap 4x SAMPLE_RANGE) — the two knobs
+    that buy consistency headroom (carto calibrate.py:398-412).
+    """
+    from math import ceil
+
+    new_sequences = min(MAX_SEQUENCES, int(ceil(sequences * 1.5)))
+    new_verify = min(4.0 * sample_range, verify_range * 1.5)
+    retry = ts.format_command(
+        "PLR_PROBE_TEST",
+        [
+            ("START", "1"),
+            ("SEQUENCES", "%d" % (new_sequences,)),
+            ("VERIFY_RANGE", "%.3f" % (new_verify,)),
+        ]
+        + ts.touch_param_pairs(params),
     )
-    validate_sample_count(samples)
-    if _print_active(printer):
-        raise gcmd.error(
-            "PLR_PROBE_TEST refused: a print is active (it moves the "
-            "toolhead); wait for the print to finish or cancel it"
+    return (
+        "PLR_PROBE_TEST failed: sequence medians disagree.\n"
+        "  sequences %d, range %s (limit %s), stddev %s, median %.6f\n"
+        "  medians: [%s]\n"
+        "The probe does not repeat within VERIFY_RANGE. Retry with more "
+        "sequences and a looser (capped) limit:\n  %s"
+        % (
+            len(stats["_medians"]),
+            ts.format_distance(stats["range"]),
+            ts.format_distance(verify_range),
+            ts.format_distance(stats["stddev"]),
+            stats["median"],
+            ", ".join("%.6f" % (m,) for m in stats["_medians"]),
+            retry,
         )
-    toolhead = printer.lookup_object("toolhead")
-    eventtime = printer.get_reactor().monotonic()
-    homed = toolhead.get_status(eventtime)["homed_axes"]
-    if any(axis not in homed for axis in "xyz"):
+    )
+
+
+def cmd_PLR_PROBE_TEST(plugin, gcmd):
+    """PLR_PROBE_TEST [SEQUENCES=5] [VERIFY_RANGE=] [SAMPLES=] [MAX_SAMPLES=]
+    [SAMPLE_RANGE=] [SPEED=] [RETRACT=] [TOUCH_ACCEL=] START=1."""
+    # Lazy import breaks the probe_test <-> touch_sequence cycle
+    # (touch_sequence imports _print_active from this module at load).
+    from . import touch_sequence as ts
+
+    printer = plugin.printer
+    try:
+        params = ts.parse_touch_params(gcmd, plugin.tunables["probe_speed"])
+    except ValueError as e:
+        raise gcmd.error("PLR_PROBE_TEST: %s" % (e,)) from None
+    sample_range = params.config.sample_range
+
+    sequences = gcmd.get_int(
+        "SEQUENCES", DEFAULT_SEQUENCES, minval=MIN_SEQUENCES, maxval=MAX_SEQUENCES
+    )
+    # VERIFY_RANGE is parsed WITHOUT gcmd bounds so the relational checks
+    # (>= SAMPLE_RANGE, <= 4x SAMPLE_RANGE) are our own loud refusals
+    # rather than klippy's generic min/max text (carto calibrate.py:269-274).
+    verify_range = gcmd.get_float("VERIFY_RANGE", 2.0 * sample_range, above=0.0)
+    if verify_range < sample_range:
         raise gcmd.error(
-            "PLR_PROBE_TEST refused: printer must be homed (homed axes: "
-            "'%s', need xyz) — run G28 first" % (homed,)
+            "PLR_PROBE_TEST: VERIFY_RANGE=%s must be >= SAMPLE_RANGE=%s — a "
+            "verification tighter than a single sequence's own consensus is "
+            "self-contradictory"
+            % (ts.format_distance(verify_range), ts.format_distance(sample_range))
         )
-    probe = printer.lookup_object("probe", None)
-    if probe is None:
+    if verify_range > 4.0 * sample_range:
         raise gcmd.error(
-            "no probe object — is the [%s] section present?"
-            % ("probe" if plugin.probe_method == "tap" else "load_cell_probe")
+            "PLR_PROBE_TEST: VERIFY_RANGE=%s must be <= 4x SAMPLE_RANGE (%s) — "
+            "a looser bound would rubber-stamp a probe that does not repeat"
+            % (
+                ts.format_distance(verify_range),
+                ts.format_distance(4.0 * sample_range),
+            )
         )
-    probe_speed = plugin.tunables["probe_speed"]
+
+    toolhead, _probe = ts.require_touch_ready(plugin, gcmd, "PLR_PROBE_TEST")
+
     if not gcmd.get_int("START", 0):
         pos = toolhead.get_position()
         gcmd.respond_info(
             "PLR_PROBE_TEST plan (no motion yet):\n"
-            "  will probe %d times at X=%.3f Y=%.3f, descending at %.2f mm/s\n"
-            "  (probe_speed from [plr]), retracting between samples\n"
+            "  will run up to %d consensus sequences at X=%.3f Y=%.3f\n"
+            "  (each: %d touches within %s in a window of %d, up to %d touches),\n"
+            "  accept if the sequence medians agree within %s,\n"
             "  then stage probe_resolution for SAVE_CONFIG.\n"
             "Re-run with START=1 to consent to this motion."
-            % (samples, pos[0], pos[1], probe_speed)
+            % (
+                sequences,
+                pos[0],
+                pos[1],
+                params.config.samples,
+                ts.format_distance(sample_range),
+                params.config.window,
+                params.config.max_samples,
+                ts.format_distance(verify_range),
+            )
         )
         return
-    # Mirror PROBE_ACCURACY's dummy per-sample command
-    # (klippy/extras/probe.py:136-140), forcing SAMPLES=1 so each
-    # run_probe takes exactly one sample, and pinning PROBE_SPEED to
-    # the [plr] probe_speed tunable (get_probe_params reads it from
-    # the gcode command, probe.py:299).
-    fo_params = dict(gcmd.get_command_parameters())
-    fo_params["SAMPLES"] = "1"
-    fo_params["PROBE_SPEED"] = "%.3f" % (probe_speed,)
-    fo_params.pop("START", None)
-    gcode = printer.lookup_object("gcode")
-    fo_gcmd = gcode.create_gcode_command("", "", fo_params)
-    params = probe.get_probe_params(fo_gcmd)
+
     start_pos = toolhead.get_position()
     gcmd.respond_info(
-        "PLR_PROBE_TEST at X:%.3f Y:%.3f (samples=%d probe_speed=%.2f "
-        "lift_speed=%.2f retract=%.3f)"
+        "PLR_PROBE_TEST at X:%.3f Y:%.3f: %d consensus sequences, accept "
+        "median range <= %s (probe_speed=%.2f)"
         % (
             start_pos[0],
             start_pos[1],
-            samples,
-            probe_speed,
-            params["lift_speed"],
-            params["sample_retract_dist"],
+            sequences,
+            ts.format_distance(verify_range),
+            params.speed,
         )
     )
-    # Probe loop, as probe.py:142-153.
-    probe_session = probe.start_probe_session(fo_gcmd)
-    try:
-        for _ in range(samples):
-            probe_session.run_probe(fo_gcmd)
-            lift_z = toolhead.get_position()[2] + params["sample_retract_dist"]
-            toolhead.manual_move(
-                [start_pos[0], start_pos[1], lift_z], params["lift_speed"]
+
+    medians = []
+    for i in range(sequences):
+        try:
+            result = ts.perform_consensus_touch(plugin, params)
+        except ts.ConsensusError as e:
+            # A single sequence could not even reach consensus: the probe
+            # is too noisy touch-to-touch.  Surface the consensus criteria
+            # and a retry that grows the per-sequence touch budget.
+            raise gcmd.error(
+                "PLR_PROBE_TEST: sequence %d/%d could not reach consensus.\n%s"
+                % (
+                    i + 1,
+                    sequences,
+                    ts.consensus_failure_text("PLR_PROBE_TEST", e, params),
+                )
+            ) from None
+        medians.append(result.median)
+        # Early exit once inconsistent (carto calibrate.py:205-215).
+        if len(medians) >= 2 and (max(medians) - min(medians)) > verify_range:
+            break
+
+    stats = compute_stats(medians)
+    stats["_medians"] = list(medians)
+
+    if stats["range"] > verify_range:
+        raise gcmd.error(
+            _verify_failure_text(
+                ts, stats, sequences, verify_range, sample_range, params
             )
-        positions = probe_session.pull_probed_results()
-    finally:
-        probe_session.end_probe_session()
-    heights = [p.bed_z for p in positions]
-    stats = compute_stats(heights)
-    resolution = resolution_from_stddev(stats["stddev"])
+        )
+
+    resolution = resolution_from_medians(stats["range"], stats["stddev"])
     plugin.probe_resolution = resolution
     configfile = printer.lookup_object("configfile")
     configfile.set("plr", "probe_resolution", "%.6f" % (resolution,))
     plugin.note_pending_save("probe_resolution")
     gcmd.respond_info(
-        "plr probe test: samples %d, range %.6f, stddev %.6f, median %.6f\n"
-        "plr: probe_resolution = %.6f mm (max(2*stddev, %.3f))\n"
+        "plr probe test: %d sequences, median range %s (limit %s), "
+        "stddev %s, median %.6f\n"
+        "plr: probe_resolution = %.6f mm (max(2*stddev, median_range/2, %.3f))\n"
         "The SAVE_CONFIG command will update the printer config file\n"
         "with the above and restart the printer."
         % (
-            samples,
-            stats["range"],
-            stats["stddev"],
+            len(medians),
+            ts.format_distance(stats["range"]),
+            ts.format_distance(verify_range),
+            ts.format_distance(stats["stddev"]),
             stats["median"],
             resolution,
             MIN_PROBE_RESOLUTION,
