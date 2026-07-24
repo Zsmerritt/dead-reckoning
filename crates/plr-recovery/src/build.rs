@@ -688,20 +688,12 @@ impl PlanConfig {
                 headroom: PROBE_TEMP_HEADROOM,
             });
         }
-        // The drag hold temperature obeys the SAME interlock: plrd must
-        // never command a temperature the plugin's ceiling gate would
-        // then refuse. `0` is the documented cold-drag opt-out.
+        // Finiteness is machine-independent: a NaN is wrong wherever it
+        // is read. The BAND check is not — it moved to
+        // `validate_for_probe`, because it only bites on the drag path.
         if !self.drag_nozzle_temp.is_finite() {
             return Err(RecoveryError::NonFinite {
                 field: "drag_nozzle_temp",
-            });
-        }
-        if self.drag_nozzle_temp < 0.0 || self.drag_nozzle_temp > clamped_max - PROBE_TEMP_HEADROOM
-        {
-            return Err(RecoveryError::DragTempOutOfRange {
-                drag_nozzle_temp: self.drag_nozzle_temp,
-                ceiling: clamped_max,
-                headroom: PROBE_TEMP_HEADROOM,
             });
         }
         // Acceleration overrides: finite and inside the shared band, or
@@ -780,6 +772,46 @@ impl PlanConfig {
         // probe_speed: non-finite values fall out of the band check in
         // compute_envelope; nothing to do here.
         Ok(())
+    }
+
+    /// The checks that only apply to a particular probe path.
+    ///
+    /// [`Self::validate`] is machine-independent by design, so it cannot
+    /// know whether `drag_nozzle_temp` will ever be commanded. On a Tap
+    /// or load-cell machine it never is — the plan emits no drag `M104`
+    /// and no drag `M109` — so refusing a recovery over its value would
+    /// be refusing over a setting this machine does not read. That is
+    /// exactly the pointless obstruction the diagnosis framework exists
+    /// to remove, and it is the same gating
+    /// [`PlanWarning::DragTempBelowFloor`] already uses.
+    ///
+    /// [`plan_recovery`] calls this immediately after
+    /// [`Self::validate`], once the machine snapshot is known.
+    ///
+    /// # Errors
+    ///
+    /// [`RecoveryError::DragTempOutOfRange`] when a drag machine's hold
+    /// temperature does not leave [`PROBE_TEMP_HEADROOM`] below the
+    /// contact ceiling — an interlock that must stay Hard, because the
+    /// plugin's own ceiling gate would refuse the drag AFTER the Z frame
+    /// is declared.
+    pub fn validate_for_probe(&self, kind: &ProbeKind) -> Result<(), RecoveryError> {
+        match kind {
+            ProbeKind::Tap | ProbeKind::LoadCell => Ok(()),
+            ProbeKind::AdxlDrag { .. } => {
+                let clamped_max = self.clamped_probe_max();
+                if self.drag_nozzle_temp < 0.0
+                    || self.drag_nozzle_temp > clamped_max - PROBE_TEMP_HEADROOM
+                {
+                    return Err(RecoveryError::DragTempOutOfRange {
+                        drag_nozzle_temp: self.drag_nozzle_temp,
+                        ceiling: clamped_max,
+                        headroom: PROBE_TEMP_HEADROOM,
+                    });
+                }
+                Ok(())
+            }
+        }
     }
 }
 
@@ -2293,6 +2325,8 @@ pub fn plan_recovery(
     let machine = validate_machine(inputs.machine).map_err(|r| RecoveryError::MachineRejected {
         failures: r.failures,
     })?;
+    // Probe-path-specific config checks, now that the machine is known.
+    config.validate_for_probe(&machine.probe.kind)?;
     let recovery = match inputs.reconstruction {
         Reconstruction::CleanShutdown(_) => return Ok(PlanOutcome::NoRecoveryNeeded),
         Reconstruction::Recovery(recovery) => recovery,

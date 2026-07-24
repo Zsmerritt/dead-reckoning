@@ -2,19 +2,32 @@
 //! tier means what it says, and the `UNSAFE_` escape hatches work only
 //! where they are documented to.
 //!
-//! # Why the variant lists are written out by hand
+//! # Exactly what is guaranteed, and by what
 //!
-//! The `Diagnose` implementations are exhaustive matches with no
-//! catch-all arm, so a new enum variant cannot compile until somebody
-//! writes its diagnosis — that is where the totality guarantee actually
-//! lives. What a test can add on top is that the diagnosis somebody wrote
-//! is not a placeholder: a non-empty `what`/`why`/`suggested_fix`, the right
-//! tier, a unique code, and an `override_key` only where one is allowed.
+//! **The compiler guarantees totality.** Each `Diagnose` implementation
+//! is an exhaustive match with no catch-all arm, so a new enum variant
+//! cannot compile until somebody writes its diagnosis. That is the real
+//! protection and it needs no test.
 //!
-//! The per-enum `assert_eq!` on the list length is the second half of the
-//! trap: adding a variant breaks the build, and someone who fixes the
-//! build by writing a diagnosis but forgets to exercise it here fails
-//! this test instead of silently shipping an unexercised arm.
+//! **A second compile-time trap lives here.** The `tier_of_*` functions
+//! below are also exhaustive matches with no catch-all, over the same
+//! enums. A new variant therefore fails to compile in TWO places: the
+//! implementation, and this test's independent statement of what tier the
+//! variant should carry. Restating the tier separately from the code that
+//! produces it is the point — a test that read the tier back off the
+//! implementation would agree with any tier the implementation happened
+//! to pick.
+//!
+//! **The hand-written lists are sample VALUES, nothing more.** They exist
+//! to give each arm a concrete input so the rendered message can be
+//! checked for substance (non-empty `what`/`why`/`suggested_fix`, a
+//! `snake_case` code, an `override_key` only where the tier allows one).
+//! Their `assert_eq!` length checks guard against silent REMOVAL from the
+//! list; they cannot detect a variant added to the enum, because nothing
+//! ties a `Vec` literal's length to an enum's cardinality. Rust has no
+//! built-in variant enumeration and this crate takes no derive-macro
+//! dependency for one, so that gap is closed by `tier_of_*` refusing to
+//! compile instead.
 
 use plr_recovery::diagnosis::{Diagnose, Tier};
 use plr_recovery::machine::PrereqFailure;
@@ -192,7 +205,7 @@ fn every_plan_warning() -> Vec<(PlanWarning, Tier)> {
             PlanWarning::ReheatParkUnverified {
                 point: [10.0, 20.0],
             },
-            Tier::Advisory,
+            Tier::Confirmable,
         ),
         (
             PlanWarning::PurgeInsidePart {
@@ -315,15 +328,142 @@ fn assert_well_formed(d: &plr_recovery::Diagnosis, expected_tier: Tier, label: &
     assert!(d.full().contains(&d.suggested_fix), "{label}: full fix");
 }
 
+// --- The second compile-time trap ------------------------------------------
+//
+// Exhaustive matches with NO catch-all arm, restating each variant's tier
+// independently of the implementation that produces it. A new variant
+// fails to compile here as well as in `diagnosis.rs`, so "what tier is
+// this?" cannot be answered by accident.
+
+/// The tier every [`RecoveryError`] must carry.
+fn tier_of_recovery_error(e: &RecoveryError) -> Tier {
+    match e {
+        // Every RecoveryError is Hard: these are errors, not
+        // defined-but-degraded outcomes (the crate draws that line by
+        // routing the latter to PlanWarning / ManualFallback instead).
+        RecoveryError::NonFinite { .. }
+        | RecoveryError::InvalidContext { .. }
+        | RecoveryError::ProbeSpeedOutOfRange { .. }
+        | RecoveryError::InvalidPlanConfig { .. }
+        | RecoveryError::AccelOutOfRange { .. }
+        | RecoveryError::ConfirmTimeoutOutOfRange { .. }
+        | RecoveryError::ProbeTempHeadroomUnavailable { .. }
+        | RecoveryError::DragTempOutOfRange { .. }
+        | RecoveryError::PurgeMacroMissing { .. }
+        | RecoveryError::PurgeZBelowBed { .. }
+        | RecoveryError::MachineRejected { .. }
+        | RecoveryError::NoContext
+        | RecoveryError::NoVirtualSd
+        | RecoveryError::FileNotTopLevel { .. }
+        | RecoveryError::NoZSpan
+        | RecoveryError::NoProbeCandidates
+        | RecoveryError::NoNozzleTarget
+        | RecoveryError::InvalidName { .. }
+        | RecoveryError::ItineraryRejected(_) => Tier::Hard,
+    }
+}
+
+/// The tier every [`PrereqFailure`] must carry.
+fn tier_of_prereq_failure(f: &PrereqFailure) -> Tier {
+    match f {
+        // The structural assumptions the whole method rests on. None of
+        // them is a judgement an operator can make from a dialog box, and
+        // none may be overridden.
+        PrereqFailure::ForceMoveDisabled
+        | PrereqFailure::ZNotSelfLocking
+        | PrereqFailure::NoZSteppers
+        | PrereqFailure::ZStepperOffPrimaryMcu { .. }
+        | PrereqFailure::NoTypeAnnotations
+        | PrereqFailure::NoProbe
+        | PrereqFailure::MultipleProbes { .. }
+        | PrereqFailure::ProbeZOffsetNonFinite
+        | PrereqFailure::ProbeActivateGcodeMoves
+        | PrereqFailure::ProbeDeactivateGcodeMoves
+        | PrereqFailure::PositionMinUnknown
+        | PrereqFailure::PositionMinNonFinite
+        | PrereqFailure::ConfigNeverValidated
+        | PrereqFailure::ConfigChangedSinceValidation { .. }
+        | PrereqFailure::SdcardRootUnknown
+        | PrereqFailure::AccelChipInvalid { .. }
+        | PrereqFailure::NoiseFloorMissing
+        | PrereqFailure::NoiseFloorInvalid { .. } => Tier::Hard,
+    }
+}
+
+/// The tier every [`PlanWarning`] must carry.
+///
+/// Two are data-dependent: a purge inside the part is a commanded
+/// collision only when a `purge_z` makes the file descend to it, and a
+/// park inside the part is a judgement the operator already made only
+/// when they configured it there.
+///
+/// **No arm may return [`Tier::Hard`].** A warning is an observation
+/// about a plan that was successfully built; a Hard diagnosis is a
+/// refusal to build one. The executor enforces the same thing at runtime
+/// (a Hard diagnosis aborts rather than being offered a continue-anyway
+/// button), and `no_plan_warning_is_hard` pins it here.
+fn tier_of_plan_warning(w: &PlanWarning) -> Tier {
+    match w {
+        PlanWarning::AdaptiveMeshNotRestorable
+        | PlanWarning::SkewProfileUnknown
+        | PlanWarning::NoBedTarget
+        | PlanWarning::ReheatParkComputed { .. }
+        | PlanWarning::ResumeNotOnInfill
+        | PlanWarning::UnrestorableFan { .. }
+        | PlanWarning::UnsafeOverrideActive { .. }
+        | PlanWarning::AccelProbeIgnoredOnTouchPath { .. }
+        | PlanWarning::AccelEntryNotAppliedToFile { .. } => Tier::Advisory,
+        PlanWarning::PurgeZBelowResume { .. }
+        | PlanWarning::NoiseFloorSpeedMismatch { .. }
+        | PlanWarning::DragTempBelowFloor { .. }
+        // Nothing is known about this park point at all; less knowledge
+        // must not buy less friction than the better-informed
+        // `ReheatParkInsidePart` below.
+        | PlanWarning::ReheatParkUnverified { .. } => Tier::Confirmable,
+        PlanWarning::PurgeInsidePart { purge_z, .. } => {
+            if purge_z.is_some() {
+                Tier::Confirmable
+            } else {
+                Tier::Advisory
+            }
+        }
+        PlanWarning::ReheatParkInsidePart { configured, .. } => {
+            if *configured {
+                Tier::Advisory
+            } else {
+                Tier::Confirmable
+            }
+        }
+    }
+}
+
+/// A plan warning is an observation, never a refusal: the executor routes
+/// Hard diagnoses to an abort rather than to the confirmation, so a Hard
+/// warning would be a refusal nobody could act on.
+#[test]
+fn no_plan_warning_is_hard() {
+    for (w, _) in every_plan_warning() {
+        assert_ne!(
+            tier_of_plan_warning(&w),
+            Tier::Hard,
+            "a PlanWarning may not be Hard: {w:?}"
+        );
+        assert_ne!(w.diagnosis().tier, Tier::Hard, "{w:?}");
+    }
+}
+
 #[test]
 fn every_recovery_error_variant_yields_a_usable_diagnosis() {
     let all = every_recovery_error();
     assert_eq!(
         all.len(),
         19,
-        "a RecoveryError variant was added or removed: exercise it here too"
+        "a sample value was removed from this list; it must exercise every arm"
     );
     for (error, tier) in &all {
+        // The declared tier and the independently-restated one must
+        // agree, and both must match what the implementation produced.
+        assert_eq!(tier_of_recovery_error(error), *tier, "{error:?}");
         assert_well_formed(&error.diagnosis(), *tier, &format!("{error:?}"));
     }
 }
@@ -334,9 +474,10 @@ fn every_prereq_failure_variant_yields_a_usable_diagnosis() {
     assert_eq!(
         all.len(),
         18,
-        "a PrereqFailure variant was added or removed: exercise it here too"
+        "a sample value was removed from this list; it must exercise every arm"
     );
     for (failure, tier) in &all {
+        assert_eq!(tier_of_prereq_failure(failure), *tier, "{failure:?}");
         assert_well_formed(&failure.diagnosis(), *tier, &format!("{failure:?}"));
     }
 }
@@ -349,9 +490,10 @@ fn every_plan_warning_variant_yields_a_usable_diagnosis() {
     assert_eq!(
         all.len(),
         17,
-        "a PlanWarning variant was added or removed: exercise it here too"
+        "a sample value was removed from this list; it must exercise every arm"
     );
     for (warning, tier) in &all {
+        assert_eq!(tier_of_plan_warning(warning), *tier, "{warning:?}");
         assert_well_formed(&warning.diagnosis(), *tier, &format!("{warning:?}"));
     }
 }

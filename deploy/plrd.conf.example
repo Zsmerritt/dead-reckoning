@@ -316,6 +316,14 @@ control_socket = /var/lib/plrd/plrd.sock
 #                          enough, and visible enough to you in advance,
 #                          to be worth an escape hatch at all.
 #
+#                          !! NOT USABLE YET. Klipper refuses to start on
+#                          a config option no module reads, and the plr
+#                          plugin does not yet declare this key (nor
+#                          several others below). Setting it today gives
+#                          you a printer that will not boot. A plugin fix
+#                          is in flight; until it lands, this escape
+#                          hatch is documented but unreachable.
+#
 # Every OTHER Hard refusal — the machine prerequisites, a non-finite
 # number, an unknown Z span, an out-of-bounds itinerary, a temperature
 # the plugin's own ceiling gate would then refuse — has NO override, by
@@ -327,6 +335,33 @@ control_socket = /var/lib/plrd/plrd.sock
 # loud as an Advisory diagnosis. An override that fires silently is not
 # an escape hatch, it is a booby trap for whoever is standing at the
 # printer next.
+#
+# ----------------------------------------------------------------------
+# THE Z-FRAME INTERLOCK — why a failed recovery blocks the next one
+#
+# The moment plrd issues the SET_KINEMATIC_POSITION that declares the
+# shifted probing frame, Klipper's idea of Z is something plrd asserted
+# rather than something anyone measured. If the recovery then stops for
+# ANY reason before it re-establishes a trusted frame, Z is unknown — and
+# driving the machine against an unknown Z is the one thing this design
+# exists to prevent.
+#
+# So plrd writes a marker file (frame_invalid.json, in wal_dir)
+# immediately BEFORE issuing that declare, and deletes it only when a
+# recovery completes successfully. While it exists, --execute is refused;
+# a fresh dry run regenerates the plan and clears it.
+#
+# Written on the way IN, not on the way out, deliberately: a marker
+# written by the abort path is a code path that has to run, and a daemon
+# restart, a SIGKILL, a crash or a second power cut are exactly the cases
+# where it would not. Writing it first means it survives all of them
+# without anything having to happen.
+#
+# And if that marker cannot be written, plrd does not declare the frame
+# at all — it refuses and leaves the printer untouched. A state we cannot
+# record that we are in is a state we must not enter. (In practice that
+# means: if wal_dir is unwritable, fix that first. It is also where your
+# transcript goes.)
 #
 # ----------------------------------------------------------------------
 # CONFIRM-POINTS — pause and ask, instead of guessing (both default False)
@@ -422,6 +457,16 @@ control_socket = /var/lib/plrd/plrd.sock
 #   print runs at your normal acceleration rather than a recovery
 #   override. touch_accel (above) remains the probe-CONTACT value and is
 #   unaffected.
+#
+#   KNOWN EDGE: "the machine's own max_accel" means the value in force
+#   when the recovery began (and, inside the recovery file, [printer]
+#   max_accel). If your sliced file had LOWERED acceleration with M204 or
+#   SET_VELOCITY_LIMIT before the point you are resuming from, the
+#   restore puts back the machine value, not the file's reduced one — so
+#   the first moves after the resume can run faster than the same moves
+#   did before the power loss, until the file's next M204. If that
+#   matters for your part, add an M204 near the top of the print, or set
+#   recovery_accel to the value your print actually uses.
 #
 # The recovery no longer seeks the original file with M26. It writes a
 # generated <original>_RECOVERY.gcode into the virtual_sdcard root and

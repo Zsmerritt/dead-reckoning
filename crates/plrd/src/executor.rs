@@ -43,15 +43,26 @@
 //!   that step's commands and verifications.
 //!
 //! A pause is not a special execution state: it is one `await` on the
-//! caller-supplied [`Confirmer`], bounded by
-//! [`ExecOptions::confirm_timeout`], whose three possible answers
-//! ([`ConfirmAnswer`]) are *continue*, *abort*, and *timed out* — and
-//! the last two are the same abort path, so a pause can never leave the
-//! machine anywhere an abort could not have left it. In particular a
-//! pause after the shifted-frame declare that times out invalidates the
-//! Z frame exactly as an abort there does, because it IS an abort there:
-//! [`ExecOutcome::Aborted::frame_invalid`] is computed from the anchor
-//! step's id by the same code either way.
+//! caller-supplied [`Confirmer`], bounded by the plan's
+//! `confirm_timeout_s` (or [`ExecOptions::confirm_timeout`]), whose three
+//! possible answers ([`ConfirmAnswer`]) are *continue*, *abort*, and
+//! *timed out* — and the last two are the same abort path, so a pause can
+//! never leave the machine anywhere an abort could not have left it.
+//!
+//! # 5. The Z frame is recorded before it is risked ([`FrameGuard`])
+//!
+//! [`ExecOutcome::Aborted::frame_invalid`] is a *report*. It is not the
+//! interlock, and it must never be the only record that the Z frame was
+//! put at risk, because producing it requires this function to return —
+//! and a runtime drop, a SIGTERM, a panic, a SIGKILL or a second power
+//! loss all prevent that while leaving the frame just as fabricated.
+//!
+//! So the interlock is armed through [`FrameGuard::arm`] immediately
+//! before the shifted-frame declare is ISSUED, and arming is fail-closed:
+//! if it cannot be persisted, execution refuses to issue the declare at
+//! all. The invariant is therefore structural rather than procedural —
+//! *if the frame was ever risked, the record of that exists, whatever
+//! happened next.*
 //!
 //! The default [`AbortConfirmer`] answers "abort" to everything, which
 //! is what preserves today's behaviour for non-interactive callers: a
@@ -413,6 +424,18 @@ pub enum StopCause {
     ComputeFailed(String),
     /// The operator declined at a `--step` gate.
     OperatorDeclined,
+    /// The frame-invalidation interlock could not be written, so
+    /// execution refused to ISSUE the shifted-frame declare. Nothing was
+    /// declared, so the Z frame is still valid — this is the fail-closed
+    /// direction: never enter a state we cannot record that we are in.
+    FrameGuardUnwritable(String),
+    /// A [`Tier::Hard`] diagnosis was raised by the pre-flight. A
+    /// refusal is not a question, so it aborts instead of being offered
+    /// a continue-anyway button.
+    HardDiagnosis {
+        /// The refusing diagnosis's code.
+        code: &'static str,
+    },
     /// A [`ConfirmPoint`] was answered "abort" — or was never asked at
     /// all, because the caller supplied the default [`AbortConfirmer`].
     ConfirmationDeclined {
@@ -438,9 +461,19 @@ impl StopCause {
     /// error.
     #[must_use]
     pub fn step_failure(&self) -> Option<StepFailure> {
+        // Enumerated, not `_ => None`: a new StopCause must state whether
+        // it carries a classified Klipper failure rather than inheriting
+        // "no" from a catch-all nobody revisits.
         match self {
             StopCause::CommandFailed { failure, .. } => Some(*failure),
-            _ => None,
+            StopCause::VerificationFailed { .. }
+            | StopCause::Transport(_)
+            | StopCause::ComputeFailed(_)
+            | StopCause::OperatorDeclined
+            | StopCause::FrameGuardUnwritable(_)
+            | StopCause::HardDiagnosis { .. }
+            | StopCause::ConfirmationDeclined { .. }
+            | StopCause::ConfirmationTimedOut { .. } => None,
         }
     }
 }
@@ -509,6 +542,55 @@ struct AccelSlots {
     machine: Option<f64>,
 }
 
+/// Records, BEFORE the shifted-frame declare is issued, that Klipper's Z
+/// frame is about to become potentially fabricated.
+///
+/// # Why this is armed on entry rather than written on abort
+///
+/// The Z frame stops being trustworthy the instant
+/// `SET_KINEMATIC_POSITION` is *issued* — not when some later code
+/// decides an abort has happened. Anything that writes the interlock on
+/// the abort path is a code path that has to RUN, and the ways it can
+/// fail to run are exactly the ways this daemon dies: a runtime drop on
+/// `systemctl restart`, a SIGTERM, a panic in the execution task, a
+/// SIGKILL, or a second power loss. Every one of those would leave the
+/// frame fabricated and the interlock absent, and the next `--execute`
+/// would re-drive the plan against it.
+///
+/// So the marker is written on ENTRY to the danger zone and cleared only
+/// on a fully successful completion. Then it persists by construction:
+/// nothing has to run for it to survive.
+///
+/// Arming is **fail-closed**. `Err` aborts the recovery *before* the
+/// declare is issued, because a state we cannot record that we are in is
+/// a state we must not enter.
+pub trait FrameGuard: Send {
+    /// Arms the interlock for `step` (the shifted-frame declare).
+    ///
+    /// # Errors
+    ///
+    /// The reason the interlock could not be persisted. Execution then
+    /// refuses to issue the declare.
+    fn arm(&mut self, step: &RecoveryStep) -> Result<(), String>;
+}
+
+/// A [`FrameGuard`] that records nothing.
+///
+/// For tests and for callers that own the interlock themselves. Named
+/// unmistakably: choosing it means choosing to have no interlock, and
+/// that should never be a quiet default — which is also why it is not
+/// the default anywhere in production. `dead_code` is allowed because
+/// plrd is a binary crate, so `pub` alone does not count as a use and
+/// only the test harness constructs this.
+#[cfg_attr(not(test), allow(dead_code))]
+pub struct NoFrameGuard;
+
+impl FrameGuard for NoFrameGuard {
+    fn arm(&mut self, _step: &RecoveryStep) -> Result<(), String> {
+        Ok(())
+    }
+}
+
 /// Executes a validated plan step by step (module safety invariants
 /// 2–4).
 ///
@@ -516,13 +598,16 @@ struct AccelSlots {
 /// returning `false` stops execution before that step sends anything.
 /// `confirmer` answers every [`ConfirmPoint`] — pass
 /// [`AbortConfirmer`] for the non-interactive behaviour in which any
-/// Confirmable diagnosis aborts.
+/// Confirmable diagnosis aborts. `frame_guard` is armed immediately
+/// before the shifted-frame declare and refuses entry if it cannot
+/// persist (see [`FrameGuard`]).
 pub async fn execute(
     plan: &RecoveryPlan,
     client: &mut MoonrakerClient,
     options: &ExecOptions,
     gate: &mut (dyn FnMut(&RecoveryStep) -> bool + Send),
     confirmer: &mut dyn Confirmer,
+    frame_guard: &mut dyn FrameGuard,
     transcript: &mut Transcript<'_>,
 ) -> ExecOutcome {
     transcript.entry(&json!({
@@ -592,6 +677,14 @@ pub async fn execute(
                 .await;
             }
         }
+        // Entry to the danger zone: arm the interlock BEFORE the declare
+        // is issued, and refuse to issue it if that cannot be persisted.
+        if let Some(cause) = arm_frame_if_entering(step, shifted_id, frame_guard, transcript) {
+            return finish_abort(
+                client, step, cause, &cleanups, accel, shifted_id, transcript,
+            )
+            .await;
+        }
         transcript.entry(&json!({
             "event": "step-start",
             "step": step.id,
@@ -628,6 +721,36 @@ pub async fn execute(
     }
 }
 
+/// Arms the frame interlock when `step` is the shifted-frame declare.
+///
+/// `Some(cause)` means the interlock could not be persisted and the
+/// declare must NOT be issued — the fail-closed direction, because a
+/// state we cannot record that we are in is a state we must not enter.
+fn arm_frame_if_entering(
+    step: &RecoveryStep,
+    shifted_id: Option<u32>,
+    frame_guard: &mut dyn FrameGuard,
+    transcript: &mut Transcript<'_>,
+) -> Option<StopCause> {
+    if Some(step.id) != shifted_id {
+        return None;
+    }
+    match frame_guard.arm(step) {
+        Ok(()) => {
+            transcript.entry(&json!({"event": "frame-armed", "step": step.id}));
+            None
+        }
+        Err(reason) => {
+            transcript.entry(&json!({
+                "event": "frame-arm-failed",
+                "step": step.id,
+                "reason": reason,
+            }));
+            Some(StopCause::FrameGuardUnwritable(reason))
+        }
+    }
+}
+
 /// Turns every plan warning into a diagnosis, transcribes it, and pauses
 /// on the Confirmable ones. `Some(cause)` means the recovery must abort.
 async fn preflight_confirmations(
@@ -646,7 +769,7 @@ async fn preflight_confirmations(
                 "event": "advisory",
                 "diagnosis": diagnosis,
             })),
-            Tier::Confirmable | Tier::Hard => {
+            Tier::Confirmable => {
                 let point = ConfirmPoint {
                     kind: ConfirmKind::Diagnosis,
                     step_id: anchor.id,
@@ -657,6 +780,21 @@ async fn preflight_confirmations(
                 if let Some(cause) = ask(&point, deadline, confirmer, transcript).await {
                     return Some(cause);
                 }
+            }
+            // A refusal is not a question. No `PlanWarning` produces a
+            // Hard diagnosis today and a test pins that, but routing one
+            // into the ask path would offer a continue-anyway button for
+            // something whose whole definition is "only a deliberate
+            // printer.cfg edit may permit this" — so it is unreachable by
+            // construction here, not merely by convention elsewhere.
+            Tier::Hard => {
+                transcript.entry(&json!({
+                    "event": "hard-refusal",
+                    "diagnosis": diagnosis,
+                }));
+                return Some(StopCause::HardDiagnosis {
+                    code: diagnosis.code,
+                });
             }
         }
     }
@@ -937,13 +1075,21 @@ fn abort(
     let reason = match &cause {
         StopCause::ConfirmationDeclined { .. } => "confirmation-declined".to_owned(),
         StopCause::ConfirmationTimedOut { .. } => "confirmation-timeout".to_owned(),
+        StopCause::FrameGuardUnwritable(_) => "frame-interlock-unwritable".to_owned(),
+        StopCause::HardDiagnosis { code } => (*code).to_owned(),
         StopCause::VerificationFailed { .. }
         | StopCause::Transport(_)
         | StopCause::CommandFailed { .. }
         | StopCause::ComputeFailed(_)
         | StopCause::OperatorDeclined => reason.code().to_owned(),
     };
-    let frame_invalid = shifted_id.is_some_and(|sid| step.id >= sid);
+    // Anchoring on the step id is right for every abort EXCEPT the
+    // fail-closed refusal to enter: there the declare was never issued,
+    // so the frame is exactly as valid as it was before this run — and
+    // saying otherwise would demand a marker we have just proven we
+    // cannot write.
+    let frame_invalid = !matches!(cause, StopCause::FrameGuardUnwritable(_))
+        && shifted_id.is_some_and(|sid| step.id >= sid);
     let diagnosis = cause.step_failure().map(|f| f.diagnosis());
     transcript.entry(&json!({
         "event": "abort",
@@ -1231,7 +1377,8 @@ fn evaluate(predicate: &Predicate, value: Option<&Value>, computed: Option<f64>)
 pub(crate) mod tests {
     use super::{
         dry_run, evaluate, execute, lookup, AbortConfirmer, ConfirmAnswer, ConfirmKind,
-        ConfirmPoint, Confirmer, ExecOptions, ExecOutcome, StepFailure, StopCause, Transcript,
+        ConfirmPoint, Confirmer, ExecOptions, ExecOutcome, FrameGuard, NoFrameGuard, StepFailure,
+        StopCause, Transcript,
     };
     use crate::moonraker::MoonrakerClient;
     use crate::testmoon::FakeMoonraker;
@@ -1385,13 +1532,35 @@ pub(crate) mod tests {
         confirmer: &mut dyn Confirmer,
         options: &ExecOptions,
     ) -> (ExecOutcome, String) {
+        run_guarded(plan, fake, gate, confirmer, &mut NoFrameGuard, options).await
+    }
+
+    /// [`run_with`] plus an explicit [`FrameGuard`], for the tests that
+    /// care about the interlock.
+    pub(crate) async fn run_guarded(
+        plan: &RecoveryPlan,
+        fake: &FakeMoonraker,
+        gate: &mut (dyn FnMut(&RecoveryStep) -> bool + Send),
+        confirmer: &mut dyn Confirmer,
+        frame_guard: &mut dyn FrameGuard,
+        options: &ExecOptions,
+    ) -> (ExecOutcome, String) {
         let mut client = MoonrakerClient::connect(&fake.url(), Duration::from_secs(5))
             .await
             .unwrap();
         let mut buffer = Vec::new();
         let outcome = {
             let mut transcript = Transcript::new(&mut buffer);
-            execute(plan, &mut client, options, gate, confirmer, &mut transcript).await
+            execute(
+                plan,
+                &mut client,
+                options,
+                gate,
+                confirmer,
+                frame_guard,
+                &mut transcript,
+            )
+            .await
         };
         (outcome, String::from_utf8(buffer).unwrap())
     }

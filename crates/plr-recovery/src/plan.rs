@@ -135,11 +135,16 @@ pub enum Phase {
     /// the Moonraker client in `recover::execute_with_gates`), and a
     /// timeout is a step failure that aborts the recovery.
     ///
-    /// That abort is CLEAN: this phase precedes [`Phase::ShiftedFrame`],
-    /// so no `SET_KINEMATIC_POSITION` has been issued, the executor's
-    /// `frame_invalid` stays false, no frame-invalidation marker is
-    /// written, and a re-run after fixing the thermal problem is
-    /// immediately possible. (The probe step's contact-ceiling gate is a
+    /// That abort is CLEAN — but not because no `SET_KINEMATIC_POSITION`
+    /// has run: [`Phase::BelievedZDeclare`] issues one two phases
+    /// earlier. It is clean because that earlier declare is the
+    /// CONSERVATIVE believed Z (the upper bound of the possible-stop set)
+    /// followed by a lift, which moves the toolhead AWAY from the part
+    /// and leaves the frame no less trustworthy than it already was. The
+    /// frame becomes unverifiable only at [`Phase::ShiftedFrame`], which
+    /// this phase precedes — so the executor's `frame_invalid` stays
+    /// false, no frame-invalidation marker is written, and a re-run after
+    /// fixing the thermal problem is immediately possible. (The probe step's contact-ceiling gate is a
     /// different guard for a different failure — it never sees a nozzle
     /// stuck at this step, because `M109` blocks long before the probe
     /// step is reached.)

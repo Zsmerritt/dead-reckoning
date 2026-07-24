@@ -254,14 +254,32 @@ fn opt_opt_f64(section: &Map<String, Value>, key: &str) -> Option<f64> {
     section.get(key).and_then(Value::as_f64)
 }
 
-/// Reads an `UNSAFE_`-prefixed boolean, case-insensitively.
+/// Reads an `UNSAFE_`-prefixed boolean, tolerating either case.
 ///
-/// The operator writes `UNSAFE_allow_purge_z_below_bed` in printer.cfg —
-/// the screaming prefix is the whole point of the naming — but klippy
-/// lowercases option names before they reach `configfile.settings`, so
-/// the key arrives as `unsafe_allow_purge_z_below_bed`. Looking both up
-/// means the documented spelling and klippy's normalization agree
-/// instead of the operator's careful edit silently doing nothing.
+/// # KNOWN GAP: this key does not reach plrd yet
+///
+/// `configfile.settings` only carries options a klippy module actually
+/// **accessed** while loading the config
+/// (`ConfigValidate._build_status_settings` builds it from the
+/// access-tracking map — see the module docs). The Klipper plugin does
+/// not read this option, so it never appears here at all; and worse,
+/// klippy's own `check_unused` REFUSES TO START for a config carrying an
+/// option no module claimed. An operator who follows the documentation
+/// and sets `UNSAFE_allow_purge_z_below_bed` currently gets a printer
+/// that will not boot, not an escape hatch.
+///
+/// That is a plugin-side defect affecting this key and roughly sixteen
+/// pre-existing `[plr]` keys, and it is being fixed separately: the
+/// plugin must declare every option plrd consumes. This function is
+/// correct for the moment it does — nothing here needs to change then.
+///
+/// # Why both spellings are accepted
+///
+/// The documented spelling is `UNSAFE_allow_purge_z_below_bed`, because
+/// the screaming prefix is the whole point of the naming. Klipper
+/// lowercases option names, so once the plugin declares the option it
+/// will arrive lowercased. Accepting both means the documented spelling
+/// keeps working whichever way the plugin ends up declaring it.
 ///
 /// Tolerant like the other FROZEN keys: absent OR wrong-typed is
 /// `false`. That direction is deliberate — a malformed override must

@@ -31,7 +31,7 @@ use std::time::Duration;
 
 use crate::config::Config;
 use crate::executor::{
-    dry_run, execute, AbortConfirmer, Confirmer, ExecOptions, ExecOutcome, Transcript,
+    dry_run, execute, AbortConfirmer, Confirmer, ExecOptions, ExecOutcome, FrameGuard, Transcript,
 };
 use crate::moonraker::MoonrakerClient;
 use crate::pipeline::{run_pipeline, PipelineOutcome, PlanBundle};
@@ -234,6 +234,39 @@ impl StepGate for PromptGate<'_> {
     }
 }
 
+/// The production [`FrameGuard`]: writes the frame-invalidation marker
+/// into the WAL directory before the shifted-frame declare is issued.
+///
+/// See [`FrameGuard`] for why this is eager rather than written on the
+/// abort path, and [`crate::detect::write_frame_invalid`] for why the
+/// write itself is atomic and durable.
+pub(crate) struct MarkerFrameGuard {
+    wal_dir: std::path::PathBuf,
+}
+
+impl FrameGuard for MarkerFrameGuard {
+    fn arm(&mut self, step: &plr_recovery::RecoveryStep) -> Result<(), String> {
+        let marker = crate::detect::FrameInvalid {
+            detected_wall_ns: wall_ns(),
+            step_id: step.id,
+            phase: step.phase.name().to_owned(),
+            // The frame is not "broken" yet — it is about to become
+            // unverifiable. An abort later overwrites this with the real
+            // reason; if nothing ever runs again, THIS is the record.
+            reason: "shifted-frame-declared".to_owned(),
+        };
+        crate::detect::write_frame_invalid(&self.wal_dir, &marker).map_err(|e| e.to_string())
+    }
+}
+
+/// Wall-clock nanoseconds since the epoch (cross-platform; the
+/// Linux-only hostclock is not available on this path).
+fn wall_ns() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX))
+}
+
 /// The non-interactive gate used by the control socket (Linux-only
 /// caller; the type itself is cross-platform).
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
@@ -325,6 +358,9 @@ pub(crate) async fn execute_with_gates(
     }
     let bundle = &bundle;
 
+    let mut frame_guard = MarkerFrameGuard {
+        wal_dir: config.wal_dir.clone(),
+    };
     let mut gate_fn = |step: &plr_recovery::RecoveryStep| -> bool {
         let _ = writeln!(
             out,
@@ -344,6 +380,7 @@ pub(crate) async fn execute_with_gates(
             exec_options,
             &mut gate_fn,
             confirmer,
+            &mut frame_guard,
             &mut transcript,
         )
         .await
@@ -360,27 +397,45 @@ pub(crate) async fn execute_with_gates(
             crate::detect::clear_frame_invalid(&config.wal_dir);
             EXIT_OK
         }
-        ExecOutcome::Aborted {
-            step_id,
-            phase,
-            reason,
-            cause,
-            frame_invalid,
-        } => {
-            let _ = writeln!(
-                out,
-                "recover: ABORTED at step {step_id} [{phase}]: {reason} ({cause:?})"
-            );
-            if frame_invalid {
-                record_frame_invalid(&config.wal_dir, step_id, &phase, &reason, out);
-            }
-            let _ = writeln!(
-                out,
-                "recover: the printer was left as-is; review the transcript before retrying."
-            );
-            EXIT_RUNTIME
-        }
+        aborted @ ExecOutcome::Aborted { .. } => report_abort(&aborted, config, out),
     }
+}
+
+/// Renders an abort for the operator and re-asserts the frame interlock
+/// when the abort landed inside the danger zone.
+fn report_abort(outcome: &ExecOutcome, config: &Config, out: &mut (dyn Write + Send)) -> u8 {
+    let ExecOutcome::Aborted {
+        step_id,
+        phase,
+        reason,
+        cause,
+        frame_invalid,
+    } = outcome
+    else {
+        return EXIT_RUNTIME;
+    };
+    let _ = writeln!(
+        out,
+        "recover: ABORTED at step {step_id} [{phase}]: {reason} ({cause:?})"
+    );
+    if *frame_invalid {
+        record_frame_invalid(&config.wal_dir, *step_id, phase, reason, out);
+    }
+    if let crate::executor::StopCause::FrameGuardUnwritable(why) = cause {
+        let _ = writeln!(
+            out,
+            "recover: REFUSED to declare the shifted Z frame — the frame-invalid \
+             interlock could not be written ({why}). NOTHING was declared, so the \
+             printer is untouched and its Z frame is exactly as it was. Fix the WAL \
+             directory {} (it is also where the transcript lives) and retry.",
+            config.wal_dir.display()
+        );
+    }
+    let _ = writeln!(
+        out,
+        "recover: the printer was left as-is; review the transcript before retrying."
+    );
+    EXIT_RUNTIME
 }
 
 /// Records the frame-invalidation marker after an abort at/after the
@@ -405,19 +460,18 @@ fn record_frame_invalid(
         phase: phase.to_owned(),
         reason: reason.to_owned(),
     };
-    // A marker that could not be persisted must never read as success:
-    // the interlock is the only thing standing between the next
-    // `--execute` and an unknown Z frame, and if it is not on disk the
-    // operator is the interlock.
+    // A RE-ASSERT, not the only writer. `MarkerFrameGuard` wrote this
+    // marker BEFORE the declare was issued, and refused to issue it at
+    // all if that write failed — so by the time execution can abort in
+    // the danger zone, the interlock is already on disk. This only
+    // enriches it with the real abort reason, and if that fails the eager
+    // marker still stands and `--execute` is still refused.
     if let Err(e) = crate::detect::write_frame_invalid(wal_dir, &marker) {
         let _ = writeln!(
             out,
-            "recover: *** THE FRAME-INVALID INTERLOCK COULD NOT BE WRITTEN: {e} ***\n\
-             recover:     The Z frame is UNKNOWN but plrd cannot record that fact, so the \
-             next --execute will NOT be refused automatically. Do not resume until a fresh \
-             dry run has regenerated the plan. Fix the WAL directory ({}) first — it is \
-             unwritable, which also means no transcript of the next attempt.",
-            wal_dir.display()
+            "recover: note — could not update the frame-invalid marker with the abort \
+             reason ({e}); the marker written before the declare still stands, so \
+             --execute remains refused."
         );
     }
     let _ = writeln!(
@@ -1297,5 +1351,320 @@ mod tests {
                 "{input:?}"
             );
         }
+    }
+
+    // --- The frame interlock is armed on ENTRY, not written on abort ---
+    //
+    // The blocker these tests pin: `frame_invalid` used to be computed
+    // inside `abort()` on the returned outcome, so any termination that
+    // prevented the outcome from being produced — a runtime drop on
+    // `systemctl restart`, a SIGTERM, a panic, a SIGKILL, a second power
+    // loss — discarded the interlock while the Z frame was already
+    // fabricated. The marker is now written before the declare is
+    // ISSUED, so it survives by construction: nothing has to run.
+
+    /// A plan whose step 2 declares the shifted frame and whose step 3
+    /// pauses for the operator, i.e. the window an operator actually sits
+    /// in for up to `confirm_timeout_s`.
+    fn framed_pausing_bundle(config: &Config) -> PlanBundle {
+        use plr_recovery::{
+            AbortReason, FailureAction, Phase, RecoveryPlan, RecoveryStep, RuntimeComputation,
+        };
+        let plan = RecoveryPlan {
+            steps: vec![
+                RecoveryStep {
+                    id: 1,
+                    phase: Phase::IdleTimeout,
+                    summary: "idle".to_owned(),
+                    commands: vec!["SET_IDLE_TIMEOUT TIMEOUT=86400".to_owned()],
+                    pre_verify: vec![],
+                    verify: vec![],
+                    compute: None,
+                    cleanup_commands: vec![],
+                    on_failure: FailureAction::Abort {
+                        reason: AbortReason::IdleTimeoutNotApplied,
+                    },
+                },
+                RecoveryStep {
+                    id: 2,
+                    phase: Phase::ShiftedFrame,
+                    summary: "declare shifted frame".to_owned(),
+                    commands: vec!["SET_KINEMATIC_POSITION Z=-1.15".to_owned()],
+                    pre_verify: vec![],
+                    verify: vec![],
+                    compute: None,
+                    cleanup_commands: vec![],
+                    on_failure: FailureAction::Abort {
+                        reason: AbortReason::ShiftedFrameNotDeclared,
+                    },
+                },
+                RecoveryStep {
+                    id: 3,
+                    phase: Phase::ZConfirmStandoff,
+                    summary: "standoff for the operator Z confirmation".to_owned(),
+                    commands: vec!["G90".to_owned(), "G1 Z{park_z} F1200".to_owned()],
+                    pre_verify: vec![],
+                    verify: vec![],
+                    compute: Some(RuntimeComputation::ParkZ {
+                        delta_z: 1.0,
+                        z_max: None,
+                    }),
+                    cleanup_commands: vec![],
+                    on_failure: FailureAction::Abort {
+                        reason: AbortReason::ZConfirmStandoffFailed,
+                    },
+                },
+            ],
+            ..test_plan()
+        };
+        PlanBundle {
+            plan,
+            file_path: "/g/x.gcode".to_owned(),
+            machine: machine_config(&crate::config::MachineSection::default(), true, None),
+            recovery_file_content: b"; recovery\nG28 X Y\n".to_vec(),
+            recovery_file_path: config.wal_dir.join("x_RECOVERY.gcode"),
+            sdcard_root: config.wal_dir.clone(),
+            recovery_source_name: "x.gcode".to_owned(),
+        }
+    }
+
+    /// A confirmer that never answers, standing in for an operator who
+    /// walked away — or a plugin that disconnected.
+    struct NeverAnswers;
+
+    impl crate::executor::Confirmer for NeverAnswers {
+        fn confirm<'a>(
+            &'a mut self,
+            _point: &'a crate::executor::ConfirmPoint,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = crate::executor::ConfirmAnswer> + Send + 'a>,
+        > {
+            Box::pin(async {
+                std::future::pending::<()>().await;
+                crate::executor::ConfirmAnswer::Continue
+            })
+        }
+    }
+
+    /// A confirmer that panics, standing in for a bug in the execution
+    /// task.
+    struct PanicsAtThePause;
+
+    impl crate::executor::Confirmer for PanicsAtThePause {
+        fn confirm<'a>(
+            &'a mut self,
+            _point: &'a crate::executor::ConfirmPoint,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = crate::executor::ConfirmAnswer> + Send + 'a>,
+        > {
+            Box::pin(async { panic!("simulated bug inside the execution task") })
+        }
+    }
+
+    /// Runs `execute_with_gates` on a spawned task with the given
+    /// confirmer, waits until the interlock appears (i.e. the declare is
+    /// about to be issued), and hands the caller the still-running
+    /// handle.
+    async fn spawn_until_armed(
+        bundle: PlanBundle,
+        config: Config,
+        confirmer: Box<dyn crate::executor::Confirmer>,
+    ) -> tokio::task::JoinHandle<u8> {
+        let wal_dir = config.wal_dir.clone();
+        let opts = fast_recover(true, true, false);
+        let handle = tokio::spawn(async move {
+            let mut confirmer = confirmer;
+            let mut out = Vec::new();
+            super::execute_with_gates(
+                &bundle,
+                &config,
+                &opts.exec_options,
+                opts.connect_timeout,
+                &mut super::AutoGate,
+                confirmer.as_mut(),
+                &mut out,
+            )
+            .await
+        });
+        for _ in 0..400 {
+            if crate::detect::read_frame_invalid(&wal_dir).is_some() {
+                return handle;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("the interlock was never armed");
+    }
+
+    /// BLOCKER 1: a daemon shutdown while paused must not discard the
+    /// interlock. Dropping the runtime drops the execution future
+    /// mid-`await`, so nothing on the abort path ever runs — and the
+    /// marker must still be there.
+    #[test]
+    fn a_daemon_shutdown_while_paused_leaves_the_interlock_set() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let fake = rt.block_on(FakeMoonraker::spawn(happy_handler));
+        let config = test_config("shutdown-paused", &fake.url());
+        let wal_dir = config.wal_dir.clone();
+        let bundle = framed_pausing_bundle(&config);
+        rt.block_on(async {
+            let handle = spawn_until_armed(bundle, config, Box::new(NeverAnswers)).await;
+            // The declare really was issued: we are in the danger zone.
+            assert!(
+                fake.gcode_sent()
+                    .iter()
+                    .any(|c| c.starts_with("SET_KINEMATIC_POSITION")),
+                "{:?}",
+                fake.gcode_sent()
+            );
+            // `systemctl restart plrd`: the task is dropped mid-await.
+            handle.abort();
+            let _ = handle.await;
+        });
+        // Nothing on the abort path ran, and the interlock is still set.
+        let marker = crate::detect::read_frame_invalid(&wal_dir)
+            .expect("the interlock must survive an abrupt shutdown");
+        assert_eq!(marker.step_id, 2);
+        assert_eq!(marker.reason, "shifted-frame-declared");
+    }
+
+    /// A panic inside the execution task is the same class of event and
+    /// must leave the interlock exactly as set.
+    #[test]
+    fn a_panic_mid_execution_leaves_the_interlock_set() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let fake = rt.block_on(FakeMoonraker::spawn(happy_handler));
+        let config = test_config("panic-mid", &fake.url());
+        let wal_dir = config.wal_dir.clone();
+        let bundle = framed_pausing_bundle(&config);
+        rt.block_on(async {
+            let handle = spawn_until_armed(bundle, config, Box::new(PanicsAtThePause)).await;
+            let joined = handle.await;
+            assert!(joined.is_err(), "the task must have panicked");
+        });
+        assert!(
+            crate::detect::read_frame_invalid(&wal_dir).is_some(),
+            "the interlock must survive a panic"
+        );
+    }
+
+    /// BLOCKER 2: if the interlock cannot be written, the declare must
+    /// never be issued — and the next execute must still be refused,
+    /// because there is nothing to refuse it with except not having gone
+    /// in the first place.
+    #[test]
+    fn an_unwritable_interlock_refuses_before_any_kinematic_declare() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let fake = rt.block_on(FakeMoonraker::spawn(happy_handler));
+        let config = test_config("interlock-blocked", &fake.url());
+        let bundle = framed_pausing_bundle(&config);
+        // Block ONLY the marker write, leaving the WAL directory writable
+        // so the transcript gate passes and execution really reaches the
+        // declare: a directory sitting on the staging path makes
+        // `File::create` fail there and nowhere else.
+        std::fs::create_dir(config.wal_dir.join(crate::detect::FRAME_INVALID_TEMP_NAME)).unwrap();
+
+        let opts = fast_recover(true, true, false);
+        let mut out = Vec::new();
+        let code = rt.block_on(super::execute_with_gates(
+            &bundle,
+            &config,
+            &opts.exec_options,
+            opts.connect_timeout,
+            &mut super::AutoGate,
+            &mut crate::executor::AbortConfirmer,
+            &mut out,
+        ));
+        let output = String::from_utf8(out).unwrap();
+        assert_eq!(code, crate::EXIT_RUNTIME, "{output}");
+        // The refusal happened BEFORE the frame was touched.
+        assert!(
+            !fake
+                .gcode_sent()
+                .iter()
+                .any(|c| c.starts_with("SET_KINEMATIC_POSITION")),
+            "a state we cannot record must never be entered: {:?}",
+            fake.gcode_sent()
+        );
+        assert!(
+            output.contains("REFUSED to declare the shifted Z frame"),
+            "{output}"
+        );
+        assert!(output.contains("NOTHING was declared"), "{output}");
+    }
+
+    /// The complement: a successful completion clears the interlock, so
+    /// arming it eagerly does not wedge every subsequent recovery.
+    #[test]
+    fn a_successful_completion_clears_the_interlock() {
+        use plr_recovery::{AbortReason, FailureAction, Phase, RecoveryPlan, RecoveryStep};
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let fake = rt.block_on(FakeMoonraker::spawn(happy_handler));
+        let config = test_config("completion-clears", &fake.url());
+        let wal_dir = config.wal_dir.clone();
+        // Two steps: idle, then the shifted-frame declare. Both succeed.
+        let plan = RecoveryPlan {
+            steps: vec![
+                RecoveryStep {
+                    id: 1,
+                    phase: Phase::IdleTimeout,
+                    summary: "idle".to_owned(),
+                    commands: vec!["SET_IDLE_TIMEOUT TIMEOUT=86400".to_owned()],
+                    pre_verify: vec![],
+                    verify: vec![],
+                    compute: None,
+                    cleanup_commands: vec![],
+                    on_failure: FailureAction::Abort {
+                        reason: AbortReason::IdleTimeoutNotApplied,
+                    },
+                },
+                RecoveryStep {
+                    id: 2,
+                    phase: Phase::ShiftedFrame,
+                    summary: "declare shifted frame".to_owned(),
+                    commands: vec!["SET_KINEMATIC_POSITION Z=-1.15".to_owned()],
+                    pre_verify: vec![],
+                    verify: vec![],
+                    compute: None,
+                    cleanup_commands: vec![],
+                    on_failure: FailureAction::Abort {
+                        reason: AbortReason::ShiftedFrameNotDeclared,
+                    },
+                },
+            ],
+            ..test_plan()
+        };
+        let bundle = PlanBundle {
+            plan,
+            ..framed_pausing_bundle(&config)
+        };
+        let opts = fast_recover(true, true, false);
+        let mut out = Vec::new();
+        let code = rt.block_on(super::execute_with_gates(
+            &bundle,
+            &config,
+            &opts.exec_options,
+            opts.connect_timeout,
+            &mut super::AutoGate,
+            &mut crate::executor::AbortConfirmer,
+            &mut out,
+        ));
+        let output = String::from_utf8(out).unwrap();
+        assert_eq!(code, crate::EXIT_OK, "{output}");
+        assert!(
+            crate::detect::read_frame_invalid(&wal_dir).is_none(),
+            "a completed recovery re-established the frame; the interlock must clear"
+        );
+        // And it really was armed on the way through.
+        let transcript = std::fs::read_dir(&wal_dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .find(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with("recovery-transcript-")
+            })
+            .expect("transcript");
+        let text = std::fs::read_to_string(transcript.path()).unwrap();
+        assert!(text.contains("\"event\":\"frame-armed\""), "{text}");
     }
 }

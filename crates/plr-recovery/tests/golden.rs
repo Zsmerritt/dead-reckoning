@@ -1471,44 +1471,89 @@ fn a_zero_drag_temperature_opts_out_of_heating_entirely() {
     assert!(tap.first_index(Phase::ProbeTempHold).is_some());
 }
 
-/// `drag_nozzle_temp` obeys the same headroom interlock as the probe temp.
+/// `drag_nozzle_temp` obeys the same headroom interlock as the probe
+/// temp — but only on the machine that reads it.
+///
+/// The interlock stays HARD: the plugin's ceiling gate would refuse the
+/// drag AFTER the Z frame is declared, which wedges the recovery. What
+/// changed is that it is now gated on the probe path, exactly like its
+/// sibling `DragTempBelowFloor` warning — a Tap machine never commands
+/// this temperature, so refusing its recovery over the value would be
+/// refusing over a setting the machine does not read.
 #[test]
-fn an_out_of_range_drag_temperature_is_refused() {
-    // Above ceiling - headroom (150 - 5 = 145).
-    for bad in [146.0, 150.0, 200.0] {
+fn an_out_of_range_drag_temperature_is_refused_on_the_drag_path_only() {
+    use plr_recovery::ProbeKind;
+    let drag = ProbeKind::AdxlDrag {
+        chip: "adxl345".to_owned(),
+    };
+    // Above ceiling - headroom (150 - 5 = 145), and negative.
+    for bad in [146.0, 150.0, 200.0, -1.0] {
         let config = PlanConfig {
             drag_nozzle_temp: bad,
             ..PlanConfig::default()
         };
-        let err = config.validate().unwrap_err();
+        // Machine-independent validation no longer decides this...
+        config
+            .validate()
+            .unwrap_or_else(|e| panic!("{bad} is not a machine-independent fault: {e:?}"));
+        // ...the drag path does.
+        let err = config.validate_for_probe(&drag).unwrap_err();
         assert!(
             matches!(err, RecoveryError::DragTempOutOfRange { .. }),
             "{bad}: {err:?}"
         );
+        assert_eq!(err.diagnosis().tier, Tier::Hard);
+        assert_eq!(err.diagnosis().override_key, None);
         let msg = err.to_string();
         assert!(msg.contains("drag_nozzle_temp"), "{msg}");
-        assert!(msg.contains("max_probe_nozzle_temp"), "{msg}");
-    }
-    // Negative is refused; 0 and the boundary are accepted.
-    assert!(matches!(
-        PlanConfig {
-            drag_nozzle_temp: -1.0,
-            ..PlanConfig::default()
+        // And a Tap / load-cell machine, which never commands it, is
+        // untouched.
+        for inert in [ProbeKind::Tap, ProbeKind::LoadCell] {
+            config
+                .validate_for_probe(&inert)
+                .unwrap_or_else(|e| panic!("{bad} must not refuse on {inert:?}: {e:?}"));
         }
-        .validate(),
-        Err(RecoveryError::DragTempOutOfRange { .. })
-    ));
-    for ok in [0.0, 100.0, 145.0] {
-        assert!(
-            PlanConfig {
-                drag_nozzle_temp: ok,
-                ..PlanConfig::default()
-            }
-            .validate()
-            .is_ok(),
-            "{ok} must be accepted"
-        );
+        // End to end: the drag machine refuses to plan, the tap machine
+        // plans happily.
+        let inputs_err = plan_for(&machine_adxl_drag(), &config).unwrap_err();
+        assert!(matches!(
+            inputs_err,
+            RecoveryError::DragTempOutOfRange { .. }
+        ));
+        assert!(plan_for(&machine_tap(), &config).is_ok());
     }
+    // 0 (the cold-drag opt-out) and the boundary are accepted everywhere.
+    for ok in [0.0, 100.0, 145.0] {
+        let config = PlanConfig {
+            drag_nozzle_temp: ok,
+            ..PlanConfig::default()
+        };
+        config.validate().expect("machine-independent");
+        config.validate_for_probe(&drag).expect("drag path");
+    }
+}
+
+/// `plan_recovery` for a machine + config, discarding the plan.
+fn plan_for(
+    machine: &plr_recovery::MachineConfig,
+    config: &PlanConfig,
+) -> Result<(), RecoveryError> {
+    let reconstruction = recovery(stop_set(&[0.4]), wal_context(plain_transforms()));
+    let contact = contact_at(0.4);
+    let match_result = match_at(resume_offset());
+    let model = model();
+    let inputs = PlanInputs {
+        machine,
+        reconstruction: &reconstruction,
+        contact: &contact,
+        match_result: &match_result,
+        model: &model,
+        file_temps: FileTemps::default(),
+        exclude_objects: &[],
+        clean_nozzle_macro_present: true,
+        purge_macro_present: false,
+    };
+    plan_recovery(&inputs, config).map(|_| ())
 }
 
 // ---- purge precedence (item 6) --------------------------------------

@@ -1011,7 +1011,12 @@ impl Diagnose for crate::plan::PlanWarning {
             ),
             W::ReheatParkUnverified { point } => Diagnosis::new(
                 "reheat_park_unverified",
-                Tier::Advisory,
+                // Confirmable, and deliberately STRICTER than the
+                // better-informed `reheat_park_inside_part`: there plrd
+                // knows the park lands on the part; here it knows
+                // nothing at all. Less knowledge must not buy less
+                // friction — that would make ignorance the cheaper path.
+                Tier::Confirmable,
                 format!(
                     "no reheat_park_x/y was configured and no part geometry is available; \
                      parking at ({}, {}) UNVERIFIED",
@@ -1020,9 +1025,12 @@ impl Diagnose for crate::plan::PlanWarning {
                 ),
                 "Without part geometry the park point could not be checked against \
                  anything. If it happens to sit over printed material, the nozzle will \
-                 dwell there at print temperature while it heats and may melt a divot.",
-                "Set `reheat_park_x` and `reheat_park_y` in printer.cfg's [plr] section to \
-                 a spot you know is clear of the part, then re-run the recovery."
+                 dwell there at print temperature while it heats and may melt a divot. \
+                 plrd is not saying the point is bad — it is saying nobody knows, and you \
+                 are the only one who can look.",
+                "If you can see that this spot is clear of the part, continue. Otherwise \
+                 set `reheat_park_x` and `reheat_park_y` in printer.cfg's [plr] section to \
+                 a spot you know is clear, then re-run the recovery."
                     .to_owned(),
             ),
             W::PurgeInsidePart {

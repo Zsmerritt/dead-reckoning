@@ -42,6 +42,10 @@ pub const PENDING_FILE_NAME: &str = "pending_recovery.json";
 /// persists independently until a fresh dry run consciously clears it.
 pub const FRAME_INVALID_FILE_NAME: &str = "frame_invalid.json";
 
+/// Staging name [`write_frame_invalid`] renames from. Fixed, not unique
+/// — see that function for why.
+pub const FRAME_INVALID_TEMP_NAME: &str = "frame_invalid.json.tmp";
+
 /// Sentinel folded into [`PendingRecovery::crash_class`] and surfaced in
 /// the operator announcement when the marker is present, so the pending
 /// announcement notes the invalid frame without growing the pending
@@ -142,10 +146,21 @@ pub fn read_frame_invalid(wal_dir: &Path) -> Option<FrameInvalid> {
 /// on the medium before the name points at them, and `fsync` of the
 /// directory afterwards so the rename itself survives.
 ///
+/// # What the staging file guarantees, precisely
+///
+/// The PUBLISHED marker is never partial: readers only ever see the file
+/// under [`FRAME_INVALID_FILE_NAME`], and it only ever appears there by
+/// `rename`. The staging file is a different claim: every failure path
+/// *inside this process* unlinks it, but a `SIGKILL` or a power cut
+/// between `create` and `rename` can leave one behind. That is harmless
+/// — nothing reads it, and the next write truncates it — which is why
+/// the name is fixed rather than unique.
+///
 /// # Errors
 ///
-/// Any I/O failure, reported rather than swallowed — a caller must be
-/// able to tell the operator that the interlock is NOT in place.
+/// Any I/O failure, reported rather than swallowed. The caller
+/// ([`crate::recover::MarkerFrameGuard`]) treats an error as "do not
+/// enter the danger zone at all".
 pub fn write_frame_invalid(wal_dir: &Path, marker: &FrameInvalid) -> std::io::Result<()> {
     use std::io::Write as _;
 
@@ -153,10 +168,14 @@ pub fn write_frame_invalid(wal_dir: &Path, marker: &FrameInvalid) -> std::io::Re
     // The temp file MUST live in the same directory as the target:
     // `rename` is only atomic within one filesystem, and a temp elsewhere
     // (say `/tmp`) can be on a different one.
-    let temp_path = wal_dir.join(format!(
-        "{FRAME_INVALID_FILE_NAME}.tmp.{}",
-        std::process::id()
-    ));
+    //
+    // The name is FIXED rather than per-process/per-attempt. Every
+    // in-process failure path unlinks it, but a SIGKILL between `create`
+    // and `rename` cannot, and a unique name would leave that debris
+    // behind forever. A fixed name is self-healing: the next write
+    // truncates whatever is there. Writes are serialized anyway — one
+    // recovery at a time, one writer.
+    let temp_path = wal_dir.join(FRAME_INVALID_TEMP_NAME);
     let write_result = (|| -> std::io::Result<()> {
         let mut file = std::fs::File::create(&temp_path)?;
         file.write_all(json.as_bytes())?;
@@ -578,8 +597,10 @@ mod tests {
         let raw = std::fs::read_to_string(frame_invalid_path(&dir)).unwrap();
         assert!(raw.contains("confirmation-timeout"), "{raw}");
 
-        // Published by rename, so nothing partial and no litter: the only
-        // file in the directory is the marker itself.
+        // Published by rename, and every in-process path cleans up after
+        // itself, so a successful write leaves exactly the marker.
+        // (A SIGKILL between `create` and `rename` can strand the staging
+        // file; that is documented, harmless, and covered below.)
         let names: Vec<String> = std::fs::read_dir(&dir)
             .unwrap()
             .filter_map(Result::ok)
@@ -616,6 +637,38 @@ mod tests {
             .expect_err("an unwritable directory must be an error, not a silent no-op");
         // And nothing was left claiming success.
         assert!(read_frame_invalid(missing).is_none(), "{error}");
+    }
+
+    /// A staging file stranded by a previous SIGKILL is self-healing:
+    /// the fixed name means the next write truncates it rather than
+    /// accumulating debris, which is why the name is not unique.
+    #[test]
+    fn a_stranded_staging_file_is_reclaimed_by_the_next_write() {
+        use super::{
+            read_frame_invalid, write_frame_invalid, FrameInvalid, FRAME_INVALID_FILE_NAME,
+            FRAME_INVALID_TEMP_NAME,
+        };
+        let dir = temp_dir("frame-stranded");
+        // As a SIGKILL between create and rename would leave it.
+        std::fs::write(dir.join(FRAME_INVALID_TEMP_NAME), b"{\"half\": written").unwrap();
+        let marker = FrameInvalid {
+            detected_wall_ns: 5,
+            step_id: 2,
+            phase: "shifted-frame".to_owned(),
+            reason: "shifted-frame-declared".to_owned(),
+        };
+        write_frame_invalid(&dir, &marker).expect("write over the stranded staging file");
+        assert_eq!(read_frame_invalid(&dir), Some(marker));
+        let names: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            names,
+            vec![FRAME_INVALID_FILE_NAME.to_owned()],
+            "the stranded staging file must be consumed, not accumulated: {names:?}"
+        );
     }
 
     /// The pending file's behaviour is unchanged: still a plain
