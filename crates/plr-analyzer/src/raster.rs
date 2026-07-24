@@ -31,14 +31,16 @@
 //! twice the strict radius as disconnected stripes, which would make
 //! every edge-margin query fail for a physically sound plate. This grid
 //! is coarsened when the island would exceed [`CELL_BUDGET`] cells;
-//! coarsening lowers the reported clearance (one cell is subtracted, see
-//! [`Raster::clearance_at`]), so it too fails conservative.
+//! coarsening scales [`CLEARANCE_SLACK`] with the cell, so it too fails
+//! conservative.
 //!
 //! Error direction, stated plainly: **area is under-reported**
 //! (typically ~85 % of the modeled area for a solid region at
-//! production line spacing, ~76 % for an isolated single bead) and
-//! **clearance is under-reported**. Both biases push the structural
-//! verdicts toward refusing to probe.
+//! production line spacing, and ~66 % of the capsule area for an
+//! isolated single bead — the strict radius is 76 % of the half width,
+//! and area falls faster than radius) and **clearance is
+//! under-reported** (see [`CLEARANCE_SLACK`] for the derivation). Both
+//! biases push the structural verdicts toward refusing to probe.
 
 // Justification for the module-wide casting allows: grid extents are
 // bounded by CELL_BUDGET (2^20), far inside f64's exactly representable
@@ -51,10 +53,41 @@
     clippy::cast_sign_loss
 )]
 
-use std::f64::consts::FRAC_1_SQRT_2;
+use std::f64::consts::{FRAC_1_SQRT_2, SQRT_2};
 
 use crate::geom;
 use crate::model::XySegment;
+
+/// Cells of slack subtracted from every clearance reading so the
+/// reported value is a genuine **lower** bound on the true distance to
+/// the edge of the material.
+///
+/// Three discretization terms stack between "distance from the query
+/// point to the boundary of the capsule union" and what the grid can
+/// answer, each bounded by a multiple of the cell size:
+///
+/// * **Query quantization** — [`Raster::clearance_at`] answers for the
+///   *center of the cell containing the query point*, which is up to
+///   `cell·√2/2` away from the point itself. Clearance is 1-Lipschitz,
+///   so this alone can inflate the answer by `cell·√2/2`.
+/// * **Occupancy bias** — the midpoint rule calls a cell material when
+///   its center is within `half_width` of a segment, so the material
+///   region the transform sees can extend up to `cell·√2/2` beyond the
+///   true boundary.
+/// * **Background targeting** — the transform measures to the nearest
+///   *background cell center*, not to the boundary. For a convex
+///   material region the nearest such center is within `cell·√2/2`
+///   beyond the nearest exterior point (step one cell further out along
+///   the outward normal and the containing cell's center is provably
+///   background).
+///
+/// The three sum to `cell·3√2/2`, which is what is subtracted. The
+/// previous value of one cell was **not** enough: it omitted term 1
+/// entirely, and an over-report of +0.049 mm at the default 0.075 mm
+/// cell was measurable — harmless against a 3 mm margin but a violation
+/// of the error direction this whole module rests on, and one that
+/// scales with the cell on a coarsened raster.
+const CLEARANCE_SLACK: f64 = 1.5 * SQRT_2;
 
 /// Maximum number of grid cells one island raster may allocate. At the
 /// default 0.075 mm cell this covers a 75 × 75 mm island exactly; bigger
@@ -204,14 +237,13 @@ impl Raster {
     /// Clamped well inside `isize`'s range: callers add a neighbourhood
     /// offset to the result, so the raw floor must not sit at the limit.
     fn cell_of(&self, p: [f64; 2]) -> (isize, isize) {
-        const LIMIT: f64 = (isize::MAX / 4) as f64;
         let fi = ((p[0] - self.origin[0]) / self.cell).floor();
         let fj = ((p[1] - self.origin[1]) / self.cell).floor();
         // Non-finite coordinates are filtered by the callers; clamping
         // keeps the cast total regardless.
         (
-            fi.clamp(-LIMIT, LIMIT) as isize,
-            fj.clamp(-LIMIT, LIMIT) as isize,
+            fi.clamp(-INDEX_LIMIT, INDEX_LIMIT) as isize,
+            fj.clamp(-INDEX_LIMIT, INDEX_LIMIT) as isize,
         )
     }
 
@@ -252,13 +284,12 @@ impl Raster {
     /// Conservative distance, mm, from `point` to the nearest place that
     /// is not this island's material; 0 when `point` is off the island.
     ///
-    /// Two sources of error are absorbed by subtracting one cell size in
-    /// [`clearance_field`]: the midpoint occupancy rule can call a cell
-    /// material when up to `cell·√2/2` of it is not, and the transform
-    /// measures to the nearest background *cell center* rather than to
-    /// the true boundary. The result therefore under-reports the true
-    /// clearance by up to roughly one cell (0.075 mm at the default cell
-    /// size, more on a coarsened raster).
+    /// The answer is the value stored for the *center of the cell
+    /// containing* `point`, less [`CLEARANCE_SLACK`] cells — see that
+    /// constant for the three discretization terms the slack covers and
+    /// why the result is a genuine lower bound. The under-report is at
+    /// most `cell·3√2/2` (0.16 mm at the default 0.075 mm cell, more on
+    /// a coarsened raster).
     pub(crate) fn clearance_at(&self, point: [f64; 2]) -> f64 {
         if !point[0].is_finite() || !point[1].is_finite() {
             return 0.0;
@@ -443,7 +474,8 @@ fn fit_grid(w: f64, h: f64, half_width: f64, base_cell: f64) -> Option<(f64, usi
 ///
 /// The transform runs on the *background* of `solid`: every non-material
 /// cell is a zero, every material cell takes the squared distance to the
-/// nearest zero, in cell units. One cell size is then subtracted from
+/// nearest zero, in cell units. [`CLEARANCE_SLACK`] cells are then
+/// subtracted from
 /// the metric distance (see [`Raster::clearance_at`]).
 fn clearance_field(solid: &[bool], nx: usize, ny: usize, cell: f64) -> Vec<f64> {
     if nx == 0 || ny == 0 {
@@ -473,7 +505,7 @@ fn clearance_field(solid: &[bool], nx: usize, ny: usize, cell: f64) -> Vec<f64> 
         }
     }
     for value in &mut d {
-        *value = (value.sqrt() * cell - cell).max(0.0);
+        *value = value.sqrt().mul_add(cell, -CLEARANCE_SLACK * cell).max(0.0);
     }
     d
 }
@@ -600,13 +632,16 @@ mod tests {
         // Center of a 20 mm square: ~10 mm to the nearest edge, minus a
         // cell of conservative slack.
         // Material spans -0.225..20.225 in both axes, so the true edge
-        // distance from the center is 10.225; one cell (0.075) of
-        // conservative slack is subtracted.
+        // distance from the centre is 10.225. The reading must sit below
+        // that (CLEARANCE_SLACK, plus grid quantization) without being
+        // uselessly pessimistic.
         let c = r.clearance_at([10.0, 10.0]);
-        assert!((10.0..=10.16).contains(&c), "center clearance {c}");
-        // 2 mm in from the left edge.
+        assert!(c <= 10.225, "centre clearance {c} over-reports");
+        assert!(c > 9.9, "centre clearance {c} is uselessly pessimistic");
+        // 2 mm in from the left edge: true clearance 2.225.
         let c = r.clearance_at([2.0, 10.0]);
-        assert!((2.0..=2.16).contains(&c), "edge clearance {c}");
+        assert!(c <= 2.225, "edge clearance {c} over-reports");
+        assert!(c > 1.9, "edge clearance {c} is uselessly pessimistic");
         // Off the island entirely.
         assert_eq!(r.clearance_at([40.0, 10.0]), 0.0);
         assert_eq!(r.clearance_at([f64::NAN, 10.0]), 0.0);
@@ -614,14 +649,65 @@ mod tests {
 
     #[test]
     fn clearance_never_exceeds_the_true_distance() {
-        let segments = square(0.0, 12.0);
-        let r = raster_of(&segments, 0.225);
-        for step in 0..25 {
-            let p = [f64::from(step).mul_add(0.45, 0.5), 6.0];
-            let true_edge = (p[0] - (-0.225)).min(12.225 - p[0]).min(6.225);
-            let c = r.clearance_at(p);
-            assert!(c <= true_edge + 1e-9, "at {p:?}: {c} > {true_edge}");
+        // A single capsule is convex and its exterior set is exact: for
+        // any interior point the true clearance is
+        // `half_width - dist(point, segment)`, with no sampling and no
+        // lower-bound hand-waving. That matters, because the earlier
+        // version of this test probed a lattice of points against a
+        // *lower* bound on the truth and so could not see the +0.049 mm
+        // over-report caused by the query point being quantized to its
+        // own cell centre.
+        //
+        // Sub-cell offsets are probed deliberately: the failure lives
+        // entirely inside one cell, so any probe scheme that lands on
+        // cell centres is blind to it.
+        let cases: [([f64; 2], [f64; 2], f64); 3] = [
+            ([0.0, 0.0], [20.0, 0.0], 3.0),   // horizontal, 1.0 mm cells
+            ([5.0, 1.0], [5.0, 25.0], 1.5),   // vertical, 0.5 mm cells
+            ([0.0, 0.0], [14.0, 14.0], 0.45), // diagonal, 0.15 mm cells
+        ];
+        let mut probes = 0_usize;
+        let mut worst = f64::NEG_INFINITY;
+        for (start, end, half_width) in cases {
+            let segment = seg(start, end);
+            let raster = raster_of(std::slice::from_ref(&segment), half_width);
+            let cell = raster.cell();
+            for along in 0..40 {
+                for across in 0..17 {
+                    for sub in 0..4 {
+                        // Walk the segment, step off it perpendicular,
+                        // and nudge by a fraction of a cell in both axes.
+                        let t = f64::from(along) / 39.0;
+                        let base = geom::lerp2(start, end, t);
+                        let dir = [end[0] - start[0], end[1] - start[1]];
+                        let len = (dir[0] * dir[0] + dir[1] * dir[1]).sqrt();
+                        let normal = [-dir[1] / len, dir[0] / len];
+                        let offset = (f64::from(across) / 16.0 - 0.5) * 1.9 * half_width;
+                        let nudge = f64::from(sub) * 0.25 * cell;
+                        let p = [
+                            base[0] + normal[0] * offset + nudge,
+                            base[1] + normal[1] * offset + nudge,
+                        ];
+                        let inside = geom::point_seg_distance(p, start, end);
+                        if inside > half_width {
+                            continue; // exterior: clearance is 0 there
+                        }
+                        let truth = half_width - inside;
+                        let reported = raster.clearance_at(p);
+                        probes += 1;
+                        worst = worst.max(reported - truth);
+                        assert!(
+                            reported <= truth + 1e-12,
+                            "over-reported at {p:?}: {reported} > {truth} \
+                             (half_width {half_width}, cell {cell})"
+                        );
+                    }
+                }
+            }
         }
+        assert!(probes > 1_000, "only {probes} interior probes");
+        // The slack is real but bounded: never wildly pessimistic.
+        assert!(worst > -1.0, "clearance is uselessly pessimistic: {worst}");
     }
 
     #[test]

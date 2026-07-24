@@ -835,22 +835,253 @@ pub(crate) mod e2e_tests {
     };
     use std::path::PathBuf;
 
-    /// The synthetic two-layer print (mirrors plr-recovery's shared
-    /// scenario): layer 0 at Z 0.2, layer 1 at Z 0.4, all deposition
-    /// annotated internal infill.
-    const MODEL_TEXT: &str = "\
-G90
+    /// The synthetic two-layer print: layer 0 at Z 0.2, layer 1 at
+    /// Z 0.4. Each layer is a solid 20 x 20 mm boustrophedon hatch at
+    /// X 40..60 / Y 40..60 (0.4 mm line spacing — the probeable body)
+    /// plus the original three-move L ending at (30, 30), all deposition
+    /// annotated internal infill. Layer 0 ends at (30, 30) with 3.0 mm of
+    /// extrusion, exactly the crash position [`crash_context`] reports.
+    ///
+    /// Three properties this fixture has to keep, each learned from a
+    /// failure:
+    ///
+    /// * **A real solid layer, not a sketch.** `plr-analyzer`'s
+    ///   structural checks measure the material that actually holds the
+    ///   part to the bed. The bare three-move L this used to be offers
+    ///   ~19 mm² against a 100 mm² bed-contact bar and is correctly
+    ///   refused as unprobeable, which left these end-to-end tests
+    ///   asserting against a manual fallback instead of the plan path
+    ///   they exist to cover. The hatch is what makes the part probeable.
+    /// * **The L carries the extrusion, the hatch barely any.** The
+    ///   reconstruction hands the matcher a *swept* stop region — here
+    ///   E 3.0..3.06 — so every move whose E range meets that window is
+    ///   a candidate. Hatch rows at a realistic 0.058 mm of E each put
+    ///   nine lines in the window and the match goes inconclusive; at
+    ///   0.02 mm with the L carrying 1.96 mm, one line explains the stop.
+    /// * **Layer 1 prints the L first, then the hatch.** The forward
+    ///   sweep starts at the crash, so the first move after the layer
+    ///   change is what it reaches. Leading with the big-E L keeps that
+    ///   neighbourhood as unambiguous as the pre-hatch fixture's was.
+    const MODEL_TEXT: &str = "G90
 M83
 G1 Z0.2 F7200
+G1 X40 Y40 F9000
 ;TYPE:Internal infill
-G1 X10 Y10 E1 F1800
-G1 X30 Y10 E1
-G1 X30 Y30 E1
+G1 X60 Y40 E0.02 F1800
+G1 X60 Y40.4 E0.0004
+G1 X40 Y40.4 E0.02
+G1 X40 Y40.8 E0.0004
+G1 X60 Y40.8 E0.02
+G1 X60 Y41.2 E0.0004
+G1 X40 Y41.2 E0.02
+G1 X40 Y41.6 E0.0004
+G1 X60 Y41.6 E0.02
+G1 X60 Y42 E0.0004
+G1 X40 Y42 E0.02
+G1 X40 Y42.4 E0.0004
+G1 X60 Y42.4 E0.02
+G1 X60 Y42.8 E0.0004
+G1 X40 Y42.8 E0.02
+G1 X40 Y43.2 E0.0004
+G1 X60 Y43.2 E0.02
+G1 X60 Y43.6 E0.0004
+G1 X40 Y43.6 E0.02
+G1 X40 Y44 E0.0004
+G1 X60 Y44 E0.02
+G1 X60 Y44.4 E0.0004
+G1 X40 Y44.4 E0.02
+G1 X40 Y44.8 E0.0004
+G1 X60 Y44.8 E0.02
+G1 X60 Y45.2 E0.0004
+G1 X40 Y45.2 E0.02
+G1 X40 Y45.6 E0.0004
+G1 X60 Y45.6 E0.02
+G1 X60 Y46 E0.0004
+G1 X40 Y46 E0.02
+G1 X40 Y46.4 E0.0004
+G1 X60 Y46.4 E0.02
+G1 X60 Y46.8 E0.0004
+G1 X40 Y46.8 E0.02
+G1 X40 Y47.2 E0.0004
+G1 X60 Y47.2 E0.02
+G1 X60 Y47.6 E0.0004
+G1 X40 Y47.6 E0.02
+G1 X40 Y48 E0.0004
+G1 X60 Y48 E0.02
+G1 X60 Y48.4 E0.0004
+G1 X40 Y48.4 E0.02
+G1 X40 Y48.8 E0.0004
+G1 X60 Y48.8 E0.02
+G1 X60 Y49.2 E0.0004
+G1 X40 Y49.2 E0.02
+G1 X40 Y49.6 E0.0004
+G1 X60 Y49.6 E0.02
+G1 X60 Y50 E0.0004
+G1 X40 Y50 E0.02
+G1 X40 Y50.4 E0.0004
+G1 X60 Y50.4 E0.02
+G1 X60 Y50.8 E0.0004
+G1 X40 Y50.8 E0.02
+G1 X40 Y51.2 E0.0004
+G1 X60 Y51.2 E0.02
+G1 X60 Y51.6 E0.0004
+G1 X40 Y51.6 E0.02
+G1 X40 Y52 E0.0004
+G1 X60 Y52 E0.02
+G1 X60 Y52.4 E0.0004
+G1 X40 Y52.4 E0.02
+G1 X40 Y52.8 E0.0004
+G1 X60 Y52.8 E0.02
+G1 X60 Y53.2 E0.0004
+G1 X40 Y53.2 E0.02
+G1 X40 Y53.6 E0.0004
+G1 X60 Y53.6 E0.02
+G1 X60 Y54 E0.0004
+G1 X40 Y54 E0.02
+G1 X40 Y54.4 E0.0004
+G1 X60 Y54.4 E0.02
+G1 X60 Y54.8 E0.0004
+G1 X40 Y54.8 E0.02
+G1 X40 Y55.2 E0.0004
+G1 X60 Y55.2 E0.02
+G1 X60 Y55.6 E0.0004
+G1 X40 Y55.6 E0.02
+G1 X40 Y56 E0.0004
+G1 X60 Y56 E0.02
+G1 X60 Y56.4 E0.0004
+G1 X40 Y56.4 E0.02
+G1 X40 Y56.8 E0.0004
+G1 X60 Y56.8 E0.02
+G1 X60 Y57.2 E0.0004
+G1 X40 Y57.2 E0.02
+G1 X40 Y57.6 E0.0004
+G1 X60 Y57.6 E0.02
+G1 X60 Y58 E0.0004
+G1 X40 Y58 E0.02
+G1 X40 Y58.4 E0.0004
+G1 X60 Y58.4 E0.02
+G1 X60 Y58.8 E0.0004
+G1 X40 Y58.8 E0.02
+G1 X40 Y59.2 E0.0004
+G1 X60 Y59.2 E0.02
+G1 X60 Y59.6 E0.0004
+G1 X40 Y59.6 E0.02
+G1 X40 Y60 E0.0004
+G1 X60 Y60 E0.02
+G1 X0 Y0 F9000
+;TYPE:Internal infill
+G1 X10 Y10 E0.65 F1800
+G1 X30 Y10 E0.65
+G1 X30 Y30 E0.66
 G1 Z0.4 F7200
+G1 X0 Y0 F9000
 ;TYPE:Internal infill
-G1 X10 Y10 E1 F1800
-G1 X30 Y10 E1
-G1 X30 Y30 E1
+G1 X10 Y10 E0.65 F1800
+G1 X30 Y10 E0.65
+G1 X30 Y30 E0.66
+G1 X40 Y40 F9000
+;TYPE:Internal infill
+G1 X60 Y40 E0.02
+G1 X60 Y40.4 E0.0004
+G1 X40 Y40.4 E0.02
+G1 X40 Y40.8 E0.0004
+G1 X60 Y40.8 E0.02
+G1 X60 Y41.2 E0.0004
+G1 X40 Y41.2 E0.02
+G1 X40 Y41.6 E0.0004
+G1 X60 Y41.6 E0.02
+G1 X60 Y42 E0.0004
+G1 X40 Y42 E0.02
+G1 X40 Y42.4 E0.0004
+G1 X60 Y42.4 E0.02
+G1 X60 Y42.8 E0.0004
+G1 X40 Y42.8 E0.02
+G1 X40 Y43.2 E0.0004
+G1 X60 Y43.2 E0.02
+G1 X60 Y43.6 E0.0004
+G1 X40 Y43.6 E0.02
+G1 X40 Y44 E0.0004
+G1 X60 Y44 E0.02
+G1 X60 Y44.4 E0.0004
+G1 X40 Y44.4 E0.02
+G1 X40 Y44.8 E0.0004
+G1 X60 Y44.8 E0.02
+G1 X60 Y45.2 E0.0004
+G1 X40 Y45.2 E0.02
+G1 X40 Y45.6 E0.0004
+G1 X60 Y45.6 E0.02
+G1 X60 Y46 E0.0004
+G1 X40 Y46 E0.02
+G1 X40 Y46.4 E0.0004
+G1 X60 Y46.4 E0.02
+G1 X60 Y46.8 E0.0004
+G1 X40 Y46.8 E0.02
+G1 X40 Y47.2 E0.0004
+G1 X60 Y47.2 E0.02
+G1 X60 Y47.6 E0.0004
+G1 X40 Y47.6 E0.02
+G1 X40 Y48 E0.0004
+G1 X60 Y48 E0.02
+G1 X60 Y48.4 E0.0004
+G1 X40 Y48.4 E0.02
+G1 X40 Y48.8 E0.0004
+G1 X60 Y48.8 E0.02
+G1 X60 Y49.2 E0.0004
+G1 X40 Y49.2 E0.02
+G1 X40 Y49.6 E0.0004
+G1 X60 Y49.6 E0.02
+G1 X60 Y50 E0.0004
+G1 X40 Y50 E0.02
+G1 X40 Y50.4 E0.0004
+G1 X60 Y50.4 E0.02
+G1 X60 Y50.8 E0.0004
+G1 X40 Y50.8 E0.02
+G1 X40 Y51.2 E0.0004
+G1 X60 Y51.2 E0.02
+G1 X60 Y51.6 E0.0004
+G1 X40 Y51.6 E0.02
+G1 X40 Y52 E0.0004
+G1 X60 Y52 E0.02
+G1 X60 Y52.4 E0.0004
+G1 X40 Y52.4 E0.02
+G1 X40 Y52.8 E0.0004
+G1 X60 Y52.8 E0.02
+G1 X60 Y53.2 E0.0004
+G1 X40 Y53.2 E0.02
+G1 X40 Y53.6 E0.0004
+G1 X60 Y53.6 E0.02
+G1 X60 Y54 E0.0004
+G1 X40 Y54 E0.02
+G1 X40 Y54.4 E0.0004
+G1 X60 Y54.4 E0.02
+G1 X60 Y54.8 E0.0004
+G1 X40 Y54.8 E0.02
+G1 X40 Y55.2 E0.0004
+G1 X60 Y55.2 E0.02
+G1 X60 Y55.6 E0.0004
+G1 X40 Y55.6 E0.02
+G1 X40 Y56 E0.0004
+G1 X60 Y56 E0.02
+G1 X60 Y56.4 E0.0004
+G1 X40 Y56.4 E0.02
+G1 X40 Y56.8 E0.0004
+G1 X60 Y56.8 E0.02
+G1 X60 Y57.2 E0.0004
+G1 X40 Y57.2 E0.02
+G1 X40 Y57.6 E0.0004
+G1 X60 Y57.6 E0.02
+G1 X60 Y58 E0.0004
+G1 X40 Y58 E0.02
+G1 X40 Y58.4 E0.0004
+G1 X60 Y58.4 E0.02
+G1 X60 Y58.8 E0.0004
+G1 X40 Y58.8 E0.02
+G1 X40 Y59.2 E0.0004
+G1 X60 Y59.2 E0.02
+G1 X60 Y59.6 E0.0004
+G1 X40 Y59.6 E0.02
+G1 X40 Y60 E0.0004
+G1 X60 Y60 E0.02
 ";
 
     fn temp_dir(tag: &str) -> PathBuf {

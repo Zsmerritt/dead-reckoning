@@ -102,13 +102,23 @@ pub struct ContactConfig {
     pub min_edge_margin: f64,
     /// Minimum narrowest bounding-box dimension of the hosting island,
     /// mm. Thinner features are treated as fins.
+    ///
+    /// **The one measurement in this module that is not conservative.**
+    /// Width is read off the island's axis-aligned bounding box, so a
+    /// fin running diagonally is credited with its enclosing box rather
+    /// than its true width — a 2 mm fin at 45° over 20 mm measures 14 mm
+    /// and clears a 5 mm floor it should fail. Raise this threshold, or
+    /// prefer [`ContactMode::Tap`], on parts with diagonal ribs.
     pub min_feature_width: f64,
     /// Nominal extrusion width used to turn centerlines into material,
     /// mm. Drives the area estimate, the raster resolution and the
     /// clearance field.
     pub extrusion_width: f64,
     /// Maximum distance between sampled points of two extrusions for
-    /// them to belong to the same island, mm.
+    /// them to belong to the same island, mm. Must be at least
+    /// [`ContactConfig::extrusion_width`]: below that, beads whose
+    /// material overlaps could be split into islands that both claim the
+    /// same XY.
     pub island_link_tolerance: f64,
 }
 
@@ -207,8 +217,15 @@ pub enum DeclineReason {
         required_run_length: Option<f64>,
         /// The longest clear run found anywhere among the evaluated
         /// candidate points, over [`crate::structure::RUN_DIRECTIONS`]
-        /// evenly spaced directions. `None` for
-        /// [`ContactMode::Tap`] and when no candidate sat on material.
+        /// evenly spaced directions. `None` for [`ContactMode::Tap`] and
+        /// when no candidate sat on material.
+        ///
+        /// **Its `start` need not appear in `rejected`.** The search
+        /// covers every evaluated candidate, while `rejected` is
+        /// truncated to [`ContactConfig::max_candidates`], so with a
+        /// small cap the best run routinely starts at a point the list
+        /// does not name. A UI must treat `start` as a coordinate to
+        /// jog to in its own right, not as a key into `rejected`.
         largest_clear_run: Option<ClearRun>,
     },
 }
@@ -353,6 +370,16 @@ pub(crate) fn validate_config(config: &ContactConfig) -> Result<(), ContactError
         if bad {
             return Err(ContactError::InvalidParams { param });
         }
+    }
+    // Below one extrusion width, two beads that physically overlap can
+    // land in different islands — and then two islands claim the same
+    // XY, `island_at` resolves the tie by list order, and a candidate is
+    // judged against whichever footprint happened to be built first.
+    // There is no safe answer at that point, so refuse the config.
+    if config.island_link_tolerance < config.extrusion_width {
+        return Err(ContactError::InvalidParams {
+            param: "island_link_tolerance",
+        });
     }
     if let ContactMode::Drag {
         direction,
@@ -1389,6 +1416,26 @@ mod tests {
                 "{param}"
             );
         }
+        // A link tolerance below one extrusion width is refused by name:
+        // it would let two islands claim the same XY.
+        let overlapping = ContactConfig {
+            extrusion_width: 0.6,
+            island_link_tolerance: 0.5,
+            ..ContactConfig::default()
+        };
+        assert_eq!(
+            select_contact_zone(&model, 1, [0.0, 0.0], &overlapping).unwrap_err(),
+            ContactError::InvalidParams {
+                param: "island_link_tolerance"
+            }
+        );
+        // Exactly one extrusion width is the boundary, and it is legal.
+        let boundary = ContactConfig {
+            extrusion_width: 0.6,
+            island_link_tolerance: 0.6,
+            ..ContactConfig::default()
+        };
+        assert!(select_contact_zone(&model, 1, [0.0, 0.0], &boundary).is_ok());
         // A zero edge margin is legal — it disables the margin gate
         // without disabling the rest.
         let permissive = ContactConfig {
@@ -1406,6 +1453,11 @@ mod tests {
         let json = serde_json::to_string(&outcome).expect("serialize");
         assert!(json.contains("NoStructurallySafePoint"));
         let back: ContactOutcome = serde_json::from_str(&json).expect("deserialize");
+        // Structurally identical, not bit-identical: serde_json's default
+        // float parser can differ by 1 ULP, so the reals are compared by
+        // tolerance and the discrete payload exactly. What this pins is
+        // that no field is an infinity or a NaN, which serde_json encodes
+        // as `null` and then refuses to read back as an f64.
         let (
             ContactOutcome::Declined(DeclineReason::NoStructurallySafePoint { rejected, .. }),
             ContactOutcome::Declined(DeclineReason::NoStructurallySafePoint {

@@ -368,6 +368,39 @@ fn square_segments(centre: [f64; 2], side: f64, z: f64, span_base: u64) -> Vec<X
     out
 }
 
+/// A coordinate strategy that can actually land on the material.
+///
+/// A pure `f64::from_bits(any::<u64>())` never does: the odds of a
+/// random bit pattern falling inside an 8 mm square at (50,50) are about
+/// 4e-9 per axis, so a property written that way exercises only the
+/// `OffMaterial` and `InvalidPoint` arms and its headline assertions
+/// (score finite and in range, every measured/threshold finite,
+/// `Safe` iff no failures) never run at all. Mixing in an in-range band
+/// keeps the adversarial coverage and makes the interesting arm
+/// reachable: roughly a quarter of cases land on the patch.
+fn probe_coordinate() -> impl Strategy<Value = f64> {
+    prop_oneof![
+        3 => 44.0f64..56.0,
+        1 => any::<u64>().prop_map(f64_from_bits),
+    ]
+}
+
+/// Drag components: mostly usable, sometimes an arbitrary bit pattern.
+fn drag_component() -> impl Strategy<Value = f64> {
+    prop_oneof![
+        2 => -5.0f64..5.0,
+        1 => any::<u64>().prop_map(f64_from_bits),
+    ]
+}
+
+/// Drag run lengths: mostly plausible, sometimes an arbitrary pattern.
+fn drag_run_length() -> impl Strategy<Value = f64> {
+    prop_oneof![
+        2 => 0.25f64..24.0,
+        1 => any::<u64>().prop_map(f64_from_bits),
+    ]
+}
+
 /// Whether the bed-adhesion criterion passed at `point`, for a model
 /// whose layer 0 is a square of `base_side` carrying a fixed 2 mm plate.
 fn adhesion_passes(base_side: f64) -> (bool, f64) {
@@ -410,11 +443,11 @@ proptest! {
     #[test]
     fn structural_verdicts_total_on_arbitrary_geometry(
         bits in proptest::collection::vec(any::<u64>(), 8),
-        px in any::<u64>(),
-        py in any::<u64>(),
-        dx in any::<u64>(),
-        dy in any::<u64>(),
-        run in any::<u64>(),
+        px in probe_coordinate(),
+        py in probe_coordinate(),
+        dx in drag_component(),
+        dy in drag_component(),
+        run in drag_run_length(),
         drag in any::<bool>(),
     ) {
         let mut prev = square_segments([50.0, 50.0], 8.0, 0.2, 1_000);
@@ -429,13 +462,13 @@ proptest! {
             .expect("the default config is valid");
         let mode = if drag {
             ContactMode::Drag {
-                direction: [f64_from_bits(dx), f64_from_bits(dy)],
-                run_length: f64_from_bits(run),
+                direction: [dx, dy],
+                run_length: run,
             }
         } else {
             ContactMode::Tap
         };
-        let point = [f64_from_bits(px), f64_from_bits(py)];
+        let point = [px, py];
         match analysis.assess(point, &mode) {
             ContactAssessment::Evaluated(verdict) => {
                 prop_assert!(verdict.score.is_finite());

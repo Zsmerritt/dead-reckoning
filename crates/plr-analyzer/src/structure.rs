@@ -170,6 +170,11 @@ impl BoundingBox {
 
     /// Smaller of the two extents — the slenderness measure used by the
     /// feature-width criterion.
+    ///
+    /// Axis-aligned, so this **over-states** the true width of a feature
+    /// that runs diagonally: a 2 mm fin from (0,0) to (20,20) reports
+    /// 20 mm, not 2 mm. It is the one place the structural analysis errs
+    /// optimistic; see [`StructuralCriterion::FeatureWidth`].
     #[must_use]
     pub fn min_dimension(&self) -> f64 {
         self.width().min(self.height())
@@ -249,6 +254,10 @@ pub enum StructuralCriterion {
     /// Height-to-footprint aspect ratio (tipping moment).
     Tipping,
     /// Narrowest bounding-box dimension of the island (slenderness).
+    ///
+    /// Measured on the axis-aligned bounding box, which **over-states**
+    /// the width of a diagonal fin — the only non-conservative estimate
+    /// in this module. See [`ContactConfig::min_feature_width`].
     FeatureWidth,
     /// Distance from the contact point to the island's boundary.
     EdgeMargin,
@@ -808,19 +817,10 @@ fn trace_stack<'m>(
         zero_z.partial_cmp(&BED_LAYER_Z_MAX),
         Some(std::cmp::Ordering::Less | std::cmp::Ordering::Equal)
     ) {
-        let layer_zero_z = finite_or(zero_z, f64::MAX);
-        let traces = (0..count)
-            .map(|island| FootprintTrace {
-                island,
-                status: TraceStatus::BedLayerMissing { layer_zero_z },
-                bed_area: 0.0,
-                bed_island_indices: Vec::new(),
-                weakest_link_area: 0.0,
-                effective_area: 0.0,
-                reached_layer: top_layer,
-            })
-            .collect();
-        return (traces, Vec::new());
+        let status = TraceStatus::BedLayerMissing {
+            layer_zero_z: finite_or(zero_z, f64::MAX),
+        };
+        return (unresolved_traces(count, status, top_layer), Vec::new());
     }
     let mut groups: Vec<Vec<usize>> = (0..count).map(|i| vec![i]).collect();
     let mut weakest = vec![f64::INFINITY; count];
@@ -830,7 +830,23 @@ fn trace_stack<'m>(
     while layer > 0 {
         layer -= 1;
         let Some(next) = model.layer(layer) else {
-            break;
+            // Unreachable for a well-formed model: `LayerModel` layers
+            // are contiguous 0..len and `top_layer` was resolved from
+            // it. Breaking out of the loop here would leave `upper`
+            // pointing at some layer above 0 and then label it the bed
+            // layer — reporting an optimistic footprint for a feature
+            // whose real footprint was never seen, precisely the failure
+            // the design exists to exclude. Refuse instead.
+            return (
+                unresolved_traces(
+                    count,
+                    TraceStatus::BedLayerMissing {
+                        layer_zero_z: finite_or(zero_z, f64::MAX),
+                    },
+                    top_layer,
+                ),
+                Vec::new(),
+            );
         };
         let lower = LayerShape::build(next, config.island_link_tolerance);
         step_down(
@@ -847,6 +863,23 @@ fn trace_stack<'m>(
         .map(|island| assemble_trace(island, &groups, &weakest, &broken, &bed))
         .collect();
     (traces, bed)
+}
+
+/// Zero-footprint traces for every island of the analysed layer, used
+/// whenever the bed layer could not be established at all. Every
+/// load-bearing criterion fails on these.
+fn unresolved_traces(count: usize, status: TraceStatus, reached_layer: u32) -> Vec<FootprintTrace> {
+    (0..count)
+        .map(|island| FootprintTrace {
+            island,
+            status,
+            bed_area: 0.0,
+            bed_island_indices: Vec::new(),
+            weakest_link_area: 0.0,
+            effective_area: 0.0,
+            reached_layer,
+        })
+        .collect()
 }
 
 /// Turn the accumulated trace state for one island into a
