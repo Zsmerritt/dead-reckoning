@@ -33,6 +33,19 @@
 //! stream, including its line terminator, so `span.end` of a line is
 //! always the byte offset of the next line — the boundary needed for
 //! `M26 S<byte>` resume offsets.
+//!
+//! Serialization (`Display`) is a reparse fixpoint for any ASCII
+//! input — parsing the serialized form yields the same body, and
+//! serializing again yields the same string (property-tested).
+//! Garbage residue whose command name would re-tokenize as a line
+//! number is protected by a neutral `N0 ` line-number guard (see
+//! `needs_line_number_guard`). One caveat, faithfully inherited from
+//! Klipper's Python: characters whose Unicode uppercase form has a
+//! different character count (e.g. U+0390) shift
+//! `get_raw_command_parameters` index arithmetic, so such (garbage)
+//! lines may reparse differently once; the serialized form is
+//! case-stable and reaches a guaranteed fixpoint on the next round
+//! (property-tested over arbitrary bytes).
 
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -242,8 +255,35 @@ impl Command {
     }
 }
 
+/// Whether a serialized line starting with `name` would re-enter the
+/// dispatcher's line-number branch on reparse (gcode.py:211-213): that
+/// branch triggers whenever the line's first letter run is exactly `N`,
+/// i.e. `name` starts with `N` not followed by another `[A-Z_]` run
+/// character. Such names only arise from garbage input (no dispatchable
+/// Klipper command starts with a lone-`N` run — the dispatcher itself
+/// would eat it as a line number), but serializing them bare would make
+/// the reparse consume the name as a line number and re-tokenize the
+/// rest, so [`Command`]'s `Display` emits a semantically neutral `N0 `
+/// line-number guard in front. The bare name `"N"` is excluded: its raw
+/// text is recovered via the head-match branch of
+/// `get_raw_command_parameters` and is already a reparse fixpoint,
+/// which the guard would break.
+fn needs_line_number_guard(name: &str) -> bool {
+    let mut chars = name.chars();
+    if chars.next() != Some('N') {
+        return false;
+    }
+    match chars.next() {
+        None => false,
+        Some(c) => !(c.is_ascii_uppercase() || c == '_'),
+    }
+}
+
 impl fmt::Display for Command {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if needs_line_number_guard(&self.name) {
+            f.write_str("N0 ")?;
+        }
         match &self.params {
             CommandParams::Traditional { pairs } => {
                 f.write_str(&self.name)?;
@@ -470,44 +510,55 @@ fn is_traditional_command(cmd: &str) -> bool {
 /// `GCodeCommand.get_raw_command_parameters` (gcode.py:40-53).
 ///
 /// `origline` is the stripped original-case line (comment included);
-/// `command` is the uppercase dispatch name. On pathological inputs where
-/// byte arithmetic falls off a char boundary, this degrades to an empty
-/// string instead of panicking (unreachable for slicer output).
+/// `command` is the uppercase dispatch name. All index arithmetic is in
+/// *characters*, exactly like the Python original — byte indices would
+/// drift whenever Unicode case mapping changes a character's UTF-8
+/// length (e.g. U+027D is two bytes but uppercases to the three-byte
+/// U+2C64), shifting the extracted region and breaking the
+/// serialize/reparse fixpoint on non-ASCII garbage. Total: never
+/// panics for any input.
 fn raw_command_parameters(origline: &str, command: &str) -> String {
-    let mut param_start = command.len();
-    let mut param_end = origline.len();
-    let head_matches = origline
-        .get(..param_start)
-        .is_some_and(|h| h.to_uppercase() == command);
-    if !head_matches {
+    let orig_chars: Vec<char> = origline.chars().collect();
+    let cmd_chars = command.chars().count();
+    let mut param_start = cmd_chars;
+    let mut param_end = orig_chars.len();
+    let head: String = orig_chars.iter().take(cmd_chars).collect();
+    if head.to_uppercase() != command {
         // Skip any gcode line-number and ignore any trailing checksum.
         let up = origline.to_uppercase();
         match up.find(command) {
-            Some(idx) => param_start += idx,
+            // Python `find` returns a character index; convert from the
+            // byte index Rust gives us.
+            Some(byte_idx) => {
+                let char_idx = up.get(..byte_idx).map_or(0, |s| s.chars().count());
+                param_start = cmd_chars + char_idx;
+            }
             // Python `str.find` returns -1 here; replicate the resulting
             // offset without underflow.
-            None => param_start = param_start.saturating_sub(1),
+            None => param_start = cmd_chars.saturating_sub(1),
         }
-        if let Some(star) = origline.rfind('*') {
-            let digits = origline
-                .get(star + 1..)
-                .is_some_and(|s| !s.is_empty() && s.chars().all(|c| c.is_ascii_digit()));
-            if digits {
+        let star = orig_chars.iter().rposition(|&c| c == '*');
+        if let Some(star) = star {
+            let suffix = orig_chars.get(star + 1..).unwrap_or_default();
+            if !suffix.is_empty() && suffix.iter().all(char::is_ascii_digit) {
                 param_end = star;
             }
         }
     }
-    if let Some(rest) = origline.get(param_start..) {
-        if let Some(first) = rest.chars().next() {
-            if first.is_whitespace() {
-                param_start += first.len_utf8();
-            }
-        }
+    if orig_chars
+        .get(param_start)
+        .is_some_and(|c| c.is_whitespace())
+    {
+        param_start += 1;
     }
-    origline
+    if param_start >= param_end {
+        return String::new();
+    }
+    orig_chars
         .get(param_start..param_end)
         .unwrap_or_default()
-        .to_string()
+        .iter()
+        .collect()
 }
 
 /// Emulation of `shlex.shlex(raw, posix=True)` with
@@ -850,6 +901,77 @@ mod tests {
             let out = l1.to_string();
             let l2 = parse(&out);
             assert_eq!(l1.body, l2.body, "unstable round trip for {s:?}");
+        }
+    }
+
+    #[test]
+    fn serializer_line_number_guard_regressions() {
+        // Reparse-fixpoint regressions: each input previously
+        // re-tokenized across the line-number/name boundary on reparse
+        // ("n0N!n0" was the reviewed counterexample; "N0 N1 N2 N3 X1"
+        // shows the chain that made any fixed convergence bound false
+        // before the N0-guard fix in `Display for Command`).
+        for s in [
+            "n0N!n0",
+            "n0n[a",
+            "N0 N1 N2 N3 X1",
+            "N0 N5.5 X1",
+            "N123",
+            "N0 N",
+            "N5 G1 X0*57",
+            "N0 N0",
+            "N!",
+            "n0N! x*12",
+            "N0 N !X",
+        ] {
+            let l1 = parse(s);
+            let out = l1.to_string();
+            let l2 = parse(&out);
+            assert_eq!(l1.body, l2.body, "body changed: {s:?} -> {out:?}");
+            assert_eq!(out, l2.to_string(), "string not a fixpoint for {s:?}");
+        }
+    }
+
+    #[test]
+    fn line_number_guard_only_fires_on_lone_n_names() {
+        // Real command names never trigger the guard.
+        for s in [
+            "G1 X0",
+            "M204 S100",
+            "SET_GCODE_OFFSET Z=1",
+            "NX_MACRO A=1",
+            "N_FOO B=2",
+        ] {
+            assert!(
+                !parse(s).to_string().starts_with("N0 "),
+                "spurious guard for {s:?}"
+            );
+        }
+        // Garbage lone-N residue does.
+        assert_eq!(parse("n0N!n0").to_string(), "N0 N! n0");
+        assert_eq!(parse("N0 N7 X1").to_string(), "N0 N7 X1");
+    }
+
+    #[test]
+    fn unicode_case_expansion_reaches_fixpoint_by_round_two() {
+        // Characters whose uppercase form has a different char count
+        // (U+03B0 -> 2, U+0390 -> 3, U+00DF -> 2) shift the
+        // Klipper-faithful index arithmetic of raw parameter
+        // extraction, so round 1 may re-tokenize; the round-1 output's
+        // command region is case-stable, making round 2 a guaranteed
+        // fixpoint (see module docs).
+        for s in [
+            "\u{3b0}g1 x2",
+            "a\u{390}b C1 x",
+            "\u{df}X=1",
+            "z\u{27d}i[x P1",
+        ] {
+            let l1 = parse(s);
+            let l2 = parse(&l1.to_string());
+            let out2 = l2.to_string();
+            let l3 = parse(&out2);
+            assert_eq!(l2.body, l3.body, "round-2 not a fixpoint for {s:?}");
+            assert_eq!(out2, l3.to_string(), "{s:?}");
         }
     }
 
