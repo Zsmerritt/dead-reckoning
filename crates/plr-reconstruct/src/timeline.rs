@@ -125,10 +125,7 @@ pub struct WalTimeline {
     pub socket_lost_tail: Option<u64>,
     /// `mono_ns` of the newest motion record (trapq segment or stepper
     /// range); `None` when the WAL holds no motion at all.
-    pub last_motion_mono_ns: u64,
-    /// Whether any motion record exists (disambiguates
-    /// `last_motion_mono_ns == 0`).
-    pub has_motion: bool,
+    pub last_motion_mono_ns: Option<u64>,
     /// Why the recovery scan stopped (propagated for classification).
     pub scan_end: ScanEnd,
     /// Everything unusual observed during ingestion.
@@ -171,7 +168,7 @@ pub fn ingest(scan: &RecoveryScan, heartbeat: Option<&HeartbeatRecovery>) -> Wal
 
     // Indices (in scan order) used to reason about what "ends" the log.
     let mut last_motion_idx: Option<usize> = None;
-    let mut last_motion_mono: u64 = 0;
+    let mut last_motion_mono: Option<u64> = None;
     let mut clean_marker_idx: Option<usize> = None;
     let mut socket_lost: Option<(usize, u64)> = None;
     let mut resubscribed_idx: Option<usize> = None;
@@ -186,7 +183,7 @@ pub fn ingest(scan: &RecoveryScan, heartbeat: Option<&HeartbeatRecovery>) -> Wal
         match &scanned.record {
             WalRecord::TrapqSegment(seg) => {
                 last_motion_idx = Some(idx);
-                last_motion_mono = last_motion_mono.max(seg.mono_ns);
+                last_motion_mono = Some(last_motion_mono.unwrap_or(0).max(seg.mono_ns));
                 if seg.queue == "toolhead" {
                     toolhead.push(seg.clone());
                 } else if seg.queue.starts_with("extruder") {
@@ -197,7 +194,7 @@ pub fn ingest(scan: &RecoveryScan, heartbeat: Option<&HeartbeatRecovery>) -> Wal
             }
             WalRecord::StepperRange(range) => {
                 last_motion_idx = Some(idx);
-                last_motion_mono = last_motion_mono.max(range.mono_ns);
+                last_motion_mono = Some(last_motion_mono.unwrap_or(0).max(range.mono_ns));
                 stepper_ranges.push(range.clone());
             }
             WalRecord::Context(ctx) => contexts.push(ctx.clone()),
@@ -284,7 +281,6 @@ pub fn ingest(scan: &RecoveryScan, heartbeat: Option<&HeartbeatRecovery>) -> Wal
         clean_shutdown,
         socket_lost_tail,
         last_motion_mono_ns: last_motion_mono,
-        has_motion: last_motion_idx.is_some(),
         scan_end: scan.end.clone(),
         notes,
     }
@@ -370,8 +366,7 @@ mod tests {
         assert_eq!(timeline.stepper_ranges.len(), 1);
         assert_eq!(timeline.contexts.len(), 1);
         assert_eq!(timeline.heartbeat.map(|hb| hb.mono_ns), Some(4_000));
-        assert!(timeline.has_motion);
-        assert_eq!(timeline.last_motion_mono_ns, 2_000);
+        assert_eq!(timeline.last_motion_mono_ns, Some(2_000));
         assert!(!timeline.clean_shutdown);
         assert!(timeline.notes.is_empty());
     }
@@ -388,7 +383,7 @@ mod tests {
 
         let empty = ingest(&scan_of(vec![]), None);
         assert_eq!(empty.trapq_end_time(), None);
-        assert!(!empty.has_motion);
+        assert_eq!(empty.last_motion_mono_ns, None);
     }
 
     #[test]
@@ -418,7 +413,7 @@ mod tests {
             [IngestNote::NonFiniteRecordSkipped { .. }]
         ));
         // A dropped record is not motion evidence.
-        assert!(!timeline.has_motion);
+        assert_eq!(timeline.last_motion_mono_ns, None);
     }
 
     #[test]
@@ -563,7 +558,7 @@ mod tests {
         assert!(timeline.contexts.is_empty());
         assert_eq!(timeline.heartbeat, None);
         assert!(!timeline.clean_shutdown);
-        assert!(!timeline.has_motion);
+        assert_eq!(timeline.last_motion_mono_ns, None);
     }
 
     #[test]

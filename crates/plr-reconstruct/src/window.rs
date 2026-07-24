@@ -427,8 +427,8 @@ fn classify(
             evidence: ShutdownEvidence::SocketLostMarker { mono_ns },
         };
     }
-    if timeline.has_motion {
-        let quiet_ns = heartbeat_mono_ns.saturating_sub(timeline.last_motion_mono_ns);
+    if let Some(last_motion) = timeline.last_motion_mono_ns {
+        let quiet_ns = heartbeat_mono_ns.saturating_sub(last_motion);
         if quiet_ns > config.quiet_tail_ns {
             return CrashClass::ShutdownPowerRetained {
                 evidence: ShutdownEvidence::QuietTail { quiet_ns },
