@@ -2,10 +2,13 @@
 
 dead-reckoning is a pipeline of five stages — **record**, **reconstruct**,
 **analyze**, **plan**, **execute** — with execution deliberately parked
-behind a stack of consent and commissioning gates. This document describes
+behind a stack of consent and commissioning gates, plus a **console
+layer**: a Klipper plugin whose `PLR_*` commands drive commissioning and
+recovery over the daemon's control socket. This document describes
 each stage as the code implements it, including the on-disk formats, the
-containment guarantee and its honest caveats, the probe-envelope math, and
-the trust model of recovery plans.
+containment guarantee and its honest caveats, the probe-envelope math,
+the trust model of recovery plans, and the console layer's protocol and
+drag-oracle design.
 
 Related: [install guide](install.md) · [operations](operations.md) ·
 [worked example](../examples/recovery-walkthrough.md).
@@ -28,7 +31,7 @@ flowchart TD
         RC --> AN["plr-analyzer:<br/>layer model, stop match, contact zone"]
         FILE --> AN
         AN --> PL["plr-recovery:<br/>validated machine + typed plan"]
-        PL --> EX["plrd recover:<br/>dry run by default,<br/>gated execution via Moonraker"]
+        PL --> EX["PLR_RECOVER / plrd recover:<br/>dry run by default,<br/>gated execution via Moonraker"]
     end
 ```
 
@@ -294,11 +297,15 @@ positions live in the same Klipper-internal frame as the WAL data:
 
 `validate_machine` checks every structural prerequisite (the
 [commissioning checklist](install.md#commissioning-checklist): force_move,
-attested self-locking Z, single-MCU Z steppers, `;TYPE:` annotations,
-exactly one Tap/load-cell probe with move-free activate G-code, known Z
+attested self-locking Z, single-MCU Z steppers, `;TYPE:` annotations, a
+contact oracle matching the configured probe method — exactly one
+Tap/load-cell probe with move-free activate G-code, or, for the drag
+oracle, an accel chip plus a calibrated noise floor — known Z
 `position_min`, virtual_sdcard root, config hash unchanged since
 validation) and reports **every** failure, not just the first. No plan is
-built for a machine that fails any check.
+built for a machine that fails any check. (In `[plr]` mode the "hash
+unchanged" check is satisfied by construction — see
+[below](#plr-mode-machine-config-why-the-blessing-is-obsolete).)
 
 ### The probe envelope and the shifted frame
 
@@ -307,13 +314,18 @@ The machine's bed rises into a fixed gantry: XY can be re-homed at will, but
 inside a frame the plan declares explicitly:
 
 ```text
-envelope = expected_gap + 0.15 s × probe_speed + margin
+envelope = expected_gap + overshoot + margin
 ```
 
 - `expected_gap` — the Z span of the possible-stop set plus a sag allowance:
   how far apart the plausible nozzle heights are;
-- `0.15 s × probe_speed` — Klipper keeps stepping for ~0.15 s after a probe
-  trigger while the drip-move flush horizon drains;
+- `overshoot` — how far below the true surface the descent can end before
+  the halt is observed; its form depends on the probe method. Continuous
+  descent (tap / load-cell `PROBE`): `0.15 s × probe_speed` — Klipper
+  keeps stepping for ~0.15 s after a probe trigger while the drip-move
+  flush horizon drains. Drag staircase (`adxl_drag`): exactly one
+  `drag_z_step` — the derivation is in
+  [the drag-oracle section](#the-adxl-drag-oracle);
 - `margin` — configured slack (default 0.5 mm).
 
 The plan declares `SET_KINEMATIC_POSITION Z = position_min + envelope`
@@ -341,9 +353,10 @@ true_Z_at_halt = z_prev_top + (halt − trigger)
 
 where `trigger` is the **raw** trigger Z (read per probe type: Tap probes
 expose it as `probe.last_z_result`; load-cell probes report `bed_z` with
-`z_offset` subtracted, so the formula adds it back) and `halt` is the raw
-kinematic `toolhead.position[2]` — never `gcode_move.position`, which reads
-back through the transform stack.
+`z_offset` subtracted, so the formula adds it back; the drag oracle
+reports `last_drag_result.trigger_z` on the `plr` status object) and
+`halt` is the raw kinematic `toolhead.position[2]` — never
+`gcode_move.position`, which reads back through the transform stack.
 
 ### The plan is data; the trust model
 
@@ -433,13 +446,18 @@ supported channel.)
 **Pipeline** (`pipeline.rs`): WAL dir → reconstruction → layer model
 seeded from the anchor context → stop-point match → contact selection →
 `plr_recovery::plan_recovery`. Machine prerequisites validate **first**
-and refusal is fatal — the `[machine]` config section supplies the
-operator attestations (all defaulting to not-commissioned), while
-`;TYPE:` presence is observed from the actual print file and the running
+and refusal is fatal. The machine snapshot comes from one of two
+sources, resolved per run (`resolve_machine_source`): the `[plr]`
+section of the **live** Klipper config when one exists (authoritative —
+see [the console layer](#plr-mode-machine-config-why-the-blessing-is-obsolete)),
+else the legacy `[machine]` section of `/etc/plrd.conf`, whose operator
+attestations all default to not-commissioned and whose running
 printer.cfg is checksummed (crc32c) and compared against the
 operator-blessed `validated_config_hash` — an operator gate against
-forgotten config edits, not a security boundary. The pipeline reads local
-files only and produces data; it never talks to the printer. Every
+forgotten config edits, not a security boundary. `;TYPE:` presence is
+observed from the actual print file in either mode. Apart from the
+`[plr]`-mode klippy query, the pipeline reads local files only and
+produces data; it never sends anything to the printer. Every
 non-plan outcome is typed: clean shutdown, machine rejection (every
 failure listed), manual fallback, not possible.
 
@@ -481,9 +499,190 @@ completes, so post-verifications read settled state. Temperature
 predicates poll up to 15 minutes; everything else up to 10 seconds.
 
 Operationally: dry-run reading, gate order, and transcript forensics are
-covered in [operations](operations.md#recovering-with-plrd-recover); the
-commissioning flow in
-[install](install.md#commissioning-the-machine-section).
+covered in
+[operations](operations.md#recovering-with-plr_recover--plrd-recover);
+the commissioning flow in
+[install](install.md#commissioning-from-the-console).
+
+## The console layer
+
+Everything above runs unchanged; the console layer is a thin, gated
+front-end onto it. Two pieces: a klippy extras plugin
+(`klippy_plugin/plr`, the `[plr]` config section and the `PLR_*`
+commands) and a UNIX control socket served by `plrd run`
+(`crates/plrd/src/ctrlsock.rs`). The division of labor is strict: the
+plugin owns the console UX, config-time checks, and the calibrations
+that must run inside klippy (probe repeatability, noise floor, drag
+passes); journaling, reconstruction, planning, and motion execution
+stay in the daemon.
+
+### The control socket
+
+A UNIX stream socket (default `/var/lib/plrd/plrd.sock`; the plugin
+reads the same path from `[plr] control_socket` — the two configs must
+agree). The protocol is fixed, and the plugin implements the client
+verbatim (`klippy_plugin/plr/daemon_link.py`):
+
+- request: one line of JSON, `{"cmd": "<name>", "args": {...}}\n`;
+- response: one line of JSON,
+  `{"ok": bool, "text": "<report>", "data": {...}}\n`;
+- commands: `ping`, `status`, `recover_dryrun`, `recover_execute`
+  (args `{"confirm": true, "step": bool}`);
+- **one request per connection** — the response is written, the
+  connection closed. One-shot framing means a wedged client can never
+  hold protocol state hostage. Malformed JSON and unknown commands get
+  an `ok: false` response, never a dropped connection; a request line
+  over 64 KiB gets an error and a close (it can never complete).
+
+`ok` means the command ran *and* reached its good outcome; refusals,
+declines, and aborts are `ok: false` with the full report in `text` and
+a stable `data.outcome` tag — so the console shows exactly what the CLI
+would have printed.
+
+**Gate preservation.** `recover_execute` runs the *same* gate stack as
+`plrd recover --execute --confirm` (`recover::execute_with_gates`):
+machine validation inside the pipeline, Moonraker reachability, klippy
+ready + printer idle, transcript-or-refuse, abort on any failed
+verification. The single difference is consent transport: the CLI's
+interactive TTY prompt is replaced by the request's explicit
+`"confirm": true`, which the plugin only sends after its own
+client-side check of the literal `EXECUTE=1 CONFIRM=YES` arguments —
+additive consent, not a replacement. `"step": true` is rejected
+(`per-step mode is CLI-only`): v1 keeps the socket one-shot rather than
+inventing a multi-round confirmation dialogue. Executions are
+serialized — a second `recover_execute` while one runs gets an
+immediate `busy` error (`try_lock`, never queued: a queued recovery
+executing minutes later against a changed printer would be
+indefensible).
+
+**Never starving the recorder.** The daemon's critical task is the
+Klipper socket reader (Klipper disconnects slow clients) and its
+durability path is a dedicated OS thread; the control server therefore
+runs accept/connection handling as separate spawned tasks and pushes
+all CPU/file-heavy work (the scan → reconstruct → plan pipeline) onto
+`spawn_blocking`'s pool. A console command can never stall recording.
+
+**Socket permissions** are mode 0666, deliberately: the stock install
+runs plrd as root while klippy — the one intended client — runs as an
+unprivileged user plrd cannot name at bind time. The mutating surface
+is narrow and fully gated (no arbitrary-G-code, no configuration
+surface), and the tightening story for multi-user hosts (systemd
+`User=`, or a `chgrp`+`0660` drop-in) is documented in
+[operations → troubleshooting](operations.md#troubleshooting) and in
+`ctrlsock.rs` itself. Stale socket files are unlinked before bind
+(crash-safe; the unlink-then-bind race is fatal-and-visible in the safe
+direction).
+
+On the plugin side, everything it persists goes through klippy's
+standard `SAVE_CONFIG` autosave staging — the plugin never writes
+printer.cfg. `PLR_STATUS`/`PLR_RECOVER` degrade honestly when the
+daemon is down: the plugin state still prints, with a
+`systemctl status plrd` hint.
+
+### The ADXL drag oracle
+
+`probe_method: adxl_drag` replaces the contact switch with an
+accelerometer listening for the nozzle dragging across the solidified
+part (`PLR_DRAG_PROBE`, `klippy_plugin/plr/drag_probe.py` +
+`classifier.py`). The physics of the sensor dictates the shape:
+accelerometer data arrives from the MCU **in batches**, so there is no
+real-time trigger and no mid-move halt. The design accepts that and
+builds a **staircase with between-pass classification**:
+
+1. every lateral pass (default 8 mm of travel, centered on the current
+   XY) runs at a **fixed Z** — a pass physically cannot descend;
+2. after each pass the complete sample window is classified: contact
+   iff its peak windowed RMS exceeds
+   `noise_floor_rms × multiplier(sensitivity)`;
+3. a clean pass descends exactly `drag_z_step` and repeats; contact
+   stops the staircase and lifts clear.
+
+**The safety model** never trusts the sensor for the descent bound:
+
+- hard bounds are computed **up front** — at most
+  `ceil(available_travel / drag_z_step)` passes, where the travel floor
+  is the kinematic Z limit plus one `drag_z_step` of reserve; no
+  descent is ever commanded below the floor;
+- exhausting the staircase with no contact **aborts**, restores the
+  starting Z, and reports an error — reconstruction and reality
+  disagree, and continuing would be guessing;
+- a pass that cannot be classified (too few samples, non-finite values,
+  frozen signal, collapsed sample rate) **aborts** the probe — it is
+  never assumed clean;
+- in a recovery plan, the whole staircase still runs inside the shifted
+  frame, so Klipper's rail-limit checking bounds it exactly as it
+  bounds a continuous probe descent — a dead accelerometer cannot drive
+  the nozzle past `position_min`.
+
+**The envelope overshoot derivation** (`OvershootTerm::DragStep`,
+`crates/plr-recovery/src/envelope.rs`): a pass never moves in Z, so
+there is no speed-proportional post-trigger travel at all — the *only*
+way the nozzle ends up below the true surface is the staircase
+decrement itself. The first contacting pass sits at most one
+`drag_z_step` below the last clean one, so the envelope's overshoot
+term is exactly `drag_z_step` — where the continuous methods contribute
+`0.15 s × probe_speed` of drip-move travel instead. The same bracket
+defines the result: `trigger_z` is the Z of the **last clean pass**,
+the surface lies within `(trigger_z − drag_z_step, trigger_z]`, and
+reporting the conservative endpoint lets the executor's true-Z
+arithmetic treat overshoot as bounded by one step. The plan's probe
+step sends `PLR_DRAG_PROBE` with the `[plr]` tunables embedded — the
+chip name always double-quoted (`CHIP="adxl345 bed"`; klippy's
+extended-command parser shlex-parses quoted values, and names quoting
+cannot carry are refused by validation) — and reads `trigger_z` back
+from the plugin's `last_drag_result` status
+(`TriggerSource::DragResult`).
+
+**The threshold** is anchored to a *measured, moving* baseline:
+`PLR_NOISE_TEST` captures the still noise floor for diagnostics but
+thresholds against the RMS of no-contact passes at the configured drag
+speed — drag passes classify samples taken while moving, so stepper
+harmonics and frame vibration must be inside the baseline or every pass
+would false-trigger on the machine's own motion. The 0–100 sensitivity
+knob log-interpolates a multiplier over that floor (0 → 8.0×,
+50 → 4.0×, 100 → 1.5×); machine validation refuses `adxl_drag` without
+a calibrated noise floor. Because the floor is speed-specific,
+`PLR_NOISE_TEST` also persists its capture speed (`noise_floor_speed`),
+and a plan whose `drag_speed` strays more than 20% from it carries a
+`NoiseFloorSpeedMismatch` warning — never a refusal. The classifier has a numpy path and a
+pure-python fallback producing identical verdicts (numpy stays optional
+inside klippy); both are tested against each other. Honesty note: the
+bounds above are what the tests establish — bench validation of
+*detection quality* on real hardware is the open E5 task.
+
+### [plr] mode machine config: why the blessing is obsolete
+
+With a `[plr]` section in printer.cfg, plrd sources the entire machine
+snapshot from the **running Klipper config** at recover time
+(`crates/plrd/src/plrcfg.rs`): it queries klippy's `configfile` status
+object — whose `settings` view carries every option as its parsed,
+typed value, with the `SAVE_CONFIG` autosave block already merged, so
+console-persisted values like `self_locking_z` and `noise_floor_*` read
+back as ordinary options — plus the plugin's own `plr` status object.
+
+That sourcing is what makes the legacy crc32c blessing unnecessary: the
+blessing existed to detect a printer.cfg that changed after the
+operator validated it against a *separately stored* snapshot in
+`/etc/plrd.conf [machine]`. In `[plr]` mode there is no separate
+snapshot — the values are re-read from the live config on every run, so
+the change-detection check is satisfied by construction (the code marks
+it with a `live:[plr]` sentinel hash; the legacy path keeps its real
+crc32c). When both exist, `[plr]` wins and the `[machine]` section is
+ignored with an info note.
+
+Two design consequences, both deliberate:
+
+- **klippy must be reachable** in `[plr]` mode — the WAL does not
+  journal the `[plr]` settings, so with klippy down there is no honest
+  copy to plan from, and both recovery *and dry-run* refuse rather than
+  invent machine data. A commissioned legacy `[machine]` snapshot is
+  the exception: that path never needed klippy, and its hash blessing
+  still detects a printer.cfg changed since blessing (including one
+  that has since grown a `[plr]` section).
+- **Defense in depth**: `PLR_SETUP` shows the operator derivations
+  (primary-MCU Z, empty `activate_gcode`, single probe section) that
+  plrd re-derives independently from the same settings at recover time
+  — a plugin bug cannot bless a machine the daemon would refuse.
 
 ## Time correlation (`plr-klipper`)
 

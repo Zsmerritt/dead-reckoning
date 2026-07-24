@@ -8,7 +8,11 @@
 # Safety: only the plrd service is touched. The klipper and moonraker
 # services are never stopped, started, or restarted; moonraker.conf and
 # moonraker.asvc are only edited with --moonraker (backed up first) —
-# otherwise you get exact manual instructions.
+# otherwise you get exact manual instructions. The klippy plugin
+# symlink (<klipper>/klippy/extras/plr) is removed only when it
+# actually points into a dead-reckoning checkout — a foreign plr module
+# is never deleted. printer.cfg is never edited: removing the [plr]
+# section (and its autosave block) is yours, with a reminder printed.
 set -euo pipefail
 
 BIN_PATH="/usr/local/bin/plrd"
@@ -22,6 +26,7 @@ ASSUME_YES=0
 PURGE=0
 EDIT_MOONRAKER=0
 PRINTER_DATA=""
+KLIPPER_DIR=""
 
 usage() {
     cat <<'EOF'
@@ -34,6 +39,9 @@ OPTIONS:
     --printer-data <path>  Klipper printer_data directory, used to locate
                            moonraker.conf / moonraker.asvc
                            (default: ~/printer_data)
+    --klipper <path>       Klipper source checkout, used to locate the
+                           klippy/extras/plr plugin symlink
+                           (default: ~/klipper)
     --moonraker            Also remove the [update_manager plrd] section
                            from moonraker.conf and the plrd line from
                            moonraker.asvc (timestamped backups first).
@@ -55,6 +63,9 @@ while [[ $# -gt 0 ]]; do
         --printer-data)
             [[ $# -ge 2 ]] || { echo "error: --printer-data requires a value" >&2; exit 2; }
             PRINTER_DATA="$2"; shift 2 ;;
+        --klipper)
+            [[ $# -ge 2 ]] || { echo "error: --klipper requires a value" >&2; exit 2; }
+            KLIPPER_DIR="$2"; shift 2 ;;
         --moonraker) EDIT_MOONRAKER=1; shift ;;
         --purge)     PURGE=1; shift ;;
         --yes|-y)    ASSUME_YES=1; shift ;;
@@ -116,6 +127,7 @@ require_sudo() {
 
 REMOVED=()
 KEPT=()
+PLR_CFG_REMINDER=0
 
 main() {
     [[ "$(uname -s)" == "Linux" ]] || die "this uninstaller must run on the printer host (Linux)"
@@ -146,6 +158,40 @@ main() {
         REMOVED+=("$BIN_PATH")
     else
         log "no $BIN_PATH — binary not installed"
+    fi
+
+    # --- klippy plugin symlink ----------------------------------------------
+    # Removed ONLY when it is a symlink pointing into a dead-reckoning
+    # checkout (target ends in klippy_plugin/plr). A regular directory,
+    # or a symlink to anything else, was not created by our installer
+    # and is never deleted — someone else's plr module is theirs.
+    local klipper="" plr_link plr_target
+    if [[ -n "$KLIPPER_DIR" ]]; then
+        klipper="$KLIPPER_DIR"
+    elif [[ -d "$HOME/klipper/klippy/extras" ]]; then
+        klipper="$HOME/klipper"
+    fi
+    if [[ -n "$klipper" ]]; then
+        plr_link="$klipper/klippy/extras/plr"
+        if [[ -L "$plr_link" ]]; then
+            plr_target="$(readlink "$plr_link")"
+            case "${plr_target%/}" in
+                */klippy_plugin/plr)
+                    rm -f "$plr_link"
+                    REMOVED+=("$plr_link (klippy plugin symlink -> $plr_target)")
+                    PLR_CFG_REMINDER=1
+                    ;;
+                *)
+                    KEPT+=("$plr_link (symlink to $plr_target — not a dead-reckoning checkout; never deleting a foreign plugin)")
+                    ;;
+            esac
+        elif [[ -e "$plr_link" ]]; then
+            KEPT+=("$plr_link (not a symlink, so not created by our installer)")
+        else
+            log "no klippy plugin symlink at $plr_link"
+        fi
+    else
+        log "no Klipper checkout at ~/klipper — if the plugin is linked elsewhere, re-run with --klipper <path> (or remove <klipper>/klippy/extras/plr yourself)"
     fi
 
     # --- config (kept by default) ------------------------------------------
@@ -223,6 +269,17 @@ main() {
         echo " Deliberately kept:"
         printf '   - %s\n' "${KEPT[@]}"
         echo "   (remove later by re-running with --purge)"
+    fi
+    if [[ $PLR_CFG_REMINDER -eq 1 ]]; then
+        echo
+        echo " The [plr] section in printer.cfg was NOT touched (this script"
+        echo " never edits printer.cfg). Before the next Klipper restart:"
+        echo "   1. delete the [plr] section from printer.cfg, AND"
+        echo "   2. delete the autosaved '#*# [plr]' block at the bottom of"
+        echo "      the file (self_locking_z, probe_resolution,"
+        echo "      noise_floor_*), if present."
+        echo " With the plugin unlinked, a leftover [plr] section makes"
+        echo " klippy fail its config load at startup."
     fi
     if [[ $mr_left -eq 1 ]]; then
         echo

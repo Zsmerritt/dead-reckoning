@@ -191,8 +191,10 @@ recover: REFUSED — machine prerequisites failed:
 
 After re-walking the [commissioning checklist](../docs/install.md#commissioning-checklist)
 and pasting `validated_config_hash = crc32c:658a94bb` into the config
-(the [blessing flow](../docs/install.md#commissioning-the-machine-section)),
-recovery proceeds.
+(the [legacy blessing flow](../docs/install.md#legacy-commissioning-the-machine-section)
+— this walkthrough uses the legacy `[machine]` path; on a `[plr]`-mode
+install the snapshot comes from the live Klipper config and no blessing
+exists), recovery proceeds.
 
 ### The dry run
 
@@ -364,7 +366,7 @@ being contacted **only after** consent — on a real printer the connection
 succeeds, the ready-and-idle gate runs, execution writes its JSONL
 transcript into the WAL directory, and any failed verification aborts
 with a typed reason. See
-[operations](../docs/operations.md#recovering-with-plrd-recover).)
+[operations](../docs/operations.md#recovering-with-plr_recover--plrd-recover).)
 
 ## Reproducing
 
@@ -374,9 +376,9 @@ with a typed reason. See
   `WalWriter`, `encode_slot`, the documented 24-byte sidecar layout — can
   produce an equivalent directory; truncate the final frame to simulate
   the torn tail.
-- The `plrd recover` outputs used a config whose `[machine]` section was
-  commissioned exactly as
-  [install.md](../docs/install.md#commissioning-the-machine-section)
+- The `plrd recover` outputs used a config whose legacy `[machine]`
+  section was commissioned exactly as
+  [install.md](../docs/install.md#legacy-commissioning-the-machine-section)
   describes, against a minimal fake printer.cfg.
 - The rendered-plan format regenerates via the golden test:
   `cargo test -p plr-recovery --test golden` (set `PLR_BLESS=1` to
