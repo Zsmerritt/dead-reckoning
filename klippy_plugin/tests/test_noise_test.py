@@ -58,7 +58,7 @@ def test_without_start_prints_plan_and_moves_nothing(noise_setup, run_cmd):
 # The measurement itself
 
 
-def test_successful_run_stages_all_three_keys(noise_setup, run_cmd, fake_printer):
+def test_successful_run_stages_all_four_keys(noise_setup, run_cmd, fake_printer):
     plugin, toolhead, chip = noise_setup(chip_script=[STILL, MOVING])
     run_cmd("PLR_NOISE_TEST", START=1)
     still_stats = classifier.stream_stats(STILL)
@@ -67,8 +67,27 @@ def test_successful_run_stages_all_three_keys(noise_setup, run_cmd, fake_printer
     assert pending["noise_floor_rms"] == "%.6f" % (moving_stats.rms,)
     assert pending["noise_floor_still_rms"] == "%.6f" % (still_stats.rms,)
     assert pending["noise_floor_peak"] == "%.6f" % (moving_stats.peak_rms,)
-    for key in ("noise_floor_rms", "noise_floor_still_rms", "noise_floor_peak"):
+    # Default SPEED is the drag_speed tunable (20.0).
+    assert pending["noise_floor_speed"] == "%.6f" % (20.0,)
+    for key in (
+        "noise_floor_rms",
+        "noise_floor_still_rms",
+        "noise_floor_peak",
+        "noise_floor_speed",
+    ):
         assert plugin.is_pending_save(key), key
+
+
+def test_noise_floor_speed_is_the_capture_speed(noise_setup, run_cmd, fake_printer):
+    """noise_floor_speed records the SPEED the moving baseline was
+    captured at — plrd warns when a plan's drag speed differs."""
+    plugin, toolhead, chip = noise_setup(chip_script=[STILL, MOVING])
+    run_cmd("PLR_NOISE_TEST", START=1, SPEED=7.5)
+    assert staged(fake_printer)["noise_floor_speed"] == "%.6f" % (7.5,)
+    assert plugin.noise_floor_speed == pytest.approx(7.5)
+    # And it matches what the moving passes actually ran at.
+    lateral = [m for m in toolhead.moves if m[0][0] is not None]
+    assert all(m[1] == pytest.approx(7.5) for m in lateral)
 
 
 def test_noise_floor_rms_is_the_moving_rms_not_still(
@@ -88,6 +107,7 @@ def test_noise_floor_rms_is_the_moving_rms_not_still(
 def test_live_values_set_for_same_session_drag_probe(noise_setup, run_cmd):
     plugin, toolhead, chip = noise_setup(chip_script=[STILL, MOVING])
     assert plugin.noise_floor_rms is None
+    assert plugin.noise_floor_speed is None
     run_cmd("PLR_NOISE_TEST", START=1)
     moving_stats = classifier.stream_stats(MOVING)
     assert plugin.noise_floor_rms == pytest.approx(moving_stats.rms)
@@ -95,6 +115,7 @@ def test_live_values_set_for_same_session_drag_probe(noise_setup, run_cmd):
         classifier.stream_stats(STILL).rms
     )
     assert plugin.noise_floor_peak == pytest.approx(moving_stats.peak_rms)
+    assert plugin.noise_floor_speed == pytest.approx(20.0)
 
 
 def test_capture_sequence_still_then_moving(noise_setup, run_cmd):
@@ -129,6 +150,7 @@ def test_report_contains_threshold_and_save_config_hint(noise_setup, run_cmd):
     assert "%.3f" % (threshold,) in report
     assert "SAVE_CONFIG" in report
     assert "away from any printed part" in report
+    assert "noise_floor_speed" in report
 
 
 def test_speed_arg_overrides_drag_speed(noise_setup, run_cmd):

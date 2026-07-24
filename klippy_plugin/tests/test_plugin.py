@@ -90,6 +90,7 @@ def test_persisted_autosave_options_read_back(plr_config):
                 "noise_floor_rms": "42.5",
                 "noise_floor_still_rms": "10.25",
                 "noise_floor_peak": "88.0",
+                "noise_floor_speed": "12.5",
             }
         )
     )
@@ -98,12 +99,14 @@ def test_persisted_autosave_options_read_back(plr_config):
     assert plugin.noise_floor_rms == 42.5
     assert plugin.noise_floor_still_rms == 10.25
     assert plugin.noise_floor_peak == 88.0
+    assert plugin.noise_floor_speed == 12.5
 
 
 def test_noise_floor_defaults_none(plugin):
     assert plugin.noise_floor_rms is None
     assert plugin.noise_floor_still_rms is None
     assert plugin.noise_floor_peak is None
+    assert plugin.noise_floor_speed is None
 
 
 def test_mangled_noise_floor_fails_config_parse(plr_config):
@@ -111,6 +114,21 @@ def test_mangled_noise_floor_fails_config_parse(plr_config):
     # error (klippy's standard message), not a mid-probe surprise.
     with pytest.raises(fake_klippy.FakeConfigError, match="noise_floor_rms"):
         plr.load_config(plr_config(options={"noise_floor_rms": "0"}))
+
+
+@pytest.mark.parametrize("bad", ["0", "-5"])
+def test_nonpositive_noise_floor_speed_rejected(plr_config, bad):
+    with pytest.raises(fake_klippy.FakeConfigError, match="noise_floor_speed"):
+        plr.load_config(plr_config(options={"noise_floor_speed": bad}))
+
+
+@pytest.mark.parametrize("bad", ["inf", "nan"])
+def test_non_finite_noise_floor_speed_rejected(plr_config, bad):
+    # getfloat's above=0.0 lets "inf" through, and "nan" fails every
+    # bound comparison silently — the explicit finiteness check must
+    # refuse both at config time.
+    with pytest.raises(fake_klippy.FakeConfigError, match="must be finite"):
+        plr.load_config(plr_config(options={"noise_floor_speed": bad}))
 
 
 def test_z_position_min_cached_from_good_sections(plugin):
