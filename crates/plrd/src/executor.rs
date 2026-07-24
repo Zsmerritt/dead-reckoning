@@ -98,11 +98,15 @@ pub const PROBE_TRIGGERED_EARLY: &str = "Probe triggered prior to movement";
 /// The exact Klipper error string for a probe that never triggered.
 pub const NO_TRIGGER_FULL_MOVEMENT: &str = "No trigger on probe after full movement";
 
-/// The `PLR_TOUCH` consensus-failure message prefix (mirrors
-/// Cartographer's `TouchError`, `probe/touch_mode.py:131-137`,
-/// "Unable to find N samples within ..."): the multi-touch sequence
-/// could not assemble an agreeing subset. Treated as a no-trigger.
-pub const TOUCH_CONSENSUS_FAILURE_PREFIX: &str = "Unable to find";
+/// A distinctive, stable substring of the `PLR_TOUCH` consensus-failure
+/// message (the plugin's `consensus_failure_text`,
+/// `klippy_plugin/plr/touch_sequence.py`, the `consensus_failure_text`
+/// "... failed: could not find N touches within ... in a sliding window
+/// of ..."): the multi-touch
+/// sequence could not assemble an agreeing subset. Treated as a
+/// no-trigger. Matched as a substring (`contains`), not a prefix, so
+/// klippy's own command-error wrapping does not defeat it.
+pub const TOUCH_CONSENSUS_FAILURE_MARKER: &str = "in a sliding window of";
 
 /// The exact Klipper error string for an out-of-range move.
 pub const MOVE_OUT_OF_RANGE: &str = "Move out of range";
@@ -132,7 +136,7 @@ impl StepFailure {
         if message.contains(PROBE_TRIGGERED_EARLY) {
             StepFailure::ProbeTriggeredEarly
         } else if message.contains(NO_TRIGGER_FULL_MOVEMENT)
-            || message.contains(TOUCH_CONSENSUS_FAILURE_PREFIX)
+            || message.contains(TOUCH_CONSENSUS_FAILURE_MARKER)
         {
             StepFailure::NoTrigger
         } else if message.contains(MOVE_OUT_OF_RANGE) {
@@ -930,7 +934,10 @@ pub(crate) mod tests {
                 "no-trigger",
             ),
             (
-                "Unable to find 3 samples within 0.010mm in a window of 5 after 7 touches",
+                // The plugin's real consensus-failure text
+                // (touch_sequence.py consensus_failure_text).
+                "PLR_TOUCH failed: could not find 3 touches within 0.010 mm of each \
+                 other in a sliding window of 5, after 10 touches.",
                 StepFailure::NoTrigger,
                 "no-trigger",
             ),
