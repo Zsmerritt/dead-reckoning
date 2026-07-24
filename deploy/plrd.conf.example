@@ -87,6 +87,45 @@ control_socket = /var/lib/plrd/plrd.sock
 # exist on the printer: it falls back to the stock single `PROBE
 # SAMPLES=1` (no consensus, no accel clamp). Adopt [plr] for the
 # consensus touch.
+#
+# RECOVERY-UX KEYS — these also live in printer.cfg's [plr] section (NOT
+# here), each parsed tolerantly and re-validated by plrd against a hard
+# band; an out-of-band value REFUSES recovery (never silently clamped):
+#   max_probe_nozzle_temp  hard ceiling for ANY contact op, C  [80,160] (150)
+#                          Clamps the probe band to
+#                          [probe_temp_min, min(probe_temp_max, this)];
+#                          an empty clamped band is refused. The probe AND
+#                          drag pre-checks (current + target temp) use it.
+#                          The drag path has NO warm minimum — cold
+#                          dragging is fine; a hot nozzle melts the part
+#                          and corrupts the accelerometer readings — so it
+#                          gates the ceiling only.
+#   pre_home_z_lift        Z lift added to the believed Z BEFORE XY homing,
+#                          mm, so the homing moves clear the part  (0,20] (5)
+#   reheat_park_x/y        nozzle park XY while reheating to print temps.
+#                          OPTIONAL: when unset, a point outside the part
+#                          bounding box (+10mm) is computed (clamped to the
+#                          axis limits) and a plan warning recommends
+#                          setting it explicitly.
+#   reheat_park_delta_z    Z lift above the current Z when parking, mm
+#                          (0,10] (2); Klipper's rail limit clamps the
+#                          absolute Z below position_max.
+#   purge_enable           purge before resuming (in the recovery file) (true)
+#   purge_amount           built-in purge extrusion length, mm  [0,50] (5)
+#   purge_macro            OPTIONAL macro to call instead of the built-in
+#                          purge, when that macro exists.
+#   clean_nozzle_macro     macro the clean-nozzle step calls when it exists
+#                          (default CLEAN_NOZZLE). When NO such macro
+#                          exists, that step emits no command and the plan
+#                          asks the operator to confirm the nozzle is clean.
+#
+# The recovery no longer seeks the original file with M26. It writes a
+# generated <original>_RECOVERY.gcode into the virtual_sdcard root and
+# selects it with M23/M24. That file reheats to print temperature, re-homes
+# XY, purges, does the entry moves, then streams the original's verbatim
+# tail — structured so no part-directed move can precede the blocking
+# M190/M109 heat waits (the heating gate).
+#
 # Recovery is REFUSED until every prerequisite validates; keys mirror
 # plr-recovery's MachineConfig (see crates/plrd/src/config.rs for the
 # full table). All attestations default to false: recovery must be

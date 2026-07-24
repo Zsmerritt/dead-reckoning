@@ -47,6 +47,7 @@ pub mod machine;
 pub mod plan;
 pub mod preflight;
 pub mod preheat;
+pub mod resume_file;
 
 pub use build::{
     plan_recovery, select_resume_target, ExcludeObjectDef, FallbackReason, PlanConfig, PlanInputs,
@@ -73,3 +74,7 @@ pub use preflight::{
     preflight_itinerary, BoundsViolation, ItineraryBounds, PlanRejection, ViolationKind,
 };
 pub use preheat::{derive_preheat, scan_file_temps, FileTemps, PreheatTargets};
+pub use resume_file::{
+    build_recovery_file, recovery_file_name, sanitize_name, verify_heating_gate,
+    GeneratedRecoveryFile, HeatingGateViolation, PurgeSpec, RecoveryFileSpec,
+};

@@ -31,6 +31,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::envelope::Envelope;
 use crate::error::RecoveryError;
+use crate::resume_file::RecoveryFileSpec;
 
 /// The placeholder substituted by the daemon with the computed true-Z
 /// value (see the module docs).
@@ -45,55 +46,72 @@ pub const TRUE_Z_PLACEHOLDER: &str = "{true_z}";
 /// substitutes the recorded value it captured before clamping.
 pub const RESTORE_ACCEL_PLACEHOLDER: &str = "{restore_accel}";
 
-/// Which §8 phase a step belongs to. The builder emits phases in
-/// exactly this declaration order; the ordering invariants
+/// Which phase a step belongs to. The builder emits phases in exactly
+/// this declaration order (the strict recovery-UX order that replaces
+/// the old §8 ordering); the ordering invariants
 /// ([`RecoveryPlan::idle_timeout_first`] and friends) verify it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum Phase {
-    /// §8.1a — disarm the idle timeout before anything else.
+    /// 1a — disarm the idle timeout before anything else.
     IdleTimeout,
-    /// §8.1b — energize the Z steppers (enabling never touches homed
+    /// 1b — energize the Z steppers (enabling never touches homed
     /// state; there is no M17 in Klipper).
     StepperEnable,
-    /// §8.2 — bed to target, nozzle to the warm-but-below-ooze band.
-    Preheat,
-    /// §8.3 — home XY only. Never bare `G28`, never Z.
+    /// 2 — the FIRST heating action: non-blocking `M140` (bed is the
+    /// long pole) plus a non-blocking `M104` toward the clamped probe
+    /// temperature. Convergence is gated later, at the probe's
+    /// `pre_verify`.
+    ImmediateBedHeat,
+    /// 3 — declare the conservative believed Z (upper bound of the
+    /// possible-stop set) then lift by `pre_home_z_lift` so the XY
+    /// homing moves cannot drag the nozzle across the part.
+    BelievedZDeclare,
+    /// 4 — home XY only (now AFTER the believed-Z lift). Never bare
+    /// `G28`, never Z.
     HomeXy,
-    /// §8.4 — freeze `z_thermal_adjust` before the shifted frame.
+    /// 5 — call the operator's clean-nozzle macro when it exists; when
+    /// it does not, emit no command and set
+    /// [`RecoveryPlan::requires_clean_nozzle_confirmation`].
+    CleanNozzle,
+    /// 6a — freeze `z_thermal_adjust` before the shifted frame.
     TransformFreeze,
-    /// §8.5a — declare the shifted frame (`SET_KINEMATIC_POSITION`).
+    /// 6b — declare the shifted frame (`SET_KINEMATIC_POSITION`).
     ShiftedFrame,
-    /// §8.5b — XY travel to the selected contact point.
+    /// 6c — XY travel to the selected contact point.
     ProbeApproach,
-    /// §8.5b′ — clamp `toolhead.max_accel` to the touch accel around the
+    /// 6c′ — clamp `toolhead.max_accel` to the touch accel around the
     /// consensus-touch phase (Cartographer `touch_mode.py:262-274`
     /// clamps `max_accel` before `z_probing_move` and restores it in a
     /// `finally`). Emitted only for the consensus `PLR_TOUCH` path
     /// (see [`crate::build`]); records the pre-clamp accel so the
     /// restore step and the abort cleanup can put it back.
     AccelClamp,
-    /// §8.5c — the probe (consensus `PLR_TOUCH`, or a single `PROBE`
+    /// 6d — the probe (consensus `PLR_TOUCH`, or a single `PROBE`
     /// on the legacy/load-cell path, or the ADXL drag staircase).
     Probe,
-    /// §8.5c′ — restore the pre-clamp `max_accel` on the success path
+    /// 6d′ — restore the pre-clamp `max_accel` on the success path
     /// (the abort path restores via the accel-clamp step's
     /// [`RecoveryStep::cleanup_commands`]). Present iff [`AccelClamp`]
     /// is.
     AccelRestore,
-    /// §8.6 — true-Z arithmetic and kinematic re-declaration.
+    /// 7a — true-Z arithmetic and kinematic re-declaration.
     TrueZDeclare,
-    /// §8.7 — load the bed-mesh profile (probe already done).
+    /// 7b — load the bed-mesh profile (probe already done).
     MeshLoad,
-    /// §8.8 — final true-frame declaration.
+    /// 7c — final true-frame declaration.
     FinalDeclare,
-    /// §8.9 — replay offsets, factors, modes, skew, temps, fans.
+    /// 8a — park the nozzle at the reheat park XY (configured or
+    /// computed) at the current Z plus `reheat_park_delta_z`, so the
+    /// print-temperature reheat (done inside the recovery file) never
+    /// dwells against the part.
+    ParkForReheat,
+    /// 8b — replay offsets, factors, modes, skew, fans (print
+    /// temperatures move into the recovery file).
     RestoreFrame,
-    /// §8.11 — entry move from above the part interior, prime.
-    Entry,
-    /// §8.12a — select the file, restore exclude-object state, seek.
-    FileSelect,
-    /// §8.12b — start playback (`M24`).
-    ResumeStart,
+    /// 9 — select the generated recovery file (`M23`) and start it
+    /// (`M24`). No `M26`: the recovery file already begins at the resume
+    /// boundary.
+    RecoveryFileSelect,
 }
 
 impl Phase {
@@ -103,8 +121,10 @@ impl Phase {
         match self {
             Phase::IdleTimeout => "idle-timeout",
             Phase::StepperEnable => "stepper-enable",
-            Phase::Preheat => "preheat",
+            Phase::ImmediateBedHeat => "immediate-bed-heat",
+            Phase::BelievedZDeclare => "believed-z-declare",
             Phase::HomeXy => "home-xy",
+            Phase::CleanNozzle => "clean-nozzle",
             Phase::TransformFreeze => "transform-freeze",
             Phase::ShiftedFrame => "shifted-frame",
             Phase::ProbeApproach => "probe-approach",
@@ -114,10 +134,9 @@ impl Phase {
             Phase::TrueZDeclare => "true-z-declare",
             Phase::MeshLoad => "mesh-load",
             Phase::FinalDeclare => "final-declare",
+            Phase::ParkForReheat => "park-for-reheat",
             Phase::RestoreFrame => "restore-frame",
-            Phase::Entry => "entry",
-            Phase::FileSelect => "file-select",
-            Phase::ResumeStart => "resume-start",
+            Phase::RecoveryFileSelect => "recovery-file-select",
         }
     }
 }
@@ -242,10 +261,15 @@ pub enum AbortReason {
     IdleTimeoutNotApplied,
     /// A Z stepper failed to enable.
     StepperEnableFailed,
-    /// Preheat targets were not reached.
-    PreheatFailed,
+    /// The immediate (non-blocking) bed/nozzle heat commands did not
+    /// take effect (their targets were not set).
+    ImmediateBedHeatFailed,
+    /// The believed-Z declaration or its pre-home lift failed.
+    BelievedZDeclareFailed,
     /// XY homing failed.
     HomingFailed,
+    /// The clean-nozzle macro call failed.
+    CleanNozzleFailed,
     /// `z_thermal_adjust` could not be frozen.
     TransformFreezeFailed,
     /// The shifted frame was not declared.
@@ -266,14 +290,12 @@ pub enum AbortReason {
     MeshLoadFailed,
     /// The final true-frame declaration failed.
     FinalDeclareFailed,
-    /// Frame/temperature restore failed.
+    /// Parking the nozzle for the print-temperature reheat failed.
+    ParkForReheatFailed,
+    /// Frame restore (offsets/factors/skew/fans) failed.
     RestoreFailed,
-    /// The entry move failed.
-    EntryFailed,
-    /// File selection / seek failed.
-    FileSelectFailed,
-    /// Playback did not start.
-    ResumeStartFailed,
+    /// Selecting or starting the recovery file failed.
+    RecoveryFileSelectFailed,
 }
 
 impl AbortReason {
@@ -283,8 +305,10 @@ impl AbortReason {
         match self {
             AbortReason::IdleTimeoutNotApplied => "idle-timeout-not-applied",
             AbortReason::StepperEnableFailed => "stepper-enable-failed",
-            AbortReason::PreheatFailed => "preheat-failed",
+            AbortReason::ImmediateBedHeatFailed => "immediate-bed-heat-failed",
+            AbortReason::BelievedZDeclareFailed => "believed-z-declare-failed",
             AbortReason::HomingFailed => "homing-failed",
+            AbortReason::CleanNozzleFailed => "clean-nozzle-failed",
             AbortReason::TransformFreezeFailed => "transform-freeze-failed",
             AbortReason::ShiftedFrameNotDeclared => "shifted-frame-not-declared",
             AbortReason::ApproachFailed => "approach-failed",
@@ -294,10 +318,9 @@ impl AbortReason {
             AbortReason::TrueZDeclareFailed => "true-z-declare-failed",
             AbortReason::MeshLoadFailed => "mesh-load-failed",
             AbortReason::FinalDeclareFailed => "final-declare-failed",
+            AbortReason::ParkForReheatFailed => "park-for-reheat-failed",
             AbortReason::RestoreFailed => "restore-failed",
-            AbortReason::EntryFailed => "entry-failed",
-            AbortReason::FileSelectFailed => "file-select-failed",
-            AbortReason::ResumeStartFailed => "resume-start-failed",
+            AbortReason::RecoveryFileSelectFailed => "recovery-file-select-failed",
         }
     }
 }
@@ -503,6 +526,13 @@ pub enum PlanWarning {
     /// No bed target was found in the WAL or the file; the bed is left
     /// unheated.
     NoBedTarget,
+    /// No `reheat_park_x`/`reheat_park_y` was configured, so the park
+    /// point was computed outside the part bounding box. Configure an
+    /// explicit park position to control where the nozzle reheats.
+    ReheatParkComputed {
+        /// The computed park point `[x, y]`, mm.
+        point: [f64; 2],
+    },
     /// The resume point is not on infill (the match did not allow an
     /// infill start).
     ResumeNotOnInfill,
@@ -542,6 +572,12 @@ impl PlanWarning {
             PlanWarning::NoBedTarget => {
                 "no bed target found in the WAL or the file; the bed is left unheated".to_owned()
             }
+            PlanWarning::ReheatParkComputed { point } => format!(
+                "no reheat_park_x/y configured; parking at computed ({}, {}) outside the part \
+                 bounding box — set an explicit park position",
+                fmt_num(point[0]),
+                fmt_num(point[1])
+            ),
             PlanWarning::ResumeNotOnInfill => {
                 "the resume point is not on infill; the seam may be visible".to_owned()
             }
@@ -566,13 +602,29 @@ impl PlanWarning {
 pub struct RecoveryPlan {
     /// The steps, in execution order.
     pub steps: Vec<RecoveryStep>,
-    /// The probe envelope and shifted-frame declaration behind §8
-    /// steps 5–6.
+    /// The probe envelope and shifted-frame declaration behind the probe
+    /// phase.
     pub envelope: Envelope,
-    /// Top-level filename passed to `M23`.
+    /// Top-level filename passed to `M23` — the GENERATED recovery file
+    /// (`<original_stem>_RECOVERY.gcode`), not the original print.
     pub resume_file: String,
-    /// Line-boundary byte offset passed to `M26 S`.
+    /// Line-boundary byte offset in the ORIGINAL file where the
+    /// generated recovery file's verbatim tail begins (consumed by the
+    /// recovery-file generator; no longer emitted as `M26 S`).
     pub resume_offset: u64,
+    /// `true` when no clean-nozzle macro exists on the machine, so the
+    /// clean-nozzle step carries no command: the wizard / plugin must
+    /// obtain the operator's confirmation that the nozzle is clean, and
+    /// the CLI `--execute` prompt must say so.
+    #[serde(default)]
+    pub requires_clean_nozzle_confirmation: bool,
+    /// The specification the daemon feeds to
+    /// [`crate::resume_file::build_recovery_file`] to emit the generated
+    /// recovery file (the file the final `M23` step selects). Carried in
+    /// the plan so the entry-move / temperature / park derivation lives
+    /// in one place.
+    #[serde(default)]
+    pub recovery_file: RecoveryFileSpec,
     /// Non-fatal observations.
     pub warnings: Vec<PlanWarning>,
 }
@@ -625,17 +677,32 @@ impl RecoveryPlan {
         first_motion.is_none_or(|m| enable < m)
     }
 
-    /// §8.2: the probe step itself pre-verifies the nozzle temperature
-    /// band (mandatory — no probe type has a temperature interlock).
+    /// The probe step itself pre-verifies the nozzle temperature ceiling
+    /// (mandatory — no probe type has a temperature interlock): the
+    /// current extruder temperature is bounded above (a warm band for
+    /// touch/`PROBE`, a bare ceiling for the drag path, which has no warm
+    /// minimum) AND the extruder TARGET is bounded above by the same
+    /// ceiling.
     #[must_use]
     pub fn temp_verify_precedes_probe(&self) -> bool {
         let Some(probe) = self.first_index(Phase::Probe) else {
             return false;
         };
-        self.steps[probe]
-            .pre_verify
-            .iter()
-            .any(|v| matches!(v.predicate, Predicate::TempWithin { .. }))
+        let pv = &self.steps[probe].pre_verify;
+        let current_bounded = pv.iter().any(|v| {
+            v.object == "extruder"
+                && v.field == "temperature"
+                && matches!(
+                    v.predicate,
+                    Predicate::TempWithin { .. } | Predicate::NumAtMost { .. }
+                )
+        });
+        let target_bounded = pv.iter().any(|v| {
+            v.object == "extruder"
+                && v.field == "target"
+                && matches!(v.predicate, Predicate::NumAtMost { .. })
+        });
+        current_bounded && target_bounded
     }
 
     /// §8.4: `z_thermal_adjust` is frozen before the shifted-frame
@@ -740,20 +807,83 @@ impl RecoveryPlan {
             .all(|c| first_word(c) != "G28")
     }
 
-    /// The `M26 S<byte>` offset actually present in the commands
-    /// (`None` when absent or malformed). Tests cross-check it against
-    /// [`Self::resume_offset`] and the line-boundary contract.
+    /// The first heating action is a `M140` (bed) sent before ANY
+    /// motion command: bed heating is the long pole, so it starts before
+    /// homing or any move (vacuously true when there is no bed target
+    /// and hence no `M140`, but then no motion may precede any other
+    /// heat command either — the immediate-bed-heat step still runs
+    /// first among heating).
     #[must_use]
-    pub fn m26_offset(&self) -> Option<u64> {
-        self.steps
+    pub fn bed_heat_precedes_motion(&self) -> bool {
+        let first_motion = self
+            .steps
             .iter()
-            .flat_map(|s| s.commands.iter())
-            .find(|c| first_word(c) == "M26")
-            .and_then(|c| {
-                c.split_whitespace()
-                    .find_map(|w| w.strip_prefix('S'))
-                    .and_then(|v| v.parse::<u64>().ok())
-            })
+            .position(|s| s.commands.iter().any(|c| is_motion_command(c)));
+        let first_m140 = self.steps.iter().position(|s| {
+            s.phase == Phase::ImmediateBedHeat && s.commands.iter().any(|c| first_word(c) == "M140")
+        });
+        match (first_m140, first_motion) {
+            // A bed target exists: its M140 must precede all motion.
+            (Some(heat), Some(motion)) => heat < motion,
+            // No motion at all, or no bed target (no M140): nothing to
+            // check — the immediate-bed-heat step is positioned before
+            // motion by construction.
+            _ => true,
+        }
+    }
+
+    /// The believed-Z declaration and its pre-home lift precede XY
+    /// homing (so the homing moves cannot drag the nozzle across the
+    /// part).
+    #[must_use]
+    pub fn believed_z_precedes_home_xy(&self) -> bool {
+        match (
+            self.first_index(Phase::BelievedZDeclare),
+            self.first_index(Phase::HomeXy),
+        ) {
+            (Some(believed), Some(home)) => believed < home,
+            (_, None) => true,
+            (None, Some(_)) => false,
+        }
+    }
+
+    /// The clean-nozzle step sits after XY homing and before the shifted
+    /// frame (so a physically-clean, homed nozzle enters the probe
+    /// phase).
+    #[must_use]
+    pub fn clean_nozzle_between_home_and_shifted(&self) -> bool {
+        let Some(clean) = self.first_index(Phase::CleanNozzle) else {
+            return false;
+        };
+        let after_home = self
+            .first_index(Phase::HomeXy)
+            .is_some_and(|home| home < clean);
+        let before_shifted = self
+            .first_index(Phase::ShiftedFrame)
+            .is_some_and(|shifted| clean < shifted);
+        after_home && before_shifted
+    }
+
+    /// The reheat park precedes the frame restore (park first, so the
+    /// restore/reheat never dwells against the part).
+    #[must_use]
+    pub fn park_precedes_restore(&self) -> bool {
+        match (
+            self.first_index(Phase::ParkForReheat),
+            self.first_index(Phase::RestoreFrame),
+        ) {
+            (Some(park), Some(restore)) => park < restore,
+            _ => false,
+        }
+    }
+
+    /// The recovery-file select (`M23`/`M24`) is the final step of the
+    /// plan.
+    #[must_use]
+    pub fn recovery_file_select_last(&self) -> bool {
+        self.steps
+            .last()
+            .is_some_and(|s| s.phase == Phase::RecoveryFileSelect)
     }
 
     /// Every step in `phase`, in order.
@@ -770,9 +900,14 @@ impl RecoveryPlan {
         out.push_str("# dead-reckoning recovery plan\n");
         let _ = writeln!(
             out,
-            "# resume: {} @ byte {}",
+            "# recovery file: {} (verbatim tail from original byte {})",
             self.resume_file, self.resume_offset
         );
+        if self.requires_clean_nozzle_confirmation {
+            out.push_str(
+                "# note: no clean-nozzle macro configured; confirm the nozzle is clean before executing\n",
+            );
+        }
         let p = self.envelope.params;
         match p.overshoot {
             crate::envelope::OvershootTerm::PostTriggerTravel { probe_speed } => {
@@ -958,8 +1093,14 @@ mod tests {
     #[test]
     fn phase_names_and_reason_codes_are_stable() {
         assert_eq!(Phase::IdleTimeout.name(), "idle-timeout");
-        assert_eq!(Phase::ResumeStart.name(), "resume-start");
+        assert_eq!(Phase::RecoveryFileSelect.name(), "recovery-file-select");
+        assert_eq!(Phase::ImmediateBedHeat.name(), "immediate-bed-heat");
+        assert_eq!(Phase::CleanNozzle.name(), "clean-nozzle");
         assert_eq!(AbortReason::ProbeNoTrigger.code(), "probe-no-trigger");
+        assert_eq!(
+            AbortReason::RecoveryFileSelectFailed.code(),
+            "recovery-file-select-failed"
+        );
     }
 
     #[test]

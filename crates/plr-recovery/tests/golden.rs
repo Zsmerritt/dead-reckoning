@@ -39,6 +39,8 @@ fn build_plan(
         model: &model,
         file_temps: FileTemps::default(),
         exclude_objects: &[],
+        clean_nozzle_macro_present: true,
+        purge_macro_present: false,
     };
     match plan_recovery(&inputs, &PlanConfig::default()) {
         Ok(PlanOutcome::Plan(plan)) => *plan,
@@ -60,6 +62,8 @@ fn clean_shutdown_produces_no_plan() {
         model: &model,
         file_temps: FileTemps::default(),
         exclude_objects: &[],
+        clean_nozzle_macro_present: true,
+        purge_macro_present: false,
     };
     assert_eq!(
         plan_recovery(&inputs, &PlanConfig::default()).unwrap(),
@@ -68,20 +72,23 @@ fn clean_shutdown_produces_no_plan() {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)] // one comprehensive golden assertion body
 fn normal_tap_recovery_matches_the_golden_plan() {
     let plan = build_plan(&machine_tap(), plain_transforms());
 
-    // §8 phase order, exact (no z_thermal_adjust, no mesh here). The
-    // default config uses the consensus PLR_TOUCH path, so the accel
-    // clamp/restore wrap the probe.
+    // Strict recovery-UX phase order, exact (no z_thermal_adjust, no
+    // mesh here). The default config uses the consensus PLR_TOUCH path,
+    // so the accel clamp/restore wrap the probe.
     let phases: Vec<Phase> = plan.steps.iter().map(|s| s.phase).collect();
     assert_eq!(
         phases,
         vec![
             Phase::IdleTimeout,
             Phase::StepperEnable,
-            Phase::Preheat,
+            Phase::ImmediateBedHeat,
+            Phase::BelievedZDeclare,
             Phase::HomeXy,
+            Phase::CleanNozzle,
             Phase::ShiftedFrame,
             Phase::ProbeApproach,
             Phase::AccelClamp,
@@ -89,10 +96,9 @@ fn normal_tap_recovery_matches_the_golden_plan() {
             Phase::AccelRestore,
             Phase::TrueZDeclare,
             Phase::FinalDeclare,
+            Phase::ParkForReheat,
             Phase::RestoreFrame,
-            Phase::Entry,
-            Phase::FileSelect,
-            Phase::ResumeStart,
+            Phase::RecoveryFileSelect,
         ]
     );
     // Ids are 1-based and sequential.
@@ -122,7 +128,7 @@ fn normal_tap_recovery_matches_the_golden_plan() {
     assert!((plan.envelope.envelope - 0.85).abs() < 1e-12);
     assert!((plan.envelope.shifted_declare_z - (-1.15)).abs() < 1e-12);
 
-    // Invariant accessors all hold.
+    // Invariant accessors all hold (old and new ordering guarantees).
     assert!(plan.idle_timeout_first());
     assert!(plan.steppers_enabled_before_motion());
     assert!(plan.temp_verify_precedes_probe());
@@ -130,29 +136,59 @@ fn normal_tap_recovery_matches_the_golden_plan() {
     assert!(plan.probe_step_precedes_mesh_load());
     assert!(plan.mesh_load_precedes_final_declare());
     assert!(plan.no_g28_after_shifted_declare());
-    assert_eq!(plan.m26_offset(), Some(plan.resume_offset));
+    assert!(plan.bed_heat_precedes_motion());
+    assert!(plan.believed_z_precedes_home_xy());
+    assert!(plan.clean_nozzle_between_home_and_shifted());
+    assert!(plan.park_precedes_restore());
+    assert!(plan.recovery_file_select_last());
     assert_eq!(plan.resume_offset, resume_offset());
-    assert_eq!(plan.resume_file, "part.gcode");
-
-    // The restore step lifts off the part (bounded relative Z, safe
-    // direction) BEFORE any print-temperature command: the nozzle must
-    // not dwell at print temperature pressed against the plastic.
-    let restore = plan
-        .steps_in_phase(Phase::RestoreFrame)
+    // The plan now selects the GENERATED recovery file, not the original.
+    assert_eq!(plan.resume_file, "part_RECOVERY.gcode");
+    assert_eq!(plan.recovery_file.source_name, "part.gcode");
+    assert_eq!(plan.recovery_file.name, "part_RECOVERY.gcode");
+    assert_eq!(plan.recovery_file.tail_offset, resume_offset());
+    // The default fixture has the clean-nozzle macro present, so no
+    // confirmation is required and the step calls the macro.
+    assert!(!plan.requires_clean_nozzle_confirmation);
+    let clean = plan
+        .steps_in_phase(Phase::CleanNozzle)
         .next()
-        .expect("restore step");
-    assert_eq!(restore.commands[0], "G91");
-    assert!(restore.commands[1].starts_with("G1 Z"));
-    assert_eq!(restore.commands[2], "G90");
-    let first_heat = restore
-        .commands
-        .iter()
-        .position(|c| c.starts_with("M104") || c.starts_with("M140"))
-        .expect("restore sets print temps");
+        .expect("clean-nozzle step");
+    assert_eq!(clean.commands, vec!["CLEAN_NOZZLE"]);
+
+    // The park step lifts off the part (bounded relative Z, safe
+    // direction) then travels to the reheat park XY: the print-temp
+    // reheat (in the file) must not dwell against the plastic. No print
+    // temperatures appear in the plan (they move into the recovery file).
+    let park = plan
+        .steps_in_phase(Phase::ParkForReheat)
+        .next()
+        .expect("park step");
+    assert_eq!(park.commands[0], "G91");
+    assert!(park.commands[1].starts_with("G1 Z"));
+    assert_eq!(park.commands[2], "G90");
+    assert!(park.commands[3].starts_with("G0 X"));
+    // The blocking heat waits (M109/M190) are the recovery file's
+    // heating gate — never in the plan. (The plan's ImmediateBedHeat
+    // does a NON-blocking M104 toward the probe temp, which is fine.)
     assert!(
-        first_heat > 2,
-        "lift must precede print-temperature restore"
+        !plan
+            .steps
+            .iter()
+            .flat_map(|s| s.commands.iter())
+            .any(|c| c.starts_with("M109") || c.starts_with("M190")),
+        "blocking heat waits must live in the recovery file, not the plan"
     );
+    // The recovery file itself carries the print-temperature reheat
+    // behind the heating gate.
+    let file = plr_recovery::build_recovery_file(
+        &plan.recovery_file,
+        common::MODEL_TEXT.as_bytes(),
+        "TEST-TS",
+    );
+    assert!(plr_recovery::verify_heating_gate(&file).is_ok());
+    assert!(file.content.contains("M109 S210"));
+    assert!(file.content.contains("M190 S60"));
 
     // The consensus Tap probe reads the plugin's consensus median.
     let probe_declare = plan
@@ -194,17 +230,18 @@ fn adxl_drag_recovery_matches_the_golden_plan() {
         vec![
             Phase::IdleTimeout,
             Phase::StepperEnable,
-            Phase::Preheat,
+            Phase::ImmediateBedHeat,
+            Phase::BelievedZDeclare,
             Phase::HomeXy,
+            Phase::CleanNozzle,
             Phase::ShiftedFrame,
             Phase::ProbeApproach,
             Phase::Probe,
             Phase::TrueZDeclare,
             Phase::FinalDeclare,
+            Phase::ParkForReheat,
             Phase::RestoreFrame,
-            Phase::Entry,
-            Phase::FileSelect,
-            Phase::ResumeStart,
+            Phase::RecoveryFileSelect,
         ]
     );
 
@@ -249,11 +286,20 @@ fn adxl_drag_recovery_matches_the_golden_plan() {
     };
     assert_eq!(formula.trigger_source, TriggerSource::DragResult);
 
+    // The drag path has NO warm minimum: cold dragging is fine, hot
+    // dragging melts the part — so the current-temperature gate is a
+    // bare ceiling (NumAtMost), not a warm band.
+    assert!(probe.pre_verify.iter().any(|v| v.object == "extruder"
+        && v.field == "temperature"
+        && matches!(v.predicate, plr_recovery::Predicate::NumAtMost { .. })));
+
     // Every structural invariant holds for the drag variant too.
     assert!(plan.idle_timeout_first());
     assert!(plan.steppers_enabled_before_motion());
     assert!(plan.no_g28_after_shifted_declare());
-    assert_eq!(plan.m26_offset(), Some(plan.resume_offset));
+    assert!(plan.bed_heat_precedes_motion());
+    assert!(plan.believed_z_precedes_home_xy());
+    assert!(plan.recovery_file_select_last());
 
     // Golden snapshot of the rendered form. Regenerate with
     // PLR_BLESS=1 after intentional changes.
@@ -354,6 +400,8 @@ fn drag_without_noise_floor_is_rejected_with_the_calibration_hint() {
         model: &model,
         file_temps: FileTemps::default(),
         exclude_objects: &[],
+        clean_nozzle_macro_present: true,
+        purge_macro_present: false,
     };
     let Err(RecoveryError::MachineRejected { failures }) =
         plan_recovery(&inputs, &PlanConfig::default())
@@ -418,6 +466,8 @@ fn legacy_single_probe_preserves_the_per_probe_readback() {
             model: &model,
             file_temps: FileTemps::default(),
             exclude_objects: &[],
+            clean_nozzle_macro_present: true,
+            purge_macro_present: false,
         };
         match plan_recovery(&inputs, &legacy) {
             Ok(PlanOutcome::Plan(plan)) => *plan,
@@ -473,6 +523,8 @@ fn hop_ambiguity_widens_the_envelope() {
             model: &model,
             file_temps: FileTemps::default(),
             exclude_objects: &[],
+            clean_nozzle_macro_present: true,
+            purge_macro_present: false,
         };
         match plan_recovery(&inputs, &PlanConfig::default()).unwrap() {
             PlanOutcome::Plan(plan) => envelopes.push(plan.envelope.envelope),
@@ -499,6 +551,8 @@ fn declined_contact_zone_degrades_to_typed_manual_fallback() {
         model: &model,
         file_temps: FileTemps::default(),
         exclude_objects: &[],
+        clean_nozzle_macro_present: true,
+        purge_macro_present: false,
     };
     let outcome = plan_recovery(&inputs, &PlanConfig::default()).unwrap();
     assert_eq!(
@@ -529,6 +583,8 @@ fn layer_only_match_degrades_to_typed_manual_fallback() {
         model: &model,
         file_temps: FileTemps::default(),
         exclude_objects: &[],
+        clean_nozzle_macro_present: true,
+        purge_macro_present: false,
     };
     let outcome = plan_recovery(&inputs, &PlanConfig::default()).unwrap();
     assert_eq!(
@@ -603,6 +659,8 @@ fn subdirectory_print_file_is_a_typed_error() {
         model: &model,
         file_temps: FileTemps::default(),
         exclude_objects: &[],
+        clean_nozzle_macro_present: true,
+        purge_macro_present: false,
     };
     assert!(matches!(
         plan_recovery(&inputs, &PlanConfig::default()),
@@ -627,6 +685,8 @@ fn machine_rejection_lists_every_failure() {
         model: &model,
         file_temps: FileTemps::default(),
         exclude_objects: &[],
+        clean_nozzle_macro_present: true,
+        purge_macro_present: false,
     };
     let Err(RecoveryError::MachineRejected { failures }) =
         plan_recovery(&inputs, &PlanConfig::default())
@@ -656,16 +716,21 @@ fn exclude_objects_are_restored_between_m23_and_m26() {
         model: &model,
         file_temps: FileTemps::default(),
         exclude_objects: &excludes,
+        clean_nozzle_macro_present: true,
+        purge_macro_present: false,
     };
     let PlanOutcome::Plan(plan) = plan_recovery(&inputs, &PlanConfig::default()).unwrap() else {
         panic!("expected plan");
     };
     let select = plan
-        .steps_in_phase(Phase::FileSelect)
+        .steps_in_phase(Phase::RecoveryFileSelect)
         .next()
-        .expect("file-select");
+        .expect("recovery-file-select");
     let commands = &select.commands;
+    // The recovery file is selected (not the original), exclude-object
+    // state is restored between M23 and M24, and there is no M26.
     let m23 = commands.iter().position(|c| c.starts_with("M23")).unwrap();
+    assert!(commands[m23].contains("_RECOVERY.gcode"));
     let define = commands
         .iter()
         .position(|c| c.starts_with("EXCLUDE_OBJECT_DEFINE NAME=cube_1"))
@@ -674,13 +739,175 @@ fn exclude_objects_are_restored_between_m23_and_m26() {
         .iter()
         .position(|c| c == "EXCLUDE_OBJECT NAME=cube_1")
         .unwrap();
-    let m26 = commands
-        .iter()
-        .position(|c| c.starts_with("M26 S"))
-        .unwrap();
-    assert!(m23 < define && define < exclude && exclude < m26);
+    let m24 = commands.iter().position(|c| c == "M24").unwrap();
+    assert!(m23 < define && define < exclude && exclude < m24);
+    assert!(!commands.iter().any(|c| c.starts_with("M26")));
     assert!(commands[define].contains("CENTER=50,50"));
     assert!(commands[define].contains("POLYGON=[[40,40],[60,40],[60,60],[40,60]]"));
+}
+
+#[test]
+fn recovery_file_matches_the_golden_and_holds_the_heating_gate() {
+    // The full generated recovery file for the normal_tap scenario: the
+    // header, the temps-at-park block, the re-home, the built-in purge,
+    // the entry moves, then the verbatim original tail.
+    let plan = build_plan(&machine_tap(), plain_transforms());
+    let file =
+        plr_recovery::build_recovery_file(&plan.recovery_file, common::MODEL_TEXT.as_bytes(), "TS");
+
+    // Heating gate: no XY move precedes the blocking waits; G28 X Y then
+    // entry follow.
+    assert!(plr_recovery::verify_heating_gate(&file).is_ok());
+
+    // The verbatim tail is byte-identical to the original from the
+    // matched offset.
+    assert_eq!(
+        &file.content.as_bytes()[file.tail_start..],
+        &common::MODEL_TEXT.as_bytes()[usize::try_from(plan.resume_offset).unwrap()..]
+    );
+
+    // Golden snapshot of the full file content.
+    let golden_path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/golden/recovery_file.gcode"
+    );
+    if std::env::var("PLR_BLESS").is_ok() {
+        std::fs::write(golden_path, &file.content).expect("write golden");
+    }
+    let golden = std::fs::read_to_string(golden_path).expect("golden file (run with PLR_BLESS=1)");
+    assert_eq!(file.content, golden.replace("\r\n", "\n"));
+}
+
+#[test]
+fn no_clean_nozzle_macro_requires_confirmation_and_emits_no_command() {
+    // With the clean-nozzle macro ABSENT the step carries no command and
+    // the plan flags that the operator must confirm the nozzle is clean.
+    let reconstruction = recovery(stop_set(&[0.4]), wal_context(plain_transforms()));
+    let contact = contact_at(0.4);
+    let match_result = match_at(resume_offset());
+    let model = model();
+    let inputs = PlanInputs {
+        machine: &machine_tap(),
+        reconstruction: &reconstruction,
+        contact: &contact,
+        match_result: &match_result,
+        model: &model,
+        file_temps: FileTemps::default(),
+        exclude_objects: &[],
+        clean_nozzle_macro_present: false,
+        purge_macro_present: false,
+    };
+    let PlanOutcome::Plan(plan) = plan_recovery(&inputs, &PlanConfig::default()).unwrap() else {
+        panic!("expected plan");
+    };
+    assert!(plan.requires_clean_nozzle_confirmation);
+    let clean = plan
+        .steps_in_phase(Phase::CleanNozzle)
+        .next()
+        .expect("clean-nozzle step");
+    assert!(clean.commands.is_empty());
+    assert!(plan
+        .render()
+        .contains("confirm the nozzle is clean before executing"));
+}
+
+#[test]
+fn configured_reheat_park_is_used_without_a_warning() {
+    let config = PlanConfig {
+        reheat_park_x: Some(5.0),
+        reheat_park_y: Some(7.0),
+        ..PlanConfig::default()
+    };
+    let reconstruction = recovery(stop_set(&[0.4]), wal_context(plain_transforms()));
+    let contact = contact_at(0.4);
+    let match_result = match_at(resume_offset());
+    let model = model();
+    let inputs = PlanInputs {
+        machine: &machine_tap(),
+        reconstruction: &reconstruction,
+        contact: &contact,
+        match_result: &match_result,
+        model: &model,
+        file_temps: FileTemps::default(),
+        exclude_objects: &[],
+        clean_nozzle_macro_present: true,
+        purge_macro_present: false,
+    };
+    let PlanOutcome::Plan(plan) = plan_recovery(&inputs, &config).unwrap() else {
+        panic!("expected plan");
+    };
+    let park = plan
+        .steps_in_phase(Phase::ParkForReheat)
+        .next()
+        .expect("park step");
+    assert!(park.commands.iter().any(|c| c == "G0 X5 Y7 F6000"));
+    assert!(!plan
+        .warnings
+        .iter()
+        .any(|w| matches!(w, plr_recovery::PlanWarning::ReheatParkComputed { .. })));
+}
+
+#[test]
+fn out_of_bounds_configured_park_is_refused_by_preflight() {
+    // A configured park outside the known axis limits is caught by the
+    // whole-itinerary pre-flight (the park step's absolute G0).
+    let mut machine = machine_tap();
+    machine.axis_limits = plr_recovery::AxisLimits {
+        x: Some((0.0, 200.0)),
+        y: Some((0.0, 200.0)),
+        z_max: Some(250.0),
+    };
+    let config = PlanConfig {
+        reheat_park_x: Some(9_999.0),
+        reheat_park_y: Some(10.0),
+        ..PlanConfig::default()
+    };
+    let reconstruction = recovery(stop_set(&[0.4]), wal_context(plain_transforms()));
+    let contact = contact_at(0.4);
+    let match_result = match_at(resume_offset());
+    let model = model();
+    let inputs = PlanInputs {
+        machine: &machine,
+        reconstruction: &reconstruction,
+        contact: &contact,
+        match_result: &match_result,
+        model: &model,
+        file_temps: FileTemps::default(),
+        exclude_objects: &[],
+        clean_nozzle_macro_present: true,
+        purge_macro_present: false,
+    };
+    assert!(matches!(
+        plan_recovery(&inputs, &config),
+        Err(RecoveryError::ItineraryRejected(_))
+    ));
+}
+
+#[test]
+fn empty_clamped_temp_band_is_refused() {
+    // A ceiling at/below probe_temp_min empties the clamped band.
+    let config = PlanConfig {
+        max_probe_nozzle_temp: 140.0, // == probe_temp_min → empty band
+        ..PlanConfig::default()
+    };
+    assert!(matches!(
+        config.validate(),
+        Err(RecoveryError::InvalidPlanConfig {
+            field: "max_probe_nozzle_temp"
+        })
+    ));
+    // A probe temp above the ceiling is refused too.
+    let config = PlanConfig {
+        max_probe_nozzle_temp: 145.0,
+        probe_nozzle_temp: 150.0,
+        ..PlanConfig::default()
+    };
+    assert!(matches!(
+        config.validate(),
+        Err(RecoveryError::InvalidPlanConfig {
+            field: "probe_nozzle_temp"
+        })
+    ));
 }
 
 #[test]

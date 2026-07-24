@@ -86,6 +86,14 @@ pub struct PlanBundle {
     pub file_path: String,
     /// The machine snapshot the plan was validated against.
     pub machine: MachineConfig,
+    /// The generated recovery-file content the executor writes into the
+    /// `virtual_sdcard` root before execution (the file the final `M23`
+    /// step selects). Empty only when the sdcard root is unknown (then
+    /// the plan cannot have been produced anyway).
+    pub recovery_file_content: String,
+    /// Absolute path the recovery-file content is written to (the sdcard
+    /// root joined with the collision-resolved recovery file name).
+    pub recovery_file_path: std::path::PathBuf,
 }
 
 /// Every outcome the pipeline can reach. Only `Plan` is executable.
@@ -185,7 +193,7 @@ pub fn run_pipeline(config: &Config, out: &mut dyn Write) -> Result<PipelineOutc
     // refusal is fatal for every mode. Which snapshot source applies
     // ([plr] live config vs legacy /etc/plrd.conf) is resolved here.
     let type_annotations = contains_type_annotations(file_bytes);
-    let (machine, plan_config, contact_config, legacy) =
+    let (machine, plan_config, contact_config, legacy, macros) =
         match machine_inputs(config, type_annotations, &mut say) {
             Ok(inputs) => inputs,
             Err(outcome) => return Ok(outcome),
@@ -208,6 +216,7 @@ pub fn run_pipeline(config: &Config, out: &mut dyn Write) -> Result<PipelineOutc
         &machine,
         &plan_config,
         &contact_config,
+        &macros,
         &file_path,
         file_bytes,
         &mut say,
@@ -221,7 +230,16 @@ fn machine_inputs(
     config: &Config,
     type_annotations: bool,
     say: &mut dyn FnMut(&str),
-) -> Result<(MachineConfig, PlanConfig, ContactConfig, bool), PipelineOutcome> {
+) -> Result<
+    (
+        MachineConfig,
+        PlanConfig,
+        ContactConfig,
+        bool,
+        std::collections::BTreeSet<String>,
+    ),
+    PipelineOutcome,
+> {
     match resolve_machine_source(config) {
         MachineSource::Unavailable { reason } => Err(PipelineOutcome::NotPossible(format!(
             "machine configuration unavailable: {reason}"
@@ -245,7 +263,10 @@ fn machine_inputs(
                 exclusion_radius: source.plr.exclusion_radius,
                 ..ContactConfig::default()
             };
-            Ok((machine, source.plr.plan_config(), contact, false))
+            // Macro existence for the clean-nozzle step and the purge
+            // fallback is resolved from the live config sections.
+            let macros = plrcfg::gcode_macro_names(&source.snapshot.settings);
+            Ok((machine, source.plr.plan_config(), contact, false, macros))
         }
         MachineSource::Legacy { note } => {
             say("pipeline: machine config from /etc/plrd.conf [machine] (legacy mode)");
@@ -266,7 +287,17 @@ fn machine_inputs(
                 legacy_single_probe: true,
                 ..PlanConfig::default()
             };
-            Ok((machine, plan_config, ContactConfig::default(), true))
+            // Legacy mode cannot see the running config's macro sections,
+            // so no clean-nozzle / purge macro is known (the recovery
+            // file falls back to the built-in purge, and the clean-nozzle
+            // step requires operator confirmation).
+            Ok((
+                machine,
+                plan_config,
+                ContactConfig::default(),
+                true,
+                std::collections::BTreeSet::new(),
+            ))
         }
     }
 }
@@ -415,11 +446,13 @@ pub(crate) fn report_machine_mode(config: &Config, out: &mut dyn Write) {
 
 /// The analysis half: model, match, contact, plan. Infallible in the
 /// `Result` sense — every failure is itself a typed outcome.
+#[allow(clippy::too_many_arguments)] // the analysis half threads several borrowed inputs
 fn plan_from_recovery(
     recovery: &RecoveryReconstruction,
     machine: &MachineConfig,
     plan_config: &PlanConfig,
     contact_config: &ContactConfig,
+    macros: &std::collections::BTreeSet<String>,
     file_path: &str,
     file_bytes: &[u8],
     say: &mut dyn FnMut(&str),
@@ -477,6 +510,15 @@ fn plan_from_recovery(
     let file_temps =
         plr_recovery::scan_file_temps(&file_bytes[base_usize..], base_offset, resume.offset);
 
+    // Clean-nozzle macro presence and the purge-macro fallback are
+    // resolved from the running config's [gcode_macro ...] sections.
+    let clean_nozzle_macro_present =
+        macros.contains(&plan_config.clean_nozzle_macro.to_ascii_uppercase());
+    let purge_macro_present = plan_config
+        .purge_macro
+        .as_deref()
+        .is_some_and(|m| macros.contains(&m.to_ascii_uppercase()));
+
     let reconstruction = Reconstruction::Recovery(Box::new(recovery.clone()));
     let plan_inputs = PlanInputs {
         machine,
@@ -486,19 +528,96 @@ fn plan_from_recovery(
         model: &model,
         file_temps,
         exclude_objects: &[],
+        clean_nozzle_macro_present,
+        purge_macro_present,
     };
     match plan_recovery(&plan_inputs, plan_config) {
         Ok(PlanOutcome::NoRecoveryNeeded) => PipelineOutcome::CleanShutdown,
         Ok(PlanOutcome::ManualFallback { reason }) => {
             PipelineOutcome::ManualFallback(format!("planner declined: {reason:?}"))
         }
-        Ok(PlanOutcome::Plan(plan)) => PipelineOutcome::Plan(Box::new(PlanBundle {
-            plan: *plan,
-            file_path: file_path.to_owned(),
-            machine: machine.clone(),
-        })),
+        Ok(PlanOutcome::Plan(plan)) => {
+            match finalize_recovery_file(*plan, machine, file_bytes, say) {
+                Ok(bundle) => PipelineOutcome::Plan(Box::new(PlanBundle {
+                    file_path: file_path.to_owned(),
+                    machine: machine.clone(),
+                    ..bundle
+                })),
+                Err(reason) => PipelineOutcome::NotPossible(reason),
+            }
+        }
         Err(e) => PipelineOutcome::NotPossible(format!("planning failed: {e}")),
     }
+}
+
+/// Resolves the recovery file's collision-free name against the sdcard
+/// root, patches the plan's `M23`/`resume_file`/spec to match, and
+/// generates the file CONTENT (not written yet — dry-run must not write).
+/// Returns a partly-filled [`PlanBundle`] (the caller fills `file_path`
+/// and `machine`).
+fn finalize_recovery_file(
+    mut plan: RecoveryPlan,
+    machine: &MachineConfig,
+    file_bytes: &[u8],
+    say: &mut dyn FnMut(&str),
+) -> Result<PlanBundle, String> {
+    let root = machine
+        .virtual_sdcard_root
+        .as_deref()
+        .ok_or_else(|| "virtual_sdcard root unknown; cannot place the recovery file".to_owned())?;
+    let root_path = std::path::Path::new(root.trim_end_matches(['/', '\\']));
+
+    // Existing top-level names in the sdcard root (best-effort: an
+    // unreadable dir just means no known collisions).
+    let taken: std::collections::BTreeSet<String> = std::fs::read_dir(root_path)
+        .into_iter()
+        .flatten()
+        .filter_map(Result::ok)
+        .filter_map(|e| e.file_name().into_string().ok())
+        .collect();
+
+    let resolved =
+        plr_recovery::recovery_file_name(&plan.recovery_file.source_name, &|n| taken.contains(n));
+    if resolved != plan.recovery_file.name {
+        say(&format!(
+            "pipeline: recovery file name collided; using {resolved}"
+        ));
+        // Patch every place the name appears so M23 matches the file.
+        for step in &mut plan.steps {
+            for command in &mut step.commands {
+                if let Some(rest) = command.strip_prefix("M23 ") {
+                    if rest == plan.recovery_file.name {
+                        *command = format!("M23 {resolved}");
+                    }
+                }
+            }
+        }
+        plan.recovery_file.name.clone_from(&resolved);
+        plan.resume_file = resolved;
+    }
+
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+        .to_string();
+    let generated = plr_recovery::build_recovery_file(&plan.recovery_file, file_bytes, &timestamp);
+
+    // The heating gate is a build-time invariant: refuse to proceed if it
+    // ever fails to hold (defense in depth over the generator).
+    if let Err(violation) = plr_recovery::verify_heating_gate(&generated) {
+        return Err(format!(
+            "generated recovery file violates the heating gate: {violation}"
+        ));
+    }
+
+    let recovery_file_path = root_path.join(&plan.recovery_file.name);
+    Ok(PlanBundle {
+        plan,
+        file_path: String::new(),
+        machine: machine.clone(),
+        recovery_file_content: generated.content,
+        recovery_file_path,
+    })
 }
 
 /// Selects the anchor context and replays the file into a layer model.
@@ -851,14 +970,23 @@ G1 X30 Y30 E1
         assert!(plan.no_g28_after_shifted_declare());
         // Resume targets the interrupted file at a line boundary at or
         // after the crash offset (skip-forward is the safe direction).
-        assert_eq!(plan.resume_file, "part.gcode");
+        // The plan now selects the GENERATED recovery file.
+        assert_eq!(plan.resume_file, "part_RECOVERY.gcode");
+        assert_eq!(plan.recovery_file.source_name, "part.gcode");
         assert!(
             plan.resume_offset >= crash_offset(),
             "resume {} before crash {}",
             plan.resume_offset,
             crash_offset()
         );
-        assert_eq!(plan.m26_offset(), Some(plan.resume_offset));
+        assert_eq!(plan.recovery_file.tail_offset, plan.resume_offset);
+        // The pipeline generated the recovery-file content and resolved
+        // its write path under the sdcard root.
+        assert!(bundle.recovery_file_content.contains("G28 X Y"));
+        assert!(bundle
+            .recovery_file_path
+            .to_string_lossy()
+            .ends_with("part_RECOVERY.gcode"));
         assert!(
             output.contains("machine prerequisites validated"),
             "{output}"

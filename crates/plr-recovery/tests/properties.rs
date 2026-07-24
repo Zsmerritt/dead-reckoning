@@ -230,6 +230,8 @@ fn build_scenario(s: &Scenario) -> RecoveryPlan {
         model: &model,
         file_temps: FileTemps::default(),
         exclude_objects: &excludes,
+        clean_nozzle_macro_present: true,
+        purge_macro_present: false,
     };
     match plan_recovery(&inputs, &config) {
         Ok(PlanOutcome::Plan(plan)) => *plan,
@@ -406,6 +408,15 @@ proptest! {
         prop_assert!(plan.probe_step_precedes_mesh_load());
         prop_assert!(plan.mesh_load_precedes_final_declare());
         prop_assert!(plan.no_g28_after_shifted_declare());
+        // New recovery-UX ordering guarantees:
+        // bed heat first (M140 before any G28/motion), believed-Z + lift
+        // before HomeXy, clean-nozzle between home and shifted frame,
+        // park before restore, file-select last.
+        prop_assert!(plan.bed_heat_precedes_motion());
+        prop_assert!(plan.believed_z_precedes_home_xy());
+        prop_assert!(plan.clean_nozzle_between_home_and_shifted());
+        prop_assert!(plan.park_precedes_restore());
+        prop_assert!(plan.recovery_file_select_last());
         // Accel clamp precedes the probe, restore follows on success,
         // and the clamp declares an abort cleanup — for every valid
         // plan (vacuously so on the drag path, which has no clamp).
@@ -426,11 +437,30 @@ proptest! {
         // Mesh step present exactly for a restorable (named) mesh.
         prop_assert_eq!(plan.first_index(Phase::MeshLoad).is_some(), s.mesh == 1);
 
-        // M26 offset: present, equals the plan's resume offset, and is
-        // a line boundary of the file.
-        let m26 = plan.m26_offset();
-        prop_assert_eq!(m26, Some(plan.resume_offset));
+        // The resume offset (the recovery file's verbatim-tail start) is
+        // a line boundary of the original file, and the recovery-file
+        // spec agrees with it.
         prop_assert!(line_starts().contains(&plan.resume_offset));
+        prop_assert_eq!(plan.recovery_file.tail_offset, plan.resume_offset);
+        prop_assert!(plan.resume_file.ends_with("_RECOVERY.gcode"));
+        prop_assert_eq!(&plan.recovery_file.name, &plan.resume_file);
+        // The clean-nozzle confirmation flag is the negation of macro
+        // presence (this generator always sets it present).
+        prop_assert!(!plan.requires_clean_nozzle_confirmation);
+
+        // Recovery-file generator over the fixture original: the heating
+        // gate always holds, and the verbatim tail is byte-identical to
+        // the original from the matched offset.
+        let file = plr_recovery::build_recovery_file(
+            &plan.recovery_file,
+            MODEL_TEXT.as_bytes(),
+            "TS",
+        );
+        prop_assert!(plr_recovery::verify_heating_gate(&file).is_ok());
+        prop_assert_eq!(
+            &file.content.as_bytes()[file.tail_start..],
+            &MODEL_TEXT.as_bytes()[usize::try_from(plan.resume_offset).unwrap()..]
+        );
 
         // Probe-phase Z bound: position_min <= Z <= shifted declare,
         // with the documented slack of 0.5e-5 mm — commands format
@@ -538,17 +568,16 @@ proptest! {
             approach.commands =
                 vec!["G90".to_owned(), format!("G0 X{} Y{} F6000", fmt_num(xw), fmt_num(yw))];
         } else {
-            // Inject an out-of-limit ABSOLUTE travel move into the entry
+            // Inject an out-of-limit ABSOLUTE travel move into the park
             // step (which runs in the absolute frame).
-            let entry = corrupted
+            let park = corrupted
                 .steps
                 .iter_mut()
-                .find(|st| st.phase == Phase::Entry)
-                .expect("entry step");
-            step_id = entry.id;
-            entry.commands.insert(0, "G90".to_owned());
-            entry
-                .commands
+                .find(|st| st.phase == Phase::ParkForReheat)
+                .expect("park step");
+            step_id = park.id;
+            park.commands.insert(0, "G90".to_owned());
+            park.commands
                 .push(format!("G1 {axis}{} F1200", fmt_num(bad)));
         }
 
@@ -630,6 +659,8 @@ proptest! {
             model: &model,
             file_temps: FileTemps::default(),
             exclude_objects: &excludes,
+            clean_nozzle_macro_present: true,
+            purge_macro_present: false,
         };
         // Must not panic; a produced plan must be finite everywhere.
         if let Ok(PlanOutcome::Plan(plan)) = plan_recovery(&inputs, &PlanConfig::default()) {
@@ -671,6 +702,8 @@ proptest! {
             model: &model,
             file_temps: FileTemps::default(),
             exclude_objects: &[],
+            clean_nozzle_macro_present: true,
+            purge_macro_present: false,
         };
         prop_assert!(plan_recovery(&inputs, &config).is_err());
     }

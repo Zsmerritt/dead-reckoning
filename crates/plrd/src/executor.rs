@@ -737,8 +737,10 @@ pub(crate) mod tests {
                 -2.0,
             )
             .expect("test envelope"),
-            resume_file: "x.gcode".to_owned(),
+            resume_file: "x_RECOVERY.gcode".to_owned(),
             resume_offset: 1234,
+            requires_clean_nozzle_confirmation: false,
+            recovery_file: plr_recovery::RecoveryFileSpec::default(),
             warnings: vec![],
         }
     }

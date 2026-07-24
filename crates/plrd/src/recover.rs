@@ -137,8 +137,10 @@ pub(crate) fn drive(
     );
 
     // Gate 1: dry run by default. This path provably cannot send: no
-    // Moonraker client is ever constructed on it.
+    // Moonraker client is ever constructed on it — and it MUST NOT write
+    // the recovery file (only a preview is rendered).
     if !options.execute {
+        preview_recovery_file(bundle, out);
         // A fresh dry run over a newly-generated plan clears any
         // frame-invalidation marker (deliverable 5): the operator is now
         // reviewing a fresh plan that re-establishes the frame from
@@ -301,6 +303,12 @@ pub(crate) async fn execute_with_gates(
     };
     let _ = writeln!(out, "recover: transcript: {}", transcript_path.display());
 
+    // WriteRecoveryFile phase gate (before step 1): a write failure
+    // aborts before any motion — no client has sent anything yet.
+    if !write_recovery_file(bundle, &mut transcript_file, out) {
+        return EXIT_RUNTIME;
+    }
+
     let mut gate_fn = |step: &plr_recovery::RecoveryStep| -> bool {
         let _ = writeln!(
             out,
@@ -394,6 +402,71 @@ fn record_frame_invalid(
     );
 }
 
+/// Renders the recovery-file preview for a DRY RUN: the target path, the
+/// total size, and the first ~40 lines. NEVER writes the file (dry-run is
+/// preview-only).
+fn preview_recovery_file(bundle: &PlanBundle, out: &mut (dyn Write + Send)) {
+    const PREVIEW_LINES: usize = 40;
+    let _ = writeln!(
+        out,
+        "recover: recovery file (NOT written in dry run): {} ({} bytes)",
+        bundle.recovery_file_path.display(),
+        bundle.recovery_file_content.len()
+    );
+    let _ = writeln!(
+        out,
+        "recover: --- recovery file preview (first {PREVIEW_LINES} lines) ---"
+    );
+    for line in bundle.recovery_file_content.lines().take(PREVIEW_LINES) {
+        let _ = writeln!(out, "  {line}");
+    }
+    let total = bundle.recovery_file_content.lines().count();
+    if total > PREVIEW_LINES {
+        let _ = writeln!(out, "  ... ({} more lines)", total - PREVIEW_LINES);
+    }
+    let _ = writeln!(out, "recover: --- end preview ---");
+}
+
+/// The `WriteRecoveryFile` phase gate: writes the generated recovery file
+/// into the sdcard root BEFORE any step runs (before step 1). A write
+/// failure aborts the recovery before any motion; the path is recorded in
+/// the transcript. Returns `false` on failure (the caller refuses).
+fn write_recovery_file(
+    bundle: &PlanBundle,
+    transcript_file: &mut std::fs::File,
+    out: &mut (dyn Write + Send),
+) -> bool {
+    match std::fs::write(&bundle.recovery_file_path, &bundle.recovery_file_content) {
+        Ok(()) => {
+            let _ = writeln!(
+                transcript_file,
+                "{}",
+                serde_json::json!({
+                    "event": "recovery-file-written",
+                    "path": bundle.recovery_file_path.display().to_string(),
+                    "bytes": bundle.recovery_file_content.len(),
+                })
+            );
+            let _ = transcript_file.flush();
+            let _ = writeln!(
+                out,
+                "recover: wrote recovery file {} ({} bytes)",
+                bundle.recovery_file_path.display(),
+                bundle.recovery_file_content.len()
+            );
+            true
+        }
+        Err(e) => {
+            let _ = writeln!(
+                out,
+                "recover: REFUSED — cannot write recovery file {}: {e}; nothing was sent.",
+                bundle.recovery_file_path.display()
+            );
+            false
+        }
+    }
+}
+
 /// Gate 4 predicate (see module docs for the exact fields, cited from
 /// Moonraker `printer.objects.query`).
 async fn printer_ready_and_idle(client: &mut MoonrakerClient) -> Result<(), String> {
@@ -454,11 +527,19 @@ mod tests {
     }
 
     fn plan_outcome() -> PipelineOutcome {
+        plan_outcome_in(&temp_wal_dir("recfile"))
+    }
+
+    /// A plan outcome whose recovery file is written under `dir` (so the
+    /// `WriteRecoveryFile` gate has a writable target during execute).
+    fn plan_outcome_in(dir: &std::path::Path) -> PipelineOutcome {
         let machine = machine_config(&crate::config::MachineSection::default(), true, None);
         PipelineOutcome::Plan(Box::new(PlanBundle {
             plan: test_plan(),
             file_path: "/g/x.gcode".to_owned(),
             machine,
+            recovery_file_content: "; recovery\nG28 X Y\n".to_owned(),
+            recovery_file_path: dir.join("x_RECOVERY.gcode"),
         }))
     }
 
@@ -638,6 +719,71 @@ mod tests {
     }
 
     #[test]
+    fn recovery_file_is_written_before_execution_and_recorded_in_the_transcript() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let fake = rt.block_on(FakeMoonraker::spawn(happy_handler));
+        let config = test_config("recwrite", &fake.url());
+        let rec_dir = temp_wal_dir("recwrite-sdcard");
+        let outcome = plan_outcome_in(&rec_dir);
+        let (code, output) = run_drive(&outcome, &config, &fast_recover(true, true, false), "y\n");
+        assert_eq!(code, crate::EXIT_OK, "{output}");
+        // The recovery file exists on disk with the generated content.
+        let written = std::fs::read_to_string(rec_dir.join("x_RECOVERY.gcode")).unwrap();
+        assert!(written.contains("G28 X Y"), "{written}");
+        // The transcript records the write, before any command.
+        let transcript = std::fs::read_dir(&config.wal_dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .find(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with("recovery-transcript-")
+            })
+            .expect("transcript");
+        let text = std::fs::read_to_string(transcript.path()).unwrap();
+        let write_at = text.find("recovery-file-written").expect("write event");
+        let first_send = text.find("\"send\"").expect("a send event");
+        assert!(
+            write_at < first_send,
+            "the recovery file must be written before any command is sent"
+        );
+        assert!(text.contains("x_RECOVERY.gcode"), "{text}");
+    }
+
+    #[test]
+    fn recovery_file_write_failure_aborts_before_any_gcode() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let fake = rt.block_on(FakeMoonraker::spawn(happy_handler));
+        let config = test_config("recfail", &fake.url());
+        // A recovery file path whose parent directory does not exist: the
+        // WriteRecoveryFile gate fails and the recovery aborts BEFORE any
+        // motion (zero gcode sent).
+        let machine = machine_config(&crate::config::MachineSection::default(), true, None);
+        let bundle = PlanBundle {
+            plan: test_plan(),
+            file_path: "/g/x.gcode".to_owned(),
+            machine,
+            recovery_file_content: "; recovery\nG28 X Y\n".to_owned(),
+            recovery_file_path: std::path::PathBuf::from(
+                "/nonexistent-plrd-dir-xyzzy/x_RECOVERY.gcode",
+            ),
+        };
+        let (code, output) = run_drive(
+            &PipelineOutcome::Plan(Box::new(bundle)),
+            &config,
+            &fast_recover(true, true, false),
+            "y\n",
+        );
+        assert_eq!(code, crate::EXIT_RUNTIME, "{output}");
+        assert!(output.contains("cannot write recovery file"), "{output}");
+        assert!(
+            fake.gcode_sent().is_empty(),
+            "a write failure must abort before any motion: {:?}",
+            fake.gcode_sent()
+        );
+    }
+
+    #[test]
     fn step_mode_gates_every_step_and_stops_on_no() {
         let rt = tokio::runtime::Runtime::new().unwrap();
         let fake = rt.block_on(FakeMoonraker::spawn(happy_handler));
@@ -755,9 +901,20 @@ mod tests {
         assert_eq!(code, crate::EXIT_OK, "{output}");
         assert!(output.contains("dead-reckoning recovery plan"), "{output}");
         assert!(output.contains("DRY RUN"), "{output}");
+        // The plan selects the generated recovery file (no M26 seek).
         assert!(
-            output.contains("M26 S"),
-            "plan must seek the file: {output}"
+            output.contains("M23 part_RECOVERY.gcode"),
+            "plan must select the recovery file: {output}"
+        );
+        assert!(!output.contains("M26 S"), "no M26 seek remains: {output}");
+        // The dry run PREVIEWS the recovery file but never writes it.
+        assert!(
+            output.contains("recovery file preview"),
+            "dry run must preview the recovery file: {output}"
+        );
+        assert!(
+            !dir.join("part_RECOVERY.gcode").exists(),
+            "dry run must NOT write the recovery file"
         );
         // Unreadable config path is a runtime error.
         let code = super::run_recover(
@@ -824,6 +981,8 @@ mod tests {
             plan,
             file_path: "/g/x.gcode".to_owned(),
             machine: machine_config(&crate::config::MachineSection::default(), true, None),
+            recovery_file_content: "; recovery\nG28 X Y\n".to_owned(),
+            recovery_file_path: config.wal_dir.join("x_RECOVERY.gcode"),
         };
         let opts = fast_recover(true, true, false);
         let mut out = Vec::new();

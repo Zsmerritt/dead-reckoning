@@ -446,8 +446,10 @@ mod tests {
                 bare_step(2, Phase::ProbeApproach, approach),
             ],
             envelope,
-            resume_file: "x.gcode".to_owned(),
+            resume_file: "x_RECOVERY.gcode".to_owned(),
             resume_offset: 0,
+            requires_clean_nozzle_confirmation: false,
+            recovery_file: crate::resume_file::RecoveryFileSpec::default(),
             warnings: vec![],
         }
     }
@@ -571,7 +573,7 @@ mod tests {
         );
         p.steps.push(bare_step(
             3,
-            Phase::Entry,
+            Phase::ParkForReheat,
             vec![
                 "G90".to_owned(),
                 "G0 X999 Y999 F1200".to_owned(),
@@ -601,7 +603,7 @@ mod tests {
         );
         p2.steps.push(bare_step(
             3,
-            Phase::Entry,
+            Phase::ParkForReheat,
             vec!["G90".to_owned(), "G1 Z9999 F1200".to_owned()],
         ));
         let Err(PlanRejection::ItineraryOutOfBounds { violations }) =
@@ -630,7 +632,7 @@ mod tests {
         );
         p.steps.push(bare_step(
             3,
-            Phase::Entry,
+            Phase::ParkForReheat,
             vec!["G90".to_owned(), "G0 X999 Y999 F1200".to_owned()],
         ));
         assert!(preflight_itinerary(&p, &b).is_ok());
@@ -715,7 +717,7 @@ mod tests {
         // non-literal: axis_literal returns None and it is skipped.
         p.steps.push(bare_step(
             5,
-            Phase::Entry,
+            Phase::ParkForReheat,
             vec!["G90".to_owned(), "G1 Z={true_z} F1200".to_owned()],
         ));
         assert!(preflight_itinerary(&p, &bounds()).is_ok());

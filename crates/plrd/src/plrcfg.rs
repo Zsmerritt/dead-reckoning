@@ -122,6 +122,25 @@ pub struct PlrSettings {
     pub exclusion_radius: f64,
     /// Entry-move feedrate, mm/min.
     pub entry_feedrate: f64,
+    /// FROZEN `max_probe_nozzle_temp` — hard ceiling for contact ops, °C.
+    pub max_probe_nozzle_temp: f64,
+    /// FROZEN `reheat_park_x` — nozzle park X while reheating (optional).
+    pub reheat_park_x: Option<f64>,
+    /// FROZEN `reheat_park_y` — nozzle park Y while reheating (optional).
+    pub reheat_park_y: Option<f64>,
+    /// FROZEN `reheat_park_delta_z` — Z lift above current Z for parking.
+    pub reheat_park_delta_z: f64,
+    /// FROZEN `pre_home_z_lift` — Z lift before XY homing, mm.
+    pub pre_home_z_lift: f64,
+    /// FROZEN `purge_enable` — whether the recovery file purges.
+    pub purge_enable: bool,
+    /// FROZEN `purge_amount` — built-in purge extrusion length, mm.
+    pub purge_amount: f64,
+    /// FROZEN `purge_macro` — optional macro to call instead of the
+    /// built-in purge.
+    pub purge_macro: Option<String>,
+    /// FROZEN `clean_nozzle_macro` — clean-nozzle macro name.
+    pub clean_nozzle_macro: String,
     /// Operator attestation autosaved by the plugin's `PLR_SETUP`.
     pub self_locking_z: bool,
     /// Autosaved probe resolution, mm; `None` before first calibration.
@@ -171,6 +190,22 @@ fn opt_f64(section: &Map<String, Value>, key: &str, default: f64) -> Result<f64,
 /// make an otherwise-valid `[plr]` section refuse.
 fn opt_stamp(section: &Map<String, Value>, key: &str) -> Option<String> {
     section.get(key).and_then(Value::as_str).map(str::to_owned)
+}
+
+/// Reads a defaulted boolean option (tolerant: absent → default).
+fn opt_bool(section: &Map<String, Value>, key: &str, default: bool) -> Result<bool, String> {
+    match section.get(key) {
+        None => Ok(default),
+        Some(v) => v
+            .as_bool()
+            .ok_or_else(|| format!("[plr] {key} is not a boolean: {v}")),
+    }
+}
+
+/// Reads an OPTIONAL float tolerantly: absent OR wrong-typed both yield
+/// `None` (these FROZEN keys are parsed tolerantly).
+fn opt_opt_f64(section: &Map<String, Value>, key: &str) -> Option<f64> {
+    section.get(key).and_then(Value::as_f64)
 }
 
 /// Reads a defaulted string option.
@@ -251,6 +286,22 @@ impl PlrSettings {
             touch_accel: opt_f64(plr, "touch_accel", d.touch_accel)?,
             exclusion_radius: opt_f64(plr, "exclusion_radius", 5.0)?,
             entry_feedrate: opt_f64(plr, "entry_feedrate", d.entry_feed)?,
+            // FROZEN recovery-UX keys — parsed tolerantly (defaults from
+            // the plan builder; optional floats absent-or-wrong-typed →
+            // None). Out-of-band values are refused later by
+            // PlanConfig::validate, not clamped here.
+            max_probe_nozzle_temp: opt_f64(plr, "max_probe_nozzle_temp", d.max_probe_nozzle_temp)?,
+            reheat_park_x: opt_opt_f64(plr, "reheat_park_x"),
+            reheat_park_y: opt_opt_f64(plr, "reheat_park_y"),
+            reheat_park_delta_z: opt_f64(plr, "reheat_park_delta_z", d.reheat_park_delta_z)?,
+            pre_home_z_lift: opt_f64(plr, "pre_home_z_lift", d.pre_home_z_lift)?,
+            purge_enable: opt_bool(plr, "purge_enable", d.purge_enable)?,
+            purge_amount: opt_f64(plr, "purge_amount", d.purge_amount)?,
+            purge_macro: match plr.get("purge_macro").and_then(Value::as_str) {
+                Some(s) if !s.trim().is_empty() => Some(s.trim().to_owned()),
+                _ => None,
+            },
+            clean_nozzle_macro: opt_str(plr, "clean_nozzle_macro", &d.clean_nozzle_macro)?,
             self_locking_z,
             probe_resolution,
             noise_floor,
@@ -296,12 +347,38 @@ impl PlrSettings {
             touch_sample_range: self.touch_sample_range,
             touch_retract: self.touch_retract,
             touch_accel: self.touch_accel,
+            // FROZEN recovery-UX keys.
+            max_probe_nozzle_temp: self.max_probe_nozzle_temp,
+            reheat_park_x: self.reheat_park_x,
+            reheat_park_y: self.reheat_park_y,
+            reheat_park_delta_z: self.reheat_park_delta_z,
+            pre_home_z_lift: self.pre_home_z_lift,
+            purge_enable: self.purge_enable,
+            purge_amount: self.purge_amount,
+            purge_macro: self.purge_macro.clone(),
+            clean_nozzle_macro: self.clean_nozzle_macro.clone(),
             // [plr] mode: the plugin (and its PLR_TOUCH command) is
             // present, so the consensus touch is used.
             legacy_single_probe: false,
             ..PlanConfig::default()
         }
     }
+}
+
+/// The set of `[gcode_macro <NAME>]` macro names present in the running
+/// config, uppercased. Klippy's config sections are `[gcode_macro NAME]`;
+/// `configfile.settings`/`config` lowercase the section name to
+/// `gcode_macro name` (`klippy/extras/gcode_macro.py` registers the
+/// object under the lowercased section name). plrd uppercases them back so a
+/// case-insensitive `macro_present(name)` check matches the operator's
+/// `clean_nozzle_macro` / `purge_macro` value.
+#[must_use]
+pub fn gcode_macro_names(sections: &Map<String, Value>) -> std::collections::BTreeSet<String> {
+    sections
+        .keys()
+        .filter_map(|name| name.strip_prefix("gcode_macro "))
+        .map(|n| n.trim().to_ascii_uppercase())
+        .collect()
 }
 
 // --- calibration fingerprinting --------------------------------------------
@@ -1199,6 +1276,70 @@ pub(crate) mod tests {
         assert!((config.entry_feed - 900.0).abs() < 1e-12);
         assert!((config.drag_z_step - 0.08).abs() < 1e-12);
         assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn plan_config_carries_the_frozen_recovery_ux_keys() {
+        let (_, plr) = parse_fixture(&[
+            ("max_probe_nozzle_temp", json!(155.0)),
+            ("reheat_park_x", json!(12.5)),
+            ("reheat_park_y", json!(30.0)),
+            ("reheat_park_delta_z", json!(3.0)),
+            ("pre_home_z_lift", json!(8.0)),
+            ("purge_enable", json!(false)),
+            ("purge_amount", json!(7.0)),
+            ("purge_macro", json!("MY_PURGE")),
+            ("clean_nozzle_macro", json!("WIPE_NOZZLE")),
+        ]);
+        assert!((plr.max_probe_nozzle_temp - 155.0).abs() < 1e-12);
+        assert!((plr.reheat_park_x.unwrap() - 12.5).abs() < 1e-12);
+        assert!((plr.reheat_park_y.unwrap() - 30.0).abs() < 1e-12);
+        assert!(!plr.purge_enable);
+        assert_eq!(plr.purge_macro.as_deref(), Some("MY_PURGE"));
+        assert_eq!(plr.clean_nozzle_macro, "WIPE_NOZZLE");
+        let config = plr.plan_config();
+        assert!((config.max_probe_nozzle_temp - 155.0).abs() < 1e-12);
+        assert!((config.reheat_park_x.unwrap() - 12.5).abs() < 1e-12);
+        assert!((config.reheat_park_delta_z - 3.0).abs() < 1e-12);
+        assert!((config.pre_home_z_lift - 8.0).abs() < 1e-12);
+        assert!(!config.purge_enable);
+        assert_eq!(config.purge_macro.as_deref(), Some("MY_PURGE"));
+        assert_eq!(config.clean_nozzle_macro, "WIPE_NOZZLE");
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn frozen_keys_default_and_parse_tolerantly() {
+        // Absent keys default to the plan-builder defaults; optional park
+        // coordinates absent → None.
+        let (_, plr) = parse_fixture(&[]);
+        assert!((plr.max_probe_nozzle_temp - 150.0).abs() < 1e-12);
+        assert_eq!(plr.reheat_park_x, None);
+        assert_eq!(plr.reheat_park_y, None);
+        assert!(plr.purge_enable);
+        assert_eq!(plr.purge_macro, None);
+        assert_eq!(plr.clean_nozzle_macro, "CLEAN_NOZZLE");
+        // A wrong-typed OPTIONAL park coordinate is tolerated as None.
+        let (_, plr) = parse_fixture(&[("reheat_park_x", json!("oops"))]);
+        assert_eq!(plr.reheat_park_x, None);
+        // An empty purge_macro string is treated as unset.
+        let (_, plr) = parse_fixture(&[("purge_macro", json!("  "))]);
+        assert_eq!(plr.purge_macro, None);
+    }
+
+    #[test]
+    fn gcode_macro_names_are_uppercased_from_lowercased_sections() {
+        use super::gcode_macro_names;
+        let sections = json!({
+            "gcode_macro clean_nozzle": {"gcode": "..."},
+            "gcode_macro my_purge": {"gcode": "..."},
+            "stepper_z": {"step_pin": "PB0"},
+        });
+        let names = gcode_macro_names(sections.as_object().unwrap());
+        assert!(names.contains("CLEAN_NOZZLE"));
+        assert!(names.contains("MY_PURGE"));
+        assert!(!names.contains("STEPPER_Z"));
+        assert_eq!(names.len(), 2);
     }
 
     #[test]

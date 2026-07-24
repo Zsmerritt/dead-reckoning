@@ -404,8 +404,19 @@ async fn cmd_recover_dryrun(state: &CtrlState) -> Value {
                     false,
                     format!("{}recover: {e}", String::from_utf8_lossy(&out)),
                     "error".to_owned(),
-                )
+                    // No plan: the clean-nozzle confirmation flag is
+                    // always present, and false when there is no plan.
+                    false,
+                );
             }
+        };
+        // The wizard reads `data.requires_clean_nozzle_confirmation` to
+        // decide whether to prompt "confirm the nozzle is clean". Emit it
+        // for every outcome (false unless a plan set it) so the field is
+        // always present and never ambiguous.
+        let requires_clean_nozzle_confirmation = match &outcome {
+            PipelineOutcome::Plan(bundle) => bundle.plan.requires_clean_nozzle_confirmation,
+            _ => false,
         };
         let options = RecoverOptions::new(false, false, false);
         let mut stdin = std::io::Cursor::new(Vec::new());
@@ -414,12 +425,21 @@ async fn cmd_recover_dryrun(state: &CtrlState) -> Value {
             code == EXIT_OK,
             String::from_utf8_lossy(&out).into_owned(),
             outcome_tag(&outcome).to_owned(),
+            requires_clean_nozzle_confirmation,
         )
     })
     .await;
     match result {
-        Ok((ok, text, outcome)) => {
-            json!({"ok": ok, "text": text, "data": {"outcome": outcome}})
+        Ok((ok, text, outcome, requires_clean_nozzle_confirmation)) => {
+            json!({
+                "ok": ok,
+                "text": text,
+                "data": {
+                    "outcome": outcome,
+                    // Top-level (not nested): the wizard reads it first.
+                    "requires_clean_nozzle_confirmation": requires_clean_nozzle_confirmation,
+                },
+            })
         }
         Err(e) => error_response("error", &format!("dry-run task failed: {e}")),
     }
@@ -705,10 +725,31 @@ mod tests {
         let response = roundtrip(&path, "{\"cmd\": \"recover_dryrun\"}\n").await;
         assert_eq!(response["ok"], json!(true), "{response}");
         assert_eq!(response["data"]["outcome"], json!("plan"));
+        // The wizard reads this top-level flag. The legacy fixture has no
+        // clean-nozzle macro, so the plan requires operator confirmation.
+        assert_eq!(
+            response["data"]["requires_clean_nozzle_confirmation"],
+            json!(true),
+            "{response}"
+        );
         let text = response["text"].as_str().unwrap();
         assert!(text.contains("dead-reckoning recovery plan"), "{text}");
         assert!(text.contains("DRY RUN"), "{text}");
         assert!(text.contains("nothing was sent"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn recover_dryrun_confirmation_flag_is_present_and_false_without_a_plan() {
+        // No WAL directory: the pipeline fails before producing a plan;
+        // the confirmation flag is still present in `data`, and false.
+        let (path, _state) = spawn_server("dryrun-noplan", Config::default());
+        let response = roundtrip(&path, "{\"cmd\": \"recover_dryrun\"}\n").await;
+        assert!(response["data"]["requires_clean_nozzle_confirmation"].is_boolean());
+        assert_eq!(
+            response["data"]["requires_clean_nozzle_confirmation"],
+            json!(false),
+            "{response}"
+        );
     }
 
     #[tokio::test]
