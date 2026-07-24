@@ -21,6 +21,7 @@ use plr_wal::{
     WalRecord, WalWriter,
 };
 use proptest::prelude::*;
+use proptest::test_runner::FileFailurePersistence;
 
 /// Finite floats only: the JSON payload encoding refuses NaN/infinity by
 /// design (the writer rejects them), so the round-trip domain is finite.
@@ -259,6 +260,19 @@ fn heartbeat_bits_equal(a: &Heartbeat, b: &Heartbeat) -> bool {
 }
 
 proptest! {
+    // Persist shrunk counterexamples to the checked-in file
+    // tests/proptests.proptest-regressions. The default
+    // (SourceParallel) cannot locate lib.rs/main.rs from an
+    // integration test and only works via a warning-emitting fallback;
+    // WithSource pins the exact same path explicitly so regressions
+    // are reliably replayed on every run.
+    #![proptest_config(ProptestConfig {
+        failure_persistence: Some(Box::new(FileFailurePersistence::WithSource(
+            "proptest-regressions",
+        ))),
+        ..ProptestConfig::default()
+    })]
+
     // Property 1: encode/decode round-trip for arbitrary record values.
     #[test]
     fn arbitrary_records_roundtrip_through_writer_and_scan(

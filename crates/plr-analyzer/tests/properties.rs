@@ -5,6 +5,7 @@
 #![allow(clippy::float_cmp)] // exact recomputation equality is intentional
 
 use proptest::prelude::*;
+use proptest::test_runner::FileFailurePersistence;
 
 use plr_analyzer::{
     build_layer_model, match_stop_point, select_contact_zone, ByteWindow, ContactConfig,
@@ -113,6 +114,19 @@ fn segment_strategy() -> impl Strategy<Value = XySegment> {
 }
 
 proptest! {
+    // Persist shrunk counterexamples to the checked-in file
+    // tests/properties.proptest-regressions. The default
+    // (SourceParallel) cannot locate lib.rs/main.rs from an
+    // integration test and only works via a warning-emitting fallback;
+    // WithSource pins the exact same path explicitly so regressions
+    // are reliably replayed on every run.
+    #![proptest_config(ProptestConfig {
+        failure_persistence: Some(Box::new(FileFailurePersistence::WithSource(
+            "proptest-regressions",
+        ))),
+        ..ProptestConfig::default()
+    })]
+
     /// The layer-model builder is total on arbitrary bytes and always
     /// produces internally consistent output.
     #[test]

@@ -14,6 +14,7 @@ use plr_wal::{
     TrapqSegment, VirtualSdState, WalRecord,
 };
 use proptest::prelude::*;
+use proptest::test_runner::FileFailurePersistence;
 
 /// Any f64 bit pattern: finite, subnormal, NaN, infinities.
 fn any_f64() -> impl Strategy<Value = f64> {
@@ -230,6 +231,19 @@ fn any_config() -> impl Strategy<Value = ReconstructConfig> {
 }
 
 proptest! {
+    // Persist shrunk counterexamples to the checked-in file
+    // tests/totality.proptest-regressions (case count stays
+    // env-overridable via ProptestConfig::default() / PROPTEST_CASES).
+    // The SourceParallel default cannot locate lib.rs/main.rs from an
+    // integration test and only works via a warning-emitting fallback;
+    // WithSource pins the exact same path explicitly.
+    #![proptest_config(ProptestConfig {
+        failure_persistence: Some(Box::new(FileFailurePersistence::WithSource(
+            "proptest-regressions",
+        ))),
+        ..ProptestConfig::default()
+    })]
+
     /// `reconstruct` is total: for any records (hostile floats
     /// included), any scan end, any heartbeat-file bytes, any file
     /// tail, and any configuration, it returns a `Result` — it never

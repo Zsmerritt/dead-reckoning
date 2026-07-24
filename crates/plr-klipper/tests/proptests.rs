@@ -4,6 +4,7 @@ use plr_klipper::{
     classify, ClockCorrelator, FrameEvent, FrameSplitter, ReceiveSeqWidener, SeqKind,
 };
 use proptest::prelude::*;
+use proptest::test_runner::FileFailurePersistence;
 
 /// Splits `bytes` into `pieces` chunks at the given fractional cut
 /// points, preserving order and content.
@@ -31,6 +32,19 @@ fn feed_all(splitter: &mut FrameSplitter, chunks: &[Vec<u8>]) -> Vec<FrameEvent>
 }
 
 proptest! {
+    // Persist shrunk counterexamples to the checked-in file
+    // tests/proptests.proptest-regressions. The default
+    // (SourceParallel) cannot locate lib.rs/main.rs from an
+    // integration test and only works via a warning-emitting fallback;
+    // WithSource pins the exact same path explicitly so regressions
+    // are reliably replayed on every run.
+    #![proptest_config(ProptestConfig {
+        failure_persistence: Some(Box::new(FileFailurePersistence::WithSource(
+            "proptest-regressions",
+        ))),
+        ..ProptestConfig::default()
+    })]
+
     /// The splitter is total: arbitrary bytes in arbitrary chunkings
     /// never panic, and buffered data respects the cap.
     #[test]

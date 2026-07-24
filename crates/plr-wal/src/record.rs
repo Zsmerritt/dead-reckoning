@@ -210,7 +210,12 @@ pub struct VirtualSdState {
 pub struct GcodeState {
     /// `M220` speed factor as a multiplier (Klipper reports 1.0 = 100%).
     pub speed_factor: f64,
-    /// Current requested feed rate, mm/s.
+    /// Current requested feed rate as `get_status` emits it:
+    /// `speed / speed_factor`, i.e. the raw G-code `F` value in
+    /// **mm/min at 100% factor** — NOT mm/s (Klipper's Status Reference
+    /// documents this field as mm/s; that is known-wrong). Recover the
+    /// internal mm/s speed with `speed * speed_factor / 60.0`, exactly
+    /// as `plr-reconstruct`'s anchor conversion does.
     pub speed: f64,
     /// `M221` extrude factor as a multiplier.
     pub extrude_factor: f64,
