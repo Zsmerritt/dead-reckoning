@@ -132,12 +132,12 @@ pub enum ExecOutcome {
 
 /// Transcript sink: JSON lines, flushed per entry.
 pub struct Transcript<'a> {
-    out: &'a mut dyn std::io::Write,
+    out: &'a mut (dyn std::io::Write + Send),
 }
 
 impl<'a> Transcript<'a> {
     /// Wraps a writer.
-    pub fn new(out: &'a mut dyn std::io::Write) -> Self {
+    pub fn new(out: &'a mut (dyn std::io::Write + Send)) -> Self {
         Self { out }
     }
 
@@ -156,7 +156,7 @@ pub async fn execute(
     plan: &RecoveryPlan,
     client: &mut MoonrakerClient,
     options: &ExecOptions,
-    gate: &mut dyn FnMut(&RecoveryStep) -> bool,
+    gate: &mut (dyn FnMut(&RecoveryStep) -> bool + Send),
     transcript: &mut Transcript<'_>,
 ) -> ExecOutcome {
     transcript.entry(&json!({
@@ -551,7 +551,7 @@ pub(crate) mod tests {
     async fn run(
         plan: &RecoveryPlan,
         fake: &FakeMoonraker,
-        gate: &mut dyn FnMut(&RecoveryStep) -> bool,
+        gate: &mut (dyn FnMut(&RecoveryStep) -> bool + Send),
     ) -> (ExecOutcome, String) {
         let mut client = MoonrakerClient::connect(&fake.url(), Duration::from_secs(5))
             .await

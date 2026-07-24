@@ -68,8 +68,8 @@ impl RecoverOptions {
 pub fn run_recover(
     config_path: &Path,
     options: &RecoverOptions,
-    stdin: &mut dyn BufRead,
-    out: &mut dyn Write,
+    stdin: &mut (dyn BufRead + Send),
+    out: &mut (dyn Write + Send),
 ) -> u8 {
     let config = match Config::load(config_path) {
         Ok(config) => config,
@@ -94,8 +94,8 @@ pub(crate) fn drive(
     outcome: &PipelineOutcome,
     config: &Config,
     options: &RecoverOptions,
-    stdin: &mut dyn BufRead,
-    out: &mut dyn Write,
+    stdin: &mut (dyn BufRead + Send),
+    out: &mut (dyn Write + Send),
 ) -> u8 {
     macro_rules! say {
         ($($arg:tt)*) => { let _ = writeln!(out, $($arg)*); };
@@ -187,19 +187,21 @@ pub(crate) fn drive(
 /// ([`AutoGate`]) — its consent is the request's explicit
 /// `confirm: true` flag, and per-step mode is rejected up front as
 /// CLI-only.
-pub(crate) trait StepGate {
+/// `Send` supertrait: the control socket drives this from a spawned
+/// task, so the whole execution future must be `Send`.
+pub(crate) trait StepGate: Send {
     /// Decides whether `step` may run; may write a prompt to `out`.
-    fn confirm(&mut self, step: &plr_recovery::RecoveryStep, out: &mut dyn Write) -> bool;
+    fn confirm(&mut self, step: &plr_recovery::RecoveryStep, out: &mut (dyn Write + Send)) -> bool;
 }
 
 /// The CLI gate: with `--step`, ask before every step.
 struct PromptGate<'a> {
-    stdin: &'a mut dyn BufRead,
+    stdin: &'a mut (dyn BufRead + Send),
     step_mode: bool,
 }
 
 impl StepGate for PromptGate<'_> {
-    fn confirm(&mut self, step: &plr_recovery::RecoveryStep, out: &mut dyn Write) -> bool {
+    fn confirm(&mut self, step: &plr_recovery::RecoveryStep, out: &mut (dyn Write + Send)) -> bool {
         if !self.step_mode {
             return true;
         }
@@ -215,7 +217,11 @@ impl StepGate for PromptGate<'_> {
 pub(crate) struct AutoGate;
 
 impl StepGate for AutoGate {
-    fn confirm(&mut self, _step: &plr_recovery::RecoveryStep, _out: &mut dyn Write) -> bool {
+    fn confirm(
+        &mut self,
+        _step: &plr_recovery::RecoveryStep,
+        _out: &mut (dyn Write + Send),
+    ) -> bool {
         true
     }
 }
@@ -230,7 +236,7 @@ pub(crate) async fn execute_with_gates(
     exec_options: &ExecOptions,
     connect_timeout: Duration,
     gate: &mut dyn StepGate,
-    out: &mut dyn Write,
+    out: &mut (dyn Write + Send),
 ) -> u8 {
     let mut client = match MoonrakerClient::connect(&config.moonraker_url, connect_timeout).await {
         Ok(client) => client,

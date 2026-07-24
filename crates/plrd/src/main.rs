@@ -150,10 +150,13 @@ fn run(command: &Command) -> u8 {
             step,
         } => {
             let options = recover::RecoverOptions::new(*execute, *confirm, *step);
-            let stdin = std::io::stdin();
-            let mut stdin_lock = stdin.lock();
+            // BufReader over Stdin (not StdinLock): the recover flow's
+            // prompt reader must be Send — the same signature the
+            // control socket's shared execution path requires — and
+            // StdinLock is deliberately not Send.
+            let mut stdin = std::io::BufReader::new(std::io::stdin());
             let mut stdout = std::io::stdout();
-            recover::run_recover(config, &options, &mut stdin_lock, &mut stdout)
+            recover::run_recover(config, &options, &mut stdin, &mut stdout)
         }
         Command::Run { config } => run_daemon(config),
         Command::CrashWriter { dir } => run_crash_writer(dir),
