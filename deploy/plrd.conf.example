@@ -1,0 +1,39 @@
+# plrd configuration — `key = value`, `#` comments. Unknown keys are
+# errors. Every value shown is the built-in default.
+
+# Klipper API Unix socket (klippy's -a flag; Moonraker installs usually
+# use /home/<user>/printer_data/comms/klippy.sock).
+klipper_socket = /tmp/klippy_uds
+
+# Where WAL segments, the heartbeat file, and the receive_seq sidecar
+# live. Must be on storage that survives power loss with the printer.
+wal_dir = /var/lib/plrd/wal
+
+# Heartbeat file path override (default: <wal_dir>/heartbeat.bin).
+#heartbeat_path = /var/lib/plrd/wal/heartbeat.bin
+
+# Z steppers to record committed-step history for (dump_stepper). Add
+# stepper_z1, stepper_z2, ... on multi-Z machines.
+z_steppers = stepper_z
+
+# Motion queues to record (dump_trapq).
+trapq_queues = toolhead,extruder
+
+# Heartbeat rewrite rate (Hz). Each rewrite is fdatasync'd.
+heartbeat_hz = 10
+
+# Batch fdatasync interval for motion records (ms). Markers and context
+# snapshots are always synced immediately.
+batch_sync_ms = 500
+
+# Open the heartbeat file O_DSYNC instead of fdatasync per rewrite
+# (same durability, one syscall instead of two).
+heartbeat_o_dsync = false
+
+# Rotate to a new WAL segment at this size (bytes).
+segment_rotate_bytes = 16777216
+
+# Bounded queue between the socket reader and the WAL thread. When the
+# disk stalls and it fills, motion records are dropped and the gap is
+# journaled as a SubscriptionGap marker.
+channel_capacity = 1024

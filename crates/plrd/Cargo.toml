@@ -9,16 +9,25 @@ repository.workspace = true
 publish = false
 
 [dependencies]
+plr-klipper = { path = "../plr-klipper" }
+plr-reconstruct = { path = "../plr-reconstruct" }
+plr-wal = { path = "../plr-wal" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
+# Reserved for the Moonraker recovery executor (see src/executor.rs); the
+# WebSocket client lands with the executor implementation.
 tokio-tungstenite = { workspace = true }
 
 # Durability syscalls (fdatasync, O_DSYNC) are Linux-only by design and are
-# never mocked; keep rustix off non-Linux builds entirely.
+# never mocked; keep rustix off non-Linux builds entirely. The `time`
+# feature adds CLOCK_MONOTONIC access (`clock_gettime`), needed so record
+# timestamps share a clock domain with Klipper's reactor `eventtime`
+# (which is `time.monotonic()`); this is a feature of an existing
+# workspace dependency, not a new dependency.
 [target.'cfg(target_os = "linux")'.dependencies]
-rustix = { workspace = true }
+rustix = { workspace = true, features = ["time"] }
 
 [lints]
 workspace = true
