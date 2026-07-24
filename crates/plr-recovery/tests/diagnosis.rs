@@ -16,11 +16,12 @@
 //! build by writing a diagnosis but forgets to exercise it here fails
 //! this test instead of silently shipping an unexercised arm.
 
-use plr_recovery::diagnosis::{Diagnose, Tier, UNSAFE_DRAG_TEMP_BELOW_FLOOR};
+use plr_recovery::diagnosis::{Diagnose, Tier};
 use plr_recovery::machine::PrereqFailure;
 use plr_recovery::preflight::{BoundsViolation, PlanRejection, ViolationKind};
 use plr_recovery::{
-    PlanConfig, PlanWarning, RecoveryError, ACCEL_MAX, ACCEL_MIN, UNSAFE_PURGE_Z_BELOW_BED,
+    PlanConfig, PlanWarning, RecoveryError, ACCEL_MAX, ACCEL_MIN, CONFIRM_TIMEOUT_MAX_S,
+    CONFIRM_TIMEOUT_MIN_S, UNSAFE_PURGE_Z_BELOW_BED,
 };
 
 /// Every [`RecoveryError`] variant, with the tier it must carry.
@@ -76,9 +77,10 @@ fn every_recovery_error() -> Vec<(RecoveryError, Tier)> {
         ),
         (RecoveryError::PurgeZBelowBed { purge_z: -0.4 }, Tier::Hard),
         (
-            RecoveryError::DragTempBelowFloor {
-                drag_nozzle_temp: 30.0,
-                floor: 50.0,
+            RecoveryError::ConfirmTimeoutOutOfRange {
+                value: 5.0,
+                min: CONFIRM_TIMEOUT_MIN_S,
+                max: CONFIRM_TIMEOUT_MAX_S,
             },
             Tier::Hard,
         ),
@@ -254,6 +256,17 @@ fn every_plan_warning() -> Vec<(PlanWarning, Tier)> {
             PlanWarning::AccelProbeIgnoredOnTouchPath { accel_probe: 500.0 },
             Tier::Advisory,
         ),
+        (
+            PlanWarning::DragTempBelowFloor {
+                drag_nozzle_temp: 30.0,
+                floor: 50.0,
+            },
+            Tier::Confirmable,
+        ),
+        (
+            PlanWarning::AccelEntryNotAppliedToFile { accel_entry: 600.0 },
+            Tier::Advisory,
+        ),
     ]
 }
 
@@ -331,11 +344,11 @@ fn every_prereq_failure_variant_yields_a_usable_diagnosis() {
 #[test]
 fn every_plan_warning_variant_yields_a_usable_diagnosis() {
     let all = every_plan_warning();
-    // 13 variants, two of which appear twice because their tier depends
+    // 15 variants, two of which appear twice because their tier depends
     // on the data they carry.
     assert_eq!(
         all.len(),
-        15,
+        17,
         "a PlanWarning variant was added or removed: exercise it here too"
     );
     for (warning, tier) in &all {
@@ -409,7 +422,7 @@ fn diagnosis_codes_are_unique_across_every_source() {
 }
 
 #[test]
-fn exactly_two_hard_diagnoses_carry_an_unsafe_override() {
+fn exactly_one_hard_diagnosis_carries_an_unsafe_override() {
     let mut overridable: Vec<(&'static str, &'static str)> = Vec::new();
     for (e, _) in every_recovery_error() {
         let d = e.diagnosis();
@@ -424,15 +437,22 @@ fn exactly_two_hard_diagnoses_carry_an_unsafe_override() {
             "no machine prerequisite may be overridden: {f:?}"
         );
     }
+    for (w, _) in every_plan_warning() {
+        assert_eq!(
+            w.diagnosis().override_key,
+            None,
+            "only a Hard diagnosis may name an UNSAFE_ key: {w:?}"
+        );
+    }
     overridable.sort_unstable();
     assert_eq!(
         overridable,
-        vec![
-            ("drag_temp_below_floor", UNSAFE_DRAG_TEMP_BELOW_FLOOR),
-            ("purge_z_below_bed", UNSAFE_PURGE_Z_BELOW_BED),
-        ],
-        "the set of runtime-unoverridable Hard refusals is a safety decision; \
-         changing it is a deliberate act, not a refactor"
+        vec![("purge_z_below_bed", UNSAFE_PURGE_Z_BELOW_BED)],
+        "EXACTLY ONE. The tier boundary is `Hard = physical damage or an unknowable \
+         machine state`, and a nozzle driven into the bed is the only consequence that \
+         clears it. Anything whose worst case is a bounded wait ending in a clean abort \
+         belongs in the Confirmable tier, where the operator gets a button instead of a \
+         config edit. Changing this set is a safety decision, not a refactor."
     );
 }
 
@@ -473,31 +493,80 @@ fn purge_z_below_bed_is_refused_and_only_the_unsafe_key_permits_it() {
     // And the key permits ONLY its own refusal: it does not become a
     // general-purpose bypass.
     let unrelated = PlanConfig {
-        drag_nozzle_temp: 30.0,
+        purge_speed: 5_000.0,
         unsafe_allow_purge_z_below_bed: true,
         ..PlanConfig::default()
     };
     assert!(matches!(
         unrelated.validate(),
-        Err(RecoveryError::DragTempBelowFloor { .. })
+        Err(RecoveryError::InvalidPlanConfig {
+            field: "purge_speed"
+        })
     ));
 }
 
+/// A sub-floor drag temperature is no longer a planning refusal at all —
+/// it is the Confirmable warning the builder raises on drag machines.
 #[test]
-fn drag_temp_below_floor_has_its_own_unsafe_key() {
-    let refused = PlanConfig {
+fn a_sub_floor_drag_temperature_is_not_a_planning_refusal() {
+    PlanConfig {
         drag_nozzle_temp: 30.0,
         ..PlanConfig::default()
-    };
-    let d = refused.validate().expect_err("must refuse").diagnosis();
-    assert_eq!(d.code, "drag_temp_below_floor");
-    assert_eq!(d.override_key, Some(UNSAFE_DRAG_TEMP_BELOW_FLOOR));
-    let permitted = PlanConfig {
+    }
+    .validate()
+    .expect("a bounded wait ending in a clean abort is Confirmable, not Hard");
+    let d = PlanWarning::DragTempBelowFloor {
         drag_nozzle_temp: 30.0,
-        unsafe_allow_drag_temp_below_floor: true,
-        ..PlanConfig::default()
-    };
-    permitted.validate().expect("the UNSAFE_ key permits it");
+        floor: 50.0,
+    }
+    .diagnosis();
+    assert_eq!(d.tier, Tier::Confirmable);
+    assert_eq!(d.override_key, None);
+    assert!(d.full().contains("answer `continue`"), "{}", d.full());
+}
+
+#[test]
+fn the_confirm_timeout_is_bounded_on_both_sides() {
+    for bad in [
+        CONFIRM_TIMEOUT_MIN_S - 1.0,
+        CONFIRM_TIMEOUT_MAX_S + 1.0,
+        0.0,
+        f64::NAN,
+        f64::INFINITY,
+    ] {
+        let error = PlanConfig {
+            confirm_timeout_s: Some(bad),
+            ..PlanConfig::default()
+        }
+        .validate()
+        .unwrap_err_or_panic(&format!("confirm_timeout_s = {bad} must refuse"));
+        assert!(
+            matches!(error, RecoveryError::ConfirmTimeoutOutOfRange { .. }),
+            "{bad}: {error:?}"
+        );
+        let d = error.diagnosis();
+        assert_eq!(d.code, "confirm_timeout_out_of_range");
+        assert_eq!(d.tier, Tier::Hard);
+        assert_eq!(d.override_key, None);
+        assert_eq!(
+            d.expected.as_ref().unwrap().min,
+            Some(CONFIRM_TIMEOUT_MIN_S)
+        );
+        assert_eq!(
+            d.expected.as_ref().unwrap().max,
+            Some(CONFIRM_TIMEOUT_MAX_S)
+        );
+    }
+    for ok in [CONFIRM_TIMEOUT_MIN_S, 600.0, CONFIRM_TIMEOUT_MAX_S] {
+        PlanConfig {
+            confirm_timeout_s: Some(ok),
+            ..PlanConfig::default()
+        }
+        .validate()
+        .unwrap_or_else(|e| panic!("{ok} must be accepted: {e:?}"));
+    }
+    // Absent is always fine: the daemon's default stays in force.
+    assert_eq!(PlanConfig::default().confirm_timeout_s, None);
 }
 
 /// A Hard refusal with `override_key: None` is refused no matter what
@@ -512,7 +581,6 @@ fn a_hard_refusal_without_an_override_cannot_be_permitted_at_all() {
         probe_temp_min: 148.0,
         max_probe_nozzle_temp: 150.0,
         unsafe_allow_purge_z_below_bed: true,
-        unsafe_allow_drag_temp_below_floor: true,
         ..PlanConfig::default()
     };
     let d = config.validate().expect_err("must refuse").diagnosis();

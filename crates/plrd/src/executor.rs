@@ -108,11 +108,14 @@ pub struct ExecOptions {
     pub temp_timeout: Duration,
     /// Poll interval.
     pub poll_interval: Duration,
-    /// How long a [`ConfirmPoint`] waits for an answer before it gives
-    /// up and aborts (see [`DEFAULT_CONFIRM_TIMEOUT`]).
+    /// Fallback deadline for a [`ConfirmPoint`], used when the plan
+    /// carries no [`RecoveryPlan::confirm_timeout_s`] of its own (see
+    /// [`DEFAULT_CONFIRM_TIMEOUT`]). The plan's value always wins: it is
+    /// the operator's `[plr]` setting, and this is only the daemon's
+    /// default.
     ///
     /// A blocking confirmer — the CLI's terminal prompt — cannot be
-    /// pre-empted by this: it holds its thread, so its bound is the
+    /// pre-empted by either: it holds its thread, so its bound is the
     /// operator standing in front of it. The bound exists for the
     /// control socket, where the client that asked to be consulted may
     /// simply go away.
@@ -545,7 +548,15 @@ pub async fn execute(
         transcript.entry(&json!({"event": "plan-complete", "steps": 0}));
         return ExecOutcome::Completed { steps: 0 };
     };
-    if let Some(cause) = preflight_confirmations(plan, anchor, options, confirmer, transcript).await
+    // The operator's `[plr]` confirm_timeout_s wins over the daemon's
+    // default; a plan that carries none keeps the default (which is what
+    // tests shrink).
+    let confirm_deadline = plan
+        .confirm_timeout_s
+        .filter(|s| s.is_finite() && *s > 0.0)
+        .map_or(options.confirm_timeout, Duration::from_secs_f64);
+    if let Some(cause) =
+        preflight_confirmations(plan, anchor, confirm_deadline, confirmer, transcript).await
     {
         return finish_abort(
             client, anchor, cause, &cleanups, accel, shifted_id, transcript,
@@ -574,7 +585,7 @@ pub async fn execute(
         // will be checked afterwards.
         if plan.debug_confirm_each_step {
             let point = step_debug_point(step);
-            if let Some(cause) = ask(&point, options, confirmer, transcript).await {
+            if let Some(cause) = ask(&point, confirm_deadline, confirmer, transcript).await {
                 return finish_abort(
                     client, step, cause, &cleanups, accel, shifted_id, transcript,
                 )
@@ -603,7 +614,7 @@ pub async fn execute(
         // the nozzle is already where the operator is being asked to look.
         if step.phase == Phase::ZConfirmStandoff {
             let point = z_confirm_point(client, plan, step, computed).await;
-            if let Some(cause) = ask(&point, options, confirmer, transcript).await {
+            if let Some(cause) = ask(&point, confirm_deadline, confirmer, transcript).await {
                 return finish_abort(
                     client, step, cause, &cleanups, accel, shifted_id, transcript,
                 )
@@ -622,7 +633,7 @@ pub async fn execute(
 async fn preflight_confirmations(
     plan: &RecoveryPlan,
     anchor: &RecoveryStep,
-    options: &ExecOptions,
+    deadline: Duration,
     confirmer: &mut dyn Confirmer,
     transcript: &mut Transcript<'_>,
 ) -> Option<StopCause> {
@@ -643,7 +654,7 @@ async fn preflight_confirmations(
                     diagnosis,
                     detail: json!({"raised_by": "pre-flight"}),
                 };
-                if let Some(cause) = ask(&point, options, confirmer, transcript).await {
+                if let Some(cause) = ask(&point, deadline, confirmer, transcript).await {
                     return Some(cause);
                 }
             }
@@ -657,7 +668,7 @@ async fn preflight_confirmations(
 /// answer in the transcript. `None` means "continue".
 async fn ask(
     point: &ConfirmPoint,
-    options: &ExecOptions,
+    deadline: Duration,
     confirmer: &mut dyn Confirmer,
     transcript: &mut Transcript<'_>,
 ) -> Option<StopCause> {
@@ -669,7 +680,7 @@ async fn ask(
         "diagnosis": point.diagnosis,
         "detail": point.detail,
     }));
-    let answer = tokio::time::timeout(options.confirm_timeout, confirmer.confirm(point))
+    let answer = tokio::time::timeout(deadline, confirmer.confirm(point))
         .await
         .unwrap_or(ConfirmAnswer::TimedOut);
     transcript.entry(&json!({
@@ -1315,6 +1326,7 @@ pub(crate) mod tests {
             requires_clean_nozzle_confirmation: false,
             recovery_file: plr_recovery::RecoveryFileSpec::default(),
             debug_confirm_each_step: false,
+            confirm_timeout_s: None,
             warnings: vec![],
         }
     }
@@ -2327,6 +2339,52 @@ pub(crate) mod tests {
             transcript.contains("\"frame_invalid\":true"),
             "{transcript}"
         );
+    }
+
+    /// The operator's `[plr]` `confirm_timeout_s` wins over the daemon's
+    /// default: somebody inspecting a Z standoff with a flashlight may
+    /// want longer than ten minutes, and a headless drill may want less.
+    #[tokio::test]
+    async fn the_plans_confirm_timeout_overrides_the_daemon_default() {
+        let mut plan = z_confirm_plan();
+        // A generous daemon default that the plan's own (tiny) value must
+        // beat — otherwise this test would hang for 60 s instead of
+        // timing out promptly.
+        plan.confirm_timeout_s = Some(0.05);
+        let options = ExecOptions {
+            confirm_timeout: Duration::from_mins(1),
+            ..fast_options()
+        };
+        let fake = FakeMoonraker::spawn(happy_handler).await;
+        let started = std::time::Instant::now();
+        let (outcome, transcript) =
+            run_with(&plan, &fake, &mut |_| true, &mut SilentConfirmer, &options).await;
+        let ExecOutcome::Aborted { reason, .. } = outcome else {
+            panic!("expected abort, got {outcome:?}");
+        };
+        assert_eq!(reason, "confirmation-timeout");
+        assert!(
+            started.elapsed() < Duration::from_secs(30),
+            "the plan's timeout must win over the daemon default"
+        );
+        assert!(
+            transcript.contains("\"answer\":\"timeout\""),
+            "{transcript}"
+        );
+
+        // With no plan value the daemon default applies, unchanged.
+        let mut defaulted = z_confirm_plan();
+        defaulted.confirm_timeout_s = None;
+        let fake = FakeMoonraker::spawn(happy_handler).await;
+        let (outcome, _) = run_with(
+            &defaulted,
+            &fake,
+            &mut |_| true,
+            &mut SilentConfirmer,
+            &fast_options(),
+        )
+        .await;
+        assert!(matches!(outcome, ExecOutcome::Aborted { .. }));
     }
 
     #[tokio::test]

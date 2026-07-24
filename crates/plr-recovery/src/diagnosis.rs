@@ -61,10 +61,13 @@ use crate::plan::fmt_num;
 /// the point — it is meant to be uncomfortable to type.
 pub const UNSAFE_PURGE_Z_BELOW_BED: &str = "UNSAFE_allow_purge_z_below_bed";
 
-/// The `[plr]` boolean that permits a nonzero `drag_nozzle_temp` below
-/// [`crate::build::DRAG_TEMP_FLOOR`] (see [`UNSAFE_PURGE_Z_BELOW_BED`]
-/// for the naming rationale).
-pub const UNSAFE_DRAG_TEMP_BELOW_FLOOR: &str = "UNSAFE_allow_drag_temp_below_floor";
+// There is deliberately exactly ONE `UNSAFE_` key. The tier boundary is
+// "Hard = physical damage or an unknowable machine state", and
+// `purge_z_below_bed` is the only refusal whose consequence is a nozzle
+// driven into the bed. Anything whose worst case is a bounded wait ending
+// in a clean abort belongs in the Confirmable tier, where the operator
+// gets an explanation and a button — which is what the whole diagnosis
+// framework exists to provide.
 
 /// What the daemon does with a [`Diagnosis`] (see the module docs).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -162,15 +165,10 @@ pub struct Diagnosis {
     /// would permit this anyway, or `None` when **nothing** may permit
     /// it.
     ///
-    /// Exactly two Hard diagnoses carry an override:
-    ///
-    /// * [`UNSAFE_PURGE_Z_BELOW_BED`] for `purge_z_below_bed` — the
-    ///   consequence is confined to the purge blob and the operator can
-    ///   see the geometry involved;
-    /// * [`UNSAFE_DRAG_TEMP_BELOW_FLOOR`] for `drag_temp_below_floor` —
-    ///   the consequence is a long wait, not a collision, and an
-    ///   operator on an open-frame machine in a cold room genuinely
-    ///   knows better than the floor does.
+    /// **Exactly one** Hard diagnosis carries an override:
+    /// [`UNSAFE_PURGE_Z_BELOW_BED`] for `purge_z_below_bed`. Its
+    /// consequence is confined to the purge blob, and the operator can
+    /// see the geometry involved — so a deliberate edit may permit it.
     ///
     /// Every other Hard diagnosis is `None`, because permitting it would
     /// mean commanding motion against an unknown or invalid Z frame
@@ -179,6 +177,11 @@ pub struct Diagnosis {
     /// commanding a temperature the Klipper plugin's own ceiling gate
     /// would refuse *after* the frame is declared — wedging the recovery
     /// in exactly the state it must never be left in.
+    ///
+    /// The set is small on purpose. A failure whose worst case is a
+    /// bounded wait ending in a clean abort is not Hard at all: it is
+    /// [`Tier::Confirmable`], where the operator gets the same
+    /// explanation and a button instead of a config edit.
     pub override_key: Option<&'static str>,
 }
 
@@ -531,31 +534,28 @@ impl Diagnose for crate::error::RecoveryError {
             .measured("purge_z", *purge_z, "mm")
             .expected("purge_z", Some(0.0), None, "mm")
             .overridable_by(UNSAFE_PURGE_Z_BELOW_BED),
-            E::DragTempBelowFloor {
-                drag_nozzle_temp,
-                floor,
-            } => Diagnosis::new(
-                "drag_temp_below_floor",
+            E::ConfirmTimeoutOutOfRange { value, min, max } => Diagnosis::new(
+                "confirm_timeout_out_of_range",
                 Tier::Hard,
                 format!(
-                    "drag_nozzle_temp {} C is below the {} C floor",
-                    fmt_num(*drag_nozzle_temp),
-                    fmt_num(*floor)
+                    "confirm_timeout_s is {} s, outside the permitted band",
+                    fmt_num(*value)
                 ),
-                "A nonzero drag temperature makes the plan WAIT for the nozzle to settle, \
-                 and on a PID hotend that includes waiting to COOL. On an enclosed or \
-                 heated-chamber printer a target at or below chamber ambient may never be \
-                 reached at all, burning the full 15-minute step timeout on every attempt.",
+                "This is how long a confirmation pause waits before giving up and aborting. \
+                 Set too short, a pause that asks you to walk to the printer and look at the \
+                 nozzle expires before you get there; set too long (or to zero, or to \
+                 infinity), an abandoned recovery sits paused with the heaters on and the \
+                 toolhead over the part indefinitely.",
                 format!(
-                    "Raise `drag_nozzle_temp` to at least {} C in printer.cfg's [plr] \
-                     section, or set it to exactly 0 for a deliberate cold drag (no \
-                     heating and no wait at all).",
-                    fmt_num(*floor)
+                    "Set `confirm_timeout_s` in printer.cfg's [plr] section to a value in \
+                     [{}, {}] seconds, or remove the key to use the {} s default.",
+                    fmt_num(*min),
+                    fmt_num(*max),
+                    fmt_num(crate::build::CONFIRM_TIMEOUT_DEFAULT_S)
                 ),
             )
-            .measured("drag_nozzle_temp", *drag_nozzle_temp, "C")
-            .expected("drag_nozzle_temp", Some(*floor), None, "C")
-            .overridable_by(UNSAFE_DRAG_TEMP_BELOW_FLOOR),
+            .measured("confirm_timeout_s", *value, "s")
+            .expected("confirm_timeout_s", Some(*min), Some(*max), "s"),
             E::MachineRejected { failures } => Diagnosis::new(
                 "machine_prerequisites_failed",
                 Tier::Hard,
@@ -1181,6 +1181,64 @@ impl Diagnose for crate::plan::PlanWarning {
                 Some(calibrated_at * 1.2),
                 "mm/s",
             ),
+            W::DragTempBelowFloor {
+                drag_nozzle_temp,
+                floor,
+            } => Diagnosis::new(
+                "drag_temp_below_floor",
+                // Confirmable, not Hard: trace the consequence. A sub-floor
+                // target makes the drag path's M109 wait for a cooldown that
+                // may never converge, and the executor's existing 15-minute
+                // step timeout then aborts — BEFORE the shifted-frame
+                // declare, so the abort is clean and the frame stays valid.
+                // The cost is wasted time, not a collision or an unknowable
+                // machine state, and that is exactly the profile this tier
+                // exists for: explain it and offer the button.
+                Tier::Confirmable,
+                format!(
+                    "drag_nozzle_temp {} C is below the {} C floor",
+                    fmt_num(*drag_nozzle_temp),
+                    fmt_num(*floor)
+                ),
+                "A nonzero drag temperature makes the plan WAIT for the nozzle to settle, \
+                 and on a PID hotend that includes waiting to COOL. On an enclosed or \
+                 heated-chamber printer a target at or below chamber ambient may never be \
+                 reached at all, burning the full 15-minute step timeout on every attempt. \
+                 On an open-frame machine in a cold room it is perfectly reachable — which \
+                 is why this asks rather than refuses. The wait happens before the Z frame \
+                 is declared, so if it does time out the abort is clean and you can simply \
+                 retry.",
+                format!(
+                    "If this machine really can reach {} C, continue. Otherwise raise \
+                     `drag_nozzle_temp` to at least {} C in printer.cfg's [plr] section, or \
+                     set it to exactly 0 for a deliberate cold drag (no heating and no wait \
+                     at all).",
+                    fmt_num(*drag_nozzle_temp),
+                    fmt_num(*floor)
+                ),
+            )
+            .measured("drag_nozzle_temp", *drag_nozzle_temp, "C")
+            .expected("drag_nozzle_temp", Some(*floor), None, "C"),
+            W::AccelEntryNotAppliedToFile { accel_entry } => Diagnosis::new(
+                "accel_entry_not_applied_to_file",
+                Tier::Advisory,
+                format!(
+                    "accel_entry ({} mm/s^2) is not applied to the recovery file's entry \
+                     moves: the machine's own max_accel is unknown",
+                    fmt_num(*accel_entry)
+                ),
+                "The recovery file has no runtime machinery, so a clamp written into it must \
+                 name the value to restore afterwards as a literal. Without the machine's \
+                 configured max_accel there is nothing to restore TO, and a clamp with no \
+                 restore would leave the printer at the recovery acceleration for the whole \
+                 remainder of the print. Skipping the clamp is the lesser harm; the \
+                 plan-level moves still honour accel_entry.",
+                "Adopt the [plr] section in printer.cfg so plrd reads the live config \
+                 (which carries [printer] max_accel). On the legacy /etc/plrd.conf \
+                 [machine] path this key cannot reach the generated file."
+                    .to_owned(),
+            )
+            .measured("accel_entry", *accel_entry, "mm/s^2"),
             W::UnsafeOverrideActive { key, permitted } => Diagnosis::new(
                 "unsafe_override_active",
                 Tier::Advisory,

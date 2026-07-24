@@ -236,6 +236,10 @@ pub fn machine_tap() -> MachineConfig {
         noise_floor: None,
         noise_floor_speed: None,
         axis_limits: plr_recovery::AxisLimits::default(),
+        // `[printer] max_accel`, as the [plr] path reads from the live
+        // config: the value the generated file restores after clamping
+        // its entry moves.
+        max_accel: Some(3_000.0),
     }
 }
 

@@ -179,6 +179,21 @@ pub struct RecoveryFileSpec {
     /// restore modes/feedrate), pre-built by the plan builder so the
     /// file and the old plan share one derivation.
     pub entry_commands: Vec<String>,
+    /// `(clamp, restore)` acceleration, mm/s², wrapped around the entry
+    /// moves: `[plr]` `accel_entry` and the machine's own configured
+    /// `max_accel`. `None` emits neither command.
+    ///
+    /// The entry moves live HERE, not in the plan — so these are the
+    /// commands that actually descend toward the part, and the one place
+    /// a low acceleration matters most. Both values are literals because
+    /// the generated file has no runtime-placeholder machinery.
+    ///
+    /// Both or neither, deliberately: a clamp this file could not undo
+    /// would govern the entire remaining print, which is worse than not
+    /// clamping. The plan builder only fills this in when it knows both
+    /// numbers, and warns when it does not.
+    #[serde(default)]
+    pub entry_accel: Option<(f64, f64)>,
     /// Cap on leading comment lines copied from the original file.
     pub header_cap: usize,
 }
@@ -362,10 +377,25 @@ pub fn build_recovery_file(
     }
 
     // (f) Entry moves (from above the part interior into the resume
-    // point), pre-built by the plan builder.
+    // point), pre-built by the plan builder — optionally wrapped in the
+    // `accel_entry` clamp.
+    //
+    // This is the near-part motion: the entry block descends toward the
+    // printed surface, so it is where a reduced acceleration earns its
+    // keep. The clamp is emitted AFTER the blocking M190/M109 above
+    // (`SET_VELOCITY_LIMIT` is not a motion command, so the heating gate
+    // is indifferent to it either way) and the restore is emitted
+    // unconditionally alongside it — including when the entry block is
+    // empty, so the pair can never be left half-applied.
+    if let Some((clamp, _)) = spec.entry_accel {
+        let _ = writeln!(pre, "SET_VELOCITY_LIMIT ACCEL={}", fmt_num(clamp));
+    }
     for command in &spec.entry_commands {
         pre.push_str(command);
         pre.push('\n');
+    }
+    if let Some((_, restore)) = spec.entry_accel {
+        let _ = writeln!(pre, "SET_VELOCITY_LIMIT ACCEL={}", fmt_num(restore));
     }
 
     // (g) The verbatim original tail, copied as raw BYTES (never
@@ -855,6 +885,7 @@ mod tests {
                 "G1 Z0.35 F1200".to_owned(),
                 "G1 F1800".to_owned(),
             ],
+            entry_accel: None,
             header_cap: 200,
         }
     }
@@ -1557,5 +1588,88 @@ mod tests {
         let file = build_recovery_file(&s, b"; h\nG1 X1\n", "TS");
         assert_eq!(file.tail_start, file.content.len());
         assert!(file.tail_bytes().is_empty());
+    }
+
+    /// The entry moves live in THIS file, so `accel_entry` has to be
+    /// applied here — the plan's phases never touch the motion that
+    /// actually descends toward the part.
+    #[test]
+    fn the_entry_accel_pair_wraps_the_entry_moves() {
+        let mut s = spec();
+        s.entry_accel = Some((600.0, 3_000.0));
+        let file = build_recovery_file(&s, b"", "TS");
+        let text = file.preamble_text().into_owned();
+        let lines: Vec<&str> = text.lines().collect();
+        let clamp = lines
+            .iter()
+            .position(|l| *l == "SET_VELOCITY_LIMIT ACCEL=600")
+            .expect("clamp");
+        let restore = lines
+            .iter()
+            .position(|l| *l == "SET_VELOCITY_LIMIT ACCEL=3000")
+            .expect("restore");
+        let first_entry = lines
+            .iter()
+            .position(|l| *l == "G0 Z1.35 F1200")
+            .expect("first entry move");
+        let last_entry = lines
+            .iter()
+            .position(|l| *l == "G1 F1800")
+            .expect("last entry move");
+        assert!(
+            clamp < first_entry,
+            "the clamp must precede the entry moves"
+        );
+        assert!(
+            last_entry < restore,
+            "the restore must follow the entry moves"
+        );
+        // The clamp comes AFTER the blocking heat waits, so the heating
+        // gate is untouched by it.
+        let m109 = lines
+            .iter()
+            .position(|l| l.starts_with("M109"))
+            .expect("M109");
+        assert!(m109 < clamp);
+        verify_heating_gate(&file, &s).expect("the heating gate still holds");
+    }
+
+    /// The pair is emitted as a PAIR, always. An entry block that happens
+    /// to be empty must not leave a clamp with no restore: that would
+    /// govern the whole remaining print.
+    #[test]
+    fn the_entry_accel_restore_is_emitted_even_with_no_entry_moves() {
+        let mut s = spec();
+        s.entry_commands = vec![];
+        s.entry_accel = Some((600.0, 3_000.0));
+        let text = build_recovery_file(&s, b"", "TS")
+            .preamble_text()
+            .into_owned();
+        let clamps: Vec<&str> = text
+            .lines()
+            .filter(|l| l.starts_with("SET_VELOCITY_LIMIT"))
+            .collect();
+        assert_eq!(
+            clamps,
+            vec![
+                "SET_VELOCITY_LIMIT ACCEL=600",
+                "SET_VELOCITY_LIMIT ACCEL=3000"
+            ],
+            "a clamp without its restore would outlive the recovery"
+        );
+    }
+
+    /// Unset: not a single byte of accel machinery in the file.
+    #[test]
+    fn no_entry_accel_emits_nothing() {
+        let s = spec();
+        assert_eq!(s.entry_accel, None);
+        let with_none = build_recovery_file(&s, b"", "TS");
+        assert!(!with_none.preamble_text().contains("SET_VELOCITY_LIMIT"));
+        // And the file is byte-identical to one built before the field
+        // existed (the field is `#[serde(default)]` and emits nothing).
+        let mut other = spec();
+        other.entry_accel = None;
+        assert_eq!(build_recovery_file(&other, b"", "TS"), with_none);
     }
 }

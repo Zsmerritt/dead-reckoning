@@ -183,10 +183,10 @@ pub struct PlrSettings {
     /// `UNSAFE_allow_purge_z_below_bed` — permits a `purge_z` below the
     /// bed surface (default `false`).
     pub unsafe_allow_purge_z_below_bed: bool,
-    /// `UNSAFE_allow_drag_temp_below_floor` — permits a nonzero
-    /// `drag_nozzle_temp` below the drag temperature floor (default
-    /// `false`).
-    pub unsafe_allow_drag_temp_below_floor: bool,
+    /// `confirm_timeout_s` — how long a confirm-point waits for an
+    /// answer before aborting cleanly, seconds. `None` uses the daemon
+    /// default.
+    pub confirm_timeout_s: Option<f64>,
     /// Operator attestation autosaved by the plugin's `PLR_SETUP`.
     pub self_locking_z: bool,
     /// Autosaved probe resolution, mm; `None` before first calibration.
@@ -389,10 +389,7 @@ impl PlrSettings {
                 plr,
                 plr_recovery::UNSAFE_PURGE_Z_BELOW_BED,
             ),
-            unsafe_allow_drag_temp_below_floor: unsafe_flag(
-                plr,
-                plr_recovery::UNSAFE_DRAG_TEMP_BELOW_FLOOR,
-            ),
+            confirm_timeout_s: opt_opt_f64(plr, "confirm_timeout_s"),
             self_locking_z,
             probe_resolution,
             noise_floor,
@@ -462,7 +459,7 @@ impl PlrSettings {
             confirm_z_before_resume: self.confirm_z_before_resume,
             debug_confirm_each_step: self.debug_confirm_each_step,
             unsafe_allow_purge_z_below_bed: self.unsafe_allow_purge_z_below_bed,
-            unsafe_allow_drag_temp_below_floor: self.unsafe_allow_drag_temp_below_floor,
+            confirm_timeout_s: self.confirm_timeout_s,
             // [plr] mode: the plugin (and its PLR_TOUCH command) is
             // present, so the consensus touch is used.
             legacy_single_probe: false,
@@ -988,6 +985,14 @@ pub fn machine_from_settings(
         noise_floor,
         noise_floor_speed: plr.noise_floor_speed,
         axis_limits,
+        // `[printer] max_accel` is a required Klipper option, so it is
+        // present here on every real machine. It exists in the snapshot
+        // for exactly one purpose: the generated recovery file restores
+        // it as a literal after clamping its entry moves to
+        // `accel_entry` (the file has no runtime-placeholder machinery).
+        max_accel: section("printer")
+            .and_then(|s| s.get("max_accel"))
+            .and_then(Value::as_f64),
     };
     (machine, notes)
 }
@@ -2109,7 +2114,7 @@ pub(crate) mod tests {
         assert!(!plr.confirm_z_before_resume);
         assert!(!plr.debug_confirm_each_step);
         assert!(!plr.unsafe_allow_purge_z_below_bed);
-        assert!(!plr.unsafe_allow_drag_temp_below_floor);
+        assert_eq!(plr.confirm_timeout_s, None);
         for value in [
             plr.recovery_accel,
             plr.accel_home,
@@ -2135,6 +2140,7 @@ pub(crate) mod tests {
             ("accel_travel", json!(3000.0)),
             ("accel_probe", json!(400.0)),
             ("accel_entry", json!(600.0)),
+            ("confirm_timeout_s", json!(120.0)),
         ]);
         let config = plr.plan_config();
         assert!(config.confirm_z_before_resume);
@@ -2144,6 +2150,7 @@ pub(crate) mod tests {
         assert_eq!(config.accel_travel, Some(3000.0));
         assert_eq!(config.accel_probe, Some(400.0));
         assert_eq!(config.accel_entry, Some(600.0));
+        assert_eq!(config.confirm_timeout_s, Some(120.0));
 
         // Out-of-band values are parsed, then REFUSED by validation with
         // the typed diagnosis — never silently clamped into range.
@@ -2160,7 +2167,7 @@ pub(crate) mod tests {
 
     #[test]
     fn unsafe_overrides_are_read_case_insensitively_and_fail_closed() {
-        use plr_recovery::{UNSAFE_DRAG_TEMP_BELOW_FLOOR, UNSAFE_PURGE_Z_BELOW_BED};
+        use plr_recovery::UNSAFE_PURGE_Z_BELOW_BED;
         // The operator writes the screaming spelling in printer.cfg;
         // klippy lowercases option names before they reach
         // configfile.settings. Both must be honoured, or a careful edit
@@ -2173,11 +2180,6 @@ pub(crate) mod tests {
             assert!(plr.unsafe_allow_purge_z_below_bed, "{key}");
             assert!(plr.plan_config().unsafe_allow_purge_z_below_bed, "{key}");
         }
-        let (_, plr) = parse_fixture(&[(
-            &UNSAFE_DRAG_TEMP_BELOW_FLOOR.to_ascii_lowercase(),
-            json!(true),
-        )]);
-        assert!(plr.unsafe_allow_drag_temp_below_floor);
 
         // Fail CLOSED: anything that is not literally `true` leaves the
         // refusal in force. A malformed override must never open a gate.

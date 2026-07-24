@@ -164,7 +164,15 @@ control_socket = /var/lib/plrd/plrd.sock
 #                          it may never reach. At 0 the plan emits no M104,
 #                          no M109 and no hold step at all; the contact
 #                          ceiling still applies. ***
-#                          *** FLOOR: a NONZERO value must be >= 50 C. ***
+#                          *** FLOOR: a NONZERO value below 50 C is
+#                          CONFIRMABLE, not refused. *** plrd explains the
+#                          trap below and offers "continue anyway": on an
+#                          open-frame machine in a cold room a 40 C target
+#                          is perfectly reachable, and the worst case if
+#                          it is not is a bounded wait ending in a CLEAN
+#                          abort (the hold runs before the Z frame is
+#                          declared), so this is your call to make, not
+#                          ours to veto.
 #                          THE CHAMBER-AMBIENT TRAP: a nonzero target makes
 #                          the plan WAIT (M109), and on a PID hotend that
 #                          includes waiting to COOL. On an enclosed or
@@ -272,12 +280,13 @@ control_socket = /var/lib/plrd/plrd.sock
 #
 #   CONFIRMABLE  Stops, explains, and offers "continue anyway". (A
 #                marginal contact zone, a stale calibration, a purge Z
-#                below the top of the part.) Answering happens over the
-#                control socket — the Klipper plugin's recovery prompts —
-#                so this is a CLICK, made while looking at the
-#                explanation. Callers that never asked to be consulted
-#                (`on_confirm` omitted or "abort") get an abort instead,
-#                which is what a non-interactive caller has always got.
+#                below the top of the part, a drag temperature below the
+#                floor.) Answering happens over the control socket — the
+#                Klipper plugin's recovery prompts — so this is a CLICK,
+#                made while looking at the explanation. Callers that
+#                never asked to be consulted (`on_confirm` omitted or
+#                "abort") get an abort instead, which is what a
+#                non-interactive caller has always got.
 #
 #   HARD         Refuses. The only way past a Hard refusal is a pre-set
 #                UNSAFE_-prefixed key below, edited in printer.cfg while
@@ -292,20 +301,20 @@ control_socket = /var/lib/plrd/plrd.sock
 # Confirmable; the things you should only wave through with a clear head
 # and a text editor are Hard.
 #
-# MOST HARD REFUSALS HAVE NO ESCAPE AT ALL. Exactly two keys exist, and
-# both are spelled to be uncomfortable to type:
+# The line between them is "does the worst case damage something or leave
+# the machine in a state nobody can vouch for?" A bounded wait that ends
+# in a clean abort is NOT Hard, however annoying — you get the
+# explanation and the button.
+#
+# ALMOST NO HARD REFUSAL HAS AN ESCAPE. Exactly ONE key exists, and it is
+# spelled to be uncomfortable to type:
 #
 #   UNSAFE_allow_purge_z_below_bed        (false)
-#                          Permits a negative purge_z. The consequence is
-#                          confined to the purge blob and you can see the
-#                          geometry involved — which is why this one may
-#                          be permitted at all.
-#   UNSAFE_allow_drag_temp_below_floor    (false)
-#                          Permits a nonzero drag_nozzle_temp below the
-#                          50 C floor. The consequence is a long wait, not
-#                          a collision, and an operator on an open-frame
-#                          machine in a cold room genuinely knows better
-#                          than the floor does.
+#                          Permits a negative purge_z — a nozzle driven
+#                          into the bed at print temperature. That is the
+#                          only refusal whose consequence is confined
+#                          enough, and visible enough to you in advance,
+#                          to be worth an escape hatch at all.
 #
 # Every OTHER Hard refusal — the machine prerequisites, a non-finite
 # number, an unknown Z span, an out-of-bounds itinerary, a temperature
@@ -352,9 +361,21 @@ control_socket = /var/lib/plrd/plrd.sock
 #   pause. Run the recovery through the Klipper plugin, which speaks the
 #   control socket's confirm protocol.
 #
-#   A pause is bounded: unanswered for 10 minutes, it aborts cleanly —
-#   with frame invalidation applied exactly as a decline at the same step
-#   would apply it, so a pause can never leave the frame ambiguous.
+#   confirm_timeout_s      (600) how long a pause waits for your answer
+#                          before it gives up and aborts cleanly. Band
+#                          [30, 3600] seconds; out-of-band REFUSES with a
+#                          diagnosis rather than clamping.
+#                          Raise it if you want time to walk to the
+#                          machine and inspect a Z standoff with a
+#                          flashlight; lower it for a headless or
+#                          unattended setup where a pause nobody will
+#                          answer should resolve quickly.
+#                          Timing out is not a failure mode to avoid at
+#                          all costs: it aborts cleanly, and abort is the
+#                          safe direction. Frame invalidation is applied
+#                          exactly as it would be for a decline at the
+#                          same step, so a pause can never leave the Z
+#                          frame ambiguous.
 #
 # ----------------------------------------------------------------------
 # ACCELERATION during recovery — all OPTIONAL, all [50, 20000] mm/s^2
@@ -380,9 +401,21 @@ control_socket = /var/lib/plrd/plrd.sock
 #                          diagnosis rather than letting two keys fight
 #                          over the one motion that must not be
 #                          over-driven.
-#   accel_entry            the moves made close to printed geometry: the
-#                          confirm_z_before_resume standoff and the
-#                          lift-and-park before the reheat.
+#   accel_entry            the moves made close to printed geometry —
+#                          INCLUDING the entry moves inside the generated
+#                          recovery file, which are the ones that
+#                          actually descend toward the part. It also
+#                          covers the confirm_z_before_resume standoff
+#                          and the lift-and-park before the reheat.
+#                          Inside the recovery file the clamp is written
+#                          as a literal pair (clamp before the entry
+#                          block, restore after it), because that file has
+#                          no runtime machinery. That needs your
+#                          [printer] max_accel to name in the restore, so
+#                          it works in [plr] mode; on the LEGACY [machine]
+#                          path plrd cannot see the running config, skips
+#                          the file-level clamp rather than leave one it
+#                          could not undo, and says so in the plan.
 #
 #   Setting ANY of them makes the plan record the machine's own max_accel
 #   first and put it back before the recovery file starts, so the resumed

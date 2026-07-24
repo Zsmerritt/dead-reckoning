@@ -805,6 +805,11 @@ pub(crate) fn machine_config(
         type_annotations_present,
         probes,
         z_position_min: section.z_position_min,
+        // The legacy path cannot see the running Klipper config, so
+        // `[printer] max_accel` is unknown here. That costs only the
+        // recovery FILE's entry-accel clamp (the plan warns when
+        // `accel_entry` is set and cannot be honoured there).
+        max_accel: None,
         config_hash: klipper_config_hash(klipper_config),
         validated_config_hash: section.validated_config_hash.clone(),
         virtual_sdcard_root: section.virtual_sdcard_root.clone(),

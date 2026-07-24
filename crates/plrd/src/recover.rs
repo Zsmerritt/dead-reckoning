@@ -405,10 +405,19 @@ fn record_frame_invalid(
         phase: phase.to_owned(),
         reason: reason.to_owned(),
     };
+    // A marker that could not be persisted must never read as success:
+    // the interlock is the only thing standing between the next
+    // `--execute` and an unknown Z frame, and if it is not on disk the
+    // operator is the interlock.
     if let Err(e) = crate::detect::write_frame_invalid(wal_dir, &marker) {
         let _ = writeln!(
             out,
-            "recover: WARNING — cannot write frame-invalid marker: {e}"
+            "recover: *** THE FRAME-INVALID INTERLOCK COULD NOT BE WRITTEN: {e} ***\n\
+             recover:     The Z frame is UNKNOWN but plrd cannot record that fact, so the \
+             next --execute will NOT be refused automatically. Do not resume until a fresh \
+             dry run has regenerated the plan. Fix the WAL directory ({}) first — it is \
+             unwritable, which also means no transcript of the next attempt.",
+            wal_dir.display()
         );
     }
     let _ = writeln!(

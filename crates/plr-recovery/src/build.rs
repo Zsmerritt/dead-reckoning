@@ -311,11 +311,35 @@ pub struct PlanConfig {
     /// [`crate::diagnosis::Tier::Hard`] refusal. Setting it raises
     /// [`PlanWarning::UnsafeOverrideActive`].
     pub unsafe_allow_purge_z_below_bed: bool,
-    /// `[plr]` key `UNSAFE_allow_drag_temp_below_floor` (see
-    /// [`crate::diagnosis::UNSAFE_DRAG_TEMP_BELOW_FLOOR`]) — permits a
-    /// nonzero `drag_nozzle_temp` below [`DRAG_TEMP_FLOOR`].
-    pub unsafe_allow_drag_temp_below_floor: bool,
+    /// `[plr]` key `confirm_timeout_s` — how long a confirm-point waits
+    /// for an operator's answer before aborting cleanly, seconds. `None`
+    /// leaves the daemon's [`CONFIRM_TIMEOUT_DEFAULT_S`] default.
+    ///
+    /// Range [[`CONFIRM_TIMEOUT_MIN_S`], [`CONFIRM_TIMEOUT_MAX_S`]]; an
+    /// out-of-band value is refused with
+    /// [`RecoveryError::ConfirmTimeoutOutOfRange`], never clamped.
+    pub confirm_timeout_s: Option<f64>,
 }
+
+/// Default [`PlanConfig::confirm_timeout_s`], seconds.
+///
+/// Long enough to walk to the printer, look at the nozzle, and walk back
+/// — which is exactly what a Z-height confirmation asks for.
+pub const CONFIRM_TIMEOUT_DEFAULT_S: f64 = 600.0;
+
+/// Lower bound for [`PlanConfig::confirm_timeout_s`], seconds.
+///
+/// Below half a minute a pause cannot survive the walk it exists to
+/// permit: the operator would be looking at the nozzle when the recovery
+/// gave up on them.
+pub const CONFIRM_TIMEOUT_MIN_S: f64 = 30.0;
+
+/// Upper bound for [`PlanConfig::confirm_timeout_s`], seconds.
+///
+/// An hour. Past that the bound stops being a bound: an abandoned
+/// recovery would sit paused with the heaters on and the toolhead over
+/// the part for as long as the number says.
+pub const CONFIRM_TIMEOUT_MAX_S: f64 = 3_600.0;
 
 /// Lower bound, mm/s², for every acceleration override
 /// ([`PlanConfig::recovery_accel`] and the per-phase `accel_*` keys).
@@ -506,7 +530,7 @@ impl Default for PlanConfig {
             confirm_z_before_resume: false,
             debug_confirm_each_step: false,
             unsafe_allow_purge_z_below_bed: false,
-            unsafe_allow_drag_temp_below_floor: false,
+            confirm_timeout_s: None,
         }
     }
 }
@@ -701,24 +725,28 @@ impl PlanConfig {
                 }
             }
         }
-        // A nonzero target below the floor means waiting for a passive
-        // cooldown that may never converge on a heated-chamber machine
-        // (see DRAG_TEMP_FLOOR). `0` — the cold-drag opt-out — is exempt
-        // precisely because it emits no wait at all.
+        // A nonzero drag target below DRAG_TEMP_FLOOR is NOT refused here.
+        // Its worst case is an M109 waiting for a cooldown that never
+        // converges, bounded by the executor's step timeout and aborting
+        // BEFORE the shifted-frame declare — wasted time and a clean
+        // abort, not damage or an unknowable frame. That is the
+        // Confirmable tier's job, so the builder raises
+        // `PlanWarning::DragTempBelowFloor` (on drag machines, where the
+        // key is actually read) and the operator gets an explanation and a
+        // button instead of a config edit.
         //
-        // The UNSAFE_ escape hatch applies here: the consequence is a long
-        // wait, not a collision, and an operator on an open-frame machine
-        // in a cold room genuinely knows better than the floor does. The
-        // permission is a deliberate printer.cfg edit, never a runtime
-        // button — and the plan says out loud that it is in force.
-        if self.drag_nozzle_temp > 0.0
-            && self.drag_nozzle_temp < DRAG_TEMP_FLOOR
-            && !self.unsafe_allow_drag_temp_below_floor
-        {
-            return Err(RecoveryError::DragTempBelowFloor {
-                drag_nozzle_temp: self.drag_nozzle_temp,
-                floor: DRAG_TEMP_FLOOR,
-            });
+        // Confirm-point timeout: bounded on both sides, refused rather
+        // than clamped, for the reasons on the two constants.
+        if let Some(seconds) = self.confirm_timeout_s {
+            if !seconds.is_finite()
+                || !(CONFIRM_TIMEOUT_MIN_S..=CONFIRM_TIMEOUT_MAX_S).contains(&seconds)
+            {
+                return Err(RecoveryError::ConfirmTimeoutOutOfRange {
+                    value: seconds,
+                    min: CONFIRM_TIMEOUT_MIN_S,
+                    max: CONFIRM_TIMEOUT_MAX_S,
+                });
+            }
         }
         // purge_z is the only raw operator-chosen ABSOLUTE Z in the
         // generated file, and that file runs in the TRUE frame where zero
@@ -2086,14 +2114,16 @@ fn noise_floor_speed_warning(
 }
 
 /// Warnings about the configuration itself: an `UNSAFE_` escape hatch in
-/// force, and an `accel_probe` this machine's probe path ignores.
+/// force, a sub-floor drag temperature, and keys this machine's probe
+/// path or config mode cannot honour.
 ///
-/// An override that fires silently is not an escape hatch, it is a
-/// booby trap: whoever set it may not be the person standing at the
-/// printer now. Both warnings are [`crate::diagnosis::Tier::Advisory`] —
-/// the deliberate `printer.cfg` edit WAS the confirmation, so demanding a
-/// second one at the worst possible moment would defeat the design.
-fn config_override_warnings(machine: &ValidatedMachine, cfg: &PlanConfig) -> Vec<PlanWarning> {
+/// An override that fires silently is not an escape hatch, it is a booby
+/// trap: whoever set it may not be the person standing at the printer
+/// now. The `UNSAFE_` warning is
+/// [`crate::diagnosis::Tier::Advisory`] — the deliberate `printer.cfg`
+/// edit WAS the confirmation, so demanding a second one at the worst
+/// possible moment would defeat the design.
+fn config_warnings(machine: &ValidatedMachine, cfg: &PlanConfig) -> Vec<PlanWarning> {
     let mut out = Vec::new();
     if cfg.unsafe_allow_purge_z_below_bed && cfg.purge_z.is_some_and(|z| z.is_finite() && z < 0.0) {
         out.push(PlanWarning::UnsafeOverrideActive {
@@ -2101,13 +2131,16 @@ fn config_override_warnings(machine: &ValidatedMachine, cfg: &PlanConfig) -> Vec
             permitted: "purge_z_below_bed".to_owned(),
         });
     }
-    if cfg.unsafe_allow_drag_temp_below_floor
+    // Only on a machine that actually drags: on Tap / load-cell the key is
+    // never read, and pausing a recovery to ask about an inert setting is
+    // precisely the pointless obstruction this framework removes.
+    if matches!(machine.probe.kind, ProbeKind::AdxlDrag { .. })
         && cfg.drag_nozzle_temp > 0.0
         && cfg.drag_nozzle_temp < DRAG_TEMP_FLOOR
     {
-        out.push(PlanWarning::UnsafeOverrideActive {
-            key: crate::diagnosis::UNSAFE_DRAG_TEMP_BELOW_FLOOR.to_owned(),
-            permitted: "drag_temp_below_floor".to_owned(),
+        out.push(PlanWarning::DragTempBelowFloor {
+            drag_nozzle_temp: cfg.drag_nozzle_temp,
+            floor: DRAG_TEMP_FLOOR,
         });
     }
     if let Some(accel_probe) = cfg.accel_probe {
@@ -2115,7 +2148,32 @@ fn config_override_warnings(machine: &ValidatedMachine, cfg: &PlanConfig) -> Vec
             out.push(PlanWarning::AccelProbeIgnoredOnTouchPath { accel_probe });
         }
     }
+    // The generated file can only carry an accel clamp if it can also name
+    // the value to restore afterwards (see `entry_accel_pair`).
+    if let Some(accel_entry) = cfg.accel_entry {
+        if machine.max_accel.is_none() {
+            out.push(PlanWarning::AccelEntryNotAppliedToFile { accel_entry });
+        }
+    }
     out
+}
+
+/// The `(clamp, restore)` acceleration pair the generated recovery file
+/// wraps its entry moves in, or `None` when it must emit neither.
+///
+/// The entry moves were relocated INTO the recovery file, so they — not
+/// the plan's phases — are the motion that actually descends toward the
+/// part, and they are the single place a low acceleration matters most.
+/// The file has no runtime-placeholder machinery, so both values must be
+/// literals known now: the clamp is `accel_entry`, and the restore is the
+/// machine's own configured `max_accel`.
+///
+/// Both or neither. A clamp the file cannot undo would leave the printer
+/// at the recovery acceleration for the entire remaining print, which is
+/// a worse outcome than not clamping at all — so an unknown `max_accel`
+/// skips the pair and says so ([`PlanWarning::AccelEntryNotAppliedToFile`]).
+fn entry_accel_pair(machine: &ValidatedMachine, cfg: &PlanConfig) -> Option<(f64, f64)> {
+    Some((cfg.accel_entry?, machine.max_accel?))
 }
 
 fn collect_warnings(
@@ -2294,7 +2352,7 @@ pub fn plan_recovery(
         inputs.machine.noise_floor_speed,
         config.drag_speed,
     ));
-    warnings.extend(config_override_warnings(&machine, config));
+    warnings.extend(config_warnings(&machine, config));
 
     // The conservative believed Z: the upper bound of the possible-stop
     // set (declared before XY homing so the homing moves clear the part).
@@ -2388,6 +2446,9 @@ pub fn plan_recovery(
         // The purge descent is a near-part move: slow entry feedrate.
         descend_feed: config.entry_feed,
         entry_commands,
+        // The entry moves are the near-part descent, so `accel_entry`
+        // belongs here rather than only on the plan's phases.
+        entry_accel: entry_accel_pair(&machine, config),
         header_cap: RECOVERY_HEADER_CAP,
     };
 
@@ -2399,6 +2460,7 @@ pub fn plan_recovery(
         requires_clean_nozzle_confirmation: !inputs.clean_nozzle_macro_present,
         recovery_file,
         debug_confirm_each_step: config.debug_confirm_each_step,
+        confirm_timeout_s: config.confirm_timeout_s,
         warnings,
     };
     run_preflight(&plan, &machine, candidate.point)?;

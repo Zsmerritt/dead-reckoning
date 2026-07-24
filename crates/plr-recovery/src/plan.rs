@@ -767,6 +767,32 @@ pub enum PlanWarning {
         /// The plan's `drag_speed`, mm/s.
         drag_speed: f64,
     },
+    /// A NONZERO `drag_nozzle_temp` below
+    /// [`crate::build::DRAG_TEMP_FLOOR`], on a machine that actually
+    /// drags. The blocking `M109` may then wait for a cooldown that never
+    /// converges — but only on an enclosed or heated-chamber machine, and
+    /// the wait is bounded by the executor's step timeout and aborts
+    /// cleanly BEFORE the Z frame is declared. So this asks rather than
+    /// refuses ([`crate::diagnosis::Tier::Confirmable`]).
+    ///
+    /// Raised only for [`crate::machine::ProbeKind::AdxlDrag`]: on a
+    /// Tap / load-cell machine the key is never read, and stopping a
+    /// recovery to ask about an inert setting is exactly the pointless
+    /// obstruction this framework exists to remove.
+    DragTempBelowFloor {
+        /// The configured drag hold temperature, °C.
+        drag_nozzle_temp: f64,
+        /// The floor it sits below, °C.
+        floor: f64,
+    },
+    /// `accel_entry` was configured but could not be written into the
+    /// generated recovery file, because the machine's own `max_accel` —
+    /// the value the file would have to restore afterwards as a literal —
+    /// is unknown (the legacy `[machine]` path cannot see it).
+    AccelEntryNotAppliedToFile {
+        /// The configured value that did not reach the file, mm/s².
+        accel_entry: f64,
+    },
     /// An `UNSAFE_`-prefixed `[plr]` key is set and permitted a
     /// [`crate::diagnosis::Tier::Hard`] refusal that would otherwise
     /// have stopped this plan. Always surfaced: the escape hatch is
@@ -789,6 +815,7 @@ pub enum PlanWarning {
 impl PlanWarning {
     /// Operator-facing one-line description (rendered into the plan).
     #[must_use]
+    #[allow(clippy::too_many_lines)] // one arm per variant, by design
     pub fn describe(&self) -> String {
         match self {
             PlanWarning::AdaptiveMeshNotRestorable => {
@@ -879,6 +906,21 @@ impl PlanWarning {
                 fmt_num(*calibrated_at),
                 fmt_num(*drag_speed)
             ),
+            PlanWarning::DragTempBelowFloor {
+                drag_nozzle_temp,
+                floor,
+            } => format!(
+                "drag_nozzle_temp {} C is below the {} C floor; the drag M109 may wait for a \
+                 cooldown that never converges on an enclosed machine (bounded by the step \
+                 timeout, and a clean abort before the Z frame is declared)",
+                fmt_num(*drag_nozzle_temp),
+                fmt_num(*floor)
+            ),
+            PlanWarning::AccelEntryNotAppliedToFile { accel_entry } => format!(
+                "accel_entry ({} mm/s^2) is not written into the recovery file: the \
+                 machine's own max_accel is unknown, so there would be nothing to restore to",
+                fmt_num(*accel_entry)
+            ),
             PlanWarning::UnsafeOverrideActive { key, permitted } => format!(
                 "UNSAFE override {key} is set and permitted {permitted}; the refusal that \
                  normally prevents this is switched off"
@@ -931,6 +973,16 @@ pub struct RecoveryPlan {
     /// byte-identical to one produced before the field existed.
     #[serde(default, skip_serializing_if = "core::ops::Not::not")]
     pub debug_confirm_each_step: bool,
+    /// `[plr]` `confirm_timeout_s`: how long a confirm-point waits for an
+    /// answer before aborting cleanly. `None` leaves the daemon's own
+    /// default in force ([`crate::build::CONFIRM_TIMEOUT_DEFAULT_S`]).
+    ///
+    /// Carried on the plan because it is a `printer.cfg` `[plr]` key like
+    /// every other one, and validated with the rest of them — so an
+    /// absurd value is refused with a diagnosis at planning time rather
+    /// than discovered at the pause.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confirm_timeout_s: Option<f64>,
     /// Non-fatal observations.
     pub warnings: Vec<PlanWarning>,
 }

@@ -53,12 +53,10 @@ pub mod resume_file;
 pub use build::{
     plan_recovery, preflight_generated_file, select_resume_target, ExcludeObjectDef,
     FallbackReason, PlanConfig, PlanInputs, PlanOutcome, ResumeTarget, ACCEL_MAX, ACCEL_MIN,
-    DRAG_TEMP_FLOOR, PROBE_HOLD_BAND, PROBE_TEMP_HEADROOM, PROBE_TEMP_MEASURED_TOLERANCE,
+    CONFIRM_TIMEOUT_DEFAULT_S, CONFIRM_TIMEOUT_MAX_S, CONFIRM_TIMEOUT_MIN_S, DRAG_TEMP_FLOOR,
+    PROBE_HOLD_BAND, PROBE_TEMP_HEADROOM, PROBE_TEMP_MEASURED_TOLERANCE,
 };
-pub use diagnosis::{
-    Diagnose, Diagnosis, Expected, Measured, Tier, UNSAFE_DRAG_TEMP_BELOW_FLOOR,
-    UNSAFE_PURGE_Z_BELOW_BED,
-};
+pub use diagnosis::{Diagnose, Diagnosis, Expected, Measured, Tier, UNSAFE_PURGE_Z_BELOW_BED};
 pub use envelope::{
     compute_envelope, Envelope, EnvelopeParams, OvershootTerm, POST_TRIGGER_TRAVEL_S,
     PROBE_SPEED_MAX, PROBE_SPEED_MIN,

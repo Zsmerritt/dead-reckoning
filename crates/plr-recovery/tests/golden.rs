@@ -1863,39 +1863,69 @@ fn a_purge_inside_the_part_with_a_low_z_warns_about_collision() {
     assert!(rendered.contains("drop filament onto"), "{rendered}");
 }
 
-/// Item 8 regression: a nonzero `drag_nozzle_temp` below the floor is
-/// refused — it would make `M109` wait for a passive cooldown that a
-/// heated-chamber machine may never reach. `0` stays exempt.
+/// Item 8, re-tiered: a nonzero `drag_nozzle_temp` below the floor
+/// CONFIRMS rather than refuses.
+///
+/// Trace the consequence: the drag path's `M109` waits for a cooldown
+/// that on an enclosed machine may never converge, the executor's step
+/// timeout bounds that wait, and the abort lands BEFORE the shifted-frame
+/// declare — wasted time and a clean abort, not damage or an unknowable
+/// frame. That is the Confirmable tier, so the operator gets the
+/// explanation and a button. `0` (the cold-drag opt-out) stays silent.
 #[test]
-fn a_sub_floor_drag_temperature_is_refused() {
+fn a_sub_floor_drag_temperature_confirms_rather_than_refusing() {
     for bad in [1.0, 30.0, 49.9] {
         let config = PlanConfig {
             drag_nozzle_temp: bad,
             ..PlanConfig::default()
         };
-        let err = config.validate().unwrap_err();
-        assert!(
-            matches!(err, RecoveryError::DragTempBelowFloor { floor, .. }
-                if (floor - plr_recovery::DRAG_TEMP_FLOOR).abs() < 1e-12),
-            "drag_nozzle_temp {bad} must be refused, got {err:?}"
-        );
-        let msg = err.to_string();
-        assert!(
-            msg.contains("chamber ambient") || msg.contains("cool"),
-            "{msg}"
-        );
-        assert!(msg.contains("drag_nozzle_temp = 0"), "{msg}");
-    }
-    // The opt-out and the floor itself are accepted.
-    for ok in [0.0, plr_recovery::DRAG_TEMP_FLOOR, 145.0] {
-        assert!(
-            PlanConfig {
-                drag_nozzle_temp: ok,
-                ..PlanConfig::default()
-            }
+        // No longer a planning refusal at all.
+        config
             .validate()
-            .is_ok(),
-            "{ok} must be accepted"
+            .unwrap_or_else(|e| panic!("drag_nozzle_temp {bad} must not refuse: {e:?}"));
+        // On a DRAG machine it raises the Confirmable diagnosis...
+        let plan = build_plan_with(&machine_adxl_drag(), plain_transforms(), &config);
+        let warning = plan
+            .warnings
+            .iter()
+            .find(|w| matches!(w, PlanWarning::DragTempBelowFloor { .. }))
+            .unwrap_or_else(|| panic!("drag_nozzle_temp {bad} must warn"));
+        let d = warning.diagnosis();
+        assert_eq!(d.code, "drag_temp_below_floor");
+        assert_eq!(d.tier, Tier::Confirmable);
+        assert_eq!(
+            d.override_key, None,
+            "a Confirmable diagnosis never names an UNSAFE_ key"
+        );
+        assert!(d.why.contains("chamber"), "{}", d.why);
+        assert!(d.suggested_fix.contains("continue"), "{}", d.suggested_fix);
+        assert!(
+            (d.expected.as_ref().unwrap().min.unwrap() - plr_recovery::DRAG_TEMP_FLOOR).abs()
+                < 1e-12
+        );
+        // ...and on a TAP machine it does not: the key is never read
+        // there, and pausing a recovery over an inert setting is the
+        // obstruction this framework exists to remove.
+        let tap = build_plan_with(&machine_tap(), plain_transforms(), &config);
+        assert!(!tap
+            .warnings
+            .iter()
+            .any(|w| matches!(w, PlanWarning::DragTempBelowFloor { .. })));
+    }
+    // The opt-out and the floor itself are silent on the drag path too.
+    for ok in [0.0, plr_recovery::DRAG_TEMP_FLOOR, 145.0] {
+        let config = PlanConfig {
+            drag_nozzle_temp: ok,
+            ..PlanConfig::default()
+        };
+        config.validate().expect("must be accepted");
+        let plan = build_plan_with(&machine_adxl_drag(), plain_transforms(), &config);
+        assert!(
+            !plan
+                .warnings
+                .iter()
+                .any(|w| matches!(w, PlanWarning::DragTempBelowFloor { .. })),
+            "{ok} must not warn"
         );
     }
 }
@@ -2036,7 +2066,7 @@ fn confirm_points_and_accel_overrides_are_inert_when_unset() {
             confirm_z_before_resume: false,
             debug_confirm_each_step: false,
             unsafe_allow_purge_z_below_bed: false,
-            unsafe_allow_drag_temp_below_floor: false,
+            confirm_timeout_s: None,
             ..PlanConfig::default()
         },
     );
@@ -2283,4 +2313,106 @@ fn an_unsafe_override_in_force_is_announced_in_the_plan() {
         .warnings
         .iter()
         .any(|w| matches!(w, PlanWarning::UnsafeOverrideActive { .. })));
+}
+
+/// `accel_entry` reaches the GENERATED FILE, which is where the entry
+/// moves actually live.
+///
+/// The plan-level phases it also covers are the standoff and the park;
+/// the descent toward the part is in the recovery file, so a version of
+/// this feature that stopped at the plan would miss the one motion that
+/// matters most.
+#[test]
+fn accel_entry_reaches_the_recovery_file_entry_moves() {
+    let plan = build_plan_with(
+        &machine_tap(),
+        plain_transforms(),
+        &PlanConfig {
+            accel_entry: Some(600.0),
+            ..PlanConfig::default()
+        },
+    );
+    // The shared fixture machine reports [printer] max_accel = 3000, so
+    // the file can name what to restore to.
+    assert_eq!(plan.recovery_file.entry_accel, Some((600.0, 3_000.0)));
+    let file = plr_recovery::build_recovery_file(&plan.recovery_file, b"", "TS");
+    let text = file.preamble_text().into_owned();
+    assert!(text.contains("SET_VELOCITY_LIMIT ACCEL=600"), "{text}");
+    assert!(text.contains("SET_VELOCITY_LIMIT ACCEL=3000"), "{text}");
+    // Unset: nothing in the file at all.
+    let unset = build_plan(&machine_tap(), plain_transforms());
+    assert_eq!(unset.recovery_file.entry_accel, None);
+    assert!(
+        !plr_recovery::build_recovery_file(&unset.recovery_file, b"", "TS")
+            .preamble_text()
+            .contains("SET_VELOCITY_LIMIT")
+    );
+}
+
+/// Both or neither: with the machine's own `max_accel` unknown (the
+/// legacy `[machine]` path) the file gets no clamp, because a clamp it
+/// could not undo would govern the entire remaining print. The plan says
+/// so rather than silently dropping the key.
+#[test]
+fn an_unknown_machine_accel_skips_the_file_clamp_and_says_so() {
+    let mut machine = machine_tap();
+    machine.max_accel = None;
+    let plan = build_plan_with(
+        &machine,
+        plain_transforms(),
+        &PlanConfig {
+            accel_entry: Some(600.0),
+            ..PlanConfig::default()
+        },
+    );
+    assert_eq!(plan.recovery_file.entry_accel, None);
+    let warning = plan
+        .warnings
+        .iter()
+        .find(|w| matches!(w, PlanWarning::AccelEntryNotAppliedToFile { .. }))
+        .expect("a dropped key must be announced");
+    let d = warning.diagnosis();
+    assert_eq!(d.code, "accel_entry_not_applied_to_file");
+    assert_eq!(d.tier, Tier::Advisory);
+    // The plan-level near-part moves still honour it.
+    let park = plan.first_index(Phase::ParkForReheat).expect("park");
+    assert_eq!(
+        plan.steps[park].commands.first().map(String::as_str),
+        Some("SET_VELOCITY_LIMIT ACCEL=600")
+    );
+    // And a machine that DOES know its accel raises no such warning.
+    let known = build_plan_with(
+        &machine_tap(),
+        plain_transforms(),
+        &PlanConfig {
+            accel_entry: Some(600.0),
+            ..PlanConfig::default()
+        },
+    );
+    assert!(!known
+        .warnings
+        .iter()
+        .any(|w| matches!(w, PlanWarning::AccelEntryNotAppliedToFile { .. })));
+}
+
+/// `confirm_timeout_s` rides onto the plan so the executor can honour the
+/// operator's setting rather than only the daemon's default.
+#[test]
+fn the_confirm_timeout_rides_onto_the_plan() {
+    let plan = build_plan_with(
+        &machine_tap(),
+        plain_transforms(),
+        &PlanConfig {
+            confirm_timeout_s: Some(120.0),
+            ..PlanConfig::default()
+        },
+    );
+    assert_eq!(plan.confirm_timeout_s, Some(120.0));
+    // Absent leaves the daemon default in force, and keeps the plan
+    // byte-identical to one built before the key existed.
+    let baseline = build_plan(&machine_tap(), plain_transforms());
+    assert_eq!(baseline.confirm_timeout_s, None);
+    assert!(!serde_json::to_string(&baseline)
+        .unwrap()
+        .contains("confirm_timeout_s"));
 }
