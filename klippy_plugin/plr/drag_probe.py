@@ -7,6 +7,22 @@ Scaffold only: just the move-duration helper used to size command
 timeouts.
 """
 
+NOT_IMPLEMENTED = (
+    "PLR_DRAG_PROBE is not implemented yet — awaiting the drag-oracle "
+    "milestone (this command will drag the nozzle across the part "
+    "surface using drag_speed/drag_z_step/drag_sensitivity from [plr])"
+)
+
+
+def cmd_PLR_DRAG_PROBE(plugin, gcmd):
+    """PLR_DRAG_PROBE — drag-oracle surface diagnostic (pending).
+
+    Entry point already wired by plugin.PLRPlugin._register_commands;
+    the drag-oracle milestone replaces this body with the real
+    diagnostic without touching the registration table.
+    """
+    gcmd.respond_info(NOT_IMPLEMENTED)
+
 
 def travel_seconds(distance_mm, speed_mm_s):
     """Duration in seconds of a straight move; used for command timeouts.
