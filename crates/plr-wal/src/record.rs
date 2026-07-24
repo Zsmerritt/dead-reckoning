@@ -125,21 +125,41 @@ fn clamp_elapsed(elapsed: f64, duration: f64) -> f64 {
     elapsed.max(0.0).min(duration.max(0.0))
 }
 
-/// One compressed step chunk as Klipper's MCU `queue_step` command encodes
-/// it: `count` steps, the first after `interval` clock ticks, each
-/// subsequent interval increasing by `add`.
+/// One compressed step chunk from a `dump_stepper` batch: `|count|`
+/// steps, the first after `interval` clock ticks, each subsequent
+/// interval increasing by `add`.
 ///
-/// Field widths match the MCU protocol (`queue_step oid=%c interval=%u
-/// count=%hu add=%hi`): interval is a 32-bit tick count, count 16-bit,
-/// add a signed 16-bit per-step interval delta.
+/// Field widths and signs match the emitting source, Klipper's host-side
+/// step history — `struct pull_history_steps` in
+/// `klippy/chelper/stepcompress.h` declares `step_count`, `interval` and
+/// `add` all as signed C `int` (i32). These are **not** the unsigned MCU
+/// `queue_step` wire widths (`interval=%u count=%hu add=%hi`): the
+/// history negates `count` for reverse-direction steps
+/// (`klippy/chelper/stepcompress.c:372`) and stores the u32 interval in
+/// an `int`, so all three can be negative in a real dump (every Z
+/// lift/lower yields negative counts).
+///
+/// # WAL format compatibility
+///
+/// Chunks are serialized as JSON integers, so widening `u32/u16/i16` to
+/// `i32` keeps every previously written record readable: all values the
+/// old recorder could produce lie inside `i32` (positive wire values are
+/// bounded by the C `int` the dump emits, and the old daemon-side
+/// saturation bounds were subsets of `i32`). The reverse is not true —
+/// records written after this change may contain negative `interval` /
+/// `count` values that a pre-change reader would reject; readers must be
+/// upgraded together with the recorder.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StepChunk {
-    /// Clock ticks before the first step of this chunk.
-    pub interval: u32,
-    /// Number of steps in this chunk.
-    pub count: u16,
+    /// Clock ticks before the first step of this chunk, as the raw
+    /// signed value from the dump; negative values are wrapped `u32`
+    /// tick counts (reinterpret as `u32` to recover the ticks).
+    pub interval: i32,
+    /// Signed step count: `|count|` steps, negative when stepping in the
+    /// reverse direction; `0` marks a `set_position` row.
+    pub count: i32,
     /// Signed tick delta added to `interval` after every step.
-    pub add: i16,
+    pub add: i32,
 }
 
 /// A batch of committed steps for one stepper, as emitted by
@@ -546,9 +566,18 @@ pub(crate) mod samples {
                     count: 12,
                     add: -3,
                 },
+                // Reverse-direction chunk: negative count (the sign is
+                // direction, stepcompress.c:372) — every Z lift emits
+                // these, so the WAL round-trip must preserve them.
                 StepChunk {
                     interval: 4_964,
-                    count: 40,
+                    count: -40,
+                    add: 0,
+                },
+                // First-step-after-idle chunk: wrapped u32 interval.
+                StepChunk {
+                    interval: -2_136_919_700,
+                    count: 1,
                     add: 0,
                 },
             ],

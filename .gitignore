@@ -7,3 +7,4 @@
 /lcov.info
 *.profraw
 *.profdata
+/.claude/

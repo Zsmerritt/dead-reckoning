@@ -53,10 +53,13 @@ prop_compose! {
 }
 
 prop_compose! {
+    // Full i32 ranges: the dump rows are the signed C ints of Klipper's
+    // `struct pull_history_steps` (negative count = reverse direction,
+    // negative interval = wrapped u32).
     fn arb_step_chunk()(
-        interval in any::<u32>(),
-        count in any::<u16>(),
-        add in any::<i16>(),
+        interval in any::<i32>(),
+        count in any::<i32>(),
+        add in any::<i32>(),
     ) -> StepChunk {
         StepChunk { interval, count, add }
     }

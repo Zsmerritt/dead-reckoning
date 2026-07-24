@@ -66,7 +66,9 @@ fn any_stepper() -> impl Strategy<Value = StepperRange> {
         any::<u64>(),
         any::<u64>(),
         proptest::collection::vec(any_f64(), 4),
-        proptest::collection::vec((any::<u32>(), any::<u16>(), any::<i16>()), 0..3),
+        // Full i32 ranges: dump rows are the signed C ints of Klipper's
+        // `struct pull_history_steps` (negative count = reverse steps).
+        proptest::collection::vec((any::<i32>(), any::<i32>(), any::<i32>()), 0..3),
     )
         .prop_map(
             |(mono_ns, stepper, first_clock, last_clock, f, chunks)| StepperRange {
