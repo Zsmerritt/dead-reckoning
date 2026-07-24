@@ -68,7 +68,7 @@ convention.
 import collections
 import math
 
-from . import classifier
+from . import calibration_meta, classifier
 from .probe_test import _print_active
 
 # Pass geometry: total back-and-forth path length in mm, centered on
@@ -413,10 +413,18 @@ def cmd_PLR_DRAG_PROBE(plugin, gcmd):
         chip = resolve_accel_chip(plugin, gcmd, chip_name)
         noise_floor = plugin.noise_floor_rms
         if noise_floor is None:
+            # A nulled floor may be a STALE calibration (fingerprint/version
+            # mismatch) rather than a never-run one: surface the specific
+            # re-calibration reason when so (calibration_meta three-tier).
+            stale = plugin.stale_calibration_message(
+                calibration_meta.GROUP_NOISE_FLOOR, "PLR_NOISE_TEST"
+            )
             raise gcmd.error(
-                "no accelerometer noise floor on record — run "
+                stale
+                or "no accelerometer noise floor on record — run "
                 "PLR_NOISE_TEST (then SAVE_CONFIG) first"
             )
+        plugin.warn_legacy_calibration_once(gcmd)
         if plugin.z_position_min is None or not math.isfinite(plugin.z_position_min):
             raise gcmd.error(
                 "no finite Z floor configured: set position_min in "

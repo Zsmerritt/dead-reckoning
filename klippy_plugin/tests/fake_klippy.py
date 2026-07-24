@@ -186,6 +186,12 @@ class FakeConfig:
             if s.startswith(prefix)
         ]
 
+    def get_prefix_options(self, prefix):
+        # klippy/configfile.py:127-129: every option in THIS section whose
+        # name starts with prefix (""=all), in file order.  Used by
+        # calibration_meta to enumerate a section for fingerprinting.
+        return [o for o in self._options if o.startswith(prefix)]
+
 
 class FakeReactor:
     """Stands in for klippy's reactor: deterministic monotonic clock.
@@ -217,13 +223,26 @@ class FakePrinter:
 
     command_error = FakeCommandError  # klippy/klippy.py Printer.command_error
 
-    def __init__(self):
+    def __init__(self, start_args=None):
         self.objects = {}
         self.event_handlers = {}
         self.reactor = FakeReactor()
+        # klippy/klippy.py: Printer.get_start_args returns the dict main()
+        # built, which carries 'software_version' (util.get_git_version()).
+        # Defaults to a realistic git-describe string; tests set it to {}
+        # or a version-less dict to exercise the unstampable path.
+        self.start_args = (
+            {"software_version": "v0.12.0-321-gabcdef012"}
+            if start_args is None
+            else start_args
+        )
 
     def get_reactor(self):
         return self.reactor
+
+    def get_start_args(self):
+        # klippy/klippy.py Printer.get_start_args.
+        return self.start_args
 
     def add_object(self, name, obj):
         if name in self.objects:

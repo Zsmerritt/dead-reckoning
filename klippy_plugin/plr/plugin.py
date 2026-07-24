@@ -37,6 +37,7 @@ import os
 import time
 
 from . import (
+    calibration_meta,
     daemon_link,
     drag_calibrate,
     drag_probe,
@@ -136,6 +137,27 @@ class PLRPlugin:
         # Options PLR_SET / PLR_SETUP / PLR_PROBE_TEST staged this
         # session (live but not yet written by SAVE_CONFIG).
         self._pending_save = set()
+        # --- calibration stamps + three-tier validation --------------
+        # The version/fingerprint stamps staged alongside each calibration
+        # value (calibration_meta).  Read here so klippy's unused-option
+        # check accepts the autosave keys, and to drive validation.  A
+        # major.minor plugin regression or a hardware-fingerprint change
+        # marks the affected value-group INVALID; its live values are then
+        # nulled below so every consumer (drag commands, get_status, plrd)
+        # sees an uncalibrated machine — treat-as-absent, our supported
+        # stand-in for carto's "remove the incompatible model" (klippy has
+        # no plugin-reachable autosave delete).
+        self.cal_plugin_version = config.get(calibration_meta.PLUGIN_VERSION_KEY, None)
+        self.cal_klipper_version = config.get(
+            calibration_meta.KLIPPER_VERSION_KEY, None
+        )
+        self._cal_fingerprints = {
+            group: config.get(calibration_meta.fingerprint_key(group), None)
+            for group in calibration_meta.GROUPS
+        }
+        self._legacy_warned = False
+        self.calibrations = self._validate_calibrations()
+        self._apply_calibration_gating()
         # --- static commissioning checks (config is immutable per
         # klippy session, so config-time results stay valid) ----------
         self.static_check_results = setup_checks.run_static_checks(
@@ -246,6 +268,109 @@ class PLRPlugin:
             )
         return chip
 
+    # -- calibration validation (calibration_meta three-tier) ---------
+
+    def _validate_calibrations(self):
+        """Classify each value-group at config time (VALID/LEGACY/INVALID/
+        UNSET) and log LEGACY/INVALID once per session (config load is
+        naturally once, so this cannot spam)."""
+        present = {
+            calibration_meta.GROUP_NOISE_FLOOR: self.noise_floor_rms is not None,
+            calibration_meta.GROUP_PROBE_RESOLUTION: self.probe_resolution is not None,
+        }
+        running = calibration_meta.plugin_version()
+        results = {}
+        for group in calibration_meta.GROUPS:
+            result = calibration_meta.validate_group(
+                self.config,
+                group,
+                value_present=present[group],
+                stored_fingerprint=self._cal_fingerprints[group],
+                stored_plugin_version=self.cal_plugin_version,
+                running_plugin_version=running,
+            )
+            results[group] = result
+            if result.tier == calibration_meta.TIER_INVALID:
+                calibration_meta.logger.warning(
+                    "plr: %s calibration is stale and will be ignored (%s); "
+                    "re-run the matching PLR_*_TEST",
+                    group,
+                    "; ".join(result.reasons),
+                )
+            elif result.tier == calibration_meta.TIER_LEGACY:
+                calibration_meta.logger.warning(
+                    "plr: %s calibration predates fingerprint stamping — "
+                    "accepted, but consider re-running the matching "
+                    "PLR_*_TEST; a future version may refuse unstamped values",
+                    group,
+                )
+        return results
+
+    def _apply_calibration_gating(self):
+        """Null the live values of every INVALID group so they are absent
+        everywhere (treat-as-absent = our autosave-delete stand-in)."""
+        if (
+            self.calibrations[calibration_meta.GROUP_NOISE_FLOOR].tier
+            == calibration_meta.TIER_INVALID
+        ):
+            self.noise_floor_rms = None
+            self.noise_floor_still_rms = None
+            self.noise_floor_peak = None
+            self.noise_floor_speed = None
+            self.noise_floor_temp = None
+        if (
+            self.calibrations[calibration_meta.GROUP_PROBE_RESOLUTION].tier
+            == calibration_meta.TIER_INVALID
+        ):
+            self.probe_resolution = None
+
+    def calibration_tier(self, group):
+        """The validation tier of ``group`` (valid/legacy/invalid/unset)."""
+        return self.calibrations[group].tier
+
+    def stale_calibration_message(self, group, commands):
+        """Console remediation text when ``group`` is INVALID (its values
+        were nulled), else ``None``.  ``commands`` names the PLR command(s)
+        that re-establish it."""
+        result = self.calibrations.get(group)
+        if result is None or result.tier != calibration_meta.TIER_INVALID:
+            return None
+        return (
+            "the recorded %s calibration was made under a different hardware "
+            "configuration and is being ignored (%s) — re-run %s (then "
+            "SAVE_CONFIG)" % (group, "; ".join(result.reasons), commands)
+        )
+
+    def warn_legacy_calibration_once(self, gcmd):
+        """Emit the LEGACY 'consider recalibrating' notice to the console at
+        most once per session (not per command)."""
+        if self._legacy_warned:
+            return
+        legacy = sorted(
+            group
+            for group, result in self.calibrations.items()
+            if result.tier == calibration_meta.TIER_LEGACY
+        )
+        if not legacy:
+            return
+        self._legacy_warned = True
+        gcmd.respond_info(
+            "plr: calibration(s) %s predate fingerprint stamping — accepted, "
+            "but consider re-running PLR_NOISE_TEST / PLR_PROBE_TEST; a future "
+            "version may refuse unstamped values" % (", ".join(legacy),)
+        )
+
+    def calibrations_valid(self):
+        """Aggregate validity for get_status: ``False`` if any group is
+        INVALID, ``"legacy"`` if any is LEGACY (and none INVALID), else
+        ``True``."""
+        tiers = [result.tier for result in self.calibrations.values()]
+        if calibration_meta.TIER_INVALID in tiers:
+            return False
+        if calibration_meta.TIER_LEGACY in tiers:
+            return "legacy"
+        return True
+
     # -- status for Moonraker / API-socket clients --------------------
 
     def _daemon_alive_now(self, eventtime):
@@ -291,4 +416,13 @@ class PLRPlugin:
             "last_drag_error": self.last_drag_error,
             "last_drag_calibrate": self.last_drag_calibrate,
             "last_touch_result": self.last_touch_result,
+            # Calibration-stamp validity (calibration_meta three-tier).
+            # ``calibrations_valid`` is False when any group is stale (its
+            # values are treated as absent), "legacy" for accepted-but-
+            # unstamped values, True otherwise; ``calibration_status`` gives
+            # the per-group tier so clients see which group is affected.
+            "calibrations_valid": self.calibrations_valid(),
+            "calibration_status": {
+                group: result.tier for group, result in self.calibrations.items()
+            },
         }

@@ -234,6 +234,7 @@ fn machine_inputs(
             }
             let (machine, assembly_notes) = plrcfg::machine_from_settings(
                 &source.snapshot.settings,
+                &source.snapshot.config,
                 &source.plr,
                 type_annotations,
             );

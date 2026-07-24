@@ -68,6 +68,51 @@ attestation staged by `PLR_SETUP ACCEPT_SELF_LOCKING_Z=1`),
 `noise_floor_speed` / `noise_floor_temp` (measured by `PLR_NOISE_TEST`),
 and `drag_sensitivity` (staged by `PLR_DRAG_CALIBRATE`).
 
+### Calibration stamping and three-tier validation
+
+Every persisted calibration value is stamped, at the moment it is staged,
+with the machine/software identity it was measured under — ported from
+Cartographer3D's stale-model defense (`config/model_validator.py`). The
+stamps are ordinary `[plr]` autosave options (never hand-edit):
+
+- `cal_fingerprint_noise_floor` / `cal_fingerprint_probe_resolution` — a
+  CRC-32 **fingerprint** (8 hex digits) of the *calibration-relevant* config
+  slice for each value-group: the `stepper_z*` sections, the active probe
+  section (`[probe]`/`[load_cell_probe]` for `probe_resolution`; the
+  `accel_chip` section for the noise floor), and the `[plr]` `probe_method`
+  (plus `accel_chip` for the noise floor). Canonicalized so section/key order
+  and whitespace never matter and integer-valued numbers normalize (`-2` ==
+  `-2.0`); unrelated config (`[fan]`, `[display]`) never changes it. The two
+  groups are fingerprinted independently — a stale noise floor does not
+  invalidate a still-good `probe_resolution`, and vice versa.
+- `cal_plugin_version` — the plugin `__version__` (single source in
+  `plr/__init__.py`).
+- `cal_klipper_version` — the running Klipper `software_version`. If it is
+  unavailable when a calibration would be staged, `PLR_NOISE_TEST` /
+  `PLR_PROBE_TEST` / `PLR_DRAG_CALIBRATE` **refuse to stage anything** rather
+  than persist an unstamped value.
+
+At every restart each value-group is classified:
+
+1. **VALID** — the stamps match; the value is used normally.
+2. **LEGACY** — a value is present but predates stamping; accepted with a
+   warn-once (`get_status` reports `calibrations_valid: "legacy"`).
+3. **INVALID** — the recomputed fingerprint differs, or the plugin
+   `major.minor` regressed below the staging version; the value is treated as
+   **absent everywhere** (commands refuse with a "calibrated under a different
+   hardware configuration — re-run PLR_NOISE_TEST / PLR_PROBE_TEST" message,
+   `PLR_SETUP` shows a `[FAIL]` row with the old-vs-new fingerprint, and
+   `get_status` reports `calibrations_valid: false` with a per-group
+   `calibration_status`). Klipper has no plugin-reachable way to delete an
+   autosave option, so treat-as-absent is our stand-in for carto's "remove the
+   incompatible model" — the stale text stays in `printer.cfg` until a
+   re-calibration overwrites it, we simply never trust it.
+
+The daemon `plrd` re-derives the same fingerprint from the live Klipper config
+(defense in depth: byte-identical CRC-32 canonicalization); a noise floor
+whose fingerprint no longer matches is treated as uncalibrated on the Rust
+side too, so recovery refuses with the usual "run PLR_NOISE_TEST first" path.
+
 ## Command reference
 
 ### `PLR_SETUP [ACCEPT_SELF_LOCKING_Z=1]`
