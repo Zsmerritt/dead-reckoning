@@ -42,6 +42,7 @@ from . import (
     noise_test,
     probe_test,
     setup_checks,
+    touch_sequence,
     tunables,
 )
 
@@ -105,6 +106,9 @@ class PLRPlugin:
         # reads these through get_status like probe status) ------------
         self.last_drag_result = None
         self.last_drag_error = None
+        # --- consensus-touch session state (PLR_TOUCH outcome; the Rust
+        # side consumes last_touch_result through get_status) ----------
+        self.last_touch_result = None
         # Z floor input for the drag staircase, cached at config time
         # (config is immutable per session).
         self.z_position_min, _ = setup_checks.z_position_min(config)
@@ -133,8 +137,13 @@ class PLRPlugin:
         "no arguments lists current values"
     )
     cmd_PLR_PROBE_TEST_help = (
-        "Measure probe repeatability at the current XY (requires START=1; "
-        "moves the toolhead) and stage probe_resolution for SAVE_CONFIG"
+        "Verify probe repeatability at the current XY by running consensus "
+        "touch sequences (requires START=1; moves the toolhead) and stage "
+        "probe_resolution for SAVE_CONFIG"
+    )
+    cmd_PLR_TOUCH_help = (
+        "Run one sliding-window consensus touch at the current XY (moves the "
+        "toolhead) and expose the result as last_touch_result"
     )
     cmd_PLR_STATUS_help = "Report plr plugin state and plrd daemon status"
     cmd_PLR_RECOVER_help = (
@@ -159,6 +168,7 @@ class PLRPlugin:
             ("PLR_SETUP", setup_checks.cmd_PLR_SETUP),
             ("PLR_SET", tunables.cmd_PLR_SET),
             ("PLR_PROBE_TEST", probe_test.cmd_PLR_PROBE_TEST),
+            ("PLR_TOUCH", touch_sequence.cmd_PLR_TOUCH),
             ("PLR_STATUS", daemon_link.cmd_PLR_STATUS),
             ("PLR_RECOVER", daemon_link.cmd_PLR_RECOVER),
             ("PLR_NOISE_TEST", noise_test.cmd_PLR_NOISE_TEST),
@@ -251,4 +261,5 @@ class PLRPlugin:
             "noise_floor_rms": self.noise_floor_rms,
             "last_drag_result": self.last_drag_result,
             "last_drag_error": self.last_drag_error,
+            "last_touch_result": self.last_touch_result,
         }

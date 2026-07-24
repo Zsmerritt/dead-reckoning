@@ -13,6 +13,7 @@ ALL_COMMANDS = [
     "PLR_SETUP",
     "PLR_SET",
     "PLR_PROBE_TEST",
+    "PLR_TOUCH",
     "PLR_STATUS",
     "PLR_RECOVER",
     "PLR_NOISE_TEST",
@@ -141,6 +142,10 @@ def test_drag_state_initialized_null(plugin):
     assert plugin.last_drag_error is None
 
 
+def test_touch_state_initialized_null(plugin):
+    assert plugin.last_touch_result is None
+
+
 def test_all_commands_registered_with_help(plugin, fake_printer):
     gcode = fake_printer.lookup_object("gcode")
     for name in ALL_COMMANDS:
@@ -159,6 +164,7 @@ def test_get_status_shape_on_good_config(plugin):
         "noise_floor_rms": None,
         "last_drag_result": None,
         "last_drag_error": None,
+        "last_touch_result": None,
     }
 
 
