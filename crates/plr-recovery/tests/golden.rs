@@ -6,9 +6,9 @@ mod common;
 
 use plr_analyzer::{ContactOutcome, DeclineReason, MatchConfidence};
 use plr_recovery::{
-    plan_recovery, select_resume_target, ExcludeObjectDef, FallbackReason, FileTemps,
-    OvershootTerm, Phase, PlanConfig, PlanInputs, PlanOutcome, RecoveryError, RecoveryPlan,
-    RuntimeComputation, TriggerSource,
+    plan_recovery, select_resume_target, Diagnose, ExcludeObjectDef, FallbackReason, FileTemps,
+    OvershootTerm, Phase, PlanConfig, PlanInputs, PlanOutcome, PlanWarning, RecoveryError,
+    RecoveryPlan, RuntimeComputation, Tier, TriggerSource,
 };
 
 use common::{
@@ -1994,4 +1994,293 @@ fn plans_round_trip_through_serde() {
     let json = serde_json::to_string(&plan).unwrap();
     let back: RecoveryPlan = serde_json::from_str(&json).unwrap();
     assert_eq!(back, plan);
+}
+
+// --- Confirm-point and acceleration steps ------------------------------------
+//
+// The load-bearing claim in this section is INERTNESS: a machine that
+// configures none of these keys must get byte-for-byte the plan it got
+// before they existed. Every test below therefore compares against the
+// default-config plan rather than merely asserting the new steps are
+// absent — "absent" would still permit a whitespace change in a summary
+// somewhere.
+
+/// The three phases these features introduce.
+const NEW_PHASES: [Phase; 3] = [
+    Phase::RecoveryAccel,
+    Phase::ZConfirmStandoff,
+    Phase::RecoveryAccelRestore,
+];
+
+#[test]
+fn confirm_points_and_accel_overrides_are_inert_when_unset() {
+    let baseline = build_plan(&machine_tap(), plain_transforms());
+    for phase in NEW_PHASES {
+        assert!(
+            baseline.first_index(phase).is_none(),
+            "{phase:?} must not exist without its config key"
+        );
+    }
+    assert!(!baseline.debug_confirm_each_step);
+    // Explicitly writing the defaults changes nothing at all — the plan
+    // is identical, and so is its rendering and its JSON.
+    let explicit = build_plan_with(
+        &machine_tap(),
+        plain_transforms(),
+        &PlanConfig {
+            recovery_accel: None,
+            accel_home: None,
+            accel_travel: None,
+            accel_probe: None,
+            accel_entry: None,
+            confirm_z_before_resume: false,
+            debug_confirm_each_step: false,
+            unsafe_allow_purge_z_below_bed: false,
+            unsafe_allow_drag_temp_below_floor: false,
+            ..PlanConfig::default()
+        },
+    );
+    assert_eq!(explicit, baseline);
+    assert_eq!(explicit.render(), baseline.render());
+    assert_eq!(
+        serde_json::to_string(&explicit).unwrap(),
+        serde_json::to_string(&baseline).unwrap(),
+        "a disabled feature must not even appear in the serialized plan"
+    );
+}
+
+#[test]
+fn confirm_z_before_resume_adds_a_standoff_that_cannot_descend() {
+    let plan = build_plan_with(
+        &machine_tap(),
+        plain_transforms(),
+        &PlanConfig {
+            confirm_z_before_resume: true,
+            ..PlanConfig::default()
+        },
+    );
+    let index = plan
+        .first_index(Phase::ZConfirmStandoff)
+        .expect("standoff step");
+    let true_z = plan.first_index(Phase::TrueZDeclare).expect("true-z");
+    assert!(
+        true_z < index,
+        "the confirmation must come AFTER Z is established"
+    );
+    let step = &plan.steps[index];
+    // It reuses the rail-clamped park arithmetic with the entry hop as
+    // the delta — `park_z_at` clamps down to the rail but never below the
+    // current Z, so the move is structurally incapable of descending.
+    let Some(RuntimeComputation::ParkZ { delta_z, .. }) = step.compute else {
+        panic!(
+            "expected the rail-clamped ParkZ computation, got {:?}",
+            step.compute
+        );
+    };
+    assert!((delta_z - PlanConfig::default().entry_hop).abs() < 1e-12);
+    assert!(step.commands.iter().any(|c| c == "G90"));
+    assert!(
+        step.commands.iter().any(|c| c.starts_with("G1 Z{park_z}")),
+        "{:?}",
+        step.commands
+    );
+    // No descent is expressible: the only Z word is the clamped
+    // placeholder, never a literal.
+    assert!(
+        !step
+            .commands
+            .iter()
+            .any(|c| c.contains('Z') && !c.contains("{park_z}")),
+        "{:?}",
+        step.commands
+    );
+}
+
+#[test]
+fn debug_confirm_each_step_rides_on_the_plan_and_changes_no_command() {
+    let baseline = build_plan(&machine_tap(), plain_transforms());
+    let plan = build_plan_with(
+        &machine_tap(),
+        plain_transforms(),
+        &PlanConfig {
+            debug_confirm_each_step: true,
+            ..PlanConfig::default()
+        },
+    );
+    assert!(plan.debug_confirm_each_step);
+    // Every command is untouched: this is a pause, not a plan change.
+    let commands = |p: &RecoveryPlan| -> Vec<String> {
+        p.steps.iter().flat_map(|s| s.commands.clone()).collect()
+    };
+    assert_eq!(commands(&plan), commands(&baseline));
+    assert!(plan.render().contains("pauses before EVERY step"));
+}
+
+#[test]
+fn a_recovery_accel_override_clamps_early_and_restores_on_both_paths() {
+    let plan = build_plan_with(
+        &machine_tap(),
+        plain_transforms(),
+        &PlanConfig {
+            recovery_accel: Some(2_500.0),
+            ..PlanConfig::default()
+        },
+    );
+    let clamp = plan.first_index(Phase::RecoveryAccel).expect("clamp step");
+    let restore = plan
+        .first_index(Phase::RecoveryAccelRestore)
+        .expect("restore step");
+    // Before every motion, and after everything that moves.
+    let first_motion = plan
+        .steps
+        .iter()
+        .position(|s| {
+            s.commands
+                .iter()
+                .any(|c| c.starts_with("G28") || c.starts_with("G0 ") || c.starts_with("G1 "))
+        })
+        .expect("some motion");
+    assert!(clamp < first_motion, "the clamp must precede any motion");
+    assert!(clamp < restore);
+    // The success path restores before the recovery file is selected: a
+    // resumed print must run at the machine's own acceleration.
+    let select = plan
+        .first_index(Phase::RecoveryFileSelect)
+        .expect("file select");
+    assert!(restore < select, "restore before M23/M24");
+    assert_eq!(
+        plan.steps[clamp].commands,
+        vec!["SET_VELOCITY_LIMIT ACCEL=2500".to_owned()]
+    );
+    assert_eq!(
+        plan.steps[clamp].compute,
+        Some(RuntimeComputation::RecordMachineAccel)
+    );
+    // The abort path goes through the existing cleanup mechanism.
+    assert_eq!(
+        plan.steps[clamp].cleanup_commands,
+        vec!["SET_VELOCITY_LIMIT ACCEL={machine_accel}".to_owned()]
+    );
+    assert_eq!(
+        plan.steps[restore].commands,
+        vec!["SET_VELOCITY_LIMIT ACCEL={machine_accel}".to_owned()]
+    );
+}
+
+#[test]
+fn per_phase_accel_overrides_lead_their_phase_and_still_restore() {
+    let plan = build_plan_with(
+        &machine_adxl_drag(),
+        plain_transforms(),
+        &PlanConfig {
+            accel_home: Some(1_000.0),
+            accel_travel: Some(3_000.0),
+            accel_probe: Some(400.0),
+            accel_entry: Some(600.0),
+            confirm_z_before_resume: true,
+            ..PlanConfig::default()
+        },
+    );
+    let leading = |phase: Phase| -> String {
+        let i = plan
+            .first_index(phase)
+            .unwrap_or_else(|| panic!("{phase:?}"));
+        plan.steps[i].commands.first().cloned().unwrap_or_default()
+    };
+    assert_eq!(leading(Phase::HomeXy), "SET_VELOCITY_LIMIT ACCEL=1000");
+    assert_eq!(
+        leading(Phase::ProbeApproach),
+        "SET_VELOCITY_LIMIT ACCEL=3000"
+    );
+    assert_eq!(leading(Phase::Probe), "SET_VELOCITY_LIMIT ACCEL=400");
+    assert_eq!(
+        leading(Phase::ZConfirmStandoff),
+        "SET_VELOCITY_LIMIT ACCEL=600"
+    );
+    assert_eq!(
+        leading(Phase::ParkForReheat),
+        "SET_VELOCITY_LIMIT ACCEL=600"
+    );
+    // Even with no global `recovery_accel`, the record/restore pair
+    // exists — otherwise a per-phase override would simply be left in
+    // force on the machine forever.
+    let record = plan.first_index(Phase::RecoveryAccel).expect("record step");
+    assert!(plan.first_index(Phase::RecoveryAccelRestore).is_some());
+    assert!(
+        plan.steps[record].commands.is_empty(),
+        "with no global override the step only RECORDS: {:?}",
+        plan.steps[record].commands
+    );
+}
+
+#[test]
+fn accel_probe_is_ignored_and_announced_on_the_consensus_touch_path() {
+    let plan = build_plan_with(
+        &machine_tap(),
+        plain_transforms(),
+        &PlanConfig {
+            accel_probe: Some(400.0),
+            ..PlanConfig::default()
+        },
+    );
+    // touch_accel owns the contact accel there, through the existing
+    // AccelClamp step; accel_probe must not also appear on the probe.
+    let probe = plan.first_index(Phase::Probe).expect("probe");
+    assert!(
+        !plan.steps[probe]
+            .commands
+            .iter()
+            .any(|c| c.contains("ACCEL=400")),
+        "{:?}",
+        plan.steps[probe].commands
+    );
+    let warning = plan
+        .warnings
+        .iter()
+        .find(|w| matches!(w, PlanWarning::AccelProbeIgnoredOnTouchPath { .. }))
+        .expect("the ignored key must be announced, never swallowed");
+    let d = warning.diagnosis();
+    assert_eq!(d.code, "accel_probe_ignored_on_touch_path");
+    assert_eq!(d.tier, Tier::Advisory);
+}
+
+#[test]
+fn an_unsafe_override_in_force_is_announced_in_the_plan() {
+    let plan = build_plan_with(
+        &machine_tap(),
+        plain_transforms(),
+        &PlanConfig {
+            purge_z: Some(-0.5),
+            unsafe_allow_purge_z_below_bed: true,
+            ..PlanConfig::default()
+        },
+    );
+    let warning = plan
+        .warnings
+        .iter()
+        .find(|w| matches!(w, PlanWarning::UnsafeOverrideActive { .. }))
+        .expect("an override that fires silently is a booby trap");
+    let d = warning.diagnosis();
+    assert_eq!(d.code, "unsafe_override_active");
+    assert_eq!(d.tier, Tier::Advisory);
+    assert!(
+        d.what.contains("UNSAFE_allow_purge_z_below_bed"),
+        "{}",
+        d.what
+    );
+    // A machine that has the key set but no offending value gets no
+    // warning: the announcement is about what was permitted, not about
+    // what is merely permissible.
+    let quiet = build_plan_with(
+        &machine_tap(),
+        plain_transforms(),
+        &PlanConfig {
+            unsafe_allow_purge_z_below_bed: true,
+            ..PlanConfig::default()
+        },
+    );
+    assert!(!quiet
+        .warnings
+        .iter()
+        .any(|w| matches!(w, PlanWarning::UnsafeOverrideActive { .. })));
 }

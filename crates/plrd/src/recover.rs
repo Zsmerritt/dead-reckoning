@@ -30,7 +30,9 @@ use std::path::Path;
 use std::time::Duration;
 
 use crate::config::Config;
-use crate::executor::{dry_run, execute, ExecOptions, ExecOutcome, Transcript};
+use crate::executor::{
+    dry_run, execute, AbortConfirmer, Confirmer, ExecOptions, ExecOutcome, Transcript,
+};
 use crate::moonraker::MoonrakerClient;
 use crate::pipeline::{run_pipeline, PipelineOutcome, PlanBundle};
 use crate::{EXIT_OK, EXIT_RUNTIME, EXIT_USAGE};
@@ -184,12 +186,20 @@ pub(crate) fn drive(
         stdin,
         step_mode: options.step,
     };
+    // The CLI answers every confirm-point with "abort" (the default,
+    // fail-closed behaviour). Interactive confirmation is the control
+    // socket's job: the CLI's own consent channel is a blocking stdin
+    // read, and `stdin` is already borrowed by the per-step gate below —
+    // a second interactive borrow of the same reader would be a lie about
+    // who is being asked what. An operator who wants to be consulted runs
+    // the recovery through the plugin, which speaks the socket protocol.
     runtime.block_on(execute_with_gates(
         bundle,
         config,
         &options.exec_options,
         options.connect_timeout,
         &mut gate,
+        &mut AbortConfirmer,
         out,
     ))
 }
@@ -249,6 +259,7 @@ pub(crate) async fn execute_with_gates(
     exec_options: &ExecOptions,
     connect_timeout: Duration,
     gate: &mut dyn StepGate,
+    confirmer: &mut dyn Confirmer,
     out: &mut (dyn Write + Send),
 ) -> u8 {
     // Frame-invalidation refuse gate (deliverable 5): a prior recovery
@@ -332,6 +343,7 @@ pub(crate) async fn execute_with_gates(
             &mut client,
             exec_options,
             &mut gate_fn,
+            confirmer,
             &mut transcript,
         )
         .await
@@ -673,6 +685,7 @@ mod tests {
                 verify_timeout: Duration::from_millis(300),
                 temp_timeout: Duration::from_millis(300),
                 poll_interval: Duration::from_millis(20),
+                confirm_timeout: Duration::from_millis(300),
             },
             connect_timeout: Duration::from_secs(2),
         }
@@ -1187,6 +1200,7 @@ mod tests {
             &opts.exec_options,
             opts.connect_timeout,
             &mut AutoGate,
+            &mut crate::executor::AbortConfirmer,
             &mut out,
         ));
         assert_eq!(code, crate::EXIT_RUNTIME);

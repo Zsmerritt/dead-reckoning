@@ -85,7 +85,14 @@ const PRIMARY_MCU: &str = "mcu";
 /// older plugin still reads coherently. Wrong-typed values are hard
 /// errors — a `[plr]` section that cannot be read faithfully must
 /// refuse, never guess.
+///
+/// The `struct_excessive_bools` allow is deliberate: this is a flat
+/// mirror of the operator's `[plr]` section, one field per documented
+/// key. Collapsing related booleans into enums would insert a layer of
+/// translation between what the operator wrote and what plrd reads —
+/// exactly the seam a config bug hides in.
 #[derive(Debug, Clone, PartialEq)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct PlrSettings {
     /// `tap`, `load_cell`, or `adxl_drag`.
     pub probe_method: String,
@@ -153,6 +160,33 @@ pub struct PlrSettings {
     /// FROZEN `drag_nozzle_temp` — nozzle temperature the ADXL drag path
     /// heats to AND HOLDS for, °C. `0` opts out (cold drag, no wait).
     pub drag_nozzle_temp: f64,
+    /// `recovery_accel` — one `max_accel` for the whole recovery, mm/s²
+    /// (`None` leaves the machine's own value alone).
+    pub recovery_accel: Option<f64>,
+    /// `accel_home` — `max_accel` for the XY homing step, mm/s².
+    pub accel_home: Option<f64>,
+    /// `accel_travel` — `max_accel` for the probe-approach travel, mm/s².
+    pub accel_travel: Option<f64>,
+    /// `accel_probe` — `max_accel` for the contact step on the drag /
+    /// legacy single-`PROBE` paths, mm/s² (ignored on the consensus-touch
+    /// path, where `touch_accel` owns it).
+    pub accel_probe: Option<f64>,
+    /// `accel_entry` — `max_accel` for the moves made close to printed
+    /// geometry (Z-confirm standoff, lift-and-park), mm/s².
+    pub accel_entry: Option<f64>,
+    /// `confirm_z_before_resume` — pause after the true-Z declaration and
+    /// ask the operator to confirm the believed Z (default `false`).
+    pub confirm_z_before_resume: bool,
+    /// `debug_confirm_each_step` — pause before every step (default
+    /// `false`).
+    pub debug_confirm_each_step: bool,
+    /// `UNSAFE_allow_purge_z_below_bed` — permits a `purge_z` below the
+    /// bed surface (default `false`).
+    pub unsafe_allow_purge_z_below_bed: bool,
+    /// `UNSAFE_allow_drag_temp_below_floor` — permits a nonzero
+    /// `drag_nozzle_temp` below the drag temperature floor (default
+    /// `false`).
+    pub unsafe_allow_drag_temp_below_floor: bool,
     /// Operator attestation autosaved by the plugin's `PLR_SETUP`.
     pub self_locking_z: bool,
     /// Autosaved probe resolution, mm; `None` before first calibration.
@@ -218,6 +252,27 @@ fn opt_bool(section: &Map<String, Value>, key: &str, default: bool) -> Result<bo
 /// `None` (these FROZEN keys are parsed tolerantly).
 fn opt_opt_f64(section: &Map<String, Value>, key: &str) -> Option<f64> {
     section.get(key).and_then(Value::as_f64)
+}
+
+/// Reads an `UNSAFE_`-prefixed boolean, case-insensitively.
+///
+/// The operator writes `UNSAFE_allow_purge_z_below_bed` in printer.cfg —
+/// the screaming prefix is the whole point of the naming — but klippy
+/// lowercases option names before they reach `configfile.settings`, so
+/// the key arrives as `unsafe_allow_purge_z_below_bed`. Looking both up
+/// means the documented spelling and klippy's normalization agree
+/// instead of the operator's careful edit silently doing nothing.
+///
+/// Tolerant like the other FROZEN keys: absent OR wrong-typed is
+/// `false`. That direction is deliberate — a malformed override must
+/// fail CLOSED (the refusal stays in force), never open.
+fn unsafe_flag(section: &Map<String, Value>, key: &str) -> bool {
+    let lower = key.to_ascii_lowercase();
+    section
+        .get(key)
+        .or_else(|| section.get(lower.as_str()))
+        .and_then(Value::as_bool)
+        == Some(true)
 }
 
 /// Reads a defaulted string option.
@@ -320,6 +375,24 @@ impl PlrSettings {
             purge_retract: opt_f64(plr, "purge_retract", d.purge_retract)?,
             clean_nozzle_macro: opt_str(plr, "clean_nozzle_macro", &d.clean_nozzle_macro)?,
             drag_nozzle_temp: opt_f64(plr, "drag_nozzle_temp", d.drag_nozzle_temp)?,
+            // Acceleration overrides: optional, parsed tolerantly, and
+            // range-checked by PlanConfig::validate (which refuses with a
+            // typed diagnosis rather than clamping).
+            recovery_accel: opt_opt_f64(plr, "recovery_accel"),
+            accel_home: opt_opt_f64(plr, "accel_home"),
+            accel_travel: opt_opt_f64(plr, "accel_travel"),
+            accel_probe: opt_opt_f64(plr, "accel_probe"),
+            accel_entry: opt_opt_f64(plr, "accel_entry"),
+            confirm_z_before_resume: opt_bool(plr, "confirm_z_before_resume", false)?,
+            debug_confirm_each_step: opt_bool(plr, "debug_confirm_each_step", false)?,
+            unsafe_allow_purge_z_below_bed: unsafe_flag(
+                plr,
+                plr_recovery::UNSAFE_PURGE_Z_BELOW_BED,
+            ),
+            unsafe_allow_drag_temp_below_floor: unsafe_flag(
+                plr,
+                plr_recovery::UNSAFE_DRAG_TEMP_BELOW_FLOOR,
+            ),
             self_locking_z,
             probe_resolution,
             noise_floor,
@@ -381,6 +454,15 @@ impl PlrSettings {
             purge_retract: self.purge_retract,
             clean_nozzle_macro: self.clean_nozzle_macro.clone(),
             drag_nozzle_temp: self.drag_nozzle_temp,
+            recovery_accel: self.recovery_accel,
+            accel_home: self.accel_home,
+            accel_travel: self.accel_travel,
+            accel_probe: self.accel_probe,
+            accel_entry: self.accel_entry,
+            confirm_z_before_resume: self.confirm_z_before_resume,
+            debug_confirm_each_step: self.debug_confirm_each_step,
+            unsafe_allow_purge_z_below_bed: self.unsafe_allow_purge_z_below_bed,
+            unsafe_allow_drag_temp_below_floor: self.unsafe_allow_drag_temp_below_floor,
             // [plr] mode: the plugin (and its PLR_TOUCH command) is
             // present, so the consensus touch is used.
             legacy_single_probe: false,
@@ -2017,5 +2099,94 @@ pub(crate) mod tests {
         // config hash matches -> floor kept, no mismatch note.
         assert_eq!(machine.noise_floor, Some(118.0));
         assert!(!notes.iter().any(|n| n.contains("mismatch")), "{notes:?}");
+    }
+
+    #[test]
+    fn confirm_point_and_accel_keys_default_off_and_parse_when_present() {
+        // Absent: every one of them off / None. A machine that never
+        // heard of these keys plans exactly as it did before.
+        let (_, plr) = parse_fixture(&[]);
+        assert!(!plr.confirm_z_before_resume);
+        assert!(!plr.debug_confirm_each_step);
+        assert!(!plr.unsafe_allow_purge_z_below_bed);
+        assert!(!plr.unsafe_allow_drag_temp_below_floor);
+        for value in [
+            plr.recovery_accel,
+            plr.accel_home,
+            plr.accel_travel,
+            plr.accel_probe,
+            plr.accel_entry,
+        ] {
+            assert_eq!(value, None);
+        }
+        let config = plr.plan_config();
+        assert!(!config.confirm_z_before_resume);
+        assert!(!config.debug_confirm_each_step);
+        assert_eq!(config.recovery_accel, None);
+
+        // Present: carried through to the plan config verbatim (range
+        // checking is PlanConfig::validate's job — it refuses rather than
+        // clamping, so clamping here would hide the refusal).
+        let (_, plr) = parse_fixture(&[
+            ("confirm_z_before_resume", json!(true)),
+            ("debug_confirm_each_step", json!(true)),
+            ("recovery_accel", json!(1500.0)),
+            ("accel_home", json!(1000.0)),
+            ("accel_travel", json!(3000.0)),
+            ("accel_probe", json!(400.0)),
+            ("accel_entry", json!(600.0)),
+        ]);
+        let config = plr.plan_config();
+        assert!(config.confirm_z_before_resume);
+        assert!(config.debug_confirm_each_step);
+        assert_eq!(config.recovery_accel, Some(1500.0));
+        assert_eq!(config.accel_home, Some(1000.0));
+        assert_eq!(config.accel_travel, Some(3000.0));
+        assert_eq!(config.accel_probe, Some(400.0));
+        assert_eq!(config.accel_entry, Some(600.0));
+
+        // Out-of-band values are parsed, then REFUSED by validation with
+        // the typed diagnosis — never silently clamped into range.
+        let (_, plr) = parse_fixture(&[("recovery_accel", json!(2.0))]);
+        let error = plr.plan_config().validate().unwrap_err();
+        assert!(matches!(
+            error,
+            plr_recovery::RecoveryError::AccelOutOfRange {
+                key: "recovery_accel",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn unsafe_overrides_are_read_case_insensitively_and_fail_closed() {
+        use plr_recovery::{UNSAFE_DRAG_TEMP_BELOW_FLOOR, UNSAFE_PURGE_Z_BELOW_BED};
+        // The operator writes the screaming spelling in printer.cfg;
+        // klippy lowercases option names before they reach
+        // configfile.settings. Both must be honoured, or a careful edit
+        // silently does nothing.
+        for key in [
+            UNSAFE_PURGE_Z_BELOW_BED,
+            &UNSAFE_PURGE_Z_BELOW_BED.to_ascii_lowercase(),
+        ] {
+            let (_, plr) = parse_fixture(&[(key, json!(true))]);
+            assert!(plr.unsafe_allow_purge_z_below_bed, "{key}");
+            assert!(plr.plan_config().unsafe_allow_purge_z_below_bed, "{key}");
+        }
+        let (_, plr) = parse_fixture(&[(
+            &UNSAFE_DRAG_TEMP_BELOW_FLOOR.to_ascii_lowercase(),
+            json!(true),
+        )]);
+        assert!(plr.unsafe_allow_drag_temp_below_floor);
+
+        // Fail CLOSED: anything that is not literally `true` leaves the
+        // refusal in force. A malformed override must never open a gate.
+        for bad in [json!(false), json!("true"), json!(1), json!(null)] {
+            let (_, plr) = parse_fixture(&[(UNSAFE_PURGE_Z_BELOW_BED, bad.clone())]);
+            assert!(
+                !plr.unsafe_allow_purge_z_below_bed,
+                "{bad} must not enable the override"
+            );
+        }
     }
 }

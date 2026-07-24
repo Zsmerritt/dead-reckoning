@@ -49,6 +49,25 @@ pub enum RecoveryError {
         /// Name of the offending field.
         field: &'static str,
     },
+    /// An acceleration override (`recovery_accel` or one of the
+    /// per-phase `accel_*` keys) was non-finite or outside
+    /// [[`crate::build::ACCEL_MIN`], [`crate::build::ACCEL_MAX`]] mm/s².
+    ///
+    /// Kept separate from [`Self::InvalidPlanConfig`] so the diagnosis
+    /// can carry the typed measured/expected pair: these are the keys an
+    /// operator is most likely to reach for mid-recovery ("just slow it
+    /// down"), and a bare "out of range" is not an answer.
+    #[error("acceleration override {key} = {value} mm/s^2 is outside [{min}, {max}] mm/s^2")]
+    AccelOutOfRange {
+        /// The offending `[plr]` key.
+        key: &'static str,
+        /// The rejected value, mm/s².
+        value: f64,
+        /// The inclusive lower bound, mm/s².
+        min: f64,
+        /// The inclusive upper bound, mm/s².
+        max: f64,
+    },
     /// The probe temperature band is too narrow to hold
     /// [`crate::build::PROBE_TEMP_HEADROOM`] below the contact ceiling.
     /// Probing AT the ceiling is refused by the Klipper plugin on any PID

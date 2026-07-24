@@ -527,6 +527,7 @@ mod tests {
             resume_offset: 0,
             requires_clean_nozzle_confirmation: false,
             recovery_file: crate::resume_file::RecoveryFileSpec::default(),
+            debug_confirm_each_step: false,
             warnings: vec![],
         }
     }

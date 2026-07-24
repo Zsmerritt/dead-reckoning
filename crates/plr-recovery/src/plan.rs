@@ -46,6 +46,20 @@ pub const TRUE_Z_PLACEHOLDER: &str = "{true_z}";
 /// substitutes the recorded value it captured before clamping.
 pub const RESTORE_ACCEL_PLACEHOLDER: &str = "{restore_accel}";
 
+/// The placeholder substituted by the daemon with the MACHINE's own
+/// `toolhead.max_accel`, recorded once by the [`Phase::RecoveryAccel`]
+/// step's [`RuntimeComputation::RecordMachineAccel`].
+///
+/// Two slots exist deliberately. [`RESTORE_ACCEL_PLACEHOLDER`] is the
+/// *phase* slot: the value in force immediately before the touch clamp,
+/// which under a `recovery_accel` override is the recovery accel, not
+/// the machine's. This one is the *machine* slot: the value the printer
+/// had before plrd touched anything. Collapsing them into one would make
+/// the touch clamp's restore and the end-of-recovery restore fight over
+/// a single variable, and whichever ran last would win — leaving the
+/// machine at a recovery acceleration after a successful resume.
+pub const MACHINE_ACCEL_PLACEHOLDER: &str = "{machine_accel}";
+
 /// The placeholder substituted by the daemon with the ABSOLUTE park Z
 /// computed by [`RuntimeComputation::ParkZ`] — `min(current_z + delta,
 /// z_max)`.
@@ -69,6 +83,17 @@ pub enum Phase {
     /// 1b — energize the Z steppers (enabling never touches homed
     /// state; there is no M17 in Klipper).
     StepperEnable,
+    /// 1c — record the machine's own `toolhead.max_accel` (into the
+    /// MACHINE slot, see [`RuntimeComputation::RecordMachineAccel`]) and,
+    /// when `recovery_accel` is configured, clamp acceleration for the
+    /// whole recovery. Its [`RecoveryStep::cleanup_commands`] restore the
+    /// machine value on ANY later abort; [`Phase::RecoveryAccelRestore`]
+    /// does it on the success path.
+    ///
+    /// Emitted only when at least one acceleration override is
+    /// configured, so a machine that sets none has a byte-identical plan
+    /// to before the feature existed.
+    RecoveryAccel,
     /// 2 — the FIRST heating action: non-blocking `M140` (bed is the
     /// long pole) plus a non-blocking `M104` toward the clamped probe
     /// temperature. Convergence is gated later, at the probe's
@@ -146,6 +171,25 @@ pub enum Phase {
     AccelRestore,
     /// 7a — true-Z arithmetic and kinematic re-declaration.
     TrueZDeclare,
+    /// 7a′ — the OPERATOR Z-CONFIRMATION standoff (`[plr]`
+    /// `confirm_z_before_resume`, default `false`).
+    ///
+    /// Lifts to the entry standoff — `min(current_Z + entry_hop, z_max)`,
+    /// the same rail-clamped [`RuntimeComputation::ParkZ`] arithmetic the
+    /// reheat park uses, with `entry_hop` (the documented safe standoff
+    /// above the resume point) as the delta — so the operator can look at
+    /// the nozzle while the daemon reports the Z it believes it is at and
+    /// how that number was derived.
+    ///
+    /// It deliberately **cannot descend**: [`park_z_at`] clamps the
+    /// target down to the rail but never below the current Z. Showing
+    /// the operator "where Z is" by driving toward the bed would be a
+    /// new, unreviewed descent — the exact class of motion this design
+    /// exists to eliminate.
+    ///
+    /// Emitted only when `confirm_z_before_resume` is set; the daemon
+    /// pauses for confirmation AFTER this step's verifications pass.
+    ZConfirmStandoff,
     /// 7b — load the bed-mesh profile (probe already done).
     MeshLoad,
     /// 7c — final true-frame declaration.
@@ -158,6 +202,13 @@ pub enum Phase {
     /// 8b — replay offsets, factors, modes, skew, fans (print
     /// temperatures move into the recovery file).
     RestoreFrame,
+    /// 8c — success-path restore of the machine's own `max_accel`
+    /// (`{machine_accel}`), placed BEFORE the recovery file starts so the
+    /// resumed print runs at the machine's normal acceleration rather
+    /// than a recovery override. Present exactly when
+    /// [`Phase::RecoveryAccel`] is; the abort path restores through that
+    /// step's [`RecoveryStep::cleanup_commands`] instead.
+    RecoveryAccelRestore,
     /// 9 — select the generated recovery file (`M23`) and start it
     /// (`M24`). No `M26`: the recovery file already begins at the resume
     /// boundary.
@@ -171,6 +222,9 @@ impl Phase {
         match self {
             Phase::IdleTimeout => "idle-timeout",
             Phase::StepperEnable => "stepper-enable",
+            Phase::RecoveryAccel => "recovery-accel",
+            Phase::ZConfirmStandoff => "z-confirm-standoff",
+            Phase::RecoveryAccelRestore => "recovery-accel-restore",
             Phase::ImmediateBedHeat => "immediate-bed-heat",
             Phase::BelievedZDeclare => "believed-z-declare",
             Phase::HomeXy => "home-xy",
@@ -312,6 +366,14 @@ pub enum AbortReason {
     IdleTimeoutNotApplied,
     /// A Z stepper failed to enable.
     StepperEnableFailed,
+    /// The recovery-wide `SET_VELOCITY_LIMIT` override did not take
+    /// effect (or its `max_accel` record failed).
+    RecoveryAccelFailed,
+    /// Restoring the machine's own `max_accel` on the success path
+    /// failed.
+    RecoveryAccelRestoreFailed,
+    /// The operator Z-confirmation standoff lift failed.
+    ZConfirmStandoffFailed,
     /// The immediate (non-blocking) bed/nozzle heat commands did not
     /// take effect (their targets were not set).
     ImmediateBedHeatFailed,
@@ -358,6 +420,9 @@ impl AbortReason {
         match self {
             AbortReason::IdleTimeoutNotApplied => "idle-timeout-not-applied",
             AbortReason::StepperEnableFailed => "stepper-enable-failed",
+            AbortReason::RecoveryAccelFailed => "recovery-accel-failed",
+            AbortReason::RecoveryAccelRestoreFailed => "recovery-accel-restore-failed",
+            AbortReason::ZConfirmStandoffFailed => "z-confirm-standoff-failed",
             AbortReason::ImmediateBedHeatFailed => "immediate-bed-heat-failed",
             AbortReason::BelievedZDeclareFailed => "believed-z-declare-failed",
             AbortReason::HomingFailed => "homing-failed",
@@ -530,6 +595,13 @@ pub enum RuntimeComputation {
     /// then `set_max_accel(TOUCH_ACCEL)`). The recorded value persists
     /// across the intervening steps in the daemon's execution state.
     RecordMaxAccel,
+    /// Read `toolhead.max_accel` **before** the step's commands run and
+    /// record it in the MACHINE slot, substituted for
+    /// [`MACHINE_ACCEL_PLACEHOLDER`] (see that constant for why the two
+    /// slots are separate). Carried by the [`Phase::RecoveryAccel`] step,
+    /// which is the first step in the plan that can change acceleration —
+    /// so the value recorded is genuinely the machine's own.
+    RecordMachineAccel,
     /// Read `toolhead.position[2]` **before** the step's commands run and
     /// substitute `min(current_z + delta_z, z_max)` for
     /// [`PARK_Z_PLACEHOLDER`] — the rail-clamped absolute park height (see
@@ -695,6 +767,23 @@ pub enum PlanWarning {
         /// The plan's `drag_speed`, mm/s.
         drag_speed: f64,
     },
+    /// An `UNSAFE_`-prefixed `[plr]` key is set and permitted a
+    /// [`crate::diagnosis::Tier::Hard`] refusal that would otherwise
+    /// have stopped this plan. Always surfaced: the escape hatch is
+    /// legitimate, but it must never be silent.
+    UnsafeOverrideActive {
+        /// The `UNSAFE_` key in force (as the operator spells it).
+        key: String,
+        /// The diagnosis code it permitted (e.g. `purge_z_below_bed`).
+        permitted: String,
+    },
+    /// `accel_probe` was configured on a machine that uses the consensus
+    /// `PLR_TOUCH` path, where `touch_accel` owns the contact
+    /// acceleration. The key is ignored rather than fought over.
+    AccelProbeIgnoredOnTouchPath {
+        /// The ignored value, mm/s².
+        accel_probe: f64,
+    },
 }
 
 impl PlanWarning {
@@ -790,6 +879,15 @@ impl PlanWarning {
                 fmt_num(*calibrated_at),
                 fmt_num(*drag_speed)
             ),
+            PlanWarning::UnsafeOverrideActive { key, permitted } => format!(
+                "UNSAFE override {key} is set and permitted {permitted}; the refusal that \
+                 normally prevents this is switched off"
+            ),
+            PlanWarning::AccelProbeIgnoredOnTouchPath { accel_probe } => format!(
+                "accel_probe ({} mm/s^2) is ignored on the consensus-touch path; \
+                 touch_accel owns the contact acceleration",
+                fmt_num(*accel_probe)
+            ),
         }
     }
 }
@@ -822,6 +920,17 @@ pub struct RecoveryPlan {
     /// in one place.
     #[serde(default)]
     pub recovery_file: RecoveryFileSpec,
+    /// `[plr]` `debug_confirm_each_step` (default `false`): pause before
+    /// EVERY step and report that step's commands and verifications,
+    /// waiting for the operator to answer over the control socket.
+    ///
+    /// Carried on the plan rather than in the daemon's runtime options
+    /// because it is a `printer.cfg` setting like every other `[plr]`
+    /// key, and because the rendered plan should say so.
+    /// `skip_serializing_if` keeps a plan that does not use it
+    /// byte-identical to one produced before the field existed.
+    #[serde(default, skip_serializing_if = "core::ops::Not::not")]
+    pub debug_confirm_each_step: bool,
     /// Non-fatal observations.
     pub warnings: Vec<PlanWarning>,
 }
@@ -1125,6 +1234,11 @@ impl RecoveryPlan {
                 "# note: no clean-nozzle macro configured; confirm the nozzle is clean before executing\n",
             );
         }
+        if self.debug_confirm_each_step {
+            out.push_str(
+                "# note: debug_confirm_each_step is set; execution pauses before EVERY step\n",
+            );
+        }
         let p = self.envelope.params;
         match p.overshoot {
             crate::envelope::OvershootTerm::PostTriggerTravel { probe_speed } => {
@@ -1225,7 +1339,8 @@ mod tests {
     #![allow(clippy::float_cmp)]
 
     use super::{
-        fmt_num, true_z_at_halt, AbortReason, Phase, Predicate, TriggerSource, TrueZFormula,
+        fmt_num, true_z_at_halt, AbortReason, Phase, PlanWarning, Predicate, TriggerSource,
+        TrueZFormula,
     };
 
     #[test]
@@ -1361,5 +1476,109 @@ mod tests {
             .describe()
             .contains("computed value"));
         assert_eq!(Predicate::NumAtMost { max: 0.015 }.describe(), "<= 0.015");
+    }
+
+    /// Every phase and abort reason has a stable kebab-case name, and no
+    /// two share one.
+    ///
+    /// These strings are the transcript's and the socket's vocabulary:
+    /// an operator greps for them and a client branches on them, so a
+    /// duplicate or a typo is a silent contract break rather than a
+    /// visible bug.
+    #[test]
+    fn phase_and_abort_names_are_unique_and_kebab_case() {
+        let phases = [
+            Phase::IdleTimeout,
+            Phase::StepperEnable,
+            Phase::RecoveryAccel,
+            Phase::ImmediateBedHeat,
+            Phase::BelievedZDeclare,
+            Phase::HomeXy,
+            Phase::ProbeTempHold,
+            Phase::CleanNozzle,
+            Phase::TransformFreeze,
+            Phase::ShiftedFrame,
+            Phase::ProbeApproach,
+            Phase::AccelClamp,
+            Phase::Probe,
+            Phase::AccelRestore,
+            Phase::TrueZDeclare,
+            Phase::ZConfirmStandoff,
+            Phase::MeshLoad,
+            Phase::FinalDeclare,
+            Phase::ParkForReheat,
+            Phase::RestoreFrame,
+            Phase::RecoveryAccelRestore,
+            Phase::RecoveryFileSelect,
+        ];
+        let mut names: Vec<&str> = phases.iter().map(|p| p.name()).collect();
+        assert_eq!(names.len(), 22, "a Phase was added: name it here too");
+        for name in &names {
+            assert!(
+                !name.is_empty()
+                    && name
+                        .chars()
+                        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-'),
+                "{name:?} is not kebab-case"
+            );
+        }
+        names.sort_unstable();
+        let count = names.len();
+        names.dedup();
+        assert_eq!(names.len(), count, "duplicate phase name");
+        // Declaration order IS emission order (the builder relies on it).
+        assert!(phases.windows(2).all(|w| w[0] < w[1]));
+
+        let reasons = [
+            AbortReason::IdleTimeoutNotApplied,
+            AbortReason::StepperEnableFailed,
+            AbortReason::RecoveryAccelFailed,
+            AbortReason::RecoveryAccelRestoreFailed,
+            AbortReason::ZConfirmStandoffFailed,
+            AbortReason::ImmediateBedHeatFailed,
+            AbortReason::BelievedZDeclareFailed,
+            AbortReason::HomingFailed,
+            AbortReason::ProbeTempHoldFailed,
+            AbortReason::CleanNozzleFailed,
+            AbortReason::TransformFreezeFailed,
+            AbortReason::ShiftedFrameNotDeclared,
+            AbortReason::ApproachFailed,
+            AbortReason::AccelClampFailed,
+            AbortReason::AccelRestoreFailed,
+            AbortReason::ProbeNoTrigger,
+            AbortReason::TrueZDeclareFailed,
+            AbortReason::MeshLoadFailed,
+            AbortReason::FinalDeclareFailed,
+            AbortReason::ParkForReheatFailed,
+            AbortReason::RestoreFailed,
+            AbortReason::RecoveryFileSelectFailed,
+        ];
+        let mut codes: Vec<&str> = reasons.iter().map(|r| r.code()).collect();
+        assert_eq!(
+            codes.len(),
+            22,
+            "an AbortReason was added: code it here too"
+        );
+        codes.sort_unstable();
+        let count = codes.len();
+        codes.dedup();
+        assert_eq!(codes.len(), count, "duplicate abort reason code");
+    }
+
+    /// The two configuration warnings render into the plan rather than
+    /// only into the structured diagnosis: an operator reading the plan
+    /// text must see that an override is in force.
+    #[test]
+    fn the_configuration_warnings_describe_themselves() {
+        let unsafe_active = PlanWarning::UnsafeOverrideActive {
+            key: "UNSAFE_allow_purge_z_below_bed".to_owned(),
+            permitted: "purge_z_below_bed".to_owned(),
+        }
+        .describe();
+        assert!(unsafe_active.contains("UNSAFE_allow_purge_z_below_bed"));
+        assert!(unsafe_active.contains("purge_z_below_bed"));
+        let ignored = PlanWarning::AccelProbeIgnoredOnTouchPath { accel_probe: 400.0 }.describe();
+        assert!(ignored.contains("400"), "{ignored}");
+        assert!(ignored.contains("touch_accel"), "{ignored}");
     }
 }

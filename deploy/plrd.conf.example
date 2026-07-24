@@ -255,6 +255,141 @@ control_socket = /var/lib/plrd/plrd.sock
 #                          exists, that step emits no command and the plan
 #                          asks the operator to confirm the nozzle is clean.
 #
+# ----------------------------------------------------------------------
+# WHEN SOMETHING GOES WRONG: the three tiers
+#
+# Recovering a print after a power loss is a bad moment to meet a bare
+# error string. Hours of machine time and a spool of filament are already
+# committed. So every refusal, warning and failure in this system comes
+# out as the same structured DIAGNOSIS — what happened, why it matters in
+# physical terms, and the exact key or command to change — and every one
+# of them carries a TIER that says what plrd does about it:
+#
+#   ADVISORY     Proceeds, and says so loudly. Nothing is being refused;
+#                you are being told. (A temperature overshoot inside the
+#                documented tolerance, an unverified park point, a resume
+#                that did not land on infill.)
+#
+#   CONFIRMABLE  Stops, explains, and offers "continue anyway". (A
+#                marginal contact zone, a stale calibration, a purge Z
+#                below the top of the part.) Answering happens over the
+#                control socket — the Klipper plugin's recovery prompts —
+#                so this is a CLICK, made while looking at the
+#                explanation. Callers that never asked to be consulted
+#                (`on_confirm` omitted or "abort") get an abort instead,
+#                which is what a non-interactive caller has always got.
+#
+#   HARD         Refuses. The only way past a Hard refusal is a pre-set
+#                UNSAFE_-prefixed key below, edited in printer.cfg while
+#                nothing is at stake. There is deliberately no runtime
+#                button. (purge_z below the bed, a nozzle above the
+#                contact ceiling, an unknown Z frame, an itinerary
+#                outside the machine's limits.)
+#
+# The escape hatch differs between the two stopping tiers only in whether
+# it is a click or a deliberate edit made while calm. That is the whole
+# policy: the things you might reasonably wave through under pressure are
+# Confirmable; the things you should only wave through with a clear head
+# and a text editor are Hard.
+#
+# MOST HARD REFUSALS HAVE NO ESCAPE AT ALL. Exactly two keys exist, and
+# both are spelled to be uncomfortable to type:
+#
+#   UNSAFE_allow_purge_z_below_bed        (false)
+#                          Permits a negative purge_z. The consequence is
+#                          confined to the purge blob and you can see the
+#                          geometry involved — which is why this one may
+#                          be permitted at all.
+#   UNSAFE_allow_drag_temp_below_floor    (false)
+#                          Permits a nonzero drag_nozzle_temp below the
+#                          50 C floor. The consequence is a long wait, not
+#                          a collision, and an operator on an open-frame
+#                          machine in a cold room genuinely knows better
+#                          than the floor does.
+#
+# Every OTHER Hard refusal — the machine prerequisites, a non-finite
+# number, an unknown Z span, an out-of-bounds itinerary, a temperature
+# the plugin's own ceiling gate would then refuse — has NO override, by
+# design. Permitting those would mean commanding motion against a Z frame
+# nobody can vouch for, or wedging the recovery after the frame is
+# declared: the one state this system exists to avoid.
+#
+# When an UNSAFE_ key actually permits something, the plan says so out
+# loud as an Advisory diagnosis. An override that fires silently is not
+# an escape hatch, it is a booby trap for whoever is standing at the
+# printer next.
+#
+# ----------------------------------------------------------------------
+# CONFIRM-POINTS — pause and ask, instead of guessing (both default False)
+#
+#   confirm_z_before_resume    (false)
+#                          After the true-Z declaration, lift to the entry
+#                          standoff and PAUSE, reporting the Z plrd
+#                          believes it is at and the arithmetic behind it,
+#                          until you confirm over the control socket.
+#                          Z was established by touching the part ONCE;
+#                          everything after this trusts that number, and
+#                          this is the last moment a human can compare it
+#                          against the actual nozzle.
+#                          The standoff lift reuses entry_hop through the
+#                          same rail-clamped arithmetic the reheat park
+#                          uses, so it CANNOT DESCEND — showing you where
+#                          Z is by driving toward the bed would be exactly
+#                          the unreviewed descent this design exists to
+#                          eliminate.
+#                          Declining (or letting it time out) aborts and
+#                          invalidates the Z frame, because the pause sits
+#                          after the shifted-frame declare: a fresh dry
+#                          run is then required before any resume.
+#   debug_confirm_each_step    (false)
+#                          Pause before EVERY step, reporting that step's
+#                          commands and verifications. A commissioning and
+#                          diagnosis aid; it changes no command.
+#
+#   Both need an interactive caller. `plrd recover --execute` on the CLI
+#   answers every confirm-point with "abort" (fail-closed), so enabling
+#   either key and then running from the CLI aborts cleanly at the first
+#   pause. Run the recovery through the Klipper plugin, which speaks the
+#   control socket's confirm protocol.
+#
+#   A pause is bounded: unanswered for 10 minutes, it aborts cleanly —
+#   with frame invalidation applied exactly as a decline at the same step
+#   would apply it, so a pause can never leave the frame ambiguous.
+#
+# ----------------------------------------------------------------------
+# ACCELERATION during recovery — all OPTIONAL, all [50, 20000] mm/s^2
+#
+# Recovery moves happen next to printed geometry in a Z frame established
+# by one contact measurement. If your machine's normal acceleration feels
+# too brisk for that, slow the recovery down without touching your print
+# profile. Absent means "leave the machine's own max_accel alone", which
+# is the default posture. An out-of-band value is REFUSED with a
+# diagnosis, never clamped.
+#
+#   recovery_accel         one max_accel for the WHOLE recovery. Recorded
+#                          and restored on completion AND on abort (via
+#                          the same cleanup mechanism that restores the
+#                          touch clamp), so a failed recovery never leaves
+#                          your printer at a recovery acceleration.
+#   accel_home             the XY homing step.
+#   accel_travel           the long XY travel to the contact point.
+#   accel_probe            the contact step on the ADXL-drag and legacy
+#                          single-PROBE paths. IGNORED on the consensus
+#                          touch path, where touch_accel owns the contact
+#                          acceleration — plrd says so with an Advisory
+#                          diagnosis rather than letting two keys fight
+#                          over the one motion that must not be
+#                          over-driven.
+#   accel_entry            the moves made close to printed geometry: the
+#                          confirm_z_before_resume standoff and the
+#                          lift-and-park before the reheat.
+#
+#   Setting ANY of them makes the plan record the machine's own max_accel
+#   first and put it back before the recovery file starts, so the resumed
+#   print runs at your normal acceleration rather than a recovery
+#   override. touch_accel (above) remains the probe-CONTACT value and is
+#   unaffected.
+#
 # The recovery no longer seeks the original file with M26. It writes a
 # generated <original>_RECOVERY.gcode into the virtual_sdcard root and
 # selects it with M23/M24. That file reheats to print temperature, re-homes

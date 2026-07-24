@@ -25,13 +25,46 @@
 //! `external_api/printer.md`), so a step's post-verifications read
 //! settled state. Slow-converging predicates ([`Predicate::TempWithin`])
 //! are polled up to `temp_timeout`; all others up to `verify_timeout`.
+//!
+//! # Confirm-points (invariant 3, refined)
+//!
+//! Invariant 3 says a verification failure aborts, and it still does.
+//! What this module adds is a *deliberate* stop: a [`ConfirmPoint`] —
+//! execution suspended, an explanation reported, and a yes/no answer
+//! awaited. Three features share the one mechanism:
+//!
+//! * a **[`plr_recovery::Tier::Confirmable`] diagnosis** raised by the
+//!   pre-flight (today: the plan's own warnings) pauses instead of
+//!   aborting outright;
+//! * **`confirm_z_before_resume`** pauses after the
+//!   [`Phase::ZConfirmStandoff`] step, reporting the believed Z and the
+//!   arithmetic behind it;
+//! * **`debug_confirm_each_step`** pauses before every step, reporting
+//!   that step's commands and verifications.
+//!
+//! A pause is not a special execution state: it is one `await` on the
+//! caller-supplied [`Confirmer`], bounded by
+//! [`ExecOptions::confirm_timeout`], whose three possible answers
+//! ([`ConfirmAnswer`]) are *continue*, *abort*, and *timed out* — and
+//! the last two are the same abort path, so a pause can never leave the
+//! machine anywhere an abort could not have left it. In particular a
+//! pause after the shifted-frame declare that times out invalidates the
+//! Z frame exactly as an abort there does, because it IS an abort there:
+//! [`ExecOutcome::Aborted::frame_invalid`] is computed from the anchor
+//! step's id by the same code either way.
+//!
+//! The default [`AbortConfirmer`] answers "abort" to everything, which
+//! is what preserves today's behaviour for non-interactive callers: a
+//! Confirmable diagnosis aborts unless somebody asked to be asked.
 
+use std::future::Future;
+use std::pin::Pin;
 use std::time::Duration;
 
 use plr_recovery::{
-    fmt_num, true_z_at_halt, FailureAction, Phase, Predicate, RecoveryPlan, RecoveryStep,
-    RuntimeComputation, TriggerSource, Verification, PARK_Z_PLACEHOLDER, RESTORE_ACCEL_PLACEHOLDER,
-    TRUE_Z_PLACEHOLDER,
+    fmt_num, true_z_at_halt, Diagnose, Diagnosis, FailureAction, Phase, Predicate, RecoveryPlan,
+    RecoveryStep, RuntimeComputation, Tier, TriggerSource, Verification, MACHINE_ACCEL_PLACEHOLDER,
+    PARK_Z_PLACEHOLDER, RESTORE_ACCEL_PLACEHOLDER, TRUE_Z_PLACEHOLDER,
 };
 use serde_json::{json, Value};
 
@@ -75,7 +108,25 @@ pub struct ExecOptions {
     pub temp_timeout: Duration,
     /// Poll interval.
     pub poll_interval: Duration,
+    /// How long a [`ConfirmPoint`] waits for an answer before it gives
+    /// up and aborts (see [`DEFAULT_CONFIRM_TIMEOUT`]).
+    ///
+    /// A blocking confirmer — the CLI's terminal prompt — cannot be
+    /// pre-empted by this: it holds its thread, so its bound is the
+    /// operator standing in front of it. The bound exists for the
+    /// control socket, where the client that asked to be consulted may
+    /// simply go away.
+    pub confirm_timeout: Duration,
 }
+
+/// Default [`ExecOptions::confirm_timeout`].
+///
+/// Long enough that an operator can walk to the printer, look at the
+/// nozzle, and walk back — which is exactly what a Z confirmation asks
+/// them to do — and short enough that an abandoned pause resolves itself
+/// the same day. Timing out is not a failure mode to be avoided at all
+/// costs: it aborts cleanly, and an abort is the safe direction.
+pub const DEFAULT_CONFIRM_TIMEOUT: Duration = Duration::from_mins(10);
 
 impl Default for ExecOptions {
     fn default() -> Self {
@@ -86,7 +137,106 @@ impl Default for ExecOptions {
             // Heating a bed from cold legitimately takes minutes.
             temp_timeout: Duration::from_mins(15),
             poll_interval: Duration::from_millis(500),
+            confirm_timeout: DEFAULT_CONFIRM_TIMEOUT,
         }
+    }
+}
+
+/// Which of the three confirm-point features raised this pause.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfirmKind {
+    /// A [`Tier::Confirmable`] diagnosis from the pre-flight.
+    Diagnosis,
+    /// The `confirm_z_before_resume` Z-height confirmation.
+    ZHeight,
+    /// The `debug_confirm_each_step` per-step pause.
+    StepDebug,
+}
+
+impl ConfirmKind {
+    /// Stable tag carried in the transcript and the socket response.
+    #[must_use]
+    pub fn tag(self) -> &'static str {
+        match self {
+            ConfirmKind::Diagnosis => "diagnosis",
+            ConfirmKind::ZHeight => "z-height",
+            ConfirmKind::StepDebug => "step-debug",
+        }
+    }
+}
+
+/// Everything a confirmer needs to put the question to a human.
+#[derive(Debug, Clone)]
+pub struct ConfirmPoint {
+    /// Which feature raised it.
+    pub kind: ConfirmKind,
+    /// The step this pause is anchored to. Every pause has one, even the
+    /// pre-flight's (which anchors on step 1, before anything is sent):
+    /// the anchor is what makes the abort path — and therefore the
+    /// frame-invalidation rule — identical to any other abort.
+    pub step_id: u32,
+    /// The anchor step's phase name.
+    pub phase: String,
+    /// The explanation, in the one shape every diagnosis takes.
+    pub diagnosis: Diagnosis,
+    /// Feature-specific evidence: the step's commands and verifications
+    /// for a step-debug pause, the believed Z and its derivation for a
+    /// Z-height pause.
+    pub detail: Value,
+}
+
+/// The answer to a [`ConfirmPoint`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfirmAnswer {
+    /// Proceed anyway.
+    Continue,
+    /// Stop; abort the recovery.
+    Abort,
+    /// Nobody answered within [`ExecOptions::confirm_timeout`]. Treated
+    /// exactly as [`ConfirmAnswer::Abort`], and distinguished only so the
+    /// transcript records which one it was.
+    TimedOut,
+}
+
+impl ConfirmAnswer {
+    /// Stable tag carried in the transcript.
+    #[must_use]
+    pub fn tag(self) -> &'static str {
+        match self {
+            ConfirmAnswer::Continue => "continue",
+            ConfirmAnswer::Abort => "abort",
+            ConfirmAnswer::TimedOut => "timeout",
+        }
+    }
+}
+
+/// How execution asks a human whether to proceed.
+///
+/// Boxed-future rather than `async fn` in trait: the control socket
+/// drives execution from a spawned task, so the whole execution future
+/// must be `Send`, and this shape says so at the type level without
+/// pulling in an async-trait dependency.
+pub trait Confirmer: Send {
+    /// Puts `point` to the operator and returns their answer.
+    fn confirm<'a>(
+        &'a mut self,
+        point: &'a ConfirmPoint,
+    ) -> Pin<Box<dyn Future<Output = ConfirmAnswer> + Send + 'a>>;
+}
+
+/// The default, non-interactive confirmer: every confirm-point aborts.
+///
+/// This is what preserves today's behaviour for callers that never asked
+/// to be consulted — a Confirmable diagnosis stops the recovery rather
+/// than silently proceeding, and there is nobody to ask.
+pub struct AbortConfirmer;
+
+impl Confirmer for AbortConfirmer {
+    fn confirm<'a>(
+        &'a mut self,
+        _point: &'a ConfirmPoint,
+    ) -> Pin<Box<dyn Future<Output = ConfirmAnswer> + Send + 'a>> {
+        Box::pin(async { ConfirmAnswer::Abort })
     }
 }
 
@@ -159,6 +309,80 @@ impl StepFailure {
     }
 }
 
+/// Every classified Klipper command failure explains itself.
+///
+/// Exhaustive with no catch-all arm, like every other [`Diagnose`]
+/// implementation: a new [`StepFailure`] variant fails to compile until
+/// its diagnosis is written. All four are [`Tier::Hard`] — these are
+/// things that went wrong *while moving*, next to the part, and none of
+/// them is a state anybody should be offered a "continue anyway" button
+/// for.
+impl Diagnose for StepFailure {
+    fn diagnosis(&self) -> Diagnosis {
+        match self {
+            StepFailure::ProbeTriggeredEarly => Diagnosis::new(
+                "probe_triggered_early",
+                Tier::Hard,
+                "the probe reported a trigger before the descent had moved",
+                "Klipper saw the probe already in contact when the move started. Either \
+                 the nozzle was resting on the part (the believed Z was too low), or the \
+                 probe is stuck triggered. Either way the reading that would come out of \
+                 this is not a measurement of anything, and the true-Z arithmetic built on \
+                 it would put the frame in the wrong place for the rest of the print.",
+                "Check the nozzle is not touching the part and that the probe reads \
+                 untriggered at rest (`QUERY_PROBE`). On a Tap-style probe this usually \
+                 means debris or a filament blob on the nozzle — clean it, then re-run a \
+                 fresh dry run before retrying."
+                    .to_owned(),
+            ),
+            StepFailure::NoTrigger => Diagnosis::new(
+                "probe_no_trigger",
+                Tier::Hard,
+                "the probe descended the full envelope without ever contacting the part",
+                "The envelope is deliberately bounded, so this is the safe failure: the \
+                 nozzle stopped short rather than pressing on indefinitely, and the part \
+                 was never touched. But it also means Z is still unknown — the one thing \
+                 the whole recovery exists to establish. On the consensus-touch path the \
+                 same code covers touches that could not agree with each other, which is \
+                 the same problem with more evidence.",
+                "The part is likely lower than the reconstruction believed (bed sag, or a \
+                 Z estimate biased high). Raise `envelope_margin` in printer.cfg's [plr] \
+                 section by a few tenths and re-run a fresh dry run. If the touches simply \
+                 disagreed, raise `touch_sample_range` toward its 0.015 cap, or reduce \
+                 machine vibration."
+                    .to_owned(),
+            ),
+            StepFailure::MoveOutOfRange => Diagnosis::new(
+                "move_out_of_range",
+                Tier::Hard,
+                "Klipper refused a commanded move as outside the machine's limits",
+                "Klipper does not clamp an out-of-range move, it refuses it — which is \
+                 the backstop working. It also means the plan's arithmetic and the \
+                 machine's rail limits disagree, and until they are reconciled every other \
+                 coordinate in the plan is equally suspect.",
+                "Check that the Z rail's `position_min`/`position_max` and the XY travel \
+                 limits in printer.cfg match the physical machine, then re-run a fresh dry \
+                 run: the whole-itinerary pre-flight checks every coordinate against those \
+                 limits before anything is sent."
+                    .to_owned(),
+            ),
+            StepFailure::Unknown => Diagnosis::new(
+                "klipper_command_error",
+                Tier::Hard,
+                "Klipper rejected a command with an error plrd does not recognize",
+                "plrd never continues past a command it could not confirm succeeded. \
+                 Because the error is unrecognized, plrd cannot say whether the command \
+                 partly took effect — so the only defensible assumption is that the \
+                 machine state is no longer what the plan believes.",
+                "Read the raw Klipper message in the transcript (and klippy.log) — it \
+                 names the real problem. Fix that, then re-run a fresh dry run before \
+                 retrying."
+                    .to_owned(),
+            ),
+        }
+    }
+}
+
 /// Why execution stopped before the plan completed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StopCause {
@@ -186,6 +410,24 @@ pub enum StopCause {
     ComputeFailed(String),
     /// The operator declined at a `--step` gate.
     OperatorDeclined,
+    /// A [`ConfirmPoint`] was answered "abort" — or was never asked at
+    /// all, because the caller supplied the default [`AbortConfirmer`].
+    ConfirmationDeclined {
+        /// Which feature raised the pause.
+        kind: ConfirmKind,
+        /// The diagnosis code that was put to the operator.
+        code: &'static str,
+    },
+    /// A [`ConfirmPoint`] went unanswered for
+    /// [`ExecOptions::confirm_timeout`]. Aborts on exactly the same path
+    /// as [`StopCause::ConfirmationDeclined`]; the distinction is only
+    /// for the transcript.
+    ConfirmationTimedOut {
+        /// Which feature raised the pause.
+        kind: ConfirmKind,
+        /// The diagnosis code that went unanswered.
+        code: &'static str,
+    },
 }
 
 impl StopCause {
@@ -247,14 +489,37 @@ impl<'a> Transcript<'a> {
     }
 }
 
+/// The two acceleration values execution carries across steps.
+///
+/// Two slots, not one: see [`MACHINE_ACCEL_PLACEHOLDER`] for why
+/// collapsing them leaves the machine at a recovery acceleration after a
+/// successful resume.
+#[derive(Debug, Clone, Copy, Default)]
+struct AccelSlots {
+    /// The value in force immediately before the touch clamp, recorded
+    /// by [`RuntimeComputation::RecordMaxAccel`]; substituted for
+    /// `{restore_accel}`.
+    phase: Option<f64>,
+    /// The machine's own value, recorded once by
+    /// [`RuntimeComputation::RecordMachineAccel`] before the plan
+    /// changes anything; substituted for `{machine_accel}`.
+    machine: Option<f64>,
+}
+
 /// Executes a validated plan step by step (module safety invariants
-/// 2–4). `gate` is consulted before every step (per-step confirmation);
+/// 2–4).
+///
+/// `gate` is consulted before every step (the CLI's `--step` mode);
 /// returning `false` stops execution before that step sends anything.
+/// `confirmer` answers every [`ConfirmPoint`] — pass
+/// [`AbortConfirmer`] for the non-interactive behaviour in which any
+/// Confirmable diagnosis aborts.
 pub async fn execute(
     plan: &RecoveryPlan,
     client: &mut MoonrakerClient,
     options: &ExecOptions,
     gate: &mut (dyn FnMut(&RecoveryStep) -> bool + Send),
+    confirmer: &mut dyn Confirmer,
     transcript: &mut Transcript<'_>,
 ) -> ExecOutcome {
     transcript.entry(&json!({
@@ -268,11 +533,26 @@ pub async fn execute(
     let shifted_id = plan
         .first_index(Phase::ShiftedFrame)
         .map(|i| plan.steps[i].id);
-    // Execution state that persists across steps: the pre-clamp accel
-    // recorded by the accel-clamp step (reused by the restore step and
-    // the abort cleanups) and the registered abort cleanups.
-    let mut recorded_accel: Option<f64> = None;
+    // Execution state that persists across steps: the two accel slots
+    // and the registered abort cleanups.
+    let mut accel = AccelSlots::default();
     let mut cleanups: Vec<(u32, Vec<String>)> = Vec::new();
+
+    // Pre-flight: every plan warning is a diagnosis, and a Confirmable
+    // one pauses here — BEFORE step 1, so declining costs nothing and
+    // sends nothing.
+    let Some(anchor) = plan.steps.first() else {
+        transcript.entry(&json!({"event": "plan-complete", "steps": 0}));
+        return ExecOutcome::Completed { steps: 0 };
+    };
+    if let Some(cause) = preflight_confirmations(plan, anchor, options, confirmer, transcript).await
+    {
+        return finish_abort(
+            client, anchor, cause, &cleanups, accel, shifted_id, transcript,
+        )
+        .await;
+    }
+
     for step in &plan.steps {
         if !gate(step) {
             transcript.entry(&json!({
@@ -283,11 +563,23 @@ pub async fn execute(
                 step,
                 StopCause::OperatorDeclined,
                 &cleanups,
-                recorded_accel,
+                accel,
                 shifted_id,
                 transcript,
             )
             .await;
+        }
+        // `debug_confirm_each_step`: pause BEFORE the step's commands, so
+        // the operator sees exactly what is about to be sent and what
+        // will be checked afterwards.
+        if plan.debug_confirm_each_step {
+            let point = step_debug_point(step);
+            if let Some(cause) = ask(&point, options, confirmer, transcript).await {
+                return finish_abort(
+                    client, step, cause, &cleanups, accel, shifted_id, transcript,
+                )
+                .await;
+            }
         }
         transcript.entry(&json!({
             "event": "step-start",
@@ -295,28 +587,29 @@ pub async fn execute(
             "phase": step.phase.name(),
             "summary": step.summary,
         }));
-        if let Err(cause) = run_step(
-            client,
-            step,
-            options,
-            &mut recorded_accel,
-            &mut cleanups,
-            transcript,
-        )
-        .await
-        {
-            return finish_abort(
-                client,
-                step,
-                cause,
-                &cleanups,
-                recorded_accel,
-                shifted_id,
-                transcript,
-            )
-            .await;
-        }
+        let computed =
+            match run_step(client, step, options, &mut accel, &mut cleanups, transcript).await {
+                Ok(computed) => computed,
+                Err(cause) => {
+                    return finish_abort(
+                        client, step, cause, &cleanups, accel, shifted_id, transcript,
+                    )
+                    .await;
+                }
+            };
         transcript.entry(&json!({"event": "step-ok", "step": step.id}));
+        // `confirm_z_before_resume`: pause AFTER the standoff lift has
+        // run and verified, so the reported Z is a settled readback and
+        // the nozzle is already where the operator is being asked to look.
+        if step.phase == Phase::ZConfirmStandoff {
+            let point = z_confirm_point(client, plan, step, computed).await;
+            if let Some(cause) = ask(&point, options, confirmer, transcript).await {
+                return finish_abort(
+                    client, step, cause, &cleanups, accel, shifted_id, transcript,
+                )
+                .await;
+            }
+        }
     }
     transcript.entry(&json!({"event": "plan-complete", "steps": plan.steps.len()}));
     ExecOutcome::Completed {
@@ -324,25 +617,230 @@ pub async fn execute(
     }
 }
 
+/// Turns every plan warning into a diagnosis, transcribes it, and pauses
+/// on the Confirmable ones. `Some(cause)` means the recovery must abort.
+async fn preflight_confirmations(
+    plan: &RecoveryPlan,
+    anchor: &RecoveryStep,
+    options: &ExecOptions,
+    confirmer: &mut dyn Confirmer,
+    transcript: &mut Transcript<'_>,
+) -> Option<StopCause> {
+    for warning in &plan.warnings {
+        let diagnosis = warning.diagnosis();
+        match diagnosis.tier {
+            // Proceeds by default — but loudly, and in the same shape
+            // every other diagnosis takes.
+            Tier::Advisory => transcript.entry(&json!({
+                "event": "advisory",
+                "diagnosis": diagnosis,
+            })),
+            Tier::Confirmable | Tier::Hard => {
+                let point = ConfirmPoint {
+                    kind: ConfirmKind::Diagnosis,
+                    step_id: anchor.id,
+                    phase: anchor.phase.name().to_owned(),
+                    diagnosis,
+                    detail: json!({"raised_by": "pre-flight"}),
+                };
+                if let Some(cause) = ask(&point, options, confirmer, transcript).await {
+                    return Some(cause);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Puts one confirm-point to the confirmer, bounded by
+/// [`ExecOptions::confirm_timeout`], and records the question and the
+/// answer in the transcript. `None` means "continue".
+async fn ask(
+    point: &ConfirmPoint,
+    options: &ExecOptions,
+    confirmer: &mut dyn Confirmer,
+    transcript: &mut Transcript<'_>,
+) -> Option<StopCause> {
+    transcript.entry(&json!({
+        "event": "confirm-pause",
+        "kind": point.kind.tag(),
+        "step": point.step_id,
+        "phase": point.phase,
+        "diagnosis": point.diagnosis,
+        "detail": point.detail,
+    }));
+    let answer = tokio::time::timeout(options.confirm_timeout, confirmer.confirm(point))
+        .await
+        .unwrap_or(ConfirmAnswer::TimedOut);
+    transcript.entry(&json!({
+        "event": "confirm-answer",
+        "kind": point.kind.tag(),
+        "step": point.step_id,
+        "code": point.diagnosis.code,
+        "answer": answer.tag(),
+    }));
+    match answer {
+        ConfirmAnswer::Continue => None,
+        ConfirmAnswer::Abort => Some(StopCause::ConfirmationDeclined {
+            kind: point.kind,
+            code: point.diagnosis.code,
+        }),
+        ConfirmAnswer::TimedOut => Some(StopCause::ConfirmationTimedOut {
+            kind: point.kind,
+            code: point.diagnosis.code,
+        }),
+    }
+}
+
+/// The `debug_confirm_each_step` question: this step, its commands, and
+/// what will be verified afterwards.
+fn step_debug_point(step: &RecoveryStep) -> ConfirmPoint {
+    ConfirmPoint {
+        kind: ConfirmKind::StepDebug,
+        step_id: step.id,
+        phase: step.phase.name().to_owned(),
+        diagnosis: Diagnosis::new(
+            "step_debug_pause",
+            Tier::Confirmable,
+            format!(
+                "about to run step {} [{}]: {}",
+                step.id,
+                step.phase.name(),
+                step.summary
+            ),
+            "debug_confirm_each_step is set, so execution stops before every step. Nothing \
+             is wrong — this pause exists so the exact commands below can be read before \
+             they are sent."
+                .to_owned(),
+            "Answer `continue` to send this step, or `abort` to stop here. Unset \
+             `debug_confirm_each_step` in printer.cfg's [plr] section to run without \
+             these pauses."
+                .to_owned(),
+        ),
+        detail: json!({
+            "summary": step.summary,
+            "commands": step.commands,
+            "pre_verify": step.pre_verify.iter().map(describe_verification).collect::<Vec<_>>(),
+            "verify": step.verify.iter().map(describe_verification).collect::<Vec<_>>(),
+            "cleanup_commands": step.cleanup_commands,
+        }),
+    }
+}
+
+fn describe_verification(v: &Verification) -> String {
+    format!("{}.{} {}", v.object, v.field, v.predicate.describe())
+}
+
+/// The `confirm_z_before_resume` question: what Z the daemon believes it
+/// is at, how that number was derived, and where the toolhead is now.
+///
+/// Deliberately read-only beyond the standoff lift the plan already
+/// performed. The live readback is best-effort: a status query that fails
+/// here must not turn an operator confirmation into an abort, so the
+/// field simply reports that it was unavailable.
+async fn z_confirm_point(
+    client: &mut MoonrakerClient,
+    plan: &RecoveryPlan,
+    step: &RecoveryStep,
+    computed: Option<f64>,
+) -> ConfirmPoint {
+    let live_z = query_number(client, "toolhead", "position.2").await.ok();
+    let formula = plan
+        .first_index(Phase::TrueZDeclare)
+        .and_then(|i| plan.steps[i].compute)
+        .and_then(|c| match c {
+            RuntimeComputation::TrueZ(f) => Some(f),
+            RuntimeComputation::RecordMaxAccel
+            | RuntimeComputation::RecordMachineAccel
+            | RuntimeComputation::ParkZ { .. } => None,
+        });
+    let derivation = formula.map_or_else(
+        || "unavailable (no true-Z step in this plan)".to_owned(),
+        |f| {
+            format!(
+                "true_Z = z_prev_top {} + (halt_Z - trigger_Z), trigger read from {}",
+                fmt_num(f.z_prev_top),
+                trigger_source_name(f.trigger_source)
+            )
+        },
+    );
+    let what = match live_z {
+        Some(z) => format!(
+            "the toolhead is standing off at Z {} mm; confirm this matches what you see",
+            fmt_num(z)
+        ),
+        None => "the toolhead is standing off above the resume point; confirm this matches \
+                 what you see"
+            .to_owned(),
+    };
+    let mut diagnosis = Diagnosis::new(
+        "z_confirm_before_resume",
+        Tier::Confirmable,
+        what,
+        format!(
+            "confirm_z_before_resume is set. Z was established by touching the part once \
+             and doing arithmetic on the result ({derivation}); everything the resume does \
+             from here trusts that number. This is the last moment at which a human can \
+             compare it against the actual nozzle before the print continues. The toolhead \
+             was lifted to this standoff and never lowered — nothing here can descend."
+        ),
+        "Answer `continue` if the standoff looks right. If it does not, answer `abort`: \
+         the recovery stops and the Z frame is invalidated, so a fresh dry run is required \
+         before any resume. Unset `confirm_z_before_resume` in printer.cfg's [plr] section \
+         to skip this pause."
+            .to_owned(),
+    );
+    if let Some(z) = live_z {
+        diagnosis = diagnosis.measured("toolhead.position.2", z, "mm");
+    }
+    if let Some(z) = computed {
+        diagnosis = diagnosis.expected("standoff target", Some(z), Some(z), "mm");
+    }
+    ConfirmPoint {
+        kind: ConfirmKind::ZHeight,
+        step_id: step.id,
+        phase: step.phase.name().to_owned(),
+        diagnosis,
+        detail: json!({
+            "standoff_target_z": computed,
+            "live_toolhead_z": live_z,
+            "derivation": derivation,
+        }),
+    }
+}
+
+fn trigger_source_name(source: TriggerSource) -> &'static str {
+    match source {
+        TriggerSource::RawLastZResult => "probe.last_z_result (raw trigger Z)",
+        TriggerSource::BedZPlusOffset { .. } => "probe.last_probe_position[2] + z_offset",
+        TriggerSource::DragResult => "plr.last_drag_result.trigger_z (ADXL drag)",
+        TriggerSource::TouchResult { .. } => {
+            "plr.last_touch_result.median_z + z_offset (consensus touch)"
+        }
+    }
+}
+
 /// Runs one step's pre-verify, compute, send, and post-verify. Registers
 /// the step's abort cleanup once its commands are about to take effect.
+/// Returns the step's resolved runtime value, which the Z-confirmation
+/// pause reports as the standoff target.
 async fn run_step(
     client: &mut MoonrakerClient,
     step: &RecoveryStep,
     options: &ExecOptions,
-    recorded_accel: &mut Option<f64>,
+    accel: &mut AccelSlots,
     cleanups: &mut Vec<(u32, Vec<String>)>,
     transcript: &mut Transcript<'_>,
-) -> Result<(), StopCause> {
+) -> Result<Option<f64>, StopCause> {
     // Pre-verifications: must hold before anything is sent.
     for verification in &step.pre_verify {
         poll_verification(client, verification, None, options, transcript, "pre").await?;
     }
-    // Runtime computation: the true-Z formula, or the max-accel record;
-    // for a plain step the resolved value is the persisted recorded
-    // accel (so the restore step's `{restore_accel}` / NumWithinComputed
-    // resolve).
-    let computed = resolve_compute(client, step, recorded_accel, transcript).await?;
+    // Runtime computation: the true-Z formula, a park height, or one of
+    // the two accel records; for a plain step the resolved value is the
+    // persisted phase accel (so the restore step's `{restore_accel}` /
+    // NumWithinComputed resolve).
+    let computed = resolve_compute(client, step, accel, transcript).await?;
     // Register this step's abort cleanup BEFORE its commands run: its
     // side effect (the accel clamp) is about to be in force, so any
     // subsequent abort must undo it.
@@ -350,12 +848,12 @@ async fn run_step(
         cleanups.push((step.id, step.cleanup_commands.clone()));
     }
     // Commands: the only send path in the crate (invariant 2).
-    send_step_commands(client, step, computed, transcript).await?;
+    send_step_commands(client, step, computed, accel.machine, transcript).await?;
     // Post-verifications.
     for verification in &step.verify {
         poll_verification(client, verification, computed, options, transcript, "post").await?;
     }
-    Ok(())
+    Ok(computed)
 }
 
 /// Runs the registered abort cleanups (in reverse registration order —
@@ -368,23 +866,33 @@ async fn finish_abort(
     step: &RecoveryStep,
     cause: StopCause,
     cleanups: &[(u32, Vec<String>)],
-    recorded_accel: Option<f64>,
+    accel: AccelSlots,
     shifted_id: Option<u32>,
     transcript: &mut Transcript<'_>,
 ) -> ExecOutcome {
     for (sid, commands) in cleanups.iter().rev() {
         for command in commands {
-            let resolved = if command.contains(RESTORE_ACCEL_PLACEHOLDER) {
-                let Some(value) = recorded_accel else {
+            // Reverse registration order means the touch clamp's restore
+            // (phase slot) runs before the recovery-accel restore
+            // (machine slot), so the machine ends at its own value even
+            // when both were in force.
+            let slot = if command.contains(RESTORE_ACCEL_PLACEHOLDER) {
+                Some((RESTORE_ACCEL_PLACEHOLDER, accel.phase))
+            } else if command.contains(MACHINE_ACCEL_PLACEHOLDER) {
+                Some((MACHINE_ACCEL_PLACEHOLDER, accel.machine))
+            } else {
+                None
+            };
+            let resolved = match slot {
+                Some((placeholder, Some(value))) => command.replace(placeholder, &fmt_num(value)),
+                Some((_, None)) => {
                     transcript.entry(&json!({
                         "event": "cleanup-skip", "step": sid, "command": command,
                         "reason": "no recorded accel to substitute",
                     }));
                     continue;
-                };
-                command.replace(RESTORE_ACCEL_PLACEHOLDER, &fmt_num(value))
-            } else {
-                command.clone()
+                }
+                None => command.clone(),
             };
             transcript.entry(&json!({
                 "event": "cleanup", "step": sid, "command": resolved,
@@ -410,20 +918,36 @@ fn abort(
     transcript: &mut Transcript<'_>,
 ) -> ExecOutcome {
     let FailureAction::Abort { reason } = step.on_failure;
+    // A confirm-point abort did not fail the step's verification, so
+    // reporting the step's own abort reason would name a failure that
+    // never happened. It reports why it really stopped instead — but it
+    // is the same abort, at the same anchor step, and therefore obeys the
+    // same frame-invalidation rule.
+    let reason = match &cause {
+        StopCause::ConfirmationDeclined { .. } => "confirmation-declined".to_owned(),
+        StopCause::ConfirmationTimedOut { .. } => "confirmation-timeout".to_owned(),
+        StopCause::VerificationFailed { .. }
+        | StopCause::Transport(_)
+        | StopCause::CommandFailed { .. }
+        | StopCause::ComputeFailed(_)
+        | StopCause::OperatorDeclined => reason.code().to_owned(),
+    };
     let frame_invalid = shifted_id.is_some_and(|sid| step.id >= sid);
+    let diagnosis = cause.step_failure().map(|f| f.diagnosis());
     transcript.entry(&json!({
         "event": "abort",
         "step": step.id,
         "phase": step.phase.name(),
-        "reason": reason.code(),
+        "reason": reason,
         "cause": format!("{cause:?}"),
         "failure": cause.step_failure().map(StepFailure::code),
+        "diagnosis": diagnosis,
         "frame_invalid": frame_invalid,
     }));
     ExecOutcome::Aborted {
         step_id: step.id,
         phase: step.phase.name().to_owned(),
-        reason: reason.code().to_owned(),
+        reason,
         cause,
         frame_invalid,
     }
@@ -436,13 +960,14 @@ async fn send_step_commands(
     client: &mut MoonrakerClient,
     step: &RecoveryStep,
     computed: Option<f64>,
+    machine_accel: Option<f64>,
     transcript: &mut Transcript<'_>,
 ) -> Result<(), StopCause> {
     for command in &step.commands {
-        let has_placeholder = command.contains(TRUE_Z_PLACEHOLDER)
+        let has_computed_placeholder = command.contains(TRUE_Z_PLACEHOLDER)
             || command.contains(RESTORE_ACCEL_PLACEHOLDER)
             || command.contains(PARK_Z_PLACEHOLDER);
-        let resolved = if has_placeholder {
+        let mut resolved = if has_computed_placeholder {
             let Some(value) = computed else {
                 // A placeholder without a computed value cannot be sent;
                 // plan construction forbids it, and so does this.
@@ -458,6 +983,17 @@ async fn send_step_commands(
         } else {
             command.clone()
         };
+        // The machine-accel slot is separate from the computed value (see
+        // MACHINE_ACCEL_PLACEHOLDER); it is recorded by an earlier step,
+        // never by this one.
+        if resolved.contains(MACHINE_ACCEL_PLACEHOLDER) {
+            let Some(value) = machine_accel else {
+                return Err(StopCause::ComputeFailed(
+                    "command carries {machine_accel} but no machine accel was recorded".to_owned(),
+                ));
+            };
+            resolved = resolved.replace(MACHINE_ACCEL_PLACEHOLDER, &fmt_num(value));
+        }
         transcript.entry(&json!({
             "event": "send", "step": step.id, "command": resolved,
         }));
@@ -485,7 +1021,7 @@ async fn send_step_commands(
 async fn resolve_compute(
     client: &mut MoonrakerClient,
     step: &RecoveryStep,
-    recorded_accel: &mut Option<f64>,
+    accel: &mut AccelSlots,
     transcript: &mut Transcript<'_>,
 ) -> Result<Option<f64>, StopCause> {
     match step.compute {
@@ -540,18 +1076,30 @@ async fn resolve_compute(
         }
         Some(RuntimeComputation::RecordMaxAccel) => {
             // Read BEFORE the step's SET_VELOCITY_LIMIT clamps it, and
-            // persist for the restore step / abort cleanup.
-            let accel = query_number(client, "toolhead", "max_accel").await?;
-            *recorded_accel = Some(accel);
+            // persist in the PHASE slot for the restore step / abort
+            // cleanup.
+            let value = query_number(client, "toolhead", "max_accel").await?;
+            accel.phase = Some(value);
             transcript.entry(&json!({
-                "event": "record-accel", "step": step.id, "max_accel": accel,
+                "event": "record-accel", "step": step.id, "max_accel": value,
             }));
-            Ok(Some(accel))
+            Ok(Some(value))
         }
-        // A plain step resolves to the persisted recorded accel: this is
+        Some(RuntimeComputation::RecordMachineAccel) => {
+            // The MACHINE slot: read before the plan changes acceleration
+            // at all, so what goes back at the end is the printer's own
+            // value rather than whatever the recovery was running at.
+            let value = query_number(client, "toolhead", "max_accel").await?;
+            accel.machine = Some(value);
+            transcript.entry(&json!({
+                "event": "record-machine-accel", "step": step.id, "max_accel": value,
+            }));
+            Ok(Some(value))
+        }
+        // A plain step resolves to the persisted PHASE accel: this is
         // what the accel-restore step's `{restore_accel}` substitution
         // and NumWithinComputed check read.
-        None => Ok(*recorded_accel),
+        None => Ok(accel.phase),
     }
 }
 
@@ -671,8 +1219,8 @@ fn evaluate(predicate: &Predicate, value: Option<&Value>, computed: Option<f64>)
 #[cfg(test)]
 pub(crate) mod tests {
     use super::{
-        dry_run, evaluate, execute, lookup, ExecOptions, ExecOutcome, StepFailure, StopCause,
-        Transcript,
+        dry_run, evaluate, execute, lookup, AbortConfirmer, ConfirmAnswer, ConfirmKind,
+        ConfirmPoint, Confirmer, ExecOptions, ExecOutcome, StepFailure, StopCause, Transcript,
     };
     use crate::moonraker::MoonrakerClient;
     use crate::testmoon::FakeMoonraker;
@@ -766,6 +1314,7 @@ pub(crate) mod tests {
             resume_offset: 1234,
             requires_clean_nozzle_confirmation: false,
             recovery_file: plr_recovery::RecoveryFileSpec::default(),
+            debug_confirm_each_step: false,
             warnings: vec![],
         }
     }
@@ -775,6 +1324,7 @@ pub(crate) mod tests {
             verify_timeout: Duration::from_millis(300),
             temp_timeout: Duration::from_millis(300),
             poll_interval: Duration::from_millis(20),
+            confirm_timeout: Duration::from_millis(300),
         }
     }
 
@@ -811,13 +1361,25 @@ pub(crate) mod tests {
         fake: &FakeMoonraker,
         gate: &mut (dyn FnMut(&RecoveryStep) -> bool + Send),
     ) -> (ExecOutcome, String) {
+        run_with(plan, fake, gate, &mut AbortConfirmer, &fast_options()).await
+    }
+
+    /// The full harness: an explicit confirmer and explicit options, so a
+    /// confirm-point test can supply both.
+    pub(crate) async fn run_with(
+        plan: &RecoveryPlan,
+        fake: &FakeMoonraker,
+        gate: &mut (dyn FnMut(&RecoveryStep) -> bool + Send),
+        confirmer: &mut dyn Confirmer,
+        options: &ExecOptions,
+    ) -> (ExecOutcome, String) {
         let mut client = MoonrakerClient::connect(&fake.url(), Duration::from_secs(5))
             .await
             .unwrap();
         let mut buffer = Vec::new();
         let outcome = {
             let mut transcript = Transcript::new(&mut buffer);
-            execute(plan, &mut client, &fast_options(), gate, &mut transcript).await
+            execute(plan, &mut client, options, gate, confirmer, &mut transcript).await
         };
         (outcome, String::from_utf8(buffer).unwrap())
     }
@@ -1478,5 +2040,565 @@ pub(crate) mod tests {
         assert!(evaluate(&computed, Some(&json!(12.26)), Some(12.25)));
         assert!(!evaluate(&computed, Some(&json!(12.26)), None));
         assert!(!evaluate(&Predicate::BoolTrue, None, None));
+    }
+
+    // --- Confirm-points --------------------------------------------------
+    //
+    // Three features, one mechanism. The tests below hold the mechanism
+    // to the promise made in the module docs: a pause is an `await` whose
+    // abort path is byte-for-byte the ordinary abort path, so nothing a
+    // pause can do is something an abort could not already do.
+
+    /// A confirmer that answers from a fixed script and records every
+    /// question it was asked.
+    struct ScriptedConfirmer {
+        answers: std::collections::VecDeque<ConfirmAnswer>,
+        /// Used once the script runs out.
+        default: ConfirmAnswer,
+        asked: Arc<Mutex<Vec<(ConfirmKind, String, u32)>>>,
+    }
+
+    impl ScriptedConfirmer {
+        fn new(answers: &[ConfirmAnswer], default: ConfirmAnswer) -> Self {
+            Self {
+                answers: answers.iter().copied().collect(),
+                default,
+                asked: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+    }
+
+    impl Confirmer for ScriptedConfirmer {
+        fn confirm<'a>(
+            &'a mut self,
+            point: &'a ConfirmPoint,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ConfirmAnswer> + Send + 'a>>
+        {
+            Box::pin(async move {
+                self.asked.lock().expect("asked").push((
+                    point.kind,
+                    point.diagnosis.code.to_owned(),
+                    point.step_id,
+                ));
+                self.answers.pop_front().unwrap_or(self.default)
+            })
+        }
+    }
+
+    /// A confirmer that never answers, so the executor's own
+    /// `confirm_timeout` is what ends the pause.
+    struct SilentConfirmer;
+
+    impl Confirmer for SilentConfirmer {
+        fn confirm<'a>(
+            &'a mut self,
+            _point: &'a ConfirmPoint,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ConfirmAnswer> + Send + 'a>>
+        {
+            Box::pin(async {
+                // Far longer than any test's confirm_timeout.
+                tokio::time::sleep(Duration::from_hours(1)).await;
+                ConfirmAnswer::Continue
+            })
+        }
+    }
+
+    /// `test_plan()` with a shifted-frame declare as step 1, so every
+    /// later abort must invalidate the Z frame.
+    fn framed_plan() -> RecoveryPlan {
+        let mut plan = test_plan();
+        plan.steps[0].phase = Phase::ShiftedFrame;
+        plan
+    }
+
+    /// [`framed_plan`] plus the operator Z-confirmation standoff the
+    /// builder emits for `confirm_z_before_resume`: a fourth step that
+    /// lifts to `min(current_Z + entry_hop, z_max)` — the same
+    /// rail-clamped arithmetic the reheat park uses, which never
+    /// descends — after the true-Z declare (step 3).
+    fn z_confirm_plan() -> RecoveryPlan {
+        let mut plan = framed_plan();
+        plan.steps.push(RecoveryStep {
+            id: 4,
+            phase: Phase::ZConfirmStandoff,
+            summary: "lift to the entry standoff for the operator Z confirmation".to_owned(),
+            commands: vec!["G90".to_owned(), "G1 Z{park_z} F1200".to_owned()],
+            pre_verify: vec![],
+            verify: vec![],
+            compute: Some(RuntimeComputation::ParkZ {
+                delta_z: 1.0,
+                z_max: None,
+            }),
+            cleanup_commands: vec![],
+            on_failure: FailureAction::Abort {
+                reason: AbortReason::ZConfirmStandoffFailed,
+            },
+        });
+        plan
+    }
+
+    #[tokio::test]
+    async fn an_advisory_diagnosis_proceeds_and_is_transcribed() {
+        let mut plan = test_plan();
+        plan.warnings = vec![plr_recovery::PlanWarning::ResumeNotOnInfill];
+        let fake = FakeMoonraker::spawn(happy_handler).await;
+        let mut confirmer = ScriptedConfirmer::new(&[], ConfirmAnswer::Abort);
+        let asked = Arc::clone(&confirmer.asked);
+        let (outcome, transcript) =
+            run_with(&plan, &fake, &mut |_| true, &mut confirmer, &fast_options()).await;
+        assert_eq!(outcome, ExecOutcome::Completed { steps: 3 }, "{transcript}");
+        // Advisory means "warn loudly, proceed": nobody was asked, and
+        // the diagnosis is in the transcript in the one shape.
+        assert!(asked.lock().expect("asked").is_empty());
+        assert!(
+            transcript.contains("\"event\":\"advisory\""),
+            "{transcript}"
+        );
+        assert!(transcript.contains("resume_not_on_infill"), "{transcript}");
+        assert!(transcript.contains("\"tier\":\"advisory\""), "{transcript}");
+    }
+
+    #[tokio::test]
+    async fn a_confirmable_diagnosis_aborts_by_default_before_anything_is_sent() {
+        // The default confirmer is the non-interactive one: preserving
+        // exactly the behaviour a caller that never asked to be consulted
+        // had before confirm-points existed.
+        let mut plan = test_plan();
+        plan.warnings = vec![plr_recovery::PlanWarning::PurgeZBelowResume {
+            purge_z: 0.1,
+            resume_z: 0.6,
+        }];
+        let fake = FakeMoonraker::spawn(happy_handler).await;
+        let (outcome, transcript) = run(&plan, &fake, &mut |_| true).await;
+        let ExecOutcome::Aborted {
+            step_id,
+            reason,
+            cause,
+            frame_invalid,
+            ..
+        } = outcome
+        else {
+            panic!("expected abort, got {outcome:?}");
+        };
+        // Anchored on step 1, before any command: declining costs nothing.
+        assert_eq!(step_id, 1);
+        assert_eq!(reason, "confirmation-declined");
+        assert!(!frame_invalid, "nothing was declared, nothing is unknown");
+        assert_eq!(
+            cause,
+            StopCause::ConfirmationDeclined {
+                kind: ConfirmKind::Diagnosis,
+                code: "purge_z_below_resume",
+            }
+        );
+        assert!(fake.gcode_sent().is_empty(), "{:?}", fake.gcode_sent());
+        assert!(
+            transcript.contains("\"event\":\"confirm-pause\""),
+            "{transcript}"
+        );
+        assert!(transcript.contains("\"answer\":\"abort\""), "{transcript}");
+    }
+
+    #[tokio::test]
+    async fn a_confirmable_diagnosis_answered_continue_proceeds() {
+        let mut plan = test_plan();
+        plan.warnings = vec![plr_recovery::PlanWarning::PurgeZBelowResume {
+            purge_z: 0.1,
+            resume_z: 0.6,
+        }];
+        let fake = FakeMoonraker::spawn(happy_handler).await;
+        let mut confirmer =
+            ScriptedConfirmer::new(&[ConfirmAnswer::Continue], ConfirmAnswer::Abort);
+        let asked = Arc::clone(&confirmer.asked);
+        let (outcome, transcript) =
+            run_with(&plan, &fake, &mut |_| true, &mut confirmer, &fast_options()).await;
+        assert_eq!(outcome, ExecOutcome::Completed { steps: 3 }, "{transcript}");
+        let asked = asked.lock().expect("asked").clone();
+        assert_eq!(asked.len(), 1);
+        assert_eq!(asked[0].0, ConfirmKind::Diagnosis);
+        assert_eq!(asked[0].1, "purge_z_below_resume");
+        assert!(
+            transcript.contains("\"answer\":\"continue\""),
+            "{transcript}"
+        );
+        assert_eq!(fake.gcode_sent().len(), 3);
+    }
+
+    /// `confirm_z_before_resume`: a plan carrying the standoff step
+    /// pauses after it, reports the believed Z and how it was derived,
+    /// and continues on `continue`.
+    #[tokio::test]
+    async fn the_z_confirmation_reports_the_believed_z_and_continues() {
+        let plan = z_confirm_plan();
+        let fake = FakeMoonraker::spawn(happy_handler).await;
+        let mut confirmer =
+            ScriptedConfirmer::new(&[ConfirmAnswer::Continue], ConfirmAnswer::Abort);
+        let asked = Arc::clone(&confirmer.asked);
+        let (outcome, transcript) =
+            run_with(&plan, &fake, &mut |_| true, &mut confirmer, &fast_options()).await;
+        assert_eq!(outcome, ExecOutcome::Completed { steps: 4 }, "{transcript}");
+        let asked = asked.lock().expect("asked").clone();
+        assert_eq!(
+            asked,
+            vec![(
+                ConfirmKind::ZHeight,
+                "z_confirm_before_resume".to_owned(),
+                4
+            )]
+        );
+        // The pause is AFTER the step ran and verified: the reported Z is
+        // a settled readback, not a prediction.
+        let pause_at = transcript.find("\"confirm-pause\"").expect("pause");
+        let step_ok = transcript
+            .find("\"step-ok\",\"step\":4")
+            .expect("step-ok 4");
+        assert!(step_ok < pause_at, "{transcript}");
+        // It explains where the number came from.
+        assert!(transcript.contains("z_prev_top"), "{transcript}");
+        assert!(transcript.contains("last_z_result"), "{transcript}");
+        assert!(transcript.contains("live_toolhead_z"), "{transcript}");
+    }
+
+    #[tokio::test]
+    async fn declining_the_z_confirmation_aborts_and_invalidates_the_frame() {
+        let plan = z_confirm_plan();
+        let fake = FakeMoonraker::spawn(happy_handler).await;
+        let mut confirmer = ScriptedConfirmer::new(&[ConfirmAnswer::Abort], ConfirmAnswer::Abort);
+        let (outcome, transcript) =
+            run_with(&plan, &fake, &mut |_| true, &mut confirmer, &fast_options()).await;
+        let ExecOutcome::Aborted {
+            step_id,
+            reason,
+            frame_invalid,
+            ..
+        } = outcome
+        else {
+            panic!("expected abort, got {outcome:?}");
+        };
+        assert_eq!(step_id, 4);
+        assert_eq!(reason, "confirmation-declined");
+        assert!(
+            frame_invalid,
+            "a pause past the shifted-frame declare aborts like any other abort there"
+        );
+        assert!(
+            transcript.contains("\"frame_invalid\":true"),
+            "{transcript}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unanswered_confirmation_times_out_into_the_same_clean_abort() {
+        let plan = z_confirm_plan();
+        let fake = FakeMoonraker::spawn(happy_handler).await;
+        let options = ExecOptions {
+            confirm_timeout: Duration::from_millis(50),
+            ..fast_options()
+        };
+        let (outcome, transcript) =
+            run_with(&plan, &fake, &mut |_| true, &mut SilentConfirmer, &options).await;
+        let ExecOutcome::Aborted {
+            step_id,
+            reason,
+            cause,
+            frame_invalid,
+            ..
+        } = outcome
+        else {
+            panic!("expected abort, got {outcome:?}");
+        };
+        assert_eq!(step_id, 4);
+        assert_eq!(reason, "confirmation-timeout");
+        assert_eq!(
+            cause,
+            StopCause::ConfirmationTimedOut {
+                kind: ConfirmKind::ZHeight,
+                code: "z_confirm_before_resume",
+            }
+        );
+        // The frame rule is honored on the timeout path exactly as on the
+        // decline path — this is the "no ambiguous frame" requirement.
+        assert!(frame_invalid);
+        assert!(
+            transcript.contains("\"answer\":\"timeout\""),
+            "{transcript}"
+        );
+        assert!(
+            transcript.contains("\"frame_invalid\":true"),
+            "{transcript}"
+        );
+    }
+
+    #[tokio::test]
+    async fn step_debug_pauses_before_every_step_and_reports_it() {
+        let mut plan = test_plan();
+        plan.debug_confirm_each_step = true;
+        let fake = FakeMoonraker::spawn(happy_handler).await;
+        let mut confirmer = ScriptedConfirmer::new(&[], ConfirmAnswer::Continue);
+        let asked = Arc::clone(&confirmer.asked);
+        let (outcome, transcript) =
+            run_with(&plan, &fake, &mut |_| true, &mut confirmer, &fast_options()).await;
+        assert_eq!(outcome, ExecOutcome::Completed { steps: 3 }, "{transcript}");
+        let asked = asked.lock().expect("asked").clone();
+        assert_eq!(asked.len(), 3, "one pause per step: {asked:?}");
+        assert!(asked
+            .iter()
+            .all(|(k, c, _)| *k == ConfirmKind::StepDebug && c == "step_debug_pause"));
+        assert_eq!(asked.iter().map(|a| a.2).collect::<Vec<_>>(), vec![1, 2, 3]);
+        // The pause carries what is about to be sent and what will be
+        // checked — that is the whole point of the mode.
+        assert!(
+            transcript.contains("SET_IDLE_TIMEOUT TIMEOUT=86400"),
+            "{transcript}"
+        );
+        assert!(transcript.contains("\"pre_verify\""), "{transcript}");
+        // Declining a step-debug pause stops before that step sends.
+        let mut declining = ScriptedConfirmer::new(
+            &[ConfirmAnswer::Continue, ConfirmAnswer::Abort],
+            ConfirmAnswer::Abort,
+        );
+        let fake2 = FakeMoonraker::spawn(happy_handler).await;
+        let (outcome, _) = run_with(
+            &plan,
+            &fake2,
+            &mut |_| true,
+            &mut declining,
+            &fast_options(),
+        )
+        .await;
+        let ExecOutcome::Aborted { step_id, .. } = outcome else {
+            panic!("expected abort");
+        };
+        assert_eq!(step_id, 2);
+        assert_eq!(fake2.gcode_sent(), vec!["SET_IDLE_TIMEOUT TIMEOUT=86400"]);
+    }
+
+    #[tokio::test]
+    async fn confirm_points_are_byte_identical_to_today_when_disabled() {
+        // The inertness proof: with no Confirmable warning, no standoff
+        // step and debug off, the transcript and the sent commands are
+        // exactly what they were before confirm-points existed — and a
+        // confirmer that would abort everything is never consulted.
+        let plan = test_plan();
+        assert!(!plan.debug_confirm_each_step);
+        let fake_a = FakeMoonraker::spawn(happy_handler).await;
+        let (outcome_a, transcript_a) = run(&plan, &fake_a, &mut |_| true).await;
+        let fake_b = FakeMoonraker::spawn(happy_handler).await;
+        let mut confirmer = ScriptedConfirmer::new(&[], ConfirmAnswer::Abort);
+        let asked = Arc::clone(&confirmer.asked);
+        let (outcome_b, transcript_b) = run_with(
+            &plan,
+            &fake_b,
+            &mut |_| true,
+            &mut confirmer,
+            &fast_options(),
+        )
+        .await;
+        assert_eq!(outcome_a, ExecOutcome::Completed { steps: 3 });
+        assert_eq!(outcome_a, outcome_b);
+        assert_eq!(transcript_a, transcript_b);
+        assert_eq!(fake_a.gcode_sent(), fake_b.gcode_sent());
+        assert!(asked.lock().expect("asked").is_empty());
+        for absent in ["confirm-pause", "confirm-answer", "advisory"] {
+            assert!(!transcript_a.contains(absent), "{absent}: {transcript_a}");
+        }
+    }
+
+    // --- The two acceleration slots --------------------------------------
+
+    /// A plan that exercises BOTH slots: a machine-accel record/clamp,
+    /// then the touch clamp inside it, then both restores.
+    fn two_slot_accel_plan() -> RecoveryPlan {
+        use plr_recovery::{MACHINE_ACCEL_PLACEHOLDER, RESTORE_ACCEL_PLACEHOLDER};
+        let mut plan = test_plan();
+        plan.steps = vec![
+            RecoveryStep {
+                id: 1,
+                phase: Phase::RecoveryAccel,
+                summary: "recovery accel".to_owned(),
+                commands: vec!["SET_VELOCITY_LIMIT ACCEL=1000".to_owned()],
+                pre_verify: vec![],
+                verify: vec![],
+                compute: Some(RuntimeComputation::RecordMachineAccel),
+                cleanup_commands: vec![format!(
+                    "SET_VELOCITY_LIMIT ACCEL={MACHINE_ACCEL_PLACEHOLDER}"
+                )],
+                on_failure: FailureAction::Abort {
+                    reason: AbortReason::RecoveryAccelFailed,
+                },
+            },
+            RecoveryStep {
+                id: 2,
+                phase: Phase::AccelClamp,
+                summary: "touch clamp".to_owned(),
+                commands: vec!["SET_VELOCITY_LIMIT ACCEL=100".to_owned()],
+                pre_verify: vec![],
+                verify: vec![],
+                compute: Some(RuntimeComputation::RecordMaxAccel),
+                cleanup_commands: vec![format!(
+                    "SET_VELOCITY_LIMIT ACCEL={RESTORE_ACCEL_PLACEHOLDER}"
+                )],
+                on_failure: FailureAction::Abort {
+                    reason: AbortReason::AccelClampFailed,
+                },
+            },
+            RecoveryStep {
+                id: 3,
+                phase: Phase::Probe,
+                summary: "touch".to_owned(),
+                commands: vec!["PLR_TOUCH SAMPLES=3".to_owned()],
+                pre_verify: vec![],
+                verify: vec![Verification::new(
+                    "plr",
+                    "last_touch_result.median_z",
+                    Predicate::FinitePresent,
+                )],
+                compute: None,
+                cleanup_commands: vec![],
+                on_failure: FailureAction::Abort {
+                    reason: AbortReason::ProbeNoTrigger,
+                },
+            },
+            RecoveryStep {
+                id: 4,
+                phase: Phase::AccelRestore,
+                summary: "restore the pre-touch accel".to_owned(),
+                commands: vec![format!(
+                    "SET_VELOCITY_LIMIT ACCEL={RESTORE_ACCEL_PLACEHOLDER}"
+                )],
+                pre_verify: vec![],
+                verify: vec![],
+                compute: None,
+                cleanup_commands: vec![],
+                on_failure: FailureAction::Abort {
+                    reason: AbortReason::AccelRestoreFailed,
+                },
+            },
+            RecoveryStep {
+                id: 5,
+                phase: Phase::RecoveryAccelRestore,
+                summary: "restore the machine accel".to_owned(),
+                commands: vec![format!(
+                    "SET_VELOCITY_LIMIT ACCEL={MACHINE_ACCEL_PLACEHOLDER}"
+                )],
+                pre_verify: vec![],
+                verify: vec![],
+                compute: None,
+                cleanup_commands: vec![],
+                on_failure: FailureAction::Abort {
+                    reason: AbortReason::RecoveryAccelRestoreFailed,
+                },
+            },
+        ];
+        plan
+    }
+
+    #[tokio::test]
+    async fn both_accel_slots_restore_independently_on_the_success_path() {
+        let plan = two_slot_accel_plan();
+        let fake = FakeMoonraker::spawn(accel_fake_handler(Some(0.75), false)).await;
+        let (outcome, transcript) = run(&plan, &fake, &mut |_| true).await;
+        assert_eq!(outcome, ExecOutcome::Completed { steps: 5 }, "{transcript}");
+        assert_eq!(
+            fake.gcode_sent(),
+            vec![
+                // machine 3000 -> recovery 1000 -> touch 100 ...
+                "SET_VELOCITY_LIMIT ACCEL=1000",
+                "SET_VELOCITY_LIMIT ACCEL=100",
+                "PLR_TOUCH SAMPLES=3",
+                // ... back to the value in force before the touch (the
+                // RECOVERY accel, not the machine's) ...
+                "SET_VELOCITY_LIMIT ACCEL=1000",
+                // ... and finally back to the machine's own.
+                "SET_VELOCITY_LIMIT ACCEL=3000",
+            ],
+            "one slot would have collapsed these two restores into one"
+        );
+        assert!(transcript.contains("record-machine-accel"), "{transcript}");
+    }
+
+    #[tokio::test]
+    async fn both_accel_slots_restore_in_reverse_order_on_abort() {
+        // The touch median is null: the probe post-verify fails at step 3
+        // and both registered cleanups run, newest first.
+        let plan = two_slot_accel_plan();
+        let fake = FakeMoonraker::spawn(accel_fake_handler(None, false)).await;
+        let (outcome, transcript) = run(&plan, &fake, &mut |_| true).await;
+        let ExecOutcome::Aborted {
+            step_id, reason, ..
+        } = outcome
+        else {
+            panic!("expected abort, got {outcome:?}");
+        };
+        assert_eq!(step_id, 3);
+        assert_eq!(reason, "probe-no-trigger", "cleanups must not mask it");
+        assert_eq!(
+            fake.gcode_sent(),
+            vec![
+                "SET_VELOCITY_LIMIT ACCEL=1000",
+                "SET_VELOCITY_LIMIT ACCEL=100",
+                "PLR_TOUCH SAMPLES=3",
+                // Reverse registration order: the touch clamp's restore
+                // first, then the machine's.
+                "SET_VELOCITY_LIMIT ACCEL=1000",
+                "SET_VELOCITY_LIMIT ACCEL=3000",
+            ],
+            "{transcript}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_machine_accel_placeholder_without_a_record_refuses_to_send() {
+        let mut plan = two_slot_accel_plan();
+        // Strip the recording computation: the restore step can no longer
+        // resolve, and must refuse rather than send a literal placeholder.
+        plan.steps[0].compute = None;
+        plan.steps[0].cleanup_commands = vec![];
+        let fake = FakeMoonraker::spawn(accel_fake_handler(Some(0.75), false)).await;
+        let (outcome, _) = run(&plan, &fake, &mut |_| true).await;
+        let ExecOutcome::Aborted { step_id, cause, .. } = outcome else {
+            panic!("expected abort, got {outcome:?}");
+        };
+        assert_eq!(step_id, 5);
+        assert!(matches!(cause, StopCause::ComputeFailed(_)), "{cause:?}");
+        assert!(!fake
+            .gcode_sent()
+            .iter()
+            .any(|c| c.contains("{machine_accel}")));
+    }
+
+    #[test]
+    fn every_step_failure_variant_explains_itself() {
+        // Exhaustive with no catch-all in the impl; this asserts the arms
+        // somebody wrote are usable and correctly tiered.
+        for failure in [
+            StepFailure::ProbeTriggeredEarly,
+            StepFailure::NoTrigger,
+            StepFailure::MoveOutOfRange,
+            StepFailure::Unknown,
+        ] {
+            let d = plr_recovery::Diagnose::diagnosis(&failure);
+            assert_eq!(d.tier, plr_recovery::Tier::Hard, "{failure:?}");
+            assert_eq!(d.override_key, None, "a step failure is never overridable");
+            assert!(!d.what.trim().is_empty(), "{failure:?}");
+            assert!(!d.why.trim().is_empty(), "{failure:?}");
+            assert!(d.suggested_fix.len() > 20, "{failure:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn an_aborting_command_error_carries_its_diagnosis_into_the_transcript() {
+        let fake = FakeMoonraker::spawn(|method, params| {
+            if method == "printer.gcode.script" {
+                Err((400, "No trigger on probe after full movement".to_owned()))
+            } else {
+                happy_handler(method, params)
+            }
+        })
+        .await;
+        let (_, transcript) = run(&test_plan(), &fake, &mut |_| true).await;
+        assert!(transcript.contains("probe_no_trigger"), "{transcript}");
+        assert!(transcript.contains("envelope_margin"), "{transcript}");
+        assert!(transcript.contains("\"tier\":\"hard\""), "{transcript}");
     }
 }

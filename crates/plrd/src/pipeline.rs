@@ -1330,7 +1330,10 @@ G1 X60 Y60 E0.02
     /// its all-false defaults, which would refuse instantly in legacy
     /// mode, and the pipeline still reaches a plan.
     #[cfg(unix)]
-    fn plr_fixture(tag: &str, plr_overrides: &[(&str, serde_json::Value)]) -> (PathBuf, Config) {
+    pub(crate) fn plr_fixture(
+        tag: &str,
+        plr_overrides: &[(&str, serde_json::Value)],
+    ) -> (PathBuf, Config) {
         use crate::plrcfg::tests as fixtures;
         let (dir, mut config) = fixture(tag);
         let mut configfile = fixtures::configfile_status(plr_overrides);
