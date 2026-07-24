@@ -17,13 +17,22 @@ USAGE:
     plrd scan --wal <dir> [--heartbeat <path>]
                                    offline: scan a WAL directory and print
                                    a recovery report
+    plrd recover --config <path> [--execute --confirm] [--step]
+                                   plan a print recovery. DEFAULT IS DRY
+                                   RUN: prints the plan and every command
+                                   that would be sent, sends nothing.
+                                   --execute additionally requires
+                                   --confirm AND an interactive yes, then
+                                   executes step by step via Moonraker,
+                                   aborting on any failed verification.
+                                   --step asks before every step.
     plrd version                   print the version
     plrd help                      print this help
 
 EXIT CODES:
-    0  success
-    1  runtime failure (I/O error, WAL failure, daemon error)
-    2  usage error (bad arguments)
+    0  success (for recover: dry run printed, or execution completed)
+    1  runtime failure (I/O error, WAL failure, refusal, abort, decline)
+    2  usage error (bad arguments; --execute without --confirm)
     3  unsupported platform (the daemon runs only on Linux)";
 
 /// A parsed invocation.
@@ -40,6 +49,18 @@ pub enum Command {
         wal: PathBuf,
         /// Heartbeat file path override (default `<wal>/heartbeat.bin`).
         heartbeat: Option<PathBuf>,
+    },
+    /// `plrd recover`: plan (and optionally execute) a recovery.
+    Recover {
+        /// Path to the configuration file (WAL dir, Moonraker URL, and
+        /// the `[machine]` snapshot all come from it).
+        config: PathBuf,
+        /// Execute the plan instead of dry-running it.
+        execute: bool,
+        /// Second explicit consent flag required by `--execute`.
+        confirm: bool,
+        /// Ask before every step during execution.
+        step: bool,
     },
     /// `plrd version`: print the crate version.
     Version,
@@ -64,6 +85,7 @@ pub fn parse(args: &[String]) -> Result<Command, String> {
     match cmd.as_str() {
         "run" => parse_run(&mut it),
         "scan" => parse_scan(&mut it),
+        "recover" => parse_recover(&mut it),
         "version" | "--version" | "-V" => reject_extra(&mut it, Command::Version),
         "help" | "--help" | "-h" => reject_extra(&mut it, Command::Help),
         "__crash-writer" => {
@@ -87,6 +109,29 @@ fn parse_run<'a>(it: &mut impl Iterator<Item = &'a String>) -> Result<Command, S
     }
     let config = config.ok_or_else(|| "run: missing required --config <path>".to_owned())?;
     Ok(Command::Run { config })
+}
+
+/// Parses `recover` flags: `--config <path>` (required), `--execute`,
+/// `--confirm`, `--step`.
+fn parse_recover<'a>(it: &mut impl Iterator<Item = &'a String>) -> Result<Command, String> {
+    let mut config: Option<PathBuf> = None;
+    let (mut execute, mut confirm, mut step) = (false, false, false);
+    while let Some(flag) = it.next() {
+        match flag.as_str() {
+            "--config" => assign_value(it, "--config", &mut config)?,
+            "--execute" => execute = true,
+            "--confirm" => confirm = true,
+            "--step" => step = true,
+            other => return Err(format!("recover: unknown flag `{other}`")),
+        }
+    }
+    let config = config.ok_or_else(|| "recover: missing required --config <path>".to_owned())?;
+    Ok(Command::Recover {
+        config,
+        execute,
+        confirm,
+        step,
+    })
 }
 
 /// Parses `scan` flags: `--wal <dir>` (required) and `--heartbeat <path>`.
@@ -204,6 +249,39 @@ mod tests {
         assert!(parse(&args(&["__crash-writer"])).is_err());
         // Hidden: not advertised in the usage text.
         assert!(!USAGE.contains("__crash-writer"));
+    }
+
+    #[test]
+    fn recover_parses_flags_in_any_order() {
+        assert_eq!(
+            parse(&args(&["recover", "--config", "/etc/plrd.conf"])),
+            Ok(Command::Recover {
+                config: "/etc/plrd.conf".into(),
+                execute: false,
+                confirm: false,
+                step: false,
+            })
+        );
+        assert_eq!(
+            parse(&args(&[
+                "recover",
+                "--step",
+                "--confirm",
+                "--config",
+                "c",
+                "--execute"
+            ])),
+            Ok(Command::Recover {
+                config: "c".into(),
+                execute: true,
+                confirm: true,
+                step: true,
+            })
+        );
+        assert!(parse(&args(&["recover"])).unwrap_err().contains("--config"));
+        assert!(parse(&args(&["recover", "--config", "c", "--force"]))
+            .unwrap_err()
+            .contains("unknown flag"));
     }
 
     #[test]

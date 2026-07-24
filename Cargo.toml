@@ -34,6 +34,11 @@ repository = "https://github.com/zsmerritt/dead-reckoning"
 [workspace.dependencies]
 tokio = { version = "1.53.1", features = ["full"] }
 tokio-tungstenite = "0.30.0"
+# Not a new tree entry: futures-util is already tokio-tungstenite's own
+# dependency (see Cargo.lock); its Stream/Sink extension traits are the
+# only way to drive a WebSocketStream, so the direct declaration merely
+# names what the WebSocket choice already implied. Minimal features.
+futures-util = { version = "0.3.31", default-features = false, features = ["sink", "std"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 thiserror = "2.0.19"

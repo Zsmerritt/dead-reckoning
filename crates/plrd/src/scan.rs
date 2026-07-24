@@ -130,8 +130,10 @@ pub fn run_scan(
     Ok(())
 }
 
-/// Lists `(index, path)` for every segment, sorted by index.
-fn list_segments(wal_dir: &Path) -> Result<Vec<(u64, PathBuf)>, String> {
+/// Lists `(index, path)` for every segment, sorted by index. Shared
+/// with the recovery pipeline (`pipeline`) and boot detection
+/// (`detect`).
+pub(crate) fn list_segments(wal_dir: &Path) -> Result<Vec<(u64, PathBuf)>, String> {
     let entries = std::fs::read_dir(wal_dir)
         .map_err(|e| format!("cannot read WAL directory {}: {e}", wal_dir.display()))?;
     let mut segments = Vec::new();
@@ -146,7 +148,7 @@ fn list_segments(wal_dir: &Path) -> Result<Vec<(u64, PathBuf)>, String> {
     Ok(segments)
 }
 
-fn scan_segment(path: &Path) -> Result<RecoveryScan, String> {
+pub(crate) fn scan_segment(path: &Path) -> Result<RecoveryScan, String> {
     let file = std::fs::File::open(path)
         .map_err(|e| format!("cannot open segment {}: {e}", path.display()))?;
     scan_read(file, MAX_SEGMENT_READ)
@@ -157,7 +159,7 @@ fn scan_segment(path: &Path) -> Result<RecoveryScan, String> {
 /// segment-relative (they are only used for reporting and resume, and
 /// resume applies to the newest segment alone); header, truncation
 /// offset, and end reason come from the newest segment.
-fn merge_scans(scans: &[RecoveryScan]) -> RecoveryScan {
+pub(crate) fn merge_scans(scans: &[RecoveryScan]) -> RecoveryScan {
     let last = scans.last().expect("caller guarantees at least one scan");
     RecoveryScan {
         header: last.header.clone(),
@@ -165,6 +167,69 @@ fn merge_scans(scans: &[RecoveryScan]) -> RecoveryScan {
         truncation_offset: last.truncation_offset,
         end: last.end.clone(),
     }
+}
+
+/// Loads and merges the whole WAL directory (segments only), without
+/// printing. `Err` for an unreadable/empty directory.
+pub(crate) fn load_merged(wal_dir: &Path) -> Result<RecoveryScan, String> {
+    load_merged_tail(wal_dir, usize::MAX)
+}
+
+/// Like [`load_merged`] but bounded to the newest `max_segments`
+/// segments. Boot-time detection uses a small bound so a months-old
+/// WAL directory cannot delay the recorder at startup; the newest
+/// segments carry everything classification needs (the tail heartbeat,
+/// contexts, and markers).
+pub(crate) fn load_merged_tail(
+    wal_dir: &Path,
+    max_segments: usize,
+) -> Result<RecoveryScan, String> {
+    let mut segments = list_segments(wal_dir)?;
+    if segments.is_empty() {
+        return Err(format!(
+            "no WAL segments (wal-*.plr) found in {}",
+            wal_dir.display()
+        ));
+    }
+    if segments.len() > max_segments {
+        segments.drain(..segments.len() - max_segments);
+    }
+    let mut scans = Vec::new();
+    for (_, path) in &segments {
+        scans.push(scan_segment(path)?);
+    }
+    Ok(merge_scans(&scans))
+}
+
+/// Loads the heartbeat file without printing; `Err` carries the
+/// human-readable reason.
+pub(crate) fn load_heartbeat(path: &Path) -> Result<HeartbeatRecovery, String> {
+    let bytes = std::fs::read(path)
+        .map_err(|e| format!("heartbeat {}: unreadable ({e})", path.display()))?;
+    recover_heartbeat(&bytes)
+        .map_err(|e| format!("heartbeat {}: unrecoverable: {e}", path.display()))
+}
+
+/// Loads the receive-seq sidecar without printing; `None` when absent
+/// or invalid (both are the conservative direction).
+pub(crate) fn load_receive_seq(path: &Path) -> Option<ReceiveSeqObservation> {
+    let (mono_ns, widened_seq) = decode_seq(&std::fs::read(path).ok()?)?;
+    Some(ReceiveSeqObservation {
+        mono_ns,
+        widened_seq,
+    })
+}
+
+/// The newest context's print file path and position, if any context
+/// named one.
+pub(crate) fn last_print_file(merged: &RecoveryScan) -> Option<(String, u64)> {
+    merged.records.iter().rev().find_map(|r| match &r.record {
+        WalRecord::Context(c) => c
+            .virtual_sdcard
+            .as_ref()
+            .map(|v| (v.file_path.clone(), v.file_position)),
+        _ => None,
+    })
 }
 
 struct Report<'a>(&'a mut dyn Write);

@@ -9,16 +9,20 @@ repository.workspace = true
 publish = false
 
 [dependencies]
+plr-analyzer = { path = "../plr-analyzer" }
+plr-gcode = { path = "../plr-gcode" }
 plr-klipper = { path = "../plr-klipper" }
 plr-reconstruct = { path = "../plr-reconstruct" }
+plr-recovery = { path = "../plr-recovery" }
 plr-wal = { path = "../plr-wal" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
-# Reserved for the Moonraker recovery executor (see src/executor.rs); the
-# WebSocket client lands with the executor implementation.
+# Moonraker WebSocket JSON-RPC client (src/moonraker.rs).
 tokio-tungstenite = { workspace = true }
+# Stream/Sink traits for the WebSocket (see the workspace table note).
+futures-util = { workspace = true }
 
 # Durability syscalls (fdatasync, O_DSYNC) are Linux-only by design and are
 # never mocked; keep rustix off non-Linux builds entirely. The `time`

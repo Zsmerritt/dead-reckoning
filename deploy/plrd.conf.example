@@ -37,3 +37,41 @@ segment_rotate_bytes = 16777216
 # disk stalls and it fills, motion records are dropped and the gap is
 # journaled as a SubscriptionGap marker.
 channel_capacity = 1024
+
+# Moonraker WebSocket endpoint, used for the boot-time pending-recovery
+# announcement and by `plrd recover --execute`.
+moonraker_url = ws://127.0.0.1:7125/websocket
+
+# Machine snapshot for recovery planning (`plrd recover`). Recovery is
+# REFUSED until every prerequisite validates; keys mirror
+# plr-recovery's MachineConfig (see crates/plrd/src/config.rs for the
+# full table). All attestations default to false: recovery must be
+# consciously commissioned per machine.
+[machine]
+# [force_move] with enable_force_move: True is present in printer.cfg.
+force_move_enabled = false
+# Operator attestation: the Z leadscrews are self-locking (the bed
+# cannot back-drive under gravity when the motors are off).
+z_self_locking_attested = false
+# Z steppers as `name` or `name:mcu` (bare names assume primary_mcu).
+# Multi-MCU Z is refused by validation.
+z_steppers = stepper_z
+primary_mcu = mcu
+# Probe: `tap` ([probe], nozzle-actuated) or `load_cell`
+# ([load_cell_probe]), plus its configured z_offset in mm.
+#probe_kind = tap
+#probe_z_offset = -0.1
+# Attestations that the probe's activate/deactivate gcode command no
+# motion (empty gcode qualifies).
+probe_activate_gcode_no_move = false
+probe_deactivate_gcode_no_move = false
+# The Z rail's position_min (or [printer] minimum_z_position), mm.
+#z_position_min = -2.0
+# printer.cfg location; plrd checksums it at recover time and compares
+# against validated_config_hash (change detection). On mismatch the
+# computed value is printed — re-validate the machine, then paste it
+# here to re-bless.
+#klipper_config_path = /home/pi/printer_data/config/printer.cfg
+#validated_config_hash = crc32c:00000000
+# [virtual_sdcard] path.
+#virtual_sdcard_root = /home/pi/printer_data/gcodes
