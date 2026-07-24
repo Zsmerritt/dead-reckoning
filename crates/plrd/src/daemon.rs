@@ -50,6 +50,13 @@ pub fn run(config_path: &Path) -> u8 {
             return EXIT_RUNTIME;
         }
     };
+    // Boot-time pending-recovery detection runs BEFORE the WAL service
+    // touches the directory, so it classifies exactly the previous
+    // session's evidence. Bounded (newest segments only) and never
+    // fatal: recording starts regardless of what it finds, and it never
+    // executes anything — it only writes a state file and announces.
+    let announcement = boot_detection(&config);
+
     let (tx, rx) = std::sync::mpsc::sync_channel::<WalCmd>(config.channel_capacity);
     let wal_thread = walsvc::spawn(wal_cfg(&config), rx);
 
@@ -77,7 +84,13 @@ pub fn run(config_path: &Path) -> u8 {
 
     let mut sender = WalSender::new(tx);
     let mut recorder = Recorder::new();
+    let moonraker_url = config.moonraker_url.clone();
     let client_result = runtime.block_on(async {
+        // Best-effort operator announcement, concurrent with recording;
+        // it can never block, delay, or fail the recorder.
+        if let Some(commands) = announcement {
+            tokio::spawn(announce_pending(moonraker_url, commands));
+        }
         tokio::select! {
             result = run_client(&client_cfg, &mut sender, &mut recorder) => result,
             () = shutdown_signal() => Ok(()),
@@ -102,6 +115,67 @@ pub fn run(config_path: &Path) -> u8 {
             EXIT_RUNTIME
         }
     }
+}
+
+/// Classifies the previous session and prepares the announcement
+/// commands, if any (see `detect` for the semantics).
+fn boot_detection(config: &Config) -> Option<(String, String)> {
+    use crate::detect::{self, Detection};
+    match detect::detect(
+        &config.wal_dir,
+        &config.heartbeat_file(),
+        crate::hostclock::now_wall_ns(),
+    ) {
+        Detection::Pending(pending) => {
+            eprintln!(
+                "plrd: unfinished print detected: {} at byte {}{} ({}); run `plrd recover`",
+                pending.file,
+                pending.file_position,
+                pending
+                    .percent
+                    .map_or(String::new(), |p| format!(" (~{p:.0}%)")),
+                pending.crash_class,
+            );
+            if let Err(e) = detect::write_pending(&config.wal_dir, &pending) {
+                eprintln!("plrd: cannot write pending-recovery state: {e}");
+            }
+            Some(detect::announcement_commands(&pending))
+        }
+        Detection::Clean => {
+            detect::clear_pending(&config.wal_dir);
+            None
+        }
+        Detection::Nothing(reason) => {
+            eprintln!("plrd: no pending recovery: {reason}");
+            None
+        }
+    }
+}
+
+/// Delivers the operator announcement via Moonraker
+/// (`printer.gcode.script`; see `detect` module docs for the channel
+/// choice). Klippy may be down at boot: retried on a slow cadence,
+/// bounded, and abandoned silently — never affecting recording.
+async fn announce_pending(url: String, commands: (String, String)) {
+    use crate::moonraker::MoonrakerClient;
+    const ATTEMPTS: u32 = 30;
+    const RETRY: std::time::Duration = std::time::Duration::from_secs(10);
+    for _ in 0..ATTEMPTS {
+        if let Ok(mut client) =
+            MoonrakerClient::connect(&url, std::time::Duration::from_secs(5)).await
+        {
+            // Primary (RESPOND), then fallback (M117): either landing
+            // in the console is success.
+            if client.gcode_script(&commands.0).await.is_ok()
+                || client.gcode_script(&commands.1).await.is_ok()
+            {
+                eprintln!("plrd: pending-recovery announcement delivered");
+                return;
+            }
+        }
+        tokio::time::sleep(RETRY).await;
+    }
+    eprintln!("plrd: could not deliver the pending-recovery announcement (gave up)");
 }
 
 /// Resolves when SIGTERM or SIGINT arrives.
@@ -145,6 +219,125 @@ mod tests {
         assert_eq!(
             super::run(std::path::Path::new("/nonexistent/plrd.conf")),
             crate::EXIT_RUNTIME
+        );
+    }
+
+    fn temp_config(tag: &str) -> Config {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "plrd-daemon-test-{tag}-{}-{nanos}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        Config {
+            wal_dir: dir,
+            ..Config::default()
+        }
+    }
+
+    #[test]
+    fn boot_detection_writes_pending_and_prepares_announcement() {
+        use plr_wal::{SegmentHeader, WalRecord, WalWriter};
+        let config = temp_config("boot-pending");
+        // Empty WAL dir: nothing pending, no announcement.
+        assert!(super::boot_detection(&config).is_none());
+        // Unclean WAL with a print in progress: pending + announcement,
+        // and the state file exists.
+        let gcode = config.wal_dir.join("part.gcode");
+        std::fs::write(&gcode, vec![b'G'; 1_000]).unwrap();
+        let mut writer = WalWriter::create(Vec::new(), &SegmentHeader::new(1, 1)).unwrap();
+        writer
+            .append(&WalRecord::Heartbeat(plr_wal::Heartbeat {
+                sequence: 1,
+                mono_ns: 1_000_000_000,
+                wall_ns: 1,
+                print_time: 5.0,
+                est_sample_mono_ns: 1_000_000_000,
+                est_sample_print_time: 5.0,
+                wal_offset: 32,
+            }))
+            .unwrap();
+        writer
+            .append(&WalRecord::Context(plr_wal::Context {
+                mono_ns: 1_000_000_000,
+                virtual_sdcard: Some(plr_wal::VirtualSdState {
+                    file_path: gcode.to_string_lossy().into_owned(),
+                    file_position: 250,
+                }),
+                gcode: plr_wal::GcodeState {
+                    speed_factor: 1.0,
+                    speed: 1500.0,
+                    extrude_factor: 1.0,
+                    absolute_coordinates: true,
+                    absolute_extrude: true,
+                    homing_origin: vec![0.0; 4],
+                    position: vec![0.0; 4],
+                    gcode_position: vec![0.0; 4],
+                },
+                transforms: plr_wal::TransformObservations {
+                    bed_mesh_active: false,
+                    bed_mesh_profile: None,
+                    z_thermal_adjust_enabled: None,
+                    z_thermal_adjust_offset: None,
+                    skew_active: false,
+                    skew_profile: None,
+                },
+                heaters: Vec::new(),
+                fans: Vec::new(),
+            }))
+            .unwrap();
+        std::fs::write(config.wal_dir.join("wal-000001.plr"), writer.into_inner()).unwrap();
+        let commands = super::boot_detection(&config).expect("announcement expected");
+        assert!(commands.0.starts_with("RESPOND"), "{}", commands.0);
+        assert!(commands.1.starts_with("M117"), "{}", commands.1);
+        let pending_path = config.wal_dir.join(crate::detect::PENDING_FILE_NAME);
+        assert!(pending_path.exists());
+        // A clean tail clears the state file and announces nothing.
+        let mut writer = WalWriter::create(Vec::new(), &SegmentHeader::new(1, 1)).unwrap();
+        writer
+            .append(&WalRecord::Marker(plr_wal::Marker {
+                mono_ns: 2_000_000_000,
+                kind: plr_wal::MarkerKind::CleanShutdown,
+            }))
+            .unwrap();
+        std::fs::write(config.wal_dir.join("wal-000001.plr"), writer.into_inner()).unwrap();
+        assert!(super::boot_detection(&config).is_none());
+        assert!(!pending_path.exists());
+    }
+
+    #[tokio::test]
+    async fn announce_pending_delivers_primary_and_falls_back() {
+        use crate::testmoon::FakeMoonraker;
+        // Primary accepted.
+        let fake = FakeMoonraker::spawn(|_, _| Ok(serde_json::json!("ok"))).await;
+        super::announce_pending(
+            fake.url(),
+            ("RESPOND MSG=\"x\"".to_owned(), "M117 x".to_owned()),
+        )
+        .await;
+        assert_eq!(fake.gcode_sent(), vec!["RESPOND MSG=\"x\""]);
+        // Primary rejected ([respond] missing): fallback delivered.
+        let fake = FakeMoonraker::spawn(|_, params| {
+            let script = params["script"].as_str().unwrap_or("");
+            if script.starts_with("RESPOND") {
+                Err((400, "Unknown command: RESPOND".to_owned()))
+            } else {
+                Ok(serde_json::json!("ok"))
+            }
+        })
+        .await;
+        super::announce_pending(
+            fake.url(),
+            ("RESPOND MSG=\"x\"".to_owned(), "M117 x".to_owned()),
+        )
+        .await;
+        assert_eq!(
+            fake.gcode_sent(),
+            vec!["RESPOND MSG=\"x\"", "M117 x"],
+            "fallback must follow a rejected primary"
         );
     }
 }

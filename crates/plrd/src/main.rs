@@ -23,6 +23,14 @@
 //! * `3` — unsupported platform (`run` off Linux)
 
 mod cli;
+// `detect`'s production caller (boot detection) lives in the Linux-only
+// daemon; the module itself is pure and tested everywhere.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+mod detect;
+mod executor;
+mod moonraker;
+mod pipeline;
+mod recover;
 mod scan;
 
 // These compile on every platform (their logic and tests are pure), but
@@ -39,10 +47,10 @@ mod sender;
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 mod seqfile;
 
-// Scaffold by design: nothing calls the executor yet on any platform
-// (see the module docs for why it ships shape-first).
-#[allow(dead_code)]
-mod executor;
+// Loopback fake-Moonraker server shared by the client/executor/recover
+// tests. Test-only by construction.
+#[cfg(test)]
+mod testmoon;
 
 #[cfg(target_os = "linux")]
 mod client;
@@ -100,6 +108,18 @@ fn run(command: &Command) -> u8 {
                     EXIT_RUNTIME
                 }
             }
+        }
+        Command::Recover {
+            config,
+            execute,
+            confirm,
+            step,
+        } => {
+            let options = recover::RecoverOptions::new(*execute, *confirm, *step);
+            let stdin = std::io::stdin();
+            let mut stdin_lock = stdin.lock();
+            let mut stdout = std::io::stdout();
+            recover::run_recover(config, &options, &mut stdin_lock, &mut stdout)
         }
         Command::Run { config } => run_daemon(config),
         Command::CrashWriter { dir } => run_crash_writer(dir),

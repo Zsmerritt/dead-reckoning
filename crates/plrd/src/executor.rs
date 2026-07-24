@@ -1,121 +1,834 @@
-//! Recovery executor scaffold: turning a reconstruction into machine
-//! action via Moonraker.
+//! Plan execution: dry-run rendering and gated live execution.
 //!
-//! # Status: scaffold
+//! # Safety invariants (tested in this module and `recover`)
 //!
-//! The executor is deliberately not implemented yet. Executing a
-//! recovery moves a hot nozzle around a solidified print, so it ships
-//! only together with its own safety review; this module pins down the
-//! *shape* the daemon and CLI already agree on, so the wiring does not
-//! churn when the implementation lands.
+//! 1. **Dry run cannot send** — [`dry_run`] takes the plan and nothing
+//!    else: no client, no socket, no async. The proof is type-level;
+//!    there is no I/O handle in scope to send with.
+//! 2. **Only plan commands are ever sent** — [`execute`] sends command
+//!    strings obtained exclusively by iterating
+//!    [`RecoveryStep::commands`] of a validated [`RecoveryPlan`] (one
+//!    call site, `send_step_commands`). No ad-hoc G-code exists in this
+//!    crate's execution path; the sole placeholder substitution is the
+//!    typed `{true_z}` computation defined by the plan itself.
+//! 3. **Verification failure ⇒ abort** — every predicate failure (or
+//!    poll timeout, or query error, or non-finite computation) stops
+//!    execution at that step with the step's typed
+//!    [`FailureAction::Abort`] reason. There is no code path that
+//!    continues past a failed verification: the step loop returns.
+//! 4. **Everything is transcribed** — commands, responses, verification
+//!    evaluations, computations, prompts, and the final outcome are
+//!    appended as JSON lines to the transcript the caller supplies.
 //!
-//! # Planned flow (documented for reviewers)
-//!
-//! 1. `plrd scan` (or the daemon after an unclean stop) produces a
-//!    [`plr_reconstruct::RecoveryReconstruction`].
-//! 2. A human (or a policy gate) approves a [`RecoveryPlan`] derived
-//!    from it: probe envelope from the Z candidates, re-arm transforms,
-//!    thermal targets, resume line window.
-//! 3. [`MoonrakerExecutor`] connects to Moonraker's WebSocket JSON-RPC
-//!    (`ws://.../websocket`, `printer.gcode.script` et al.) — the
-//!    `tokio-tungstenite` workspace dependency is reserved for exactly
-//!    this — and executes the plan step by step, aborting on any
-//!    unexpected printer state.
+//! Moonraker semantics this leans on: `printer.gcode.script` resolves
+//! only when the script has completed (Moonraker docs,
+//! `external_api/printer.md`), so a step's post-verifications read
+//! settled state. Slow-converging predicates ([`Predicate::TempWithin`])
+//! are polled up to `temp_timeout`; all others up to `verify_timeout`.
 
-use std::path::PathBuf;
+use std::time::Duration;
 
-/// One executable recovery step, in execution order.
+use plr_recovery::{
+    fmt_num, true_z_at_halt, FailureAction, Predicate, RecoveryPlan, RecoveryStep,
+    RuntimeComputation, TriggerSource, Verification, TRUE_Z_PLACEHOLDER,
+};
+use serde_json::{json, Value};
+
+use crate::moonraker::MoonrakerClient;
+
+/// What a dry run would send, with no means to send it.
 #[derive(Debug, Clone, PartialEq)]
-pub enum RecoveryStep {
-    /// Re-heat to journaled targets and wait.
-    RestoreThermals {
-        /// `(heater name, target °C)` pairs from the last context.
-        targets: Vec<(String, f64)>,
-    },
-    /// Home safe axes / re-establish a trusted Z reference within the
-    /// reconstruction's probe envelope.
-    ReestablishReference {
-        /// Lowest Z the probe may approach, from the stop set.
-        z_floor_mm: f64,
-    },
-    /// Re-arm move transforms (bed mesh profile, skew, gcode offsets).
-    RearmTransforms {
-        /// G-code commands to replay, in order.
-        gcode: Vec<String>,
-    },
-    /// Resume the print from a file offset.
-    ResumeAt {
-        /// The file to print.
-        file: PathBuf,
-        /// Byte offset chosen from the reconstruction's offset window.
-        offset: u64,
-    },
+pub struct DryRun {
+    /// `(step id, command)` in exact send order. `{true_z}` stays
+    /// symbolic: it does not exist until a live probe.
+    pub would_send: Vec<(u32, String)>,
+    /// The full rendered plan (steps, verifications, failure actions).
+    pub rendered: String,
 }
 
-/// A vetted, ordered plan. Construction from a reconstruction lands with
-/// the executor implementation.
-#[derive(Debug, Clone, PartialEq)]
-pub struct RecoveryPlan {
-    /// Steps in execution order.
-    pub steps: Vec<RecoveryStep>,
+/// Enumerates the plan without any ability to execute it (see module
+/// safety invariant 1).
+#[must_use]
+pub fn dry_run(plan: &RecoveryPlan) -> DryRun {
+    let would_send = plan
+        .steps
+        .iter()
+        .flat_map(|step| {
+            step.commands
+                .iter()
+                .map(move |command| (step.id, command.clone()))
+        })
+        .collect();
+    DryRun {
+        would_send,
+        rendered: plan.render(),
+    }
 }
 
-/// Error surface of the (future) executor.
-#[derive(Debug, thiserror::Error)]
-pub enum ExecutorError {
-    /// The executor is not implemented yet; see the module docs.
-    #[error("recovery execution is not implemented yet (scaffold only)")]
-    NotImplemented,
+/// Execution tuning.
+#[derive(Debug, Clone)]
+pub struct ExecOptions {
+    /// Poll deadline for non-temperature predicates.
+    pub verify_timeout: Duration,
+    /// Poll deadline for [`Predicate::TempWithin`].
+    pub temp_timeout: Duration,
+    /// Poll interval.
+    pub poll_interval: Duration,
 }
 
-/// Client for Moonraker's WebSocket JSON-RPC API.
+impl Default for ExecOptions {
+    fn default() -> Self {
+        Self {
+            // Position/state predicates settle as soon as the script
+            // returns; 10 s absorbs status-refresh lag.
+            verify_timeout: Duration::from_secs(10),
+            // Heating a bed from cold legitimately takes minutes.
+            temp_timeout: Duration::from_mins(15),
+            poll_interval: Duration::from_millis(500),
+        }
+    }
+}
+
+/// Why execution stopped before the plan completed.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MoonrakerExecutor {
-    /// Moonraker WebSocket URL, e.g. `ws://localhost:7125/websocket`.
-    pub url: String,
+pub enum StopCause {
+    /// A verification predicate failed (or timed out) and the step's
+    /// failure action fired.
+    VerificationFailed {
+        /// The failing verification, rendered.
+        verification: String,
+        /// The last observed value, rendered.
+        observed: String,
+    },
+    /// Moonraker rejected or failed a command/query.
+    Transport(String),
+    /// The runtime computation was invalid (non-finite inputs, missing
+    /// values, or a placeholder without a computation).
+    ComputeFailed(String),
+    /// The operator declined at a `--step` gate.
+    OperatorDeclined,
 }
 
-impl MoonrakerExecutor {
-    /// Creates an executor pointed at a Moonraker instance.
-    #[must_use]
-    pub fn new(url: String) -> Self {
-        Self { url }
+/// Result of [`execute`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExecOutcome {
+    /// Every step completed and verified.
+    Completed {
+        /// Number of steps executed.
+        steps: usize,
+    },
+    /// Execution stopped at `step_id` with the plan's abort reason.
+    Aborted {
+        /// The step that failed.
+        step_id: u32,
+        /// The step's phase name.
+        phase: String,
+        /// The plan's typed abort reason code.
+        reason: String,
+        /// What actually went wrong.
+        cause: StopCause,
+    },
+}
+
+/// Transcript sink: JSON lines, flushed per entry.
+pub struct Transcript<'a> {
+    out: &'a mut dyn std::io::Write,
+}
+
+impl<'a> Transcript<'a> {
+    /// Wraps a writer.
+    pub fn new(out: &'a mut dyn std::io::Write) -> Self {
+        Self { out }
     }
 
-    /// Executes a plan. Scaffold: always
-    /// [`ExecutorError::NotImplemented`].
-    // Scaffold: the implementation will use `self.url`; the signature is
-    // pinned now so callers do not churn when it lands.
-    #[allow(clippy::unused_self)]
-    pub fn execute(&self, _plan: &RecoveryPlan) -> Result<(), ExecutorError> {
-        Err(ExecutorError::NotImplemented)
+    fn entry(&mut self, value: &Value) {
+        // Transcript write failures must never stop a recovery
+        // mid-motion; the caller inspects the file afterwards.
+        let _ = writeln!(self.out, "{value}");
+        let _ = self.out.flush();
+    }
+}
+
+/// Executes a validated plan step by step (module safety invariants
+/// 2–4). `gate` is consulted before every step (per-step confirmation);
+/// returning `false` stops execution before that step sends anything.
+pub async fn execute(
+    plan: &RecoveryPlan,
+    client: &mut MoonrakerClient,
+    options: &ExecOptions,
+    gate: &mut dyn FnMut(&RecoveryStep) -> bool,
+    transcript: &mut Transcript<'_>,
+) -> ExecOutcome {
+    transcript.entry(&json!({
+        "event": "plan-start",
+        "steps": plan.steps.len(),
+        "resume_file": plan.resume_file,
+        "resume_offset": plan.resume_offset,
+    }));
+    for step in &plan.steps {
+        if !gate(step) {
+            transcript.entry(&json!({
+                "event": "operator-declined", "step": step.id,
+            }));
+            return abort(step, StopCause::OperatorDeclined, transcript);
+        }
+        transcript.entry(&json!({
+            "event": "step-start",
+            "step": step.id,
+            "phase": step.phase.name(),
+            "summary": step.summary,
+        }));
+        // Pre-verifications: must hold before anything is sent.
+        for verification in &step.pre_verify {
+            if let Err(cause) =
+                poll_verification(client, verification, None, options, transcript, "pre").await
+            {
+                return abort(step, cause, transcript);
+            }
+        }
+        // Runtime computation (true-Z): reads live values, evaluates
+        // the typed formula, feeds the single defined placeholder.
+        let computed = match runtime_compute(client, step, transcript).await {
+            Ok(computed) => computed,
+            Err(cause) => return abort(step, cause, transcript),
+        };
+        // Commands: the only send path in the crate (invariant 2).
+        if let Err(cause) = send_step_commands(client, step, computed, transcript).await {
+            return abort(step, cause, transcript);
+        }
+        // Post-verifications.
+        for verification in &step.verify {
+            if let Err(cause) =
+                poll_verification(client, verification, computed, options, transcript, "post").await
+            {
+                return abort(step, cause, transcript);
+            }
+        }
+        transcript.entry(&json!({"event": "step-ok", "step": step.id}));
+    }
+    transcript.entry(&json!({"event": "plan-complete", "steps": plan.steps.len()}));
+    ExecOutcome::Completed {
+        steps: plan.steps.len(),
+    }
+}
+
+fn abort(step: &RecoveryStep, cause: StopCause, transcript: &mut Transcript<'_>) -> ExecOutcome {
+    let FailureAction::Abort { reason } = step.on_failure;
+    transcript.entry(&json!({
+        "event": "abort",
+        "step": step.id,
+        "phase": step.phase.name(),
+        "reason": reason.code(),
+        "cause": format!("{cause:?}"),
+    }));
+    ExecOutcome::Aborted {
+        step_id: step.id,
+        phase: step.phase.name().to_owned(),
+        reason: reason.code().to_owned(),
+        cause,
+    }
+}
+
+/// Sends every command of one step, in order, substituting the computed
+/// true-Z when present. This is the crate's only G-code send site.
+async fn send_step_commands(
+    client: &mut MoonrakerClient,
+    step: &RecoveryStep,
+    computed: Option<f64>,
+    transcript: &mut Transcript<'_>,
+) -> Result<(), StopCause> {
+    for command in &step.commands {
+        let resolved = if command.contains(TRUE_Z_PLACEHOLDER) {
+            let Some(true_z) = computed else {
+                // A placeholder without a computation cannot be sent;
+                // plan construction forbids it, and so does this.
+                return Err(StopCause::ComputeFailed(
+                    "command carries {true_z} but the step has no computation".to_owned(),
+                ));
+            };
+            command.replace(TRUE_Z_PLACEHOLDER, &fmt_num(true_z))
+        } else {
+            command.clone()
+        };
+        transcript.entry(&json!({
+            "event": "send", "step": step.id, "command": resolved,
+        }));
+        match client.gcode_script(&resolved).await {
+            Ok(()) => transcript.entry(&json!({
+                "event": "response", "step": step.id, "result": "ok",
+            })),
+            Err(e) => {
+                transcript.entry(&json!({
+                    "event": "response", "step": step.id, "error": e.to_string(),
+                }));
+                return Err(StopCause::Transport(e.to_string()));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Evaluates the step's runtime computation, if any.
+async fn runtime_compute(
+    client: &mut MoonrakerClient,
+    step: &RecoveryStep,
+    transcript: &mut Transcript<'_>,
+) -> Result<Option<f64>, StopCause> {
+    let Some(RuntimeComputation::TrueZ(formula)) = step.compute else {
+        return Ok(None);
+    };
+    // Trigger reading, per probe type (plr-recovery documents the
+    // Klipper field semantics behind each source).
+    let (object, field) = match formula.trigger_source {
+        TriggerSource::RawLastZResult => ("probe", "last_z_result"),
+        TriggerSource::BedZPlusOffset { .. } => ("probe", "last_probe_position.2"),
+    };
+    let trigger_reading = query_number(client, object, field).await?;
+    let halt_z = query_number(client, "toolhead", "position.2").await?;
+    match true_z_at_halt(&formula, trigger_reading, halt_z) {
+        Ok(true_z) => {
+            transcript.entry(&json!({
+                "event": "compute",
+                "step": step.id,
+                "trigger_reading": trigger_reading,
+                "halt_z": halt_z,
+                "true_z": true_z,
+            }));
+            Ok(Some(true_z))
+        }
+        // Never substitute on error (plr-recovery contract).
+        Err(e) => Err(StopCause::ComputeFailed(e.to_string())),
+    }
+}
+
+async fn query_number(
+    client: &mut MoonrakerClient,
+    object: &str,
+    field: &str,
+) -> Result<f64, StopCause> {
+    let status = client
+        .query_objects(&[object])
+        .await
+        .map_err(|e| StopCause::Transport(e.to_string()))?;
+    let value = lookup(&status, object, field)
+        .ok_or_else(|| StopCause::ComputeFailed(format!("{object}.{field} absent from status")))?;
+    value
+        .as_f64()
+        .filter(|v| v.is_finite())
+        .ok_or_else(|| StopCause::ComputeFailed(format!("{object}.{field} is not a finite number")))
+}
+
+/// Polls one verification until it holds or its deadline passes.
+async fn poll_verification(
+    client: &mut MoonrakerClient,
+    verification: &Verification,
+    computed: Option<f64>,
+    options: &ExecOptions,
+    transcript: &mut Transcript<'_>,
+    stage: &str,
+) -> Result<(), StopCause> {
+    let timeout = match verification.predicate {
+        Predicate::TempWithin { .. } => options.temp_timeout,
+        _ => options.verify_timeout,
+    };
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let status = client
+            .query_objects(&[&verification.object])
+            .await
+            .map_err(|e| StopCause::Transport(e.to_string()))?;
+        let value = lookup(&status, &verification.object, &verification.field);
+        let observed = value.map_or_else(|| "absent".to_owned(), Value::to_string);
+        let holds = evaluate(&verification.predicate, value, computed);
+        if holds || tokio::time::Instant::now() >= deadline {
+            transcript.entry(&json!({
+                "event": "verify",
+                "stage": stage,
+                "object": verification.object,
+                "field": verification.field,
+                "predicate": verification.predicate.describe(),
+                "observed": observed,
+                "holds": holds,
+            }));
+            if holds {
+                return Ok(());
+            }
+            return Err(StopCause::VerificationFailed {
+                verification: format!(
+                    "{}.{} {}",
+                    verification.object,
+                    verification.field,
+                    verification.predicate.describe()
+                ),
+                observed,
+            });
+        }
+        tokio::time::sleep(options.poll_interval).await;
+    }
+}
+
+/// Resolves `object` + dotted `field` path inside a status map; numeric
+/// segments index arrays (the `Verification::field` contract).
+fn lookup<'a>(status: &'a Value, object: &str, field: &str) -> Option<&'a Value> {
+    let mut current = status.get(object)?;
+    for segment in field.split('.') {
+        current = match segment.parse::<usize>() {
+            Ok(index) => current.get(index)?,
+            Err(_) => current.get(segment)?,
+        };
+    }
+    Some(current)
+}
+
+/// Evaluates one predicate against an observed value. Total: absent or
+/// mistyped values simply do not hold.
+fn evaluate(predicate: &Predicate, value: Option<&Value>, computed: Option<f64>) -> bool {
+    let Some(value) = value else {
+        return false;
+    };
+    let num = value.as_f64().filter(|v| v.is_finite());
+    match predicate {
+        Predicate::NumWithin { expected, epsilon } => {
+            num.is_some_and(|v| (v - expected).abs() <= *epsilon)
+        }
+        Predicate::NumAtLeast { min } => num.is_some_and(|v| v >= *min),
+        Predicate::TempWithin { min, max } => num.is_some_and(|v| v >= *min && v <= *max),
+        Predicate::Contains { needle } => value.as_str().is_some_and(|s| s.contains(needle)),
+        Predicate::Equals { value: expected } => value.as_str().is_some_and(|s| s == expected),
+        Predicate::BoolTrue => value.as_bool() == Some(true),
+        Predicate::BoolFalse => value.as_bool() == Some(false),
+        Predicate::FinitePresent => match value {
+            Value::Number(_) => num.is_some(),
+            Value::Null => false,
+            _ => true,
+        },
+        Predicate::NonEmptyMatrix => value.as_array().is_some_and(|rows| {
+            rows.iter()
+                .any(|r| r.as_array().is_some_and(|c| !c.is_empty()))
+        }),
+        Predicate::NumWithinComputed { epsilon } => match (num, computed) {
+            (Some(v), Some(c)) => (v - c).abs() <= *epsilon,
+            _ => false,
+        },
     }
 }
 
 #[cfg(test)]
-mod tests {
-    use super::{ExecutorError, MoonrakerExecutor, RecoveryPlan, RecoveryStep};
+pub(crate) mod tests {
+    use super::{
+        dry_run, evaluate, execute, lookup, ExecOptions, ExecOutcome, StopCause, Transcript,
+    };
+    use crate::moonraker::MoonrakerClient;
+    use crate::testmoon::FakeMoonraker;
+    use plr_recovery::{
+        compute_envelope, AbortReason, EnvelopeParams, FailureAction, Phase, Predicate,
+        RecoveryPlan, RecoveryStep, RuntimeComputation, TriggerSource, TrueZFormula, Verification,
+    };
+    use serde_json::{json, Value};
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    /// A three-step plan exercising pre-verify, commands, post-verify,
+    /// and the true-Z computation. Built by hand: executor tests must
+    /// not depend on the full pipeline.
+    pub(crate) fn test_plan() -> RecoveryPlan {
+        let steps = vec![
+            RecoveryStep {
+                id: 1,
+                phase: Phase::IdleTimeout,
+                summary: "disarm idle timeout".to_owned(),
+                commands: vec!["SET_IDLE_TIMEOUT TIMEOUT=86400".to_owned()],
+                pre_verify: vec![],
+                verify: vec![Verification::new(
+                    "idle_timeout",
+                    "idle_timeout",
+                    Predicate::NumWithin {
+                        expected: 86_400.0,
+                        epsilon: 0.5,
+                    },
+                )],
+                compute: None,
+                on_failure: FailureAction::Abort {
+                    reason: AbortReason::IdleTimeoutNotApplied,
+                },
+            },
+            RecoveryStep {
+                id: 2,
+                phase: Phase::Probe,
+                summary: "probe".to_owned(),
+                commands: vec!["PROBE PROBE_SPEED=1 SAMPLES=1".to_owned()],
+                pre_verify: vec![Verification::new(
+                    "extruder",
+                    "temperature",
+                    Predicate::TempWithin {
+                        min: 140.0,
+                        max: 160.0,
+                    },
+                )],
+                verify: vec![Verification::new(
+                    "probe",
+                    "last_z_result",
+                    Predicate::FinitePresent,
+                )],
+                compute: None,
+                on_failure: FailureAction::Abort {
+                    reason: AbortReason::ProbeNoTrigger,
+                },
+            },
+            RecoveryStep {
+                id: 3,
+                phase: Phase::TrueZDeclare,
+                summary: "declare true Z".to_owned(),
+                commands: vec!["SET_KINEMATIC_POSITION Z={true_z}".to_owned()],
+                pre_verify: vec![],
+                verify: vec![],
+                compute: Some(RuntimeComputation::TrueZ(TrueZFormula {
+                    z_prev_top: 12.4,
+                    trigger_source: TriggerSource::RawLastZResult,
+                    frozen_z_adjust: None,
+                })),
+                on_failure: FailureAction::Abort {
+                    reason: AbortReason::TrueZDeclareFailed,
+                },
+            },
+        ];
+        RecoveryPlan {
+            steps,
+            envelope: compute_envelope(
+                EnvelopeParams {
+                    expected_gap: 0.5,
+                    probe_speed: 1.0,
+                    margin: 0.5,
+                },
+                -2.0,
+            )
+            .expect("test envelope"),
+            resume_file: "x.gcode".to_owned(),
+            resume_offset: 1234,
+            warnings: vec![],
+        }
+    }
+
+    fn fast_options() -> ExecOptions {
+        ExecOptions {
+            verify_timeout: Duration::from_millis(300),
+            temp_timeout: Duration::from_millis(300),
+            poll_interval: Duration::from_millis(20),
+        }
+    }
+
+    /// Serves plausible printer state for the happy path: trigger at
+    /// shifted 0.90, halt at 0.75 → true Z = 12.4 + (0.75 − 0.90) =
+    /// 12.25.
+    pub(crate) fn happy_handler(method: &str, params: &Value) -> Result<Value, (i64, String)> {
+        match method {
+            "printer.gcode.script" => Ok(json!("ok")),
+            "printer.objects.query" => {
+                let objects = params["objects"].as_object().expect("objects param");
+                let mut status = serde_json::Map::new();
+                for name in objects.keys() {
+                    let value = match name.as_str() {
+                        "idle_timeout" => json!({"idle_timeout": 86_400.0, "state": "Ready"}),
+                        "extruder" => json!({"temperature": 150.2, "target": 150.0}),
+                        "probe" => json!({"last_z_result": 0.90}),
+                        "toolhead" => json!({"position": [10.0, 20.0, 0.75, 0.0]}),
+                        "webhooks" => json!({"state": "ready"}),
+                        "print_stats" => json!({"state": "standby"}),
+                        "virtual_sdcard" => json!({"is_active": false}),
+                        other => json!({"unknown-object": other}),
+                    };
+                    status.insert(name.clone(), value);
+                }
+                Ok(json!({"eventtime": 1.0, "status": status}))
+            }
+            other => Err((-32601, format!("Method not found: {other}"))),
+        }
+    }
+
+    async fn run(
+        plan: &RecoveryPlan,
+        fake: &FakeMoonraker,
+        gate: &mut dyn FnMut(&RecoveryStep) -> bool,
+    ) -> (ExecOutcome, String) {
+        let mut client = MoonrakerClient::connect(&fake.url(), Duration::from_secs(5))
+            .await
+            .unwrap();
+        let mut buffer = Vec::new();
+        let outcome = {
+            let mut transcript = Transcript::new(&mut buffer);
+            execute(plan, &mut client, &fast_options(), gate, &mut transcript).await
+        };
+        (outcome, String::from_utf8(buffer).unwrap())
+    }
+
+    #[tokio::test]
+    async fn happy_path_executes_every_step_in_order() {
+        let plan = test_plan();
+        let fake = FakeMoonraker::spawn(happy_handler).await;
+        let (outcome, transcript) = run(&plan, &fake, &mut |_| true).await;
+        assert_eq!(outcome, ExecOutcome::Completed { steps: 3 });
+        // The fake saw exactly the plan's commands, in order, with the
+        // computed true-Z substituted — and nothing else.
+        assert_eq!(
+            fake.gcode_sent(),
+            vec![
+                "SET_IDLE_TIMEOUT TIMEOUT=86400",
+                "PROBE PROBE_SPEED=1 SAMPLES=1",
+                "SET_KINEMATIC_POSITION Z=12.25",
+            ]
+        );
+        for needle in [
+            "plan-start",
+            "step-start",
+            "\"send\"",
+            "\"compute\"",
+            "plan-complete",
+        ] {
+            assert!(
+                transcript.contains(needle),
+                "missing {needle}: {transcript}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn pre_verification_failure_aborts_before_sending_the_step() {
+        let plan = test_plan();
+        // Nozzle stone cold: step 2's PRE-verification cannot hold, so
+        // step 2's PROBE must never be sent.
+        let fake = FakeMoonraker::spawn(|method, params| {
+            let mut v = happy_handler(method, params)?;
+            if method == "printer.objects.query" {
+                if let Some(extruder) = v.get_mut("status").and_then(|s| s.get_mut("extruder")) {
+                    *extruder = json!({"temperature": 22.5, "target": 0.0});
+                }
+            }
+            Ok(v)
+        })
+        .await;
+        let (outcome, transcript) = run(&plan, &fake, &mut |_| true).await;
+        let ExecOutcome::Aborted {
+            step_id,
+            reason,
+            cause,
+            ..
+        } = outcome
+        else {
+            panic!("expected abort, got {outcome:?}");
+        };
+        assert_eq!(step_id, 2);
+        assert_eq!(reason, "probe-no-trigger");
+        assert!(matches!(cause, StopCause::VerificationFailed { .. }));
+        // Step 1's command went out; steps 2 and 3 sent nothing.
+        assert_eq!(fake.gcode_sent(), vec!["SET_IDLE_TIMEOUT TIMEOUT=86400"]);
+        assert!(transcript.contains("\"holds\":false"), "{transcript}");
+        assert!(transcript.contains("abort"), "{transcript}");
+    }
+
+    #[tokio::test]
+    async fn post_verification_failure_aborts_mid_plan() {
+        let plan = test_plan();
+        // Step 1's own post-verify fails: idle_timeout never applies.
+        let fake = FakeMoonraker::spawn(|method, params| {
+            let mut v = happy_handler(method, params)?;
+            if method == "printer.objects.query" {
+                if let Some(it) = v.get_mut("status").and_then(|s| s.get_mut("idle_timeout")) {
+                    *it = json!({"idle_timeout": 600.0});
+                }
+            }
+            Ok(v)
+        })
+        .await;
+        let (outcome, _) = run(&plan, &fake, &mut |_| true).await;
+        let ExecOutcome::Aborted {
+            step_id, reason, ..
+        } = outcome
+        else {
+            panic!("expected abort");
+        };
+        assert_eq!(step_id, 1);
+        assert_eq!(reason, "idle-timeout-not-applied");
+        // Only step 1's command was ever sent: abort never continues.
+        assert_eq!(fake.gcode_sent().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn transport_error_aborts_immediately() {
+        let plan = test_plan();
+        let fake = FakeMoonraker::spawn(|method, params| {
+            if method == "printer.gcode.script" {
+                Err((400, "Klippy shutdown".to_owned()))
+            } else {
+                happy_handler(method, params)
+            }
+        })
+        .await;
+        let (outcome, _) = run(&plan, &fake, &mut |_| true).await;
+        let ExecOutcome::Aborted { step_id, cause, .. } = outcome else {
+            panic!("expected abort");
+        };
+        assert_eq!(step_id, 1);
+        assert!(matches!(cause, StopCause::Transport(_)));
+        assert_eq!(fake.gcode_sent().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn step_gate_decline_stops_before_sending() {
+        let plan = test_plan();
+        let fake = FakeMoonraker::spawn(happy_handler).await;
+        // Approve step 1 only.
+        let gates = Arc::new(Mutex::new(0_u32));
+        let counter = Arc::clone(&gates);
+        let (outcome, transcript) = run(&plan, &fake, &mut move |step| {
+            *counter.lock().expect("gate counter") += 1;
+            step.id == 1
+        })
+        .await;
+        let ExecOutcome::Aborted { step_id, cause, .. } = outcome else {
+            panic!("expected abort");
+        };
+        assert_eq!(step_id, 2);
+        assert_eq!(cause, StopCause::OperatorDeclined);
+        assert_eq!(*gates.lock().expect("gate counter"), 2);
+        assert_eq!(fake.gcode_sent(), vec!["SET_IDLE_TIMEOUT TIMEOUT=86400"]);
+        assert!(transcript.contains("operator-declined"), "{transcript}");
+    }
+
+    #[tokio::test]
+    async fn compute_failure_never_substitutes() {
+        let plan = test_plan();
+        // The halt-Z reading is null (toolhead is only queried by the
+        // step-3 computation): the computation must abort the step and
+        // SET_KINEMATIC_POSITION must never be sent.
+        let fake = FakeMoonraker::spawn(|method, params| {
+            let mut v = happy_handler(method, params)?;
+            if method == "printer.objects.query" {
+                if let Some(th) = v.get_mut("status").and_then(|s| s.get_mut("toolhead")) {
+                    *th = json!({"position": [10.0, 20.0, null, 0.0]});
+                }
+            }
+            Ok(v)
+        })
+        .await;
+        let (outcome, _) = run(&plan, &fake, &mut |_| true).await;
+        let ExecOutcome::Aborted { step_id, cause, .. } = outcome else {
+            panic!("expected abort");
+        };
+        assert_eq!(step_id, 3);
+        assert!(matches!(cause, StopCause::ComputeFailed(_)), "{cause:?}");
+        assert!(
+            !fake
+                .gcode_sent()
+                .iter()
+                .any(|c| c.contains("SET_KINEMATIC_POSITION")),
+            "must not send with an unresolved placeholder"
+        );
+    }
+
+    #[tokio::test]
+    async fn placeholder_without_computation_refuses_to_send() {
+        let mut plan = test_plan();
+        plan.steps[2].compute = None; // malformed plan shape
+        let fake = FakeMoonraker::spawn(happy_handler).await;
+        let (outcome, _) = run(&plan, &fake, &mut |_| true).await;
+        let ExecOutcome::Aborted { step_id, cause, .. } = outcome else {
+            panic!("expected abort");
+        };
+        assert_eq!(step_id, 3);
+        assert!(matches!(cause, StopCause::ComputeFailed(_)));
+        assert!(!fake.gcode_sent().iter().any(|c| c.contains("{true_z}")));
+    }
 
     #[test]
-    fn scaffold_refuses_to_execute() {
-        let executor = MoonrakerExecutor::new("ws://localhost:7125/websocket".to_owned());
-        let plan = RecoveryPlan {
-            steps: vec![
-                RecoveryStep::RestoreThermals {
-                    targets: vec![("extruder".to_owned(), 215.0)],
-                },
-                RecoveryStep::ReestablishReference { z_floor_mm: 4.2 },
-                RecoveryStep::RearmTransforms {
-                    gcode: vec!["BED_MESH_PROFILE LOAD=default".to_owned()],
-                },
-                RecoveryStep::ResumeAt {
-                    file: "/g/x.gcode".into(),
-                    offset: 123_456,
-                },
-            ],
+    fn dry_run_lists_commands_and_takes_no_client() {
+        // The type-level proof is the signature (no client parameter
+        // exists); this asserts the enumeration matches the plan and
+        // the placeholder stays symbolic.
+        let plan = test_plan();
+        let dry = dry_run(&plan);
+        assert_eq!(
+            dry.would_send,
+            vec![
+                (1, "SET_IDLE_TIMEOUT TIMEOUT=86400".to_owned()),
+                (2, "PROBE PROBE_SPEED=1 SAMPLES=1".to_owned()),
+                (3, "SET_KINEMATIC_POSITION Z={true_z}".to_owned()),
+            ]
+        );
+        assert!(dry.rendered.contains("idle-timeout"));
+        assert!(dry.rendered.contains("fail: abort"));
+    }
+
+    #[test]
+    fn lookup_walks_dotted_paths_and_indices() {
+        let status = json!({
+            "toolhead": {"position": [1.0, 2.0, 3.5, 0.0], "homed_axes": "xyz"},
+        });
+        assert_eq!(lookup(&status, "toolhead", "position.2"), Some(&json!(3.5)));
+        assert_eq!(
+            lookup(&status, "toolhead", "homed_axes"),
+            Some(&json!("xyz"))
+        );
+        assert_eq!(lookup(&status, "toolhead", "position.9"), None);
+        assert_eq!(lookup(&status, "toolhead", "missing"), None);
+        assert_eq!(lookup(&status, "extruder", "target"), None);
+    }
+
+    #[test]
+    fn predicates_evaluate_faithfully() {
+        let within = Predicate::NumWithin {
+            expected: 86_400.0,
+            epsilon: 0.5,
         };
-        let err = executor.execute(&plan).unwrap_err();
-        assert!(matches!(err, ExecutorError::NotImplemented));
-        assert!(err.to_string().contains("not implemented"));
+        assert!(evaluate(&within, Some(&json!(86_400.2)), None));
+        assert!(!evaluate(&within, Some(&json!(86_300.0)), None));
+        assert!(!evaluate(&within, Some(&json!("86400")), None));
+        assert!(evaluate(
+            &Predicate::NumAtLeast { min: 5.0 },
+            Some(&json!(5.0)),
+            None
+        ));
+        let band = Predicate::TempWithin {
+            min: 140.0,
+            max: 160.0,
+        };
+        assert!(evaluate(&band, Some(&json!(150.0)), None));
+        assert!(!evaluate(&band, Some(&json!(139.9)), None));
+        assert!(evaluate(
+            &Predicate::Contains {
+                needle: "z".to_owned()
+            },
+            Some(&json!("xyz")),
+            None
+        ));
+        assert!(evaluate(
+            &Predicate::Equals {
+                value: "ready".to_owned()
+            },
+            Some(&json!("ready")),
+            None
+        ));
+        assert!(evaluate(&Predicate::BoolTrue, Some(&json!(true)), None));
+        assert!(evaluate(&Predicate::BoolFalse, Some(&json!(false)), None));
+        assert!(!evaluate(&Predicate::BoolTrue, Some(&json!("true")), None));
+        assert!(evaluate(&Predicate::FinitePresent, Some(&json!(1.5)), None));
+        assert!(!evaluate(
+            &Predicate::FinitePresent,
+            Some(&json!(null)),
+            None
+        ));
+        assert!(evaluate(
+            &Predicate::NonEmptyMatrix,
+            Some(&json!([[0.1], [0.2]])),
+            None
+        ));
+        assert!(!evaluate(
+            &Predicate::NonEmptyMatrix,
+            Some(&json!([[]])),
+            None
+        ));
+        let computed = Predicate::NumWithinComputed { epsilon: 0.05 };
+        assert!(evaluate(&computed, Some(&json!(12.26)), Some(12.25)));
+        assert!(!evaluate(&computed, Some(&json!(12.26)), None));
+        assert!(!evaluate(&Predicate::BoolTrue, None, None));
     }
 }
