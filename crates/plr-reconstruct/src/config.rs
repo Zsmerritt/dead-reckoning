@@ -62,6 +62,67 @@ pub struct ReconstructConfig {
     /// `max_lines` budget also caps how many parsed lines are collected
     /// from the file tail.
     pub sim: SimConfig,
+    /// How stale journaled `exclude_object` knowledge may be, in
+    /// print-time seconds measured from the newest exclude-bearing
+    /// context to the end of the possible-stop set's evaluation span,
+    /// before [`crate::ExclusionReport::is_conclusive`] turns false and
+    /// the operator must confirm which objects stay cancelled.
+    ///
+    /// Budget for a healthy recovery: the recorder throttles
+    /// position-only contexts to one per second
+    /// (`plrd::convert::POSITION_CONTEXT_MIN_NS`), Klipper batches its
+    /// motion dumps at ~0.5 s, and the stop window deliberately extends
+    /// past the last context by the planning lead plus the
+    /// `extension_horizon` (2 s by default) — so ~3.5 s is expected and
+    /// must not prompt. 5.0 leaves margin without letting a genuinely
+    /// old observation pass as current.
+    ///
+    /// Note the asymmetry this cannot see: while the printer *dwells*
+    /// (heating, waiting) no context is written at all, so the gap grows
+    /// even though no cancellation could have gone unrecorded — a
+    /// cancellation would itself have forced an immediate context.
+    /// Prompting there is a false positive we accept, because the
+    /// alternative is trusting a stale set.
+    pub exclusion_freshness_horizon: f64,
+    /// Expected spacing, in nanoseconds, of the heartbeat samples that
+    /// reach [`crate::WalTimeline::heartbeats`].
+    ///
+    /// # This is the WAL heartbeat period, not the file heartbeat period
+    ///
+    /// `plrd` rewrites the heartbeat *file* at `heartbeat_hz` (default
+    /// 10 Hz), but appends a `Heartbeat` **record** only every
+    /// `WAL_HEARTBEAT_EVERY`-th file heartbeat (`plrd::walsvc`,
+    /// currently 10). The historical stream a recovery can read back is
+    /// therefore
+    ///
+    /// ```text
+    /// wal_heartbeat_hz = heartbeat_hz / WAL_HEARTBEAT_EVERY
+    /// ```
+    ///
+    /// — about **1 Hz** at the defaults, not 10 Hz. (The heartbeat file
+    /// itself contributes exactly one further sample, the newest.)
+    /// Setting this to the file period makes an on-time stream look like
+    /// a chain of holes and defeats the `Continuous` classification
+    /// entirely; `plrd::convert::reconstruct_config` derives it from
+    /// both real constants. The default here mirrors the daemon
+    /// defaults (10 Hz / 10 = 1 Hz ⇒ 1 s); it is not an assumption about
+    /// the running daemon, which should pass its own.
+    ///
+    /// [`crate::exclude`] uses heartbeat *continuity* to decide whether
+    /// a long silence between the last exclusion observation and the
+    /// stop window is evidence of absence (the recorder was alive and
+    /// journaled no cancellation) or merely silence (it was stalled).
+    pub heartbeat_period_ns: u64,
+    /// How many heartbeat periods may elapse between consecutive
+    /// heartbeats before liveness coverage counts as broken.
+    ///
+    /// The writer re-arms its timer from the previous deadline and
+    /// resynchronizes when it falls behind, so ordinary scheduling
+    /// jitter costs well under one period; 3 tolerates a couple of
+    /// missed WAL heartbeats plus jitter without tolerating a real
+    /// stall. A break is reported as
+    /// [`crate::UncertaintyCause::HeartbeatGap`] with its span.
+    pub heartbeat_gap_tolerance: f64,
     /// Two Z candidates closer than this (mm) with identical
     /// kind/provenance/knowledge merge into one. Covers float noise
     /// between independently-computed copies of the same layer height;
@@ -78,6 +139,11 @@ impl Default for ReconstructConfig {
             quiet_tail_ns: 2_000_000_000,
             max_processing_lead: 3.0,
             extension_horizon: 2.0,
+            exclusion_freshness_horizon: 5.0,
+            // 1 s: plrd's default 10 Hz file heartbeat divided by
+            // WAL_HEARTBEAT_EVERY = 10. See the field docs.
+            heartbeat_period_ns: 1_000_000_000,
+            heartbeat_gap_tolerance: 3.0,
             sim: SimConfig::default(),
             z_merge_tolerance: 1e-6,
         }
@@ -108,6 +174,15 @@ impl ReconstructConfig {
         }
         if !self.z_merge_tolerance.is_finite() || self.z_merge_tolerance < 0.0 {
             return err("z_merge_tolerance must be finite and >= 0");
+        }
+        if !self.exclusion_freshness_horizon.is_finite() || self.exclusion_freshness_horizon < 0.0 {
+            return err("exclusion_freshness_horizon must be finite and >= 0");
+        }
+        if self.heartbeat_period_ns == 0 {
+            return err("heartbeat_period_ns must be > 0");
+        }
+        if !self.heartbeat_gap_tolerance.is_finite() || self.heartbeat_gap_tolerance < 1.0 {
+            return err("heartbeat_gap_tolerance must be finite and >= 1");
         }
         if !self.sim.max_velocity.is_finite() || self.sim.max_velocity <= 0.0 {
             return err("sim.max_velocity must be finite and > 0");

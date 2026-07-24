@@ -10,7 +10,8 @@
 //! | `toolhead.estimated_print_time` + eventtime | heartbeat sample | (10 Hz file, see `walsvc`) |
 //! | `mcu.last_stats.receive_seq` (widened)      | sidecar file     | own file, synced on advance |
 //! | lifecycle events (socket, print end)        | `Marker`         | immediate  |
-//! | `exclude_object`, `idle_timeout`, `probe`   | observed only — no `Context` field today; subscribed for forward compatibility |
+//! | `exclude_object` status delta               | `Context.exclude` | immediate |
+//! | `idle_timeout`, `probe`                     | observed only — no `Context` field today; subscribed for forward compatibility |
 //!
 //! # What counts as a meaningful change (Context triggers)
 //!
@@ -30,6 +31,62 @@
 //!   enable flag, skew profile. The continuously-drifting
 //!   `z_thermal_adjust.current_z_adjust` is merged silently and rides
 //!   along on the next context.
+//! * **Exclude-object change**: the first `exclude_object` observation,
+//!   any change to `objects` (a new `EXCLUDE_OBJECT_DEFINE`, an
+//!   `EXCLUDE_OBJECT_START` auto-definition, or the wholesale clear of
+//!   `EXCLUDE_OBJECT_DEFINE RESET=1`) and any change to
+//!   `excluded_objects` (a cancellation, an `EXCLUDE_OBJECT RESET=1`,
+//!   or an individual un-exclude). See the dedicated section below.
+//!
+//! # Exclude-object trigger rules
+//!
+//! An operator usually cancels an object *because it failed* — it
+//! detached, warped, or turned into spaghetti. Klipper holds that
+//! decision only in RAM, so it must reach the disk before the power
+//! does: an exclusion change forces an **immediate** (fsync'd)
+//! `Context` rather than waiting for the batch window, and bypasses
+//! [`POSITION_CONTEXT_MIN_NS`], which throttles position-only contexts.
+//!
+//! What that does **not** buy is undroppability. Records — contexts
+//! included — are dropped when the WAL channel fills, because blocking
+//! the socket reader gets the daemon disconnected by Klipper
+//! (`crate::sender`); only markers are never dropped. The guarantee is
+//! therefore: *if* an exclusion-bearing context reaches the WAL thread
+//! it is fsync'd before the next record, and *if* it does not, the
+//! sender journals a never-dropped
+//! [`plr_wal::MarkerKind::ExclusionUpdateLost`] marker so
+//! reconstruction knows to distrust the surviving set. Recovery never
+//! silently loses a cancellation; at worst it has to ask.
+//!
+//! # Positive journaling
+//!
+//! The excluded set is journaled from the **first** `exclude_object`
+//! observation onward, including when it is empty. "Zero objects
+//! excluded as of t" is a recorded fact, so reconstruction can tell
+//! *nothing was cancelled* from *we never looked* — the distinction the
+//! whole provenance machinery in `plr-reconstruct` rests on.
+//!
+//! * `objects` change → immediate context carrying
+//!   [`ExcludeState::definitions`] `= Some(..)`.
+//! * `excluded_objects` change → immediate context. The excluded set is
+//!   short, so it rides in **every** context that carries exclude state
+//!   (`definitions` does not — see the payload-size rationale on
+//!   [`ExcludeState`]).
+//! * `current_object` change is **merged silently and never triggers**:
+//!   `EXCLUDE_OBJECT_START`/`END` bracket every object on every layer,
+//!   so triggering on it would turn an N-object, M-layer print into
+//!   N×M immediate fsyncs while adding nothing recovery needs. It rides
+//!   along on the next context like `current_z_adjust`.
+//! * [`Recorder::reset_session`] drops the snapshot, so the next
+//!   session's initial full status re-journals definitions — Klipper
+//!   resets `exclude_object` on restart, and stale definitions must not
+//!   outlive it.
+//!
+//! Geometry is normalized on the way in by
+//! [`ExcludeObjectDef::normalized`]: non-finite or malformed outlines
+//! become `PolygonFidelity::Unusable` and over-long ones become their
+//! bounding box, so a hostile polygon can never make the whole context
+//! non-finite and cost us the excluded set.
 //!
 //! # Clean-shutdown detection
 //!
@@ -43,15 +100,18 @@
 use std::collections::BTreeMap;
 
 use plr_klipper::{
-    ClockCorrelator, GcodeMoveStatus, Notification, ReceiveSeqWidener, ResponseTemplate,
-    SampleOutcome, SeqKind, StatusUpdate, StepperBatch, TrapqBatch, VirtualSdcardStatus,
+    ClockCorrelator, ExcludeObjectDefinition, ExcludeObjectSnapshot, GcodeMoveStatus, Notification,
+    ReceiveSeqWidener, ResponseTemplate, SampleOutcome, SeqKind, StatusUpdate, StepperBatch,
+    TrapqBatch, VirtualSdcardStatus,
 };
+use plr_reconstruct::ReconstructConfig;
 use plr_wal::{
-    Context, FanTarget, GcodeState, HeaterTarget, StepChunk, StepperRange, TransformObservations,
-    TrapqSegment, VirtualSdState, WalRecord,
+    Context, ExcludeObjectDef, ExcludeState, FanTarget, GcodeState, HeaterTarget, StepChunk,
+    StepperRange, TransformObservations, TrapqSegment, VirtualSdState, WalRecord,
 };
 use serde_json::{Map, Value};
 
+use crate::config::Config;
 use crate::sender::{HeartbeatData, SyncPolicy};
 
 /// The response-template key used to demultiplex subscriptions. Klipper
@@ -62,6 +122,64 @@ pub const TEMPLATE_KEY: &str = "k";
 
 /// Minimum spacing of contexts triggered *only* by file-position advance.
 pub const POSITION_CONTEXT_MIN_NS: u64 = 1_000_000_000;
+
+/// Append a WAL `Heartbeat` record every Nth heartbeat-file rewrite
+/// (10 Hz file rate → 1 Hz WAL rate). Consumed by `walsvc`, which
+/// applies it, and by [`reconstruct_config`], which tells recovery how
+/// far apart the heartbeat *records* it reads back should be.
+///
+/// It lives here rather than in `walsvc` because it is a contract
+/// between the writer and the reader, and `walsvc` is Linux-only while
+/// this module is not.
+pub const WAL_HEARTBEAT_EVERY: u64 = 10;
+
+/// Derives the reconstruction tunables from the daemon's own
+/// configuration, so recovery is not left guessing at rates this process
+/// already knows.
+///
+/// Only the heartbeat cadence is derived today; everything else keeps
+/// [`ReconstructConfig::default`]. The cadence matters because
+/// `plr-reconstruct` uses heartbeat *continuity* to tell a long dwell
+/// (the writer was alive and journaled no object cancellation — nothing
+/// to confirm) from a stalled recorder (a cancellation may be missing).
+/// Get the period wrong and an on-time stream reads as a chain of holes,
+/// which makes every recovery of a plate with objects prompt the
+/// operator.
+///
+/// The period is the **WAL** heartbeat period, not the heartbeat-file
+/// period: `walsvc` rewrites the file at `heartbeat_hz` but appends a
+/// `Heartbeat` record only every [`WAL_HEARTBEAT_EVERY`]-th tick, so
+///
+/// ```text
+/// period = WAL_HEARTBEAT_EVERY / heartbeat_hz
+/// ```
+///
+/// `None` is for entry points that run without a loaded config (the
+/// forensic `scan` subcommand, and `detect`, which classifies the
+/// previous session and does not read the exclusion report); they get
+/// the documented defaults.
+#[must_use]
+pub fn reconstruct_config(config: Option<&Config>) -> ReconstructConfig {
+    let defaults = ReconstructConfig::default();
+    let Some(config) = config else {
+        return defaults;
+    };
+    // `Config::validate` guarantees heartbeat_hz is finite and > 0, but
+    // this must stay total for a hand-built Config: fall back rather
+    // than produce a nonsense period.
+    #[allow(clippy::cast_precision_loss)]
+    let period_ns = WAL_HEARTBEAT_EVERY as f64 / config.heartbeat_hz * 1e9;
+    #[allow(clippy::cast_precision_loss)]
+    let max = u64::MAX as f64;
+    if !period_ns.is_finite() || period_ns < 1.0 || period_ns >= max {
+        return defaults;
+    }
+    ReconstructConfig {
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        heartbeat_period_ns: period_ns as u64,
+        ..defaults
+    }
+}
 
 /// Which subscription a notification belongs to, decoded from the echoed
 /// response template.
@@ -155,6 +273,13 @@ pub struct Recorder {
     est_sample: Option<(u64, f64)>,
     last_context_mono_ns: Option<u64>,
     last_context_file_position: u64,
+    exclude: ExcludeObjectSnapshot,
+    /// Whether `exclude_object` has ever been observed this session.
+    /// Gates the whole `Context.exclude` field: `None` must keep meaning
+    /// "not observed", never "nothing excluded".
+    exclude_seen: bool,
+    /// Whether the current definition list still needs journaling.
+    exclude_definitions_dirty: bool,
 }
 
 impl Default for Recorder {
@@ -193,6 +318,9 @@ impl Recorder {
             est_sample: None,
             last_context_mono_ns: None,
             last_context_file_position: 0,
+            exclude: ExcludeObjectSnapshot::new(),
+            exclude_seen: false,
+            exclude_definitions_dirty: false,
         }
     }
 
@@ -216,10 +344,21 @@ impl Recorder {
     /// values. Merged *configuration-ish* state (heater targets,
     /// transforms) is kept: the initial full status of the next session
     /// overwrites it wholesale anyway.
+    ///
+    /// `exclude_object` state is dropped rather than kept: Klipper
+    /// clears it on restart (`_reset_state`) and on
+    /// `virtual_sdcard:reset_file`, so carrying the old session's
+    /// cancellations forward would journal exclusions the printer no
+    /// longer honours. Clearing forces the next session's initial full
+    /// status to re-journal definitions and the excluded set from
+    /// scratch.
     pub fn reset_session(&mut self) {
         self.is_active = false;
         self.est_sample = None;
         self.latest_print_time = 0.0;
+        self.exclude = ExcludeObjectSnapshot::new();
+        self.exclude_seen = false;
+        self.exclude_definitions_dirty = false;
     }
 
     /// Handles one routed notification. Payloads that fail to parse are
@@ -276,6 +415,7 @@ impl Recorder {
         }
         state_changed |= self.merge_heaters_and_fans(update);
         state_changed |= self.merge_transforms(update);
+        state_changed |= self.merge_exclude_object(update);
 
         let position_due = self
             .last_context_mono_ns
@@ -285,10 +425,19 @@ impl Recorder {
             && position_due;
         if state_changed || position_trigger {
             if let Some(context) = self.build_context(mono_ns) {
+                // Definitions are journaled once per change: clear the
+                // dirty flag only when this context actually carried
+                // them (build_context returns `None` before a full
+                // g-code state exists, and then nothing was written).
+                let carried_definitions = context
+                    .exclude
+                    .as_ref()
+                    .is_some_and(|state| state.definitions.is_some());
                 out.records
                     .push((WalRecord::Context(context), SyncPolicy::Immediate));
                 self.last_context_mono_ns = Some(mono_ns);
                 self.last_context_file_position = self.file_position;
+                self.exclude_definitions_dirty &= !carried_definitions;
             }
         }
         out.heartbeat = self.heartbeat_data();
@@ -527,6 +676,41 @@ impl Recorder {
         trigger
     }
 
+    /// Merges an `exclude_object` diff; `true` when the cancellation
+    /// picture changed and a context must be journaled immediately.
+    ///
+    /// `current_object` is merged but deliberately never triggers — see
+    /// the module-level trigger rules.
+    fn merge_exclude_object(&mut self, update: &StatusUpdate) -> bool {
+        let Ok(Some(status)) = update.status.exclude_object() else {
+            return false;
+        };
+        let first_observation = !self.exclude_seen;
+        self.exclude_seen = true;
+        let change = self.exclude.merge(&status);
+        self.exclude_definitions_dirty |= first_observation || change.definitions;
+        first_observation || change.definitions || change.excluded
+    }
+
+    /// The exclude-object payload for the next context, or `None` when
+    /// `exclude_object` has never been observed (the module is not
+    /// configured, or no update carried it yet).
+    fn exclude_state(&self) -> Option<Box<ExcludeState>> {
+        self.exclude_seen.then(|| {
+            Box::new(ExcludeState {
+                definitions: self.exclude_definitions_dirty.then(|| {
+                    self.exclude
+                        .objects
+                        .iter()
+                        .map(exclude_definition)
+                        .collect()
+                }),
+                excluded: self.exclude.excluded_objects.clone(),
+                current: self.exclude.current_object.clone(),
+            })
+        })
+    }
+
     /// Builds a context snapshot; `None` until a full `gcode_move` state
     /// has been seen (always present after the initial subscribe
     /// response).
@@ -556,8 +740,21 @@ impl Recorder {
                     speed: *speed,
                 })
                 .collect(),
+            exclude: self.exclude_state(),
         })
     }
+}
+
+/// Maps one Klipper object definition to its WAL form, normalizing the
+/// geometry so a hostile outline can never poison the record.
+///
+/// The name is stored as Klipper reports it: `exclude_object.py` already
+/// upper-cases every name it stores (`name.upper()` in
+/// `cmd_EXCLUDE_OBJECT_DEFINE` and `cmd_EXCLUDE_OBJECT_START`), and the
+/// same strings populate `excluded_objects`, so re-casing here could
+/// only introduce a mismatch.
+fn exclude_definition(def: &ExcludeObjectDefinition) -> ExcludeObjectDef {
+    ExcludeObjectDef::normalized(def.name.clone(), def.center_xy(), def.polygon_xy())
 }
 
 /// Result of merging one `virtual_sdcard` diff.
@@ -634,7 +831,7 @@ mod tests {
     };
     use crate::sender::SyncPolicy;
     use plr_klipper::{StatusUpdate, StepperBatch, TrapqBatch};
-    use plr_wal::WalRecord;
+    use plr_wal::{ExcludeObjectDef, PolygonFidelity, WalRecord};
     use serde_json::json;
 
     fn status(v: serde_json::Value) -> StatusUpdate {
@@ -674,6 +871,80 @@ mod tests {
         let out = r.on_initial_status(&initial_status(100.0), 1_000).unwrap();
         assert_eq!(out.records.len(), 1, "initial context expected");
         r
+    }
+
+    #[test]
+    fn reconstruct_config_derives_the_wal_heartbeat_period() {
+        use crate::config::Config;
+
+        // The default 10 Hz *file* rate becomes a 1 Hz *record* rate,
+        // because walsvc appends one record per WAL_HEARTBEAT_EVERY
+        // ticks. Getting this wrong by that factor makes an on-time
+        // heartbeat stream look like a chain of holes to recovery.
+        let config = Config::default();
+        assert_eq!(config.heartbeat_hz, 10.0);
+        assert_eq!(
+            super::reconstruct_config(Some(&config)).heartbeat_period_ns,
+            1_000_000_000
+        );
+
+        // A non-default rate is followed, not assumed away (the daemon's
+        // own test fixtures configure 20 Hz).
+        let faster = Config {
+            heartbeat_hz: 20.0,
+            ..Config::default()
+        };
+        assert_eq!(
+            super::reconstruct_config(Some(&faster)).heartbeat_period_ns,
+            500_000_000
+        );
+        let slower = Config {
+            heartbeat_hz: 2.0,
+            ..Config::default()
+        };
+        assert_eq!(
+            super::reconstruct_config(Some(&slower)).heartbeat_period_ns,
+            5_000_000_000
+        );
+
+        // Entry points without a loaded config get the documented
+        // defaults rather than a fabricated rate.
+        assert_eq!(
+            super::reconstruct_config(None),
+            plr_reconstruct::ReconstructConfig::default()
+        );
+
+        // Everything else is left at the defaults.
+        let derived = super::reconstruct_config(Some(&faster));
+        let defaults = plr_reconstruct::ReconstructConfig::default();
+        assert_eq!(derived.extension_horizon, defaults.extension_horizon);
+        assert_eq!(
+            derived.exclusion_freshness_horizon,
+            defaults.exclusion_freshness_horizon
+        );
+        assert_eq!(
+            derived.heartbeat_gap_tolerance,
+            defaults.heartbeat_gap_tolerance
+        );
+    }
+
+    #[test]
+    fn reconstruct_config_is_total_on_a_degenerate_rate() {
+        use crate::config::Config;
+
+        // `Config::validate` rejects these, but a hand-built Config must
+        // not be able to produce a nonsense period.
+        for hz in [0.0, -1.0, f64::NAN, f64::INFINITY, 1e-30, 1e30] {
+            let config = Config {
+                heartbeat_hz: hz,
+                ..Config::default()
+            };
+            let derived = super::reconstruct_config(Some(&config));
+            assert!(
+                derived.validate().is_ok(),
+                "heartbeat_hz {hz} produced an invalid config"
+            );
+        }
     }
 
     #[test]
@@ -1119,6 +1390,420 @@ mod tests {
         );
         // Rejected by the correlator: the sample keeps the old anchor.
         assert_eq!(out.heartbeat.unwrap().est_sample_print_time, 9.5);
+    }
+
+    /// Extracts the single context a status update produced.
+    fn only_context(out: &super::Output) -> &plr_wal::Context {
+        assert_eq!(out.records.len(), 1, "expected exactly one record");
+        let (WalRecord::Context(ctx), SyncPolicy::Immediate) = &out.records[0] else {
+            panic!("expected an immediate context, got {:?}", out.records[0]);
+        };
+        ctx
+    }
+
+    /// An `exclude_object` status delta, in Klipper's shape.
+    fn exclude_update(eventtime: f64, exclude: &serde_json::Value) -> StatusUpdate {
+        status(json!({"eventtime": eventtime, "status": {"exclude_object": exclude}}))
+    }
+
+    #[test]
+    fn no_exclude_object_observation_leaves_the_field_absent() {
+        // A printer without [exclude_object] never sends the object.
+        // `None` must keep meaning "not observed", never "nothing
+        // excluded" — that distinction is the whole point downstream.
+        let mut r = recorder_with_snapshot();
+        let out = r.on_status(
+            &status(json!({"eventtime": 101.0, "status": {"gcode_move": {"speed_factor": 0.5}}})),
+            2_000,
+            false,
+        );
+        assert_eq!(only_context(&out).exclude, None);
+    }
+
+    #[test]
+    fn first_exclude_observation_journals_definitions_once() {
+        let mut r = recorder_with_snapshot();
+        // The initial full status of a plate with two objects.
+        let out = r.on_status(
+            &exclude_update(
+                101.0,
+                &json!({
+                    "objects": [
+                        {"name": "CUBE_ID_0_COPY_0", "center": [50.0, 50.0],
+                         "polygon": [[45.0, 45.0], [55.0, 45.0], [55.0, 55.0], [45.0, 55.0]]},
+                        {"name": "CUBE_ID_1_COPY_0"}
+                    ],
+                    "excluded_objects": [],
+                    "current_object": null
+                }),
+            ),
+            2_000,
+            false,
+        );
+        let state = only_context(&out).exclude.clone().unwrap();
+        let definitions = state.definitions.unwrap();
+        assert_eq!(definitions.len(), 2);
+        assert_eq!(definitions[0].name, "CUBE_ID_0_COPY_0");
+        assert_eq!(definitions[0].center, Some([50.0, 50.0]));
+        assert_eq!(definitions[0].polygon.len(), 4);
+        assert_eq!(definitions[0].fidelity, PolygonFidelity::Exact);
+        assert_eq!(
+            definitions[1],
+            ExcludeObjectDef::name_only("CUBE_ID_1_COPY_0")
+        );
+        assert!(state.excluded.is_empty());
+        assert_eq!(state.current, None);
+
+        // A later, unrelated trigger must NOT re-journal the polygons.
+        let out = r.on_status(
+            &status(json!({"eventtime": 102.0, "status": {"fan": {"speed": 0.2}}})),
+            3_000,
+            false,
+        );
+        let state = only_context(&out).exclude.clone().unwrap();
+        assert_eq!(
+            state.definitions, None,
+            "definitions are journaled once, not in every context"
+        );
+        assert!(state.excluded.is_empty());
+    }
+
+    #[test]
+    fn the_empty_excluded_set_is_journaled_positively() {
+        // Positive journaling: the very first exclude_object
+        // observation records "zero objects excluded as of t" as a
+        // fact. Without this, reconstruction could not distinguish
+        // "nothing was cancelled" from "we never looked", and the
+        // absence-of-record path would be the common case rather than
+        // the rare one.
+        let mut r = recorder_with_snapshot();
+        let out = r.on_status(
+            &exclude_update(
+                101.0,
+                &json!({"objects": [{"name": "A"}, {"name": "B"}],
+                        "excluded_objects": [], "current_object": null}),
+            ),
+            2_000,
+            false,
+        );
+        let state = only_context(&out).exclude.clone().unwrap();
+        assert!(
+            state.excluded.is_empty(),
+            "an empty set is still journaled, not omitted"
+        );
+        assert_eq!(state.definitions.unwrap().len(), 2);
+
+        // And it keeps riding along on every later context, so the
+        // newest surviving one always states the set.
+        let out = r.on_status(
+            &status(json!({"eventtime": 102.0, "status": {"fan": {"speed": 0.3}}})),
+            3_000,
+            false,
+        );
+        let state = only_context(&out).exclude.clone().unwrap();
+        assert!(state.excluded.is_empty());
+        assert_eq!(state.definitions, None, "definitions are not repeated");
+    }
+
+    #[test]
+    fn cancelling_an_object_forces_an_immediate_context() {
+        let mut r = recorder_with_snapshot();
+        r.on_status(
+            &exclude_update(
+                101.0,
+                &json!({"objects": [{"name": "A"}, {"name": "B"}],
+                       "excluded_objects": [], "current_object": "A"}),
+            ),
+            2_000,
+            false,
+        );
+        // EXCLUDE_OBJECT NAME=B — arrives as a diff carrying only the
+        // changed field. This is the record we cannot afford to lose to
+        // the batch window.
+        let out = r.on_status(
+            &exclude_update(101.5, &json!({"excluded_objects": ["B"]})),
+            2_100,
+            false,
+        );
+        let (record, sync) = &out.records[0];
+        assert_eq!(*sync, SyncPolicy::Immediate, "exclusions must be fsync'd");
+        let WalRecord::Context(ctx) = record else {
+            panic!("expected a context");
+        };
+        let state = ctx.exclude.clone().unwrap();
+        assert_eq!(state.excluded, vec!["B".to_owned()]);
+        assert_eq!(state.definitions, None, "definitions unchanged");
+
+        // Re-sending the same set changes nothing.
+        assert!(r
+            .on_status(
+                &exclude_update(102.0, &json!({"excluded_objects": ["B"]})),
+                2_200,
+                false
+            )
+            .records
+            .is_empty());
+    }
+
+    #[test]
+    fn exclusion_change_bypasses_the_position_throttle() {
+        let mut r = recorder_with_snapshot();
+        r.on_status(
+            &exclude_update(
+                101.0,
+                &json!({"objects": [{"name": "A"}], "excluded_objects": [], "current_object": null}),
+            ),
+            2_000,
+            false,
+        );
+        // Well inside POSITION_CONTEXT_MIN_NS of the previous context: a
+        // position-only advance would be swallowed, an exclusion is not.
+        let out = r.on_status(
+            &status(json!({"eventtime": 101.1, "status": {
+                "virtual_sdcard": {"file_position": 1_100},
+                "exclude_object": {"excluded_objects": ["A"]},
+            }})),
+            2_001,
+            false,
+        );
+        let ctx = only_context(&out);
+        assert_eq!(ctx.exclude.clone().unwrap().excluded, vec!["A".to_owned()]);
+        assert_eq!(ctx.virtual_sdcard.as_ref().unwrap().file_position, 1_100);
+    }
+
+    #[test]
+    fn exclude_object_reset_and_define_reset_are_journaled() {
+        let mut r = recorder_with_snapshot();
+        r.on_status(
+            &exclude_update(
+                101.0,
+                &json!({"objects": [{"name": "A"}, {"name": "B"}],
+                       "excluded_objects": ["A", "B"], "current_object": null}),
+            ),
+            2_000,
+            false,
+        );
+        // EXCLUDE_OBJECT RESET=1: exclusions clear, definitions stay.
+        let out = r.on_status(
+            &exclude_update(102.0, &json!({"excluded_objects": []})),
+            3_000,
+            false,
+        );
+        let state = only_context(&out).exclude.clone().unwrap();
+        assert!(state.excluded.is_empty());
+        assert_eq!(state.definitions, None);
+
+        // EXCLUDE_OBJECT_DEFINE RESET=1 runs _reset_file(): everything
+        // clears at once, and the empty definition list is journaled
+        // explicitly (Some(vec![]) != None).
+        let out = r.on_status(
+            &exclude_update(
+                103.0,
+                &json!({"objects": [], "excluded_objects": [], "current_object": null}),
+            ),
+            4_000,
+            false,
+        );
+        let state = only_context(&out).exclude.clone().unwrap();
+        assert_eq!(state.definitions, Some(Vec::new()));
+        assert!(state.excluded.is_empty());
+    }
+
+    #[test]
+    fn current_object_changes_ride_along_without_triggering() {
+        let mut r = recorder_with_snapshot();
+        r.on_status(
+            &exclude_update(
+                101.0,
+                &json!({"objects": [{"name": "A"}, {"name": "B"}],
+                       "excluded_objects": [], "current_object": null}),
+            ),
+            2_000,
+            false,
+        );
+        // EXCLUDE_OBJECT_START NAME=A: one per object per layer. If this
+        // triggered, an N-object M-layer print would cost N*M fsyncs.
+        let out = r.on_status(
+            &exclude_update(101.2, &json!({"current_object": "A"})),
+            2_100,
+            false,
+        );
+        assert!(out.records.is_empty(), "current_object must not trigger");
+        // ... but it rides along on the next real trigger.
+        let out = r.on_status(
+            &status(json!({"eventtime": 101.3, "status": {"fan": {"speed": 0.4}}})),
+            2_200,
+            false,
+        );
+        assert_eq!(
+            only_context(&out).exclude.clone().unwrap().current,
+            Some("A".to_owned())
+        );
+        // EXCLUDE_OBJECT_END sets it back to JSON null.
+        let out = r.on_status(
+            &exclude_update(101.4, &json!({"current_object": null})),
+            2_300,
+            false,
+        );
+        assert!(out.records.is_empty());
+    }
+
+    #[test]
+    fn new_object_definitions_appearing_mid_print_are_journaled() {
+        // EXCLUDE_OBJECT_START NAME=<unknown> auto-defines a name-only
+        // object, so `objects` grows mid-print
+        // (exclude_object.py:199-204).
+        let mut r = recorder_with_snapshot();
+        r.on_status(
+            &exclude_update(
+                101.0,
+                &json!({"objects": [{"name": "A"}], "excluded_objects": [], "current_object": null}),
+            ),
+            2_000,
+            false,
+        );
+        let out = r.on_status(
+            &exclude_update(102.0, &json!({"objects": [{"name": "A"}, {"name": "B"}]})),
+            3_000,
+            false,
+        );
+        let definitions = only_context(&out)
+            .exclude
+            .clone()
+            .unwrap()
+            .definitions
+            .unwrap();
+        assert_eq!(definitions.len(), 2);
+    }
+
+    #[test]
+    fn hostile_geometry_is_normalized_and_keeps_the_record_writable() {
+        let mut r = recorder_with_snapshot();
+        let mut long_polygon: Vec<serde_json::Value> = Vec::new();
+        for i in 0..=plr_wal::MAX_POLYGON_POINTS {
+            #[allow(clippy::cast_precision_loss)]
+            let t = i as f64;
+            long_polygon.push(json!([t, 2.0 * t]));
+        }
+        let out = r.on_status(
+            &exclude_update(
+                101.0,
+                &json!({
+                    "objects": [
+                        {"name": "BADPOINT", "polygon": [[0.0, 0.0], [1.0], [2.0, 2.0]]},
+                        {"name": "SHORT", "polygon": [[0.0, 0.0], [1.0, 1.0]]},
+                        {"name": "HUGE", "polygon": long_polygon},
+                        {"name": "BADCENTER", "center": [0.0]}
+                    ],
+                    "excluded_objects": ["BADPOINT"],
+                    "current_object": null
+                }),
+            ),
+            2_000,
+            false,
+        );
+        let ctx = only_context(&out);
+        let definitions = ctx.exclude.clone().unwrap().definitions.unwrap();
+        // A one-component point invalidates the ring rather than being
+        // dropped: a partial ring encloses the wrong region. (A literal
+        // NaN cannot reach us — JSON has no NaN token and serde_json
+        // rejects one — so arity is the realistic corruption.)
+        assert_eq!(
+            definitions[0].fidelity,
+            PolygonFidelity::Unusable { source_points: 3 }
+        );
+        assert!(definitions[0].polygon.is_empty());
+        assert_eq!(
+            definitions[1].fidelity,
+            PolygonFidelity::Unusable { source_points: 2 }
+        );
+        // Over-long outlines become their bounding box, flagged.
+        let expected_points = u32::try_from(plr_wal::MAX_POLYGON_POINTS + 1).unwrap();
+        assert_eq!(
+            definitions[2].fidelity,
+            PolygonFidelity::BoundingBox {
+                source_points: expected_points
+            }
+        );
+        #[allow(clippy::cast_precision_loss)]
+        let max = plr_wal::MAX_POLYGON_POINTS as f64;
+        assert_eq!(
+            definitions[2].polygon,
+            vec![[0.0, 0.0], [max, 0.0], [max, 2.0 * max], [0.0, 2.0 * max]]
+        );
+        assert_eq!(definitions[3].center, None);
+        // The excluded set survived intact and the record is writable.
+        assert_eq!(
+            ctx.exclude.clone().unwrap().excluded,
+            vec!["BADPOINT".to_owned()]
+        );
+        assert!(WalRecord::Context(ctx.clone()).values_are_finite());
+    }
+
+    #[test]
+    fn session_reset_drops_exclude_state_and_re_journals_definitions() {
+        let mut r = recorder_with_snapshot();
+        r.on_status(
+            &exclude_update(
+                101.0,
+                &json!({"objects": [{"name": "A"}], "excluded_objects": ["A"],
+                       "current_object": null}),
+            ),
+            2_000,
+            false,
+        );
+        r.reset_session();
+        // Klipper cleared exclude_object across the restart; the fresh
+        // baseline must re-journal from scratch, not inherit "A".
+        let out = r.on_status(
+            &exclude_update(
+                150.0,
+                &json!({"objects": [], "excluded_objects": [], "current_object": null}),
+            ),
+            50_000,
+            false,
+        );
+        let state = only_context(&out).exclude.clone().unwrap();
+        assert_eq!(state.definitions, Some(Vec::new()));
+        assert!(state.excluded.is_empty());
+    }
+
+    #[test]
+    fn exclude_state_is_held_until_a_context_can_be_built() {
+        // Before a full gcode_move state exists no context is written;
+        // the pending definitions must not be lost.
+        let mut r = Recorder::new();
+        let out = r.on_status(
+            &exclude_update(
+                1.0,
+                &json!({"objects": [{"name": "A"}], "excluded_objects": ["A"],
+                       "current_object": null}),
+            ),
+            100,
+            false,
+        );
+        assert!(out.records.is_empty());
+        let out = r.on_initial_status(&initial_status(100.0), 1_000).unwrap();
+        let state = only_context(&out).exclude.clone().unwrap();
+        assert_eq!(
+            state.definitions,
+            Some(vec![ExcludeObjectDef::name_only("A")])
+        );
+        assert_eq!(state.excluded, vec!["A".to_owned()]);
+    }
+
+    #[test]
+    fn malformed_exclude_object_payload_is_ignored() {
+        // A wrong-shaped object must not kill the recording session.
+        let mut r = recorder_with_snapshot();
+        let out = r.on_status(
+            &status(json!({"eventtime": 101.0, "status": {
+                "exclude_object": {"objects": "not-a-list"},
+            }})),
+            2_000,
+            false,
+        );
+        assert!(out.records.is_empty());
     }
 
     #[test]

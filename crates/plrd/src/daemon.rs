@@ -327,6 +327,7 @@ mod tests {
                 },
                 heaters: Vec::new(),
                 fans: Vec::new(),
+                exclude: None,
             }))
             .unwrap();
         std::fs::write(config.wal_dir.join("wal-000001.plr"), writer.into_inner()).unwrap();

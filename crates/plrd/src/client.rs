@@ -658,6 +658,7 @@ mod tests {
             MarkerKind::SocketLost => "SocketLost",
             MarkerKind::Resubscribed => "Resubscribed",
             MarkerKind::SubscriptionGap { .. } => "SubscriptionGap",
+            MarkerKind::ExclusionUpdateLost => "ExclusionUpdateLost",
             MarkerKind::Unknown => "Unknown",
         }
     }

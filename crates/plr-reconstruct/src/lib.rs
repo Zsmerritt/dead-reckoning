@@ -49,6 +49,23 @@
 //! lines) never silently shrink the set; they surface as typed flags in
 //! [`stopset::Degradation`] with per-line vs per-layer confidence.
 //!
+//! # Cancelled (excluded) objects
+//!
+//! Recovery also has to know what the operator **cancelled** — usually
+//! because that object failed — so a resume does not print back into
+//! the debris. [`exclude`] resolves that from the WAL's journaled
+//! `exclude_object` state, falling back to the print file's
+//! `EXCLUDE_OBJECT_DEFINE` block. Crucially it gates on **uncertainty,
+//! not on which answer it saw**: [`ExclusionReport::is_conclusive`] is
+//! true only when nothing the log records as lost postdates the newest
+//! exclusion observation *and* that observation is fresh, so a stale or
+//! gap-shadowed excluded set prompts just as a missing one does. Every
+//! reason is a named [`UncertaintyCause`], and
+//! [`ExclusionReport::confirmation`] hands back the full per-object
+//! payload so the prompt is a per-object selection, never a yes/no. The
+//! report also answers "which object contains this XY?" from the
+//! outlines.
+//!
 //! # Crash classes
 //!
 //! [`window::CrashClass`] classifies the stop: clean shutdown (reported
@@ -72,6 +89,7 @@
 
 pub mod config;
 pub mod error;
+pub mod exclude;
 pub mod reconstruct;
 pub mod stopset;
 pub mod timeline;
@@ -79,6 +97,12 @@ pub mod window;
 
 pub use config::ReconstructConfig;
 pub use error::{ContextDefect, ReconstructError};
+pub use exclude::{
+    parse_object_definitions, point_in_polygon, resolve_exclusions, ExclusionConfirmation,
+    ExclusionDiagnostic, ExclusionFreshness, ExclusionInputs, ExclusionProvenance, ExclusionReport,
+    FileObjectScan, HeartbeatCoverage, ObjectKnowledge, ObjectState, UncertaintyCause,
+    EDGE_TOLERANCE_MM,
+};
 pub use reconstruct::{reconstruct, ReconstructInputs, Reconstruction, RecoveryReconstruction};
 pub use stopset::{
     anchor_state_from_context, compute_stop_set, Confidence, Degradation, ExtensionSummary,
@@ -262,6 +286,7 @@ pub(crate) mod testutil {
             },
             heaters: Vec::new(),
             fans: Vec::new(),
+            exclude: None,
         }
     }
 }

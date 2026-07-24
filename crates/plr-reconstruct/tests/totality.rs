@@ -6,12 +6,14 @@
 
 use plr_gcode::SimConfig;
 use plr_reconstruct::{
-    reconstruct, FileTail, ReceiveSeqObservation, ReconstructConfig, ReconstructInputs,
+    compute_stop_window, ingest, parse_object_definitions, point_in_polygon, reconstruct,
+    resolve_exclusions, ExclusionInputs, FileTail, ReceiveSeqObservation, ReconstructConfig,
+    ReconstructInputs,
 };
 use plr_wal::{
-    recover_heartbeat, Context, FanTarget, GcodeState, Heartbeat, HeaterTarget, Marker, MarkerKind,
-    RecoveryScan, ScanEnd, ScannedRecord, StepChunk, StepperRange, TransformObservations,
-    TrapqSegment, VirtualSdState, WalRecord,
+    recover_heartbeat, Context, ExcludeObjectDef, ExcludeState, FanTarget, GcodeState, Heartbeat,
+    HeaterTarget, Marker, MarkerKind, PolygonFidelity, RecoveryScan, ScanEnd, ScannedRecord,
+    StepChunk, StepperRange, TransformObservations, TrapqSegment, VirtualSdState, WalRecord,
 };
 use proptest::prelude::*;
 use proptest::test_runner::FileFailurePersistence;
@@ -114,14 +116,56 @@ fn any_gcode_state() -> impl Strategy<Value = GcodeState> {
         })
 }
 
+/// Hostile object outlines: NaN and infinite vertices, degenerate
+/// rings, points with the wrong arity already collapsed away, and every
+/// fidelity flag — the shapes a corrupt or hand-built WAL can carry.
+fn any_polygon() -> impl Strategy<Value = Vec<[f64; 2]>> {
+    proptest::collection::vec((any_f64(), any_f64()).prop_map(|(x, y)| [x, y]), 0..6)
+}
+
+fn any_exclude_def() -> impl Strategy<Value = ExcludeObjectDef> {
+    (
+        "[A-Z_0-9]{0,8}",
+        proptest::option::of((any_f64(), any_f64()).prop_map(|(x, y)| [x, y])),
+        any_polygon(),
+        prop_oneof![
+            Just(PolygonFidelity::Absent),
+            Just(PolygonFidelity::Exact),
+            any::<u32>().prop_map(|n| PolygonFidelity::BoundingBox { source_points: n }),
+            any::<u32>().prop_map(|n| PolygonFidelity::Unusable { source_points: n }),
+            Just(PolygonFidelity::Unknown),
+        ],
+    )
+        .prop_map(|(name, center, polygon, fidelity)| ExcludeObjectDef {
+            name,
+            center,
+            polygon,
+            fidelity,
+        })
+}
+
+fn any_exclude_state() -> impl Strategy<Value = ExcludeState> {
+    (
+        proptest::option::of(proptest::collection::vec(any_exclude_def(), 0..4)),
+        proptest::collection::vec("[A-Z_0-9]{0,8}", 0..4),
+        proptest::option::of("[A-Z_0-9]{0,8}"),
+    )
+        .prop_map(|(definitions, excluded, current)| ExcludeState {
+            definitions,
+            excluded,
+            current,
+        })
+}
+
 fn any_context() -> impl Strategy<Value = Context> {
     (
         any::<u64>(),
         proptest::option::of((any::<u64>(), "[a-z/.]{0,12}")),
         any_gcode_state(),
         any_f64(),
+        proptest::option::of(any_exclude_state().prop_map(Box::new)),
     )
-        .prop_map(|(mono_ns, vsd, gcode, target)| Context {
+        .prop_map(|(mono_ns, vsd, gcode, target, exclude)| Context {
             mono_ns,
             virtual_sdcard: vsd.map(|(file_position, file_path)| VirtualSdState {
                 file_path,
@@ -144,6 +188,7 @@ fn any_context() -> impl Strategy<Value = Context> {
                 name: "fan".to_owned(),
                 speed: target,
             }],
+            exclude,
         })
 }
 
@@ -221,6 +266,12 @@ fn any_config() -> impl Strategy<Value = ReconstructConfig> {
             quiet_tail_ns: 2_000_000_000,
             max_processing_lead: lead,
             extension_horizon: horizon,
+            exclusion_freshness_horizon: horizon,
+            // Hostile but in-domain: 0 would fail validation, so the
+            // period is any positive tick count and the tolerance any
+            // multiplier >= 1.
+            heartbeat_period_ns: 1,
+            heartbeat_gap_tolerance: 1.0,
             z_merge_tolerance: tol,
             sim: SimConfig {
                 max_velocity: sim[0],
@@ -290,5 +341,111 @@ proptest! {
         let _ = reconstruct(&inputs, &config);
         // The default config must also never panic on hostile records.
         let _ = reconstruct(&inputs, &ReconstructConfig::default());
+    }
+
+    /// The exclusion resolver is total: arbitrary journaled exclude
+    /// state (NaN/infinite polygons, degenerate rings, contradictory
+    /// fidelity flags) and arbitrary print-file bytes never panic, and
+    /// point-in-object lookup answers for arbitrary query points.
+    #[test]
+    fn exclusion_resolution_never_panics(
+        records in proptest::collection::vec(any_record(), 0..12),
+        end in any_scan_end(),
+        tail in proptest::collection::vec(any::<u8>(), 0..512),
+        base_offset in prop_oneof![Just(0_u64), any::<u64>()],
+        x in any_f64(),
+        y in any_f64(),
+        config in any_config(),
+    ) {
+        let scan = RecoveryScan {
+            header: None,
+            records: records
+                .into_iter()
+                .enumerate()
+                .map(|(i, record)| ScannedRecord {
+                    offset: i as u64 * 97,
+                    record,
+                })
+                .collect(),
+            truncation_offset: 0,
+            end,
+        };
+        let timeline = ingest(&scan, None);
+        let file = FileTail { base_offset, bytes: &tail };
+        // The window is itself derived from hostile records, so it may
+        // legitimately fail to compute; both paths must be total.
+        let window = compute_stop_window(&timeline, None, &config).ok();
+        for file in [None, Some(&file)] {
+            for window in [None, window.as_ref()] {
+                let inputs = ExclusionInputs {
+                    window,
+                    stop_end_print_time: Some(x),
+                    file,
+                };
+                let report = resolve_exclusions(&timeline, &inputs, &config);
+                // Every query is total and self-consistent.
+                let at = report.objects_at(x, y);
+                prop_assert!(at.len() <= report.definitions().len());
+                prop_assert_eq!(report.object_at(x, y).is_some(), !at.is_empty());
+                if let Some(hit) = report.excluded_object_at(x, y) {
+                    prop_assert!(report.is_excluded(&hit.name));
+                }
+                // Conclusiveness and the confirmation payload agree, and
+                // a prompt always carries every known object.
+                prop_assert_eq!(
+                    report.is_conclusive(),
+                    report.confirmation().is_none()
+                );
+                if let Some(confirmation) = report.confirmation() {
+                    prop_assert!(!confirmation.causes.is_empty());
+                    prop_assert_eq!(
+                        confirmation.objects.len(),
+                        report.object_states().len()
+                    );
+                    // Every recorded exclusion is pre-selected.
+                    for name in report.excluded() {
+                        prop_assert!(confirmation
+                            .objects
+                            .iter()
+                            .any(|o| o.name.eq_ignore_ascii_case(name) && o.preselected()));
+                    }
+                }
+                // The structural invariant: exclusions only ever come
+                // from a journaled log.
+                if !report.excluded().is_empty() {
+                    prop_assert_eq!(
+                        report.provenance(),
+                        plr_reconstruct::ExclusionProvenance::Journaled
+                    );
+                }
+                let _ = report.geometry_is_complete();
+                let _ = report.excluded_definitions();
+                let _ = report.freshness();
+            }
+        }
+    }
+
+    /// Point-in-polygon is total over arbitrary rings and query points,
+    /// and never claims containment for a non-finite input.
+    #[test]
+    fn point_in_polygon_never_panics(
+        polygon in any_polygon(),
+        x in any_f64(),
+        y in any_f64(),
+    ) {
+        let inside = point_in_polygon(x, y, &polygon);
+        if !x.is_finite() || !y.is_finite() || polygon.len() < 3 {
+            prop_assert!(!inside);
+        }
+    }
+
+    /// The print-file object scan is total over arbitrary bytes.
+    #[test]
+    fn object_definition_scan_never_panics(
+        bytes in proptest::collection::vec(any::<u8>(), 0..512),
+    ) {
+        let scan = parse_object_definitions(&bytes);
+        prop_assert_eq!(scan.is_empty(), scan.definitions.is_empty() && scan.unparsed_lines == 0);
+        prop_assert_eq!(scan.names().len(), scan.definitions.len());
     }
 }

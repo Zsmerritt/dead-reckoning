@@ -25,8 +25,15 @@
 //! * Lifecycle markers are interpreted: a terminal
 //!   [`MarkerKind::CleanShutdown`] flags the timeline as needing no
 //!   recovery; a tail [`MarkerKind::SocketLost`] without a subsequent
-//!   `Resubscribed` is classification evidence; subscription gaps are
-//!   noted for honest degradation.
+//!   `Resubscribed` is classification evidence; subscription gaps and
+//!   [`MarkerKind::ExclusionUpdateLost`] are noted for honest
+//!   degradation. Markers are kept in append order in
+//!   [`WalTimeline::markers`] so later stages can ask *when* an event
+//!   happened relative to other records.
+//! * Every finite heartbeat is kept, sorted, in
+//!   [`WalTimeline::heartbeats`] — not just the newest — because the
+//!   *continuity* of that stream is the only proof the WAL writer was
+//!   running across a span in which it journaled nothing else.
 
 use plr_wal::{
     Context, Heartbeat, HeartbeatRecovery, Marker, MarkerKind, RecoveryScan, ScanEnd, StepperRange,
@@ -72,6 +79,14 @@ pub enum IngestNote {
     /// A `CleanShutdown` marker exists but motion records follow it, so
     /// it does not end the log and recovery proceeds.
     StaleCleanShutdownMarker,
+    /// The daemon journaled that a `Context` carrying an exclude-object
+    /// **change** was dropped under WAL backpressure: an operator
+    /// cancellation may be missing from the log. See
+    /// [`crate::exclude`] for how this defeats conclusiveness.
+    ExclusionUpdateLost {
+        /// Host-monotonic time of the dropped update (ns).
+        mono_ns: u64,
+    },
     /// A marker written by a newer format revision was preserved as
     /// opaque and ignored.
     UnknownMarker {
@@ -114,6 +129,16 @@ pub struct WalTimeline {
     /// WAL heartbeat record (by `mono_ns`). `None` when no finite
     /// heartbeat exists anywhere.
     pub heartbeat: Option<Heartbeat>,
+    /// Every finite heartbeat sample (heartbeat file plus WAL records),
+    /// sorted ascending by `mono_ns` and deduplicated on that key.
+    ///
+    /// Heartbeats are written on the WAL writer's own timer,
+    /// independently of context records, which makes them the only
+    /// evidence that the **WAL writer thread** was running and able to
+    /// append across a span in which it journaled nothing else. See
+    /// [`crate::exclude`] for exactly what that does and does not
+    /// prove, and for the markers that cover the rest.
+    pub heartbeats: Vec<Heartbeat>,
     /// `true` when a [`MarkerKind::CleanShutdown`] marker ends the log
     /// (no motion records after it): the print ended on purpose and no
     /// recovery is needed.
@@ -216,6 +241,11 @@ pub fn ingest(scan: &RecoveryScan, heartbeat: Option<&HeartbeatRecovery>) -> Wal
                         start_mono_ns,
                         end_mono_ns,
                     }),
+                    MarkerKind::ExclusionUpdateLost => {
+                        notes.push(IngestNote::ExclusionUpdateLost {
+                            mono_ns: marker.mono_ns,
+                        });
+                    }
                     MarkerKind::Unknown => notes.push(IngestNote::UnknownMarker {
                         mono_ns: marker.mono_ns,
                     }),
@@ -263,12 +293,15 @@ pub fn ingest(scan: &RecoveryScan, heartbeat: Option<&HeartbeatRecovery>) -> Wal
         notes.push(IngestNote::TornHeartbeatSlot);
     }
 
-    let best_heartbeat = heartbeat
+    let mut all_heartbeats: Vec<Heartbeat> = heartbeat
         .map(|recovery| recovery.heartbeat)
         .into_iter()
         .chain(wal_heartbeats)
         .filter(Heartbeat::values_are_finite)
-        .max_by_key(|hb| hb.mono_ns);
+        .collect();
+    all_heartbeats.sort_by_key(|hb| hb.mono_ns);
+    all_heartbeats.dedup_by_key(|hb| hb.mono_ns);
+    let best_heartbeat = all_heartbeats.last().copied();
 
     WalTimeline {
         toolhead_segments: toolhead,
@@ -278,6 +311,7 @@ pub fn ingest(scan: &RecoveryScan, heartbeat: Option<&HeartbeatRecovery>) -> Wal
         contexts,
         markers,
         heartbeat: best_heartbeat,
+        heartbeats: all_heartbeats,
         clean_shutdown,
         socket_lost_tail,
         last_motion_mono_ns: last_motion_mono,

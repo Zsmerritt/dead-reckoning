@@ -12,6 +12,13 @@ publish = false
 plr-gcode = { path = "../plr-gcode" }
 plr-klipper = { path = "../plr-klipper" }
 plr-wal = { path = "../plr-wal" }
+# float_roundtrip, for the same reason plr-wal enables it: object
+# outlines parsed out of `EXCLUDE_OBJECT_DEFINE POLYGON=` decide
+# geometry, and a coordinate that shifts by an ULP on parse would
+# silently disagree with the same value journaled through the WAL.
+# Workspace feature unification already supplies it in this tree;
+# naming it here keeps a standalone build of this crate correct.
+serde_json = { workspace = true, features = ["float_roundtrip"] }
 thiserror.workspace = true
 
 [dev-dependencies]

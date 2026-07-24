@@ -16,6 +16,24 @@
 //! channel is full they queue in an in-process outbox and flush before
 //! any later send. They are rare (order: a handful per print), so the
 //! outbox is bounded by event count, not by time.
+//!
+//! # Exclude-object changes: droppable record, undroppable evidence
+//!
+//! A `Context` carrying an operator's object cancellation is still a
+//! record, and records are droppable — making it block would hand
+//! Klipper a reason to disconnect us, which is worse. What is *not*
+//! droppable is the knowledge that it was lost: when such a context is
+//! dropped, [`WalSender`] queues a
+//! [`MarkerKind::ExclusionUpdateLost`] marker in the same never-dropped
+//! outbox. Reconstruction then has hard evidence and refuses to treat
+//! the surviving excluded set as authoritative, instead of silently
+//! resuming a part the operator had cancelled.
+//!
+//! Detection is local to this module: the sender remembers the excluded
+//! name set it last successfully handed over, and treats a context as
+//! carrying an exclusion change when the set differs or the context
+//! re-journals definitions. At most one loss marker is queued per
+//! lost-then-recovered episode, so a long stall cannot grow the outbox.
 
 use std::collections::VecDeque;
 use std::sync::mpsc::{SyncSender, TrySendError};
@@ -91,6 +109,13 @@ pub struct WalSender {
     gap_start: Option<u64>,
     /// Markers waiting for channel space. Never dropped.
     outbox: VecDeque<Marker>,
+    /// Excluded-object name set of the last exclude-bearing context that
+    /// was successfully handed to the WAL thread.
+    last_excluded: Option<Vec<String>>,
+    /// A [`MarkerKind::ExclusionUpdateLost`] has been queued and no
+    /// exclude-bearing context has landed since; suppresses duplicates
+    /// while the channel stays jammed.
+    exclusion_loss_pending: bool,
 }
 
 impl WalSender {
@@ -101,31 +126,48 @@ impl WalSender {
             tx,
             gap_start: None,
             outbox: VecDeque::new(),
+            last_excluded: None,
+            exclusion_loss_pending: false,
         }
     }
 
     /// Offers a record. On a full channel the record is dropped and the
     /// gap is tracked; the caller is never blocked.
+    ///
+    /// When the dropped record carried an exclude-object **change**, a
+    /// [`MarkerKind::ExclusionUpdateLost`] marker is additionally queued
+    /// in the never-dropped outbox — see the module docs.
     pub fn record(
         &mut self,
         record: WalRecord,
         sync: SyncPolicy,
         mono_ns: u64,
     ) -> Result<(), WalGone> {
+        let exclusion = exclude_fingerprint(&record);
+        let changes_exclusion = exclusion.as_ref().is_some_and(|(excluded, redefines)| {
+            *redefines || self.last_excluded.as_ref() != Some(excluded)
+        });
+
         self.flush_outbox()?;
         if !self.outbox.is_empty() {
             // Markers are still queued; preserve marker-before-record
             // ordering by treating the channel as full for this record.
-            self.note_drop(mono_ns);
+            self.drop_record(mono_ns, changes_exclusion)?;
             return Ok(());
         }
         if self.gap_start.is_some() && !self.close_gap(mono_ns)? {
             // No room for the gap marker means no room for the record
             // either; the gap keeps extending.
+            self.drop_record(mono_ns, changes_exclusion)?;
             return Ok(());
         }
-        if !self.try_send(WalCmd::Append { record, sync })? {
-            self.note_drop(mono_ns);
+        if self.try_send(WalCmd::Append { record, sync })? {
+            if let Some((excluded, _)) = exclusion {
+                self.last_excluded = Some(excluded);
+                self.exclusion_loss_pending = false;
+            }
+        } else {
+            self.drop_record(mono_ns, changes_exclusion)?;
         }
         Ok(())
     }
@@ -189,6 +231,23 @@ impl WalSender {
         Ok(())
     }
 
+    /// Records that a record was dropped: opens/extends the observation
+    /// gap and, when the record carried an exclusion change, queues the
+    /// undroppable evidence marker.
+    fn drop_record(&mut self, mono_ns: u64, changes_exclusion: bool) -> Result<(), WalGone> {
+        self.note_drop(mono_ns);
+        if changes_exclusion && !self.exclusion_loss_pending {
+            self.exclusion_loss_pending = true;
+            self.outbox.push_back(Marker {
+                mono_ns,
+                kind: MarkerKind::ExclusionUpdateLost,
+            });
+            // Best-effort immediate delivery; it stays queued otherwise.
+            self.flush_outbox()?;
+        }
+        Ok(())
+    }
+
     fn note_drop(&mut self, mono_ns: u64) {
         if self.gap_start.is_none() {
             self.gap_start = Some(mono_ns);
@@ -214,6 +273,17 @@ impl WalSender {
             Ok(false)
         }
     }
+}
+
+/// The exclude-object fingerprint of a record: `(excluded names,
+/// re-journals definitions)`, or `None` for records that carry no
+/// exclude state at all.
+fn exclude_fingerprint(record: &WalRecord) -> Option<(Vec<String>, bool)> {
+    let WalRecord::Context(context) = record else {
+        return None;
+    };
+    let exclude = context.exclude.as_deref()?;
+    Some((exclude.excluded.clone(), exclude.definitions.is_some()))
 }
 
 #[cfg(test)]
@@ -456,6 +526,247 @@ mod tests {
             Err(WalGone)
         );
         assert!(WalGone.to_string().contains("durability"));
+    }
+
+    /// A `Context` record carrying the given excluded-name set.
+    fn exclusion_context(mono_ns: u64, excluded: &[&str], redefine: bool) -> WalRecord {
+        WalRecord::Context(plr_wal::Context {
+            mono_ns,
+            virtual_sdcard: None,
+            gcode: plr_wal::GcodeState {
+                speed_factor: 1.0,
+                speed: 1_500.0,
+                extrude_factor: 1.0,
+                absolute_coordinates: true,
+                absolute_extrude: true,
+                homing_origin: vec![0.0; 4],
+                position: vec![0.0; 4],
+                gcode_position: vec![0.0; 4],
+            },
+            transforms: plr_wal::TransformObservations {
+                bed_mesh_active: false,
+                bed_mesh_profile: None,
+                z_thermal_adjust_enabled: None,
+                z_thermal_adjust_offset: None,
+                skew_active: false,
+                skew_profile: None,
+            },
+            heaters: Vec::new(),
+            fans: Vec::new(),
+            exclude: Some(Box::new(plr_wal::ExcludeState {
+                definitions: redefine.then(|| vec![plr_wal::ExcludeObjectDef::name_only("PART_A")]),
+                excluded: excluded.iter().map(|s| (*s).to_owned()).collect(),
+                current: None,
+            })),
+        })
+    }
+
+    /// Every marker kind that reached the channel, in order.
+    fn marker_kinds(cmds: &[WalCmd]) -> Vec<MarkerKind> {
+        cmds.iter()
+            .filter_map(|cmd| match cmd {
+                WalCmd::Append {
+                    record: WalRecord::Marker(m),
+                    ..
+                } => Some(m.kind.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn dropping_an_exclusion_change_journals_undroppable_evidence() {
+        // The operator cancels a part while the WAL thread is stalled.
+        // The context itself is droppable (blocking would get us
+        // disconnected by Klipper), but the *fact* that it was lost is
+        // not: a marker must reach the log.
+        let (tx, rx) = sync_channel(1);
+        let mut sender = WalSender::new(tx);
+        sender
+            .record(motion_record(1), SyncPolicy::Batched, 1)
+            .unwrap(); // fills the channel
+        sender
+            .record(
+                exclusion_context(2, &["PART_A"], false),
+                SyncPolicy::Immediate,
+                2,
+            )
+            .unwrap(); // dropped -> loss marker queued in the outbox
+
+        // Drain and let the outbox flush.
+        assert!(matches!(rx.try_recv(), Ok(WalCmd::Append { .. })));
+        sender
+            .record(motion_record(9), SyncPolicy::Batched, 9)
+            .unwrap();
+        let cmds = drain(&rx);
+        assert_eq!(
+            marker_kinds(&cmds).first(),
+            Some(&MarkerKind::ExclusionUpdateLost),
+            "the loss marker must lead, got {cmds:?}"
+        );
+    }
+
+    #[test]
+    fn exclusion_loss_marker_is_emitted_once_per_episode() {
+        let (tx, rx) = sync_channel(1);
+        let mut sender = WalSender::new(tx);
+        sender
+            .record(motion_record(1), SyncPolicy::Batched, 1)
+            .unwrap();
+        // A long stall: many exclusion-bearing contexts are dropped. The
+        // outbox must not grow without bound.
+        for t in 2..40 {
+            sender
+                .record(
+                    exclusion_context(t, &["PART_A"], false),
+                    SyncPolicy::Immediate,
+                    t,
+                )
+                .unwrap();
+        }
+        assert!(matches!(rx.try_recv(), Ok(WalCmd::Append { .. })));
+        sender
+            .record(motion_record(50), SyncPolicy::Batched, 50)
+            .unwrap();
+        let cmds = drain(&rx);
+        assert_eq!(
+            marker_kinds(&cmds)
+                .iter()
+                .filter(|k| **k == MarkerKind::ExclusionUpdateLost)
+                .count(),
+            1,
+            "one marker per lost-then-recovered episode"
+        );
+    }
+
+    #[test]
+    fn a_landed_exclusion_context_re_arms_the_loss_detector() {
+        let (tx, rx) = sync_channel(4);
+        let mut sender = WalSender::new(tx);
+        // First episode: fill, drop an exclusion change, recover.
+        for t in 1..=4 {
+            sender
+                .record(motion_record(t), SyncPolicy::Batched, t)
+                .unwrap();
+        }
+        sender
+            .record(
+                exclusion_context(5, &["PART_A"], false),
+                SyncPolicy::Immediate,
+                5,
+            )
+            .unwrap(); // dropped
+        drain(&rx);
+        sender
+            .record(
+                exclusion_context(6, &["PART_A"], false),
+                SyncPolicy::Immediate,
+                6,
+            )
+            .unwrap(); // lands (with the queued marker + gap marker)
+        let cmds = drain(&rx);
+        assert!(marker_kinds(&cmds).contains(&MarkerKind::ExclusionUpdateLost));
+
+        // Second episode with a *different* excluded set must produce a
+        // fresh marker.
+        for t in 10..=13 {
+            sender
+                .record(motion_record(t), SyncPolicy::Batched, t)
+                .unwrap();
+        }
+        sender
+            .record(
+                exclusion_context(14, &["PART_A", "PART_B"], false),
+                SyncPolicy::Immediate,
+                14,
+            )
+            .unwrap(); // dropped
+        drain(&rx);
+        sender
+            .record(motion_record(20), SyncPolicy::Batched, 20)
+            .unwrap();
+        let cmds = drain(&rx);
+        assert!(
+            marker_kinds(&cmds).contains(&MarkerKind::ExclusionUpdateLost),
+            "a later, different exclusion change must be flagged too"
+        );
+    }
+
+    #[test]
+    fn dropping_an_unchanged_exclusion_context_is_not_a_loss() {
+        // Every context re-states the excluded set (it is cheap), so most
+        // dropped contexts carry no *change*. Flagging those would cry
+        // wolf on every disk hiccup.
+        let (tx, rx) = sync_channel(2);
+        let mut sender = WalSender::new(tx);
+        sender
+            .record(
+                exclusion_context(1, &["PART_A"], false),
+                SyncPolicy::Immediate,
+                1,
+            )
+            .unwrap(); // lands, arms last_excluded
+        sender
+            .record(motion_record(2), SyncPolicy::Batched, 2)
+            .unwrap(); // fills
+        sender
+            .record(
+                exclusion_context(3, &["PART_A"], false),
+                SyncPolicy::Immediate,
+                3,
+            )
+            .unwrap(); // dropped, but nothing changed
+        drain(&rx);
+        sender
+            .record(motion_record(9), SyncPolicy::Batched, 9)
+            .unwrap();
+        let cmds = drain(&rx);
+        assert!(
+            !marker_kinds(&cmds).contains(&MarkerKind::ExclusionUpdateLost),
+            "an unchanged excluded set is not a lost update"
+        );
+        // The ordinary observation gap is still journaled.
+        assert!(marker_kinds(&cmds)
+            .iter()
+            .any(|k| matches!(k, MarkerKind::SubscriptionGap { .. })));
+    }
+
+    #[test]
+    fn dropping_a_definition_refresh_counts_as_a_loss() {
+        // Re-journaled definitions carry the geometry recovery needs; a
+        // dropped one leaves the excluded set unmatched to any outline.
+        let (tx, rx) = sync_channel(1);
+        let mut sender = WalSender::new(tx);
+        sender
+            .record(motion_record(1), SyncPolicy::Batched, 1)
+            .unwrap();
+        sender
+            .record(exclusion_context(2, &[], true), SyncPolicy::Immediate, 2)
+            .unwrap(); // dropped; empty set but definitions present
+        assert!(matches!(rx.try_recv(), Ok(WalCmd::Append { .. })));
+        sender
+            .record(motion_record(9), SyncPolicy::Batched, 9)
+            .unwrap();
+        let cmds = drain(&rx);
+        assert!(marker_kinds(&cmds).contains(&MarkerKind::ExclusionUpdateLost));
+    }
+
+    #[test]
+    fn exclusion_contexts_never_block_the_caller() {
+        // The non-blocking property is deliberate: Klipper closes clients
+        // whose socket stays blocked. Even with a full channel and a
+        // full outbox, every call returns immediately.
+        let (tx, _rx) = sync_channel(1);
+        let mut sender = WalSender::new(tx);
+        for t in 0..100 {
+            sender
+                .record(
+                    exclusion_context(t, &["PART_A"], t % 2 == 0),
+                    SyncPolicy::Immediate,
+                    t,
+                )
+                .unwrap();
+        }
     }
 
     #[test]

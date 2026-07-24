@@ -383,12 +383,45 @@ impl BedMeshStatus {
 }
 
 /// `exclude_object` status (`klippy/extras/exclude_object.py`,
-/// `ExcludeObject.get_status`).
+/// `ExcludeObject.get_status` returns exactly
+/// `{"objects": [...], "excluded_objects": [...], "current_object": ...}`).
+///
+/// # Lifetime of the state (why it must be journaled)
+///
+/// Every field here is per-print runtime state held only in Klipper's
+/// memory. `_reset_state` clears all three at construction, and
+/// `_reset_file` clears them again on the `virtual_sdcard:reset_file`
+/// event and on `EXCLUDE_OBJECT_DEFINE RESET=1`. Nothing persists it, so
+/// a power loss erases the operator's cancellations.
+///
+/// # Command semantics (all name comparisons are upper-cased)
+///
+/// * `EXCLUDE_OBJECT_DEFINE NAME=<n> [CENTER=x,y] [POLYGON=[[x,y],...]]`
+///   appends `{"name": n.upper(), ...}` to `objects`, kept sorted by
+///   name (`_add_object_definition`). `CENTER` is parsed as
+///   `json.loads('[%s]' % center)` and `POLYGON` as `json.loads(polygon)`.
+///   Any other `KEY=VALUE` pairs are merged into the object dict
+///   verbatim (`obj.update(parameters)`).
+/// * `EXCLUDE_OBJECT_DEFINE RESET=1` calls `_reset_file()`: `objects`,
+///   `excluded_objects` **and** `current_object` are all cleared.
+/// * `EXCLUDE_OBJECT_START NAME=<n>` sets `current_object` to
+///   `n.upper()` and, if that name is unknown, auto-defines a name-only
+///   object `{"name": n}` — so `objects` can grow mid-print.
+/// * `EXCLUDE_OBJECT_END` sets `current_object` back to `None`.
+/// * `EXCLUDE_OBJECT NAME=<n>` adds `n.upper()` to `excluded_objects`
+///   (kept sorted); `EXCLUDE_OBJECT CURRENT=1` excludes
+///   `current_object`, erroring when there is none.
+/// * `EXCLUDE_OBJECT RESET=1` clears **all** exclusions;
+///   `EXCLUDE_OBJECT RESET=1 NAME=<n>` un-excludes just that object.
+///   Note the Python truthiness: `RESET=0` is a non-empty string and so
+///   still resets.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct ExcludeObjectStatus {
-    /// All objects defined for this print (`EXCLUDE_OBJECT_DEFINE`).
+    /// All objects defined for this print, sorted by name
+    /// (`EXCLUDE_OBJECT_DEFINE`, plus auto-definitions from
+    /// `EXCLUDE_OBJECT_START`).
     pub objects: Option<Vec<ExcludeObjectDefinition>>,
-    /// Names of objects currently excluded.
+    /// Names of objects currently excluded, sorted.
     pub excluded_objects: Option<Vec<String>>,
     /// Name of the object being printed; JSON `null` between objects.
     #[serde(default, deserialize_with = "double_option")]
@@ -396,16 +429,148 @@ pub struct ExcludeObjectStatus {
 }
 
 /// One defined printable object (`klippy/extras/exclude_object.py`,
-/// `_cmd_EXCLUDE_OBJECT_DEFINE` builds `{"name": ..., "center": ...,
+/// `cmd_EXCLUDE_OBJECT_DEFINE` builds `{"name": ..., "center": ...,
 /// "polygon": ...}` with `center`/`polygon` optional).
+///
+/// Slicer-specific extra parameters that Klipper merges into the same
+/// dict are ignored (no `deny_unknown_fields`): recovery has no use for
+/// them.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct ExcludeObjectDefinition {
     /// Object name (upper-cased by Klipper).
     pub name: String,
-    /// Optional `[x, y]` (or `[x, y, z]`) center point.
+    /// Optional centre point. Klipper parses `CENTER=` as
+    /// `json.loads('[%s]' % center)`, so the component count is whatever
+    /// the slicer emitted — usually `[x, y]`, sometimes `[x, y, z]`.
     pub center: Option<Vec<f64>>,
-    /// Optional outline polygon of `[x, y]` points.
+    /// Optional outline polygon of `[x, y]` points, straight from
+    /// `json.loads(POLYGON)`. Element shape is not validated by Klipper.
     pub polygon: Option<Vec<Vec<f64>>>,
+}
+
+impl ExcludeObjectDefinition {
+    /// The centre as a finite `[x, y]` pair, or `None` when Klipper
+    /// supplied no centre, fewer than two components, or a non-finite
+    /// coordinate.
+    #[must_use]
+    pub fn center_xy(&self) -> Option<[f64; 2]> {
+        let center = self.center.as_ref()?;
+        let (&x, &y) = (center.first()?, center.get(1)?);
+        (x.is_finite() && y.is_finite()).then_some([x, y])
+    }
+
+    /// The outline as finite `[x, y]` pairs.
+    ///
+    /// * `None` — Klipper supplied no `polygon` at all.
+    /// * `Some(Err(count))` — a `polygon` was supplied but is unusable:
+    ///   some point has fewer than two components or a non-finite
+    ///   coordinate. `count` is the number of points reported.
+    /// * `Some(Ok(points))` — every point converted.
+    ///
+    /// Malformed points are never silently dropped: one bad point
+    /// invalidates the whole outline, because a partial ring changes
+    /// which region it encloses.
+    #[must_use]
+    pub fn polygon_xy(&self) -> Option<Result<Vec<[f64; 2]>, usize>> {
+        let polygon = self.polygon.as_ref()?;
+        let mut points = Vec::with_capacity(polygon.len());
+        for point in polygon {
+            match (point.first(), point.get(1)) {
+                (Some(&x), Some(&y)) if x.is_finite() && y.is_finite() => points.push([x, y]),
+                _ => return Some(Err(polygon.len())),
+            }
+        }
+        Some(Ok(points))
+    }
+}
+
+/// The `exclude_object` state accumulated from Klipper's diff-style
+/// status updates.
+///
+/// [`ExcludeObjectStatus`] is a *diff* (see the module docs): a field is
+/// re-sent only when it changed. Consumers that need the full picture —
+/// the WAL recorder, above all — must merge updates onto a snapshot,
+/// which is what this type does.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct ExcludeObjectSnapshot {
+    /// All objects Klipper currently knows, in its order (sorted by
+    /// name).
+    pub objects: Vec<ExcludeObjectDefinition>,
+    /// Names of the objects the operator has cancelled, in Klipper's
+    /// order (sorted).
+    pub excluded_objects: Vec<String>,
+    /// The object currently being printed, `None` between objects.
+    pub current_object: Option<String>,
+}
+
+/// Which parts of an [`ExcludeObjectSnapshot`] one merge actually
+/// changed. Callers decide what is worth journaling: `current` flips at
+/// every `EXCLUDE_OBJECT_START`/`END` (once per object per layer) while
+/// `definitions` and `excluded` change only on operator or slicer
+/// action.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ExcludeObjectChange {
+    /// The object definition list changed.
+    pub definitions: bool,
+    /// The excluded-name set changed — the safety-critical one.
+    pub excluded: bool,
+    /// The currently-printing object changed.
+    pub current: bool,
+}
+
+impl ExcludeObjectChange {
+    /// `true` when the merge changed anything at all.
+    #[must_use]
+    pub const fn any(&self) -> bool {
+        self.definitions || self.excluded || self.current
+    }
+}
+
+impl ExcludeObjectSnapshot {
+    /// An empty snapshot, matching Klipper's `_reset_state`.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Merges one status diff, reporting what changed. Fields absent
+    /// from the diff are left untouched.
+    pub fn merge(&mut self, status: &ExcludeObjectStatus) -> ExcludeObjectChange {
+        let mut change = ExcludeObjectChange::default();
+        if let Some(objects) = &status.objects {
+            change.definitions = *objects != self.objects;
+            self.objects.clone_from(objects);
+        }
+        if let Some(excluded) = &status.excluded_objects {
+            change.excluded = *excluded != self.excluded_objects;
+            self.excluded_objects.clone_from(excluded);
+        }
+        if let Some(current) = &status.current_object {
+            // Outer Option: presence in the diff. Inner: JSON null,
+            // which Klipper emits between objects.
+            change.current = *current != self.current_object;
+            self.current_object.clone_from(current);
+        }
+        change
+    }
+
+    /// `true` when `name` is currently excluded. Comparison is
+    /// case-insensitive because Klipper stores upper-cased names
+    /// (`name.upper()` in `cmd_EXCLUDE_OBJECT`).
+    #[must_use]
+    pub fn is_excluded(&self, name: &str) -> bool {
+        self.excluded_objects
+            .iter()
+            .any(|excluded| excluded.eq_ignore_ascii_case(name))
+    }
+
+    /// The definition of `name`, if Klipper knows it (case-insensitive).
+    #[must_use]
+    pub fn definition(&self, name: &str) -> Option<&ExcludeObjectDefinition> {
+        self.objects
+            .iter()
+            .find(|object| object.name.eq_ignore_ascii_case(name))
+    }
 }
 
 /// `z_thermal_adjust` status (`klippy/extras/z_thermal_adjust.py`,

@@ -19,8 +19,8 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use plr_reconstruct::{
-    reconstruct, CrashClass, PossibleStopSet, ReceiveSeqObservation, ReconstructConfig,
-    ReconstructInputs, Reconstruction, StopWindow,
+    reconstruct, CrashClass, PossibleStopSet, ReceiveSeqObservation, ReconstructInputs,
+    Reconstruction, StopWindow,
 };
 use plr_wal::{
     recover_heartbeat, scan_read, HeartbeatRecovery, RecordKind, RecoveryScan, ScanEnd, WalRecord,
@@ -113,7 +113,7 @@ pub fn run_scan(
         file_tail,
         receive_seq,
     };
-    match reconstruct(&inputs, &ReconstructConfig::default()) {
+    match reconstruct(&inputs, &crate::convert::reconstruct_config(None)) {
         Ok(Reconstruction::CleanShutdown(_)) => {
             w.line("reconstruction: CLEAN SHUTDOWN — the print ended on purpose;");
             w.line("  no recovery is needed and none should be attempted.");
@@ -483,6 +483,7 @@ mod tests {
             },
             heaters: Vec::new(),
             fans: Vec::new(),
+            exclude: None,
         }
     }
 

@@ -457,6 +457,7 @@ fn context_record(pt: f64, file_position: u64, state: &GcodeState) -> WalRecord 
         },
         heaters: Vec::new(),
         fans: Vec::new(),
+        exclude: None,
     })
 }
 

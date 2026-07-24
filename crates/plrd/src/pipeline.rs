@@ -48,9 +48,17 @@
 //!     boundary). On mismatch the computed value is printed so the
 //!     operator can re-bless deliberately.
 //!
-//! `exclude_objects` are passed empty: the WAL context format does not
-//! journal exclude-object state (documented in `convert`), so restoring
-//! exclusions is out of scope until the WAL format grows a field.
+//! `exclude_objects` are still passed empty here, but **not** because
+//! the data is missing: the WAL context now journals exclude-object
+//! state (`plr_wal::ExcludeState`, written by `convert`) and
+//! reconstruction resolves it into
+//! `plr_reconstruct::RecoveryReconstruction::exclusions`. Wiring that
+//! report into the resume file's `EXCLUDE_OBJECT_DEFINE` /
+//! `EXCLUDE_OBJECT` replay is the remaining work. Whoever does it must
+//! gate on `ExclusionReport::is_conclusive()` and, when it is false,
+//! drive a per-object operator confirmation from
+//! `ExclusionReport::confirmation()` — resuming a cancelled part prints
+//! into the debris that caused the cancellation.
 
 use std::io::Write;
 use std::path::Path;
@@ -60,8 +68,8 @@ use plr_analyzer::{
     ContactOutcome, Interval, MatchConfig, ModelConfig, StopEvidence,
 };
 use plr_reconstruct::{
-    anchor_state_from_context, reconstruct, FileTail, PossibleStopSet, ReconstructConfig,
-    ReconstructInputs, Reconstruction, RecoveryReconstruction,
+    anchor_state_from_context, reconstruct, FileTail, PossibleStopSet, ReconstructInputs,
+    Reconstruction, RecoveryReconstruction,
 };
 use plr_recovery::{
     plan_recovery, select_resume_target, validate_machine, MachineConfig, MachineRejection,
@@ -172,7 +180,7 @@ pub fn run_pipeline(config: &Config, out: &mut dyn Write) -> Result<PipelineOutc
         }),
         receive_seq,
     };
-    let recovery = match reconstruct(&inputs, &ReconstructConfig::default()) {
+    let recovery = match reconstruct(&inputs, &crate::convert::reconstruct_config(Some(config))) {
         Ok(Reconstruction::CleanShutdown(_)) => return Ok(PipelineOutcome::CleanShutdown),
         Ok(Reconstruction::Recovery(recovery)) => recovery,
         Err(e) => {
@@ -1142,6 +1150,7 @@ G1 X60 Y60 E0.02
                 name: "fan".to_owned(),
                 speed: 0.5,
             }],
+            exclude: None,
         }
     }
 
