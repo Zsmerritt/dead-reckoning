@@ -278,13 +278,22 @@ progress, resume byte and crash classification, each shown only when the
 daemon actually reports it — with two choices:
 
 - **Attempt recovery** → `PLR_WIZARD_DRYRUN`: fetches and prints the full
-  recovery plan (no motion), then prompts the next step:
-  - if the plan needs a clean nozzle and no auto-clean macro is
-    configured server-side, it asks *"Is the nozzle clean?"* →
-    **Nozzle is clean** (`PLR_WIZARD_CONFIRM_CLEAN`) or **abort**
-    (`PLR_WIZARD_CANCEL`);
-  - otherwise it goes straight to the execute prompt (noting your
-    `clean_nozzle_macro` will run automatically).
+  recovery plan (no motion), then prompts the next step. It **asks
+  *"Is the nozzle clean?"*** — **Nozzle is clean**
+  (`PLR_WIZARD_CONFIRM_CLEAN`) or **abort** (`PLR_WIZARD_CANCEL`) —
+  unless *both* independent sources agree the nozzle is cleaned
+  automatically: plrd reports the plan does not need confirmation **and**
+  the plugin can see the configured `[gcode_macro CLEAN_NOZZLE]` section.
+  Only then does it skip to the execute prompt, which names that macro
+  section as the reason. In particular it **asks anyway** when:
+  - plrd is older (or the field is unreadable) and reports nothing about
+    cleaning — the unknown case takes the conservative branch;
+  - plrd says cleaning is automatic but no such macro is configured here
+    — the two sources disagree, and the prompt says so.
+
+  This asymmetry is deliberate: asking redundantly costs one click, while
+  skipping the check when nothing actually cleans the nozzle silently
+  corrupts the contact reading recovery depends on.
 - **`PLR_WIZARD_EXECUTE`** runs the plan — **the printer WILL MOVE** (all
   motion is plrd's, over the control socket; the wizard itself never
   issues g-code). On success it reports *resuming print*; a typed failure
@@ -515,20 +524,29 @@ still carry dried filament. The recovery wizard makes cleanliness an
 explicit step:
 
 - If you configure a nozzle-cleaning macro and name it in
-  `clean_nozzle_macro` (default `CLEAN_NOZZLE`), recovery treats
-  cleaning as automatic — the wizard notes *"your `CLEAN_NOZZLE` will run
-  automatically"* and skips straight to the execute prompt. The
-  convention is a `[gcode_macro CLEAN_NOZZLE]` that wipes/purges the tip;
-  the name is configurable so an existing wipe macro can be reused.
-- If no such macro exists, the wizard asks you to confirm the nozzle is
-  clean before executing (**Nozzle is clean** vs **It's dirty — abort**).
+  `clean_nozzle_macro` (default `CLEAN_NOZZLE`) **and** plrd's plan
+  reports that cleaning is handled automatically, the wizard skips the
+  question and the execute prompt names that macro section as the reason.
+  The convention is a `[gcode_macro CLEAN_NOZZLE]` that wipes/purges the
+  tip; the name is configurable so an existing wipe macro can be reused.
+- **In every other case the wizard asks** you to confirm the nozzle is
+  clean before executing (**Nozzle is clean** vs **It's dirty — abort**),
+  and says why it is asking: no macro is configured, plrd reported
+  nothing about cleaning (an older daemon), or plrd and the plugin
+  disagree about whether a macro exists.
+
+The skip therefore requires **both** independent sources to agree; an
+unknown or contradictory answer takes the conservative branch. That is
+deliberate — a redundant question costs one click, whereas skipping the
+check when nothing cleans the nozzle silently corrupts the reference
+measurement that recovery re-establishes Z from.
 
 `PLR_SETUP` reports which mode applies, and `get_status` exposes
 `clean_nozzle_macro_available` so UIs can surface it. Whether a plan
 actually requires the manual confirmation is decided by plrd (it knows
 the server-side park/purge configuration) and carried to the wizard as a
-plan flag; the plugin-side macro detection drives the report and status
-row.
+plan flag; the plugin-side macro detection is the second, independent
+source and drives the report and status row.
 
 ## Commissioning in 5 console commands
 

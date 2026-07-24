@@ -122,6 +122,21 @@ def _new_responses(gcode):
     return since
 
 
+@pytest.fixture
+def plugin_with_clean_macro(fake_printer, plr_config):
+    """A plugin whose config HAS the [gcode_macro CLEAN_NOZZLE] section.
+
+    The default ``plugin`` fixture has no such section, so
+    ``clean_nozzle_macro_available`` is False there — the clean-nozzle
+    branch needs both variants to cover the agree/disagree cases.
+    """
+    fake_printer.add_object("toolhead", fake_klippy.FakeToolhead())
+    fake_printer.add_object("idle_timeout", fake_klippy.FakeIdleTimeout())
+    return plr.load_config(
+        plr_config(sections={"gcode_macro CLEAN_NOZZLE": {"gcode": "M117 clean"}})
+    )
+
+
 # --- literal action-string builders (the researched Mainsail spec) ---
 
 
@@ -307,24 +322,23 @@ def test_dryrun_requires_clean_shows_clean_prompt(plugin, run_cmd, fake_printer)
     )
 
 
-def test_requires_clean_read_at_both_contract_locations():
+def test_clean_flag_tri_state_read_at_both_contract_locations():
     # The Rust side may land the flag top level in `data` or nested under
-    # a `plan` object; both must be honoured, absent in both -> False.
-    assert wizard._requires_clean({"requires_clean_nozzle_confirmation": True}) is True
+    # a `plan` object; a valid boolean at the top level wins.  Anything
+    # unreadable is None, which the decision layer resolves conservatively.
+    assert wizard._clean_flag({"requires_clean_nozzle_confirmation": True}) is True
+    assert wizard._clean_flag({"requires_clean_nozzle_confirmation": False}) is False
     assert (
-        wizard._requires_clean({"plan": {"requires_clean_nozzle_confirmation": True}})
+        wizard._clean_flag({"plan": {"requires_clean_nozzle_confirmation": True}})
         is True
     )
     assert (
-        wizard._requires_clean({"requires_clean_nozzle_confirmation": False}) is False
-    )
-    assert (
-        wizard._requires_clean({"plan": {"requires_clean_nozzle_confirmation": False}})
+        wizard._clean_flag({"plan": {"requires_clean_nozzle_confirmation": False}})
         is False
     )
     # Top level wins when both are present and disagree.
     assert (
-        wizard._requires_clean(
+        wizard._clean_flag(
             {
                 "requires_clean_nozzle_confirmation": False,
                 "plan": {"requires_clean_nozzle_confirmation": True},
@@ -332,21 +346,94 @@ def test_requires_clean_read_at_both_contract_locations():
         )
         is False
     )
-    # Absent in both, and a non-object plan, read as False.
-    assert wizard._requires_clean({"outcome": "pending-recovery"}) is False
-    assert wizard._requires_clean({"plan": "nope"}) is False
+    # Absent, non-boolean, or a non-object plan -> unreadable (None).
+    assert wizard._clean_flag({"outcome": "pending-recovery"}) is None
+    assert wizard._clean_flag({"plan": "nope"}) is None
+    assert wizard._clean_flag({"requires_clean_nozzle_confirmation": "yes"}) is None
+    assert wizard._clean_flag({"requires_clean_nozzle_confirmation": None}) is None
+    # A non-boolean at the top level still falls back to a valid nested one.
+    assert (
+        wizard._clean_flag(
+            {
+                "requires_clean_nozzle_confirmation": "yes",
+                "plan": {"requires_clean_nozzle_confirmation": True},
+            }
+        )
+        is True
+    )
 
 
-def test_dryrun_nested_plan_clean_flag_shows_clean_prompt(
-    plugin, run_cmd, fake_printer
-):
-    # The in-flight Rust change may nest the flag under `plan`.
+@pytest.mark.parametrize(
+    "flag,available,expected",
+    [
+        # Skip ONLY when both sources agree cleaning is automatic.
+        pytest.param(False, True, (False, None), id="false+macro-skips"),
+        # Daemon says nothing cleans it -> ask.
+        pytest.param(True, True, (True, wizard._ASK_NO_MACRO), id="true-asks"),
+        pytest.param(True, False, (True, wizard._ASK_NO_MACRO), id="true-nomacro-asks"),
+        # FAIL-SAFE: unknown flag always asks, macro or not.
+        pytest.param(None, True, (True, wizard._ASK_UNKNOWN), id="absent-asks"),
+        pytest.param(
+            None, False, (True, wizard._ASK_UNKNOWN), id="absent-nomacro-asks"
+        ),
+        # Sources disagree: daemon says auto, plugin sees no macro -> ask.
+        pytest.param(False, False, (True, wizard._ASK_DISAGREE), id="disagree-asks"),
+    ],
+)
+def test_clean_decision_matrix(flag, available, expected):
+    assert wizard._clean_decision(flag, available, "CLEAN_NOZZLE") == expected
+
+
+@pytest.mark.parametrize(
+    "data",
+    [
+        pytest.param({"requires_clean_nozzle_confirmation": True}, id="top-level-true"),
+        pytest.param(
+            {"plan": {"requires_clean_nozzle_confirmation": True}}, id="nested-true"
+        ),
+        # The fail-safe cases: a daemon predating the flag, or a field
+        # that never lands / lands unreadable, must ASK — never silently
+        # promise an automatic clean that nothing performs.
+        pytest.param({}, id="absent"),
+        pytest.param({"requires_clean_nozzle_confirmation": "yes"}, id="non-boolean"),
+        pytest.param({"plan": "nope"}, id="non-object-plan"),
+    ],
+)
+def test_dryrun_asks_for_clean_confirmation(plugin, run_cmd, fake_printer, data):
+    plugin.daemon = FakeDaemon(
+        responses={"status": _status_pending(), "recover_dryrun": _dryrun(**data)}
+    )
+    run_cmd("PLR_WIZARD_START")
+    gcode = fake_printer.lookup_object("gcode")
+    since = _new_responses(gcode)
+    run_cmd("PLR_WIZARD_DRYRUN")
+    lines = since()
+    assert "action:prompt_button Nozzle is clean|PLR_WIZARD_CONFIRM_CLEAN|primary" in (
+        lines
+    )
+    # It must never claim an automatic clean on the ask branch.
+    assert not any("will run to clean the nozzle" in line for line in lines)
+
+
+def test_dryrun_absent_flag_explains_why_it_asks(plugin, run_cmd, fake_printer):
+    plugin.daemon = FakeDaemon(
+        responses={"status": _status_pending(), "recover_dryrun": _dryrun()}
+    )
+    run_cmd("PLR_WIZARD_START")
+    gcode = fake_printer.lookup_object("gcode")
+    since = _new_responses(gcode)
+    run_cmd("PLR_WIZARD_DRYRUN")
+    assert any("did not report whether the nozzle" in line for line in since())
+
+
+def test_dryrun_sources_disagree_asks_and_says_why(plugin, run_cmd, fake_printer):
+    # plrd says cleaning is automatic, but this printer has no
+    # [gcode_macro CLEAN_NOZZLE] — the conservative branch must win.
+    assert plugin.clean_nozzle_macro_available is False
     plugin.daemon = FakeDaemon(
         responses={
             "status": _status_pending(),
-            "recover_dryrun": _dryrun(
-                plan={"requires_clean_nozzle_confirmation": True}
-            ),
+            "recover_dryrun": _dryrun(requires_clean_nozzle_confirmation=False),
         }
     )
     run_cmd("PLR_WIZARD_START")
@@ -357,17 +444,24 @@ def test_dryrun_nested_plan_clean_flag_shows_clean_prompt(
     assert "action:prompt_button Nozzle is clean|PLR_WIZARD_CONFIRM_CLEAN|primary" in (
         lines
     )
+    assert any("the two disagree" in line for line in lines)
+    assert any("[gcode_macro CLEAN_NOZZLE]" in line for line in lines)
 
 
 @pytest.mark.parametrize(
     "data",
     [
-        {"requires_clean_nozzle_confirmation": False},
-        {"plan": {"requires_clean_nozzle_confirmation": False}},
-        {},
+        pytest.param({"requires_clean_nozzle_confirmation": False}, id="top-level"),
+        pytest.param(
+            {"plan": {"requires_clean_nozzle_confirmation": False}}, id="nested"
+        ),
     ],
 )
-def test_dryrun_no_clean_skips_to_execute(plugin, run_cmd, fake_printer, data):
+def test_dryrun_skips_to_execute_only_when_both_sources_agree(
+    plugin_with_clean_macro, run_cmd, fake_printer, data
+):
+    plugin = plugin_with_clean_macro
+    assert plugin.clean_nozzle_macro_available is True
     plugin.daemon = FakeDaemon(
         responses={"status": _status_pending(), "recover_dryrun": _dryrun(**data)}
     )
@@ -379,10 +473,32 @@ def test_dryrun_no_clean_skips_to_execute(plugin, run_cmd, fake_printer, data):
     assert "action:prompt_text Execute the recovery plan? The printer WILL MOVE." in (
         lines
     )
-    # The auto-clean note names the configured macro.
-    assert any("CLEAN_NOZZLE macro will run automatically" in line for line in lines)
+    # The auto-clean note is grounded in the plugin's own config, not the
+    # daemon boolean alone: it names the configured macro SECTION.
+    assert (
+        "action:prompt_text [gcode_macro CLEAN_NOZZLE] is configured and plrd "
+        "reports it will run to clean the nozzle first." in lines
+    )
     assert "action:prompt_button Execute|PLR_WIZARD_EXECUTE|primary" in lines
     assert not any("Nozzle is clean" in line for line in lines)
+
+
+def test_dryrun_absent_flag_asks_even_when_macro_is_available(
+    plugin_with_clean_macro, run_cmd, fake_printer
+):
+    # Redundant ask costs one click; skipping when nothing cleans the
+    # nozzle corrupts the reference measurement. Unknown always asks.
+    plugin = plugin_with_clean_macro
+    plugin.daemon = FakeDaemon(
+        responses={"status": _status_pending(), "recover_dryrun": _dryrun()}
+    )
+    run_cmd("PLR_WIZARD_START")
+    gcode = fake_printer.lookup_object("gcode")
+    since = _new_responses(gcode)
+    run_cmd("PLR_WIZARD_DRYRUN")
+    assert "action:prompt_button Nozzle is clean|PLR_WIZARD_CONFIRM_CLEAN|primary" in (
+        since()
+    )
 
 
 def test_dryrun_before_start_is_error(plugin, run_cmd):
@@ -466,7 +582,9 @@ def test_execute_typed_failure_reports_remediation(plugin, run_cmd, fake_printer
         }
     )
     run_cmd("PLR_WIZARD_START")
-    run_cmd("PLR_WIZARD_DRYRUN")  # no clean confirm -> execute prompt
+    run_cmd("PLR_WIZARD_DRYRUN")
+    # Flag absent -> the fail-safe branch asks; confirm to reach execute.
+    run_cmd("PLR_WIZARD_CONFIRM_CLEAN")
     gcode = fake_printer.lookup_object("gcode")
     since = _new_responses(gcode)
     with pytest.raises(fake_klippy.FakeCommandError, match="did not complete"):
@@ -556,6 +674,7 @@ def test_daemon_down_at_execute(plugin, run_cmd, fake_printer):
     )
     run_cmd("PLR_WIZARD_START")
     run_cmd("PLR_WIZARD_DRYRUN")
+    run_cmd("PLR_WIZARD_CONFIRM_CLEAN")
     gcode = fake_printer.lookup_object("gcode")
     since = _new_responses(gcode)
     with pytest.raises(fake_klippy.FakeCommandError, match="closed connection"):

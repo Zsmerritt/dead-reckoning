@@ -129,23 +129,87 @@ def _pending_recovery(data):
     return None
 
 
-def _requires_clean(data):
-    """Plan-level clean-nozzle-confirmation flag; absent everywhere → False.
+CLEAN_FLAG_KEY = "requires_clean_nozzle_confirmation"
+
+
+def _clean_flag(data):
+    """Tri-state read of the clean-nozzle-confirmation flag.
+
+    Returns ``True`` (daemon wants the user asked), ``False`` (daemon
+    reports cleaning is handled automatically), or ``None`` when the flag
+    is absent, non-boolean, or otherwise unreadable.
 
     CONTRACT SOURCE — crates/plrd/src/ctrlsock.rs ``cmd_recover_dryrun``
     returns ``data: {"outcome": <tag>}`` today; the frozen
-    ``requires_clean_nozzle_confirmation`` flag is being added by the
-    Rust side and may land either at the top level of ``data`` or nested
-    under a ``plan`` object.  Both spellings are accepted (top level
-    first); absent in both — any daemon predating the flag — reads as
-    "no confirmation required" (the auto-clean / no-clean path).
+    ``requires_clean_nozzle_confirmation`` flag is being added by the Rust
+    side and may land either at the top level of ``data`` or nested under
+    a ``plan`` object.  Both are read, a valid boolean at the TOP LEVEL
+    winning over a nested one; anything else yields ``None`` for the
+    caller to resolve conservatively (see :func:`_clean_decision`).
     """
-    if "requires_clean_nozzle_confirmation" in data:
-        return bool(data.get("requires_clean_nozzle_confirmation"))
+    value = data.get(CLEAN_FLAG_KEY)
+    if isinstance(value, bool):
+        return value
     plan = data.get("plan")
     if isinstance(plan, dict):
-        return bool(plan.get("requires_clean_nozzle_confirmation"))
-    return False
+        nested = plan.get(CLEAN_FLAG_KEY)
+        if isinstance(nested, bool):
+            return nested
+    return None
+
+
+# Why the wizard asks, when it asks (drives the extra prompt line).
+_ASK_NO_MACRO = "no_macro"  # daemon: nothing cleans it automatically
+_ASK_UNKNOWN = "unknown"  # flag absent/unreadable — conservative branch
+_ASK_DISAGREE = "disagree"  # daemon says auto, plugin sees no macro section
+
+
+def _clean_decision(flag, macro_available, macro_name):
+    """Resolve the clean-nozzle branch: ``(ask, reason)``.
+
+    FAIL-SAFE DEFAULT — the confirmation is skipped ONLY when both
+    independent sources agree that something will actually clean the
+    nozzle: the daemon says so with an explicit boolean ``False`` AND the
+    plugin can see the configured ``[gcode_macro <name>]`` section.
+    Every other case asks:
+
+    * ``True``  — the daemon reports no cleaning macro server-side;
+    * ``None``  — the flag is absent/unreadable (a daemon predating it, or
+      a renamed field): UNKNOWN TAKES THE CONSERVATIVE BRANCH. Asking
+      redundantly when a macro does exist costs the operator one click;
+      skipping the check when nothing cleans the nozzle silently corrupts
+      the very reference measurement recovery depends on — contact
+      readings (touch AND drag) are only trustworthy from a clean tip;
+    * ``False`` but no visible macro — the two sources DISAGREE, so the
+      conservative branch wins and the prompt says why rather than
+      promising a macro run the plugin cannot see.
+    """
+    if flag is False and macro_available:
+        return (False, None)
+    if flag is None:
+        return (True, _ASK_UNKNOWN)
+    if flag is False:
+        return (True, _ASK_DISAGREE)
+    return (True, _ASK_NO_MACRO)
+
+
+def _ask_reason_text(reason, macro_name):
+    """The extra prompt line explaining WHY the wizard is asking."""
+    if reason == _ASK_UNKNOWN:
+        return (
+            "plrd did not report whether the nozzle gets cleaned "
+            "automatically, so you are being asked to be safe."
+        )
+    if reason == _ASK_DISAGREE:
+        return (
+            "plrd reports an automatic nozzle clean, but no "
+            "[gcode_macro %s] is configured here — the two disagree, so "
+            "you are being asked." % (macro_name,)
+        )
+    return (
+        "No [gcode_macro %s] will run for this recovery, so nothing "
+        "cleans the nozzle automatically." % (macro_name,)
+    )
 
 
 def _is_number(value):
@@ -332,20 +396,29 @@ class RecoveryWizard:
         data = resp.get("data", {})
         # ctrlsock.rs cmd_recover_dryrun: data carries {"outcome": <tag>}
         # today; the frozen clean-nozzle flag may arrive top level or
-        # nested under "plan" (see _requires_clean).
-        if _requires_clean(data):
-            self._show_clean_check(gcmd)
+        # nested under "plan" (see _clean_flag).  The branch is decided by
+        # BOTH the daemon flag and the plugin's own macro detection, and
+        # the unknown case asks (see _clean_decision).
+        macro = self.plugin.clean_nozzle_macro
+        ask, reason = _clean_decision(
+            _clean_flag(data), self.plugin.clean_nozzle_macro_available, macro
+        )
+        if ask:
+            self._show_clean_check(gcmd, reason)
         else:
             self._show_execute(gcmd, auto_clean=True)
 
-    def _show_clean_check(self, gcmd):
+    def _show_clean_check(self, gcmd, reason=None):
+        texts = [
+            "Contact readings need a clean nozzle — filament or ooze on "
+            "the tip skews every reading.",
+        ]
+        if reason is not None:
+            texts.append(_ask_reason_text(reason, self.plugin.clean_nozzle_macro))
+        texts.append("Is the nozzle clean?")
         prompt = _Prompt(
             title=_TITLE,
-            texts=[
-                "Contact readings need a clean nozzle — filament or ooze on "
-                "the tip skews every reading.",
-                "Is the nozzle clean?",
-            ],
+            texts=texts,
             buttons=[("Nozzle is clean", "PLR_WIZARD_CONFIRM_CLEAN", "primary")],
             footers=[("It's dirty - abort", "PLR_WIZARD_CANCEL", "error")],
             fallbacks=[
@@ -356,11 +429,18 @@ class RecoveryWizard:
         self._show(gcmd, prompt, STATE_CLEAN_CHECK)
 
     def _show_execute(self, gcmd, auto_clean):
+        """Emit the execute prompt.
+
+        ``auto_clean`` is only ever set when BOTH sources agree the nozzle
+        gets cleaned automatically (:func:`_clean_decision`), so the copy
+        can name the macro as a fact grounded in the plugin's own config
+        rather than in the daemon's boolean alone.
+        """
         texts = ["Execute the recovery plan? The printer WILL MOVE."]
         if auto_clean:
             texts.append(
-                "Your %s macro will run automatically to clean the nozzle "
-                "first." % (self.plugin.clean_nozzle_macro,)
+                "[gcode_macro %s] is configured and plrd reports it will run "
+                "to clean the nozzle first." % (self.plugin.clean_nozzle_macro,)
             )
         prompt = _Prompt(
             title=_TITLE,
