@@ -231,6 +231,7 @@ pub fn machine_tap() -> MachineConfig {
         validated_config_hash: Some("cfg-v1".to_owned()),
         virtual_sdcard_root: Some("/tmp".to_owned()),
         noise_floor: None,
+        noise_floor_speed: None,
     }
 }
 

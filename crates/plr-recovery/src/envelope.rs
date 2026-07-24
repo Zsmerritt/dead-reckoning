@@ -30,6 +30,27 @@
 //!   `drag_z_step` below the last non-contacting one, so the overshoot
 //!   is exactly `drag_z_step` ([`OvershootTerm::DragStep`]).
 //!
+//!   **First-pass clearance, by construction.** `PLR_DRAG_PROBE`
+//!   treats contact on the very first pass as a typed FAILURE: its
+//!   `trigger_z` is the last *clean* pass, so with no clean pass there
+//!   is no datum. The plan must therefore start the staircase at
+//!   least one `drag_z_step` above the highest plausible surface —
+//!   and it does, arithmetically:
+//!
+//!   ```text
+//!   staircase start   = shifted_declare_z
+//!                     = position_min + expected_gap + drag_z_step + margin
+//!   highest plausible
+//!   surface (shifted) = position_min + expected_gap
+//!   clearance         = drag_z_step + margin  >=  drag_z_step
+//!   ```
+//!
+//!   (`margin >= 0` is validated), so even against the worst-case
+//!   highest surface the first pass clears it by a full `drag_z_step`
+//!   plus the margin, and the first *possible* contact pass always has
+//!   a clean pass above it. Pinned by the
+//!   `drag_start_clears_the_highest_surface` property test.
+//!
 //! # The shifted frame
 //!
 //! The recovery plan declares `SET_KINEMATIC_POSITION

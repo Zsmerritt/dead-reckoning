@@ -268,7 +268,16 @@ proptest! {
                     + (c.point[1] - crash_y).powi(2))
                 .sqrt();
                 prop_assert!(d_crash > radius, "candidate inside exclusion radius");
-                prop_assert_eq!(c.distance_from_crash, d_crash);
+                // Not exact-eq: the selector computes the distance via
+                // geom::point_distance, whose operation order may
+                // differ from the recomputation above by an ulp
+                // (found by proptest).
+                prop_assert!(
+                    (c.distance_from_crash - d_crash).abs() <= 1e-9,
+                    "distance_from_crash {} != recomputed {}",
+                    c.distance_from_crash,
+                    d_crash
+                );
                 // Exactly on the host segment (identified by span).
                 let host = prev
                     .iter()

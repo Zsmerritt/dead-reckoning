@@ -648,6 +648,7 @@ pub(crate) fn machine_config(
         // way to commission it (probe_kind is tap|load_cell only), so
         // there is never a noise floor here.
         noise_floor: None,
+        noise_floor_speed: None,
     }
 }
 
@@ -969,6 +970,10 @@ G1 X30 Y30 E1
                 ("drag_speed", json!(4.0)),
                 ("drag_z_step", json!(0.04)),
                 ("drag_sensitivity", json!(2.5)),
+                // Calibrated at 20 mm/s, planned at 4 mm/s: the plan
+                // must carry the speed-mismatch warning (never a
+                // refusal).
+                ("noise_floor_speed", json!(20.0)),
             ],
         );
         let (outcome, output) = run(&config);
@@ -983,12 +988,24 @@ G1 X30 Y30 E1
             .expect("probe step");
         assert_eq!(
             probe.commands,
-            vec!["PLR_DRAG_PROBE CHIP=adxl345 SPEED=4 Z_STEP=0.04 SENSITIVITY=2.5"]
+            vec!["PLR_DRAG_PROBE CHIP=\"adxl345\" SPEED=4 Z_STEP=0.04 SENSITIVITY=2.5"]
         );
         // The drag envelope has no speed-proportional term.
         assert_eq!(
             bundle.plan.envelope.params.overshoot,
             plr_recovery::OvershootTerm::DragStep { drag_z_step: 0.04 }
+        );
+        // The [plr] noise_floor_speed rode through to the plan warning.
+        assert!(
+            bundle.plan.warnings.iter().any(|w| matches!(
+                w,
+                plr_recovery::PlanWarning::NoiseFloorSpeedMismatch {
+                    calibrated_at,
+                    drag_speed,
+                } if (*calibrated_at - 20.0).abs() < 1e-12 && (*drag_speed - 4.0).abs() < 1e-12
+            )),
+            "{:?}",
+            bundle.plan.warnings
         );
     }
 

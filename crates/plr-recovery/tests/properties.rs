@@ -316,6 +316,36 @@ proptest! {
         prop_assert!((coarser.envelope - base.envelope - step_delta).abs() < 1e-9);
     }
 
+    /// First-pass clearance (see the envelope module docs, DragStep
+    /// arm): PLR_DRAG_PROBE treats first-pass contact as a typed
+    /// failure (no clean pass exists to be the datum), so the
+    /// staircase start must clear the highest plausible surface —
+    /// `position_min + expected_gap` in the shifted frame — by at
+    /// least one `drag_z_step`. Holds by construction for every valid
+    /// parameter set.
+    #[test]
+    fn drag_start_clears_the_highest_surface(
+        gap in 0.0..50.0_f64,
+        z_step in 0.001..0.5_f64,
+        margin in 0.0..5.0_f64,
+        position_min in -5.0..5.0_f64,
+    ) {
+        let e = compute_envelope(
+            EnvelopeParams {
+                expected_gap: gap,
+                overshoot: OvershootTerm::DragStep { drag_z_step: z_step },
+                margin,
+            },
+            position_min,
+        ).unwrap();
+        let highest_surface = position_min + gap;
+        prop_assert!(
+            e.shifted_declare_z - highest_surface >= z_step - 1e-12,
+            "start {} must clear the highest surface {} by >= drag_z_step {}",
+            e.shifted_declare_z, highest_surface, z_step
+        );
+    }
+
     /// Non-positive or non-finite drag decrements are typed errors.
     #[test]
     fn drag_z_step_rejection_is_total(bad in prop_oneof![
@@ -425,7 +455,7 @@ proptest! {
         // the envelope's overshoot term.
         let probe = plan.steps_in_phase(Phase::Probe).next().expect("probe step");
         if s.drag {
-            prop_assert!(probe.commands[0].starts_with("PLR_DRAG_PROBE CHIP=adxl345 "));
+            prop_assert!(probe.commands[0].starts_with("PLR_DRAG_PROBE CHIP=\"adxl345\" "));
             prop_assert!(probe.verify.iter().any(
                 |v| v.object == "plr" && v.field == "last_drag_result.trigger_z"
             ));
