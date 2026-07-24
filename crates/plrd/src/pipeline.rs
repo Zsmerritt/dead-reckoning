@@ -48,9 +48,17 @@
 //!     boundary). On mismatch the computed value is printed so the
 //!     operator can re-bless deliberately.
 //!
-//! `exclude_objects` are passed empty: the WAL context format does not
-//! journal exclude-object state (documented in `convert`), so restoring
-//! exclusions is out of scope until the WAL format grows a field.
+//! `exclude_objects` are still passed empty here, but **not** because
+//! the data is missing: the WAL context now journals exclude-object
+//! state (`plr_wal::ExcludeState`, written by `convert`) and
+//! reconstruction resolves it into
+//! `plr_reconstruct::RecoveryReconstruction::exclusions`. Wiring that
+//! report into the resume file's `EXCLUDE_OBJECT_DEFINE` /
+//! `EXCLUDE_OBJECT` replay is the remaining work. Whoever does it must
+//! gate on `ExclusionReport::is_conclusive()` and, when it is false,
+//! drive a per-object operator confirmation from
+//! `ExclusionReport::confirmation()` — resuming a cancelled part prints
+//! into the debris that caused the cancellation.
 
 use std::io::Write;
 use std::path::Path;

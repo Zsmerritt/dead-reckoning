@@ -55,13 +55,16 @@
 //! because that object failed — so a resume does not print back into
 //! the debris. [`exclude`] resolves that from the WAL's journaled
 //! `exclude_object` state, falling back to the print file's
-//! `EXCLUDE_OBJECT_DEFINE` block, and always reports *where the answer
-//! came from* ([`ExclusionProvenance`]). The case where the WAL is
-//! silent but the file defines objects is never treated as "nothing was
-//! excluded": it raises
-//! [`ExclusionDiagnostic::CancellationRecordLost`] and requires
-//! operator confirmation. The report also answers "which object
-//! contains this XY?" from the journaled outlines.
+//! `EXCLUDE_OBJECT_DEFINE` block. Crucially it gates on **uncertainty,
+//! not on which answer it saw**: [`ExclusionReport::is_conclusive`] is
+//! true only when nothing the log records as lost postdates the newest
+//! exclusion observation *and* that observation is fresh, so a stale or
+//! gap-shadowed excluded set prompts just as a missing one does. Every
+//! reason is a named [`UncertaintyCause`], and
+//! [`ExclusionReport::confirmation`] hands back the full per-object
+//! payload so the prompt is a per-object selection, never a yes/no. The
+//! report also answers "which object contains this XY?" from the
+//! outlines.
 //!
 //! # Crash classes
 //!
@@ -95,8 +98,9 @@ pub mod window;
 pub use config::ReconstructConfig;
 pub use error::{ContextDefect, ReconstructError};
 pub use exclude::{
-    parse_object_definitions, point_in_polygon, resolve_exclusions, ExclusionDiagnostic,
-    ExclusionProvenance, ExclusionReport, FileObjectScan, EDGE_TOLERANCE_MM,
+    parse_object_definitions, point_in_polygon, resolve_exclusions, ExclusionConfirmation,
+    ExclusionDiagnostic, ExclusionFreshness, ExclusionInputs, ExclusionProvenance, ExclusionReport,
+    FileObjectScan, ObjectKnowledge, ObjectState, UncertaintyCause, EDGE_TOLERANCE_MM,
 };
 pub use reconstruct::{reconstruct, ReconstructInputs, Reconstruction, RecoveryReconstruction};
 pub use stopset::{

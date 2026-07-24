@@ -6,8 +6,9 @@
 
 use plr_gcode::SimConfig;
 use plr_reconstruct::{
-    ingest, parse_object_definitions, point_in_polygon, reconstruct, resolve_exclusions, FileTail,
-    ReceiveSeqObservation, ReconstructConfig, ReconstructInputs,
+    compute_stop_window, ingest, parse_object_definitions, point_in_polygon, reconstruct,
+    resolve_exclusions, ExclusionInputs, FileTail, ReceiveSeqObservation, ReconstructConfig,
+    ReconstructInputs,
 };
 use plr_wal::{
     recover_heartbeat, Context, ExcludeObjectDef, ExcludeState, FanTarget, GcodeState, Heartbeat,
@@ -265,6 +266,7 @@ fn any_config() -> impl Strategy<Value = ReconstructConfig> {
             quiet_tail_ns: 2_000_000_000,
             max_processing_lead: lead,
             extension_horizon: horizon,
+            exclusion_freshness_horizon: horizon,
             z_merge_tolerance: tol,
             sim: SimConfig {
                 max_velocity: sim[0],
@@ -348,6 +350,7 @@ proptest! {
         base_offset in prop_oneof![Just(0_u64), any::<u64>()],
         x in any_f64(),
         y in any_f64(),
+        config in any_config(),
     ) {
         let scan = RecoveryScan {
             header: None,
@@ -364,18 +367,56 @@ proptest! {
         };
         let timeline = ingest(&scan, None);
         let file = FileTail { base_offset, bytes: &tail };
-        for input in [None, Some(&file)] {
-            let report = resolve_exclusions(&timeline, input);
-            // Every query is total and self-consistent.
-            let at = report.objects_at(x, y);
-            prop_assert!(at.len() <= report.definitions.len());
-            prop_assert_eq!(report.object_at(x, y).is_some(), !at.is_empty());
-            if let Some(hit) = report.excluded_object_at(x, y) {
-                prop_assert!(report.is_excluded(&hit.name));
+        // The window is itself derived from hostile records, so it may
+        // legitimately fail to compute; both paths must be total.
+        let window = compute_stop_window(&timeline, None, &config).ok();
+        for file in [None, Some(&file)] {
+            for window in [None, window.as_ref()] {
+                let inputs = ExclusionInputs {
+                    window,
+                    stop_end_print_time: Some(x),
+                    file,
+                };
+                let report = resolve_exclusions(&timeline, &inputs, &config);
+                // Every query is total and self-consistent.
+                let at = report.objects_at(x, y);
+                prop_assert!(at.len() <= report.definitions().len());
+                prop_assert_eq!(report.object_at(x, y).is_some(), !at.is_empty());
+                if let Some(hit) = report.excluded_object_at(x, y) {
+                    prop_assert!(report.is_excluded(&hit.name));
+                }
+                // Conclusiveness and the confirmation payload agree, and
+                // a prompt always carries every known object.
+                prop_assert_eq!(
+                    report.is_conclusive(),
+                    report.confirmation().is_none()
+                );
+                if let Some(confirmation) = report.confirmation() {
+                    prop_assert!(!confirmation.causes.is_empty());
+                    prop_assert_eq!(
+                        confirmation.objects.len(),
+                        report.object_states().len()
+                    );
+                    // Every recorded exclusion is pre-selected.
+                    for name in report.excluded() {
+                        prop_assert!(confirmation
+                            .objects
+                            .iter()
+                            .any(|o| o.name.eq_ignore_ascii_case(name) && o.preselected()));
+                    }
+                }
+                // The structural invariant: exclusions only ever come
+                // from a journaled log.
+                if !report.excluded().is_empty() {
+                    prop_assert_eq!(
+                        report.provenance(),
+                        plr_reconstruct::ExclusionProvenance::Journaled
+                    );
+                }
+                let _ = report.geometry_is_complete();
+                let _ = report.excluded_definitions();
+                let _ = report.freshness();
             }
-            let _ = report.requires_operator_confirmation();
-            let _ = report.geometry_is_complete();
-            let _ = report.excluded_definitions();
         }
     }
 

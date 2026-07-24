@@ -25,8 +25,11 @@
 //! * Lifecycle markers are interpreted: a terminal
 //!   [`MarkerKind::CleanShutdown`] flags the timeline as needing no
 //!   recovery; a tail [`MarkerKind::SocketLost`] without a subsequent
-//!   `Resubscribed` is classification evidence; subscription gaps are
-//!   noted for honest degradation.
+//!   `Resubscribed` is classification evidence; subscription gaps and
+//!   [`MarkerKind::ExclusionUpdateLost`] are noted for honest
+//!   degradation. Markers are kept in append order in
+//!   [`WalTimeline::markers`] so later stages can ask *when* an event
+//!   happened relative to other records.
 
 use plr_wal::{
     Context, Heartbeat, HeartbeatRecovery, Marker, MarkerKind, RecoveryScan, ScanEnd, StepperRange,
@@ -72,6 +75,14 @@ pub enum IngestNote {
     /// A `CleanShutdown` marker exists but motion records follow it, so
     /// it does not end the log and recovery proceeds.
     StaleCleanShutdownMarker,
+    /// The daemon journaled that a `Context` carrying an exclude-object
+    /// **change** was dropped under WAL backpressure: an operator
+    /// cancellation may be missing from the log. See
+    /// [`crate::exclude`] for how this defeats conclusiveness.
+    ExclusionUpdateLost {
+        /// Host-monotonic time of the dropped update (ns).
+        mono_ns: u64,
+    },
     /// A marker written by a newer format revision was preserved as
     /// opaque and ignored.
     UnknownMarker {
@@ -216,6 +227,11 @@ pub fn ingest(scan: &RecoveryScan, heartbeat: Option<&HeartbeatRecovery>) -> Wal
                         start_mono_ns,
                         end_mono_ns,
                     }),
+                    MarkerKind::ExclusionUpdateLost => {
+                        notes.push(IngestNote::ExclusionUpdateLost {
+                            mono_ns: marker.mono_ns,
+                        });
+                    }
                     MarkerKind::Unknown => notes.push(IngestNote::UnknownMarker {
                         mono_ns: marker.mono_ns,
                     }),

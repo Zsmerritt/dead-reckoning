@@ -62,6 +62,28 @@ pub struct ReconstructConfig {
     /// `max_lines` budget also caps how many parsed lines are collected
     /// from the file tail.
     pub sim: SimConfig,
+    /// How stale journaled `exclude_object` knowledge may be, in
+    /// print-time seconds measured from the newest exclude-bearing
+    /// context to the end of the possible-stop set's evaluation span,
+    /// before [`crate::ExclusionReport::is_conclusive`] turns false and
+    /// the operator must confirm which objects stay cancelled.
+    ///
+    /// Budget for a healthy recovery: the recorder throttles
+    /// position-only contexts to one per second
+    /// (`plrd::convert::POSITION_CONTEXT_MIN_NS`), Klipper batches its
+    /// motion dumps at ~0.5 s, and the stop window deliberately extends
+    /// past the last context by the planning lead plus the
+    /// `extension_horizon` (2 s by default) — so ~3.5 s is expected and
+    /// must not prompt. 5.0 leaves margin without letting a genuinely
+    /// old observation pass as current.
+    ///
+    /// Note the asymmetry this cannot see: while the printer *dwells*
+    /// (heating, waiting) no context is written at all, so the gap grows
+    /// even though no cancellation could have gone unrecorded — a
+    /// cancellation would itself have forced an immediate context.
+    /// Prompting there is a false positive we accept, because the
+    /// alternative is trusting a stale set.
+    pub exclusion_freshness_horizon: f64,
     /// Two Z candidates closer than this (mm) with identical
     /// kind/provenance/knowledge merge into one. Covers float noise
     /// between independently-computed copies of the same layer height;
@@ -78,6 +100,7 @@ impl Default for ReconstructConfig {
             quiet_tail_ns: 2_000_000_000,
             max_processing_lead: 3.0,
             extension_horizon: 2.0,
+            exclusion_freshness_horizon: 5.0,
             sim: SimConfig::default(),
             z_merge_tolerance: 1e-6,
         }
@@ -108,6 +131,9 @@ impl ReconstructConfig {
         }
         if !self.z_merge_tolerance.is_finite() || self.z_merge_tolerance < 0.0 {
             return err("z_merge_tolerance must be finite and >= 0");
+        }
+        if !self.exclusion_freshness_horizon.is_finite() || self.exclusion_freshness_horizon < 0.0 {
+            return err("exclusion_freshness_horizon must be finite and >= 0");
         }
         if !self.sim.max_velocity.is_finite() || self.sim.max_velocity <= 0.0 {
             return err("sim.max_velocity must be finite and > 0");

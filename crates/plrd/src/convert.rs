@@ -43,10 +43,28 @@
 //! An operator usually cancels an object *because it failed* — it
 //! detached, warped, or turned into spaghetti. Klipper holds that
 //! decision only in RAM, so it must reach the disk before the power
-//! does: an exclusion change therefore forces an **immediate**
-//! (fsync'd) `Context`, exactly like markers, never waiting for the
-//! batch window. It also bypasses [`POSITION_CONTEXT_MIN_NS`], which
-//! throttles position-only contexts.
+//! does: an exclusion change forces an **immediate** (fsync'd)
+//! `Context` rather than waiting for the batch window, and bypasses
+//! [`POSITION_CONTEXT_MIN_NS`], which throttles position-only contexts.
+//!
+//! What that does **not** buy is undroppability. Records — contexts
+//! included — are dropped when the WAL channel fills, because blocking
+//! the socket reader gets the daemon disconnected by Klipper
+//! (`crate::sender`); only markers are never dropped. The guarantee is
+//! therefore: *if* an exclusion-bearing context reaches the WAL thread
+//! it is fsync'd before the next record, and *if* it does not, the
+//! sender journals a never-dropped
+//! [`plr_wal::MarkerKind::ExclusionUpdateLost`] marker so
+//! reconstruction knows to distrust the surviving set. Recovery never
+//! silently loses a cancellation; at worst it has to ask.
+//!
+//! # Positive journaling
+//!
+//! The excluded set is journaled from the **first** `exclude_object`
+//! observation onward, including when it is empty. "Zero objects
+//! excluded as of t" is a recorded fact, so reconstruction can tell
+//! *nothing was cancelled* from *we never looked* — the distinction the
+//! whole provenance machinery in `plr-reconstruct` rests on.
 //!
 //! * `objects` change → immediate context carrying
 //!   [`ExcludeState::definitions`] `= Some(..)`.
@@ -1314,6 +1332,43 @@ mod tests {
             "definitions are journaled once, not in every context"
         );
         assert!(state.excluded.is_empty());
+    }
+
+    #[test]
+    fn the_empty_excluded_set_is_journaled_positively() {
+        // Positive journaling: the very first exclude_object
+        // observation records "zero objects excluded as of t" as a
+        // fact. Without this, reconstruction could not distinguish
+        // "nothing was cancelled" from "we never looked", and the
+        // absence-of-record path would be the common case rather than
+        // the rare one.
+        let mut r = recorder_with_snapshot();
+        let out = r.on_status(
+            &exclude_update(
+                101.0,
+                &json!({"objects": [{"name": "A"}, {"name": "B"}],
+                        "excluded_objects": [], "current_object": null}),
+            ),
+            2_000,
+            false,
+        );
+        let state = only_context(&out).exclude.clone().unwrap();
+        assert!(
+            state.excluded.is_empty(),
+            "an empty set is still journaled, not omitted"
+        );
+        assert_eq!(state.definitions.unwrap().len(), 2);
+
+        // And it keeps riding along on every later context, so the
+        // newest surviving one always states the set.
+        let out = r.on_status(
+            &status(json!({"eventtime": 102.0, "status": {"fan": {"speed": 0.3}}})),
+            3_000,
+            false,
+        );
+        let state = only_context(&out).exclude.clone().unwrap();
+        assert!(state.excluded.is_empty());
+        assert_eq!(state.definitions, None, "definitions are not repeated");
     }
 
     #[test]

@@ -5,7 +5,7 @@ use plr_wal::{HeartbeatRecovery, RecoveryScan};
 
 use crate::config::ReconstructConfig;
 use crate::error::ReconstructError;
-use crate::exclude::{resolve_exclusions, ExclusionReport};
+use crate::exclude::{resolve_exclusions, ExclusionInputs, ExclusionReport};
 use crate::stopset::{compute_stop_set, FileTail, PossibleStopSet};
 use crate::timeline::{ingest, WalTimeline};
 use crate::window::{compute_stop_window, ReceiveSeqObservation, StopWindow};
@@ -43,10 +43,14 @@ pub struct RecoveryReconstruction {
     /// The possible-stop set.
     pub stop_set: PossibleStopSet,
     /// Which objects the operator cancelled, and how much that answer
-    /// can be trusted. **Check
-    /// [`ExclusionReport::requires_operator_confirmation`] before
-    /// resuming**: an empty excluded set is only meaningful together
-    /// with its [`provenance`](ExclusionReport::provenance).
+    /// can be trusted.
+    ///
+    /// **Gate any automatic resume on
+    /// [`ExclusionReport::is_conclusive`]**, which is true only when
+    /// nothing the log records as lost postdates the newest exclusion
+    /// observation and that observation is fresh. When it is false,
+    /// [`ExclusionReport::confirmation`] carries the per-object payload
+    /// the operator prompt must be built from.
     pub exclusions: ExclusionReport,
 }
 
@@ -80,7 +84,15 @@ pub fn reconstruct(
     }
     let window = compute_stop_window(&timeline, inputs.receive_seq.as_ref(), config)?;
     let stop_set = compute_stop_set(&timeline, &window, inputs.file_tail.as_ref(), config)?;
-    let exclusions = resolve_exclusions(&timeline, inputs.file_tail.as_ref());
+    let exclusions = resolve_exclusions(
+        &timeline,
+        &ExclusionInputs {
+            window: Some(&window),
+            stop_end_print_time: Some(stop_set.wal_eval_end),
+            file: inputs.file_tail.as_ref(),
+        },
+        config,
+    );
     Ok(Reconstruction::Recovery(Box::new(RecoveryReconstruction {
         timeline,
         window,
@@ -96,7 +108,9 @@ mod tests {
     use super::{reconstruct, ReconstructInputs, Reconstruction};
     use crate::config::ReconstructConfig;
     use crate::error::ReconstructError;
-    use crate::exclude::{ExclusionDiagnostic, ExclusionProvenance};
+    use crate::exclude::{
+        ExclusionDiagnostic, ExclusionFreshness, ExclusionProvenance, UncertaintyCause,
+    };
     use crate::stopset::FileTail;
     use crate::testutil::{context_at, heartbeat_at, scan_of};
     use crate::window::CrashClass;
@@ -174,7 +188,10 @@ mod tests {
         assert!(recovery.stop_set.degradation.extension_unavailable);
         // With no exclude state and no file, the exclusion picture is
         // honestly unknown rather than "nothing was cancelled".
-        assert_eq!(recovery.exclusions.provenance, ExclusionProvenance::Unknown);
+        assert_eq!(
+            recovery.exclusions.provenance(),
+            ExclusionProvenance::Unknown
+        );
         assert!(recovery.exclusions.requires_operator_confirmation());
     }
 
@@ -195,11 +212,55 @@ mod tests {
             panic!("expected Recovery");
         };
         assert_eq!(
-            recovery.exclusions.provenance,
+            recovery.exclusions.provenance(),
             ExclusionProvenance::Journaled
         );
         assert!(recovery.exclusions.is_excluded("PART_A"));
-        assert!(!recovery.exclusions.requires_operator_confirmation());
+        // The stop window is derived from this very context, the scan
+        // ended cleanly and no marker postdates it: nothing to ask.
+        assert!(
+            recovery.exclusions.is_conclusive(),
+            "{:?}",
+            recovery.exclusions.uncertainty_causes()
+        );
+        assert!(matches!(
+            recovery.exclusions.freshness(),
+            ExclusionFreshness::Known { .. }
+        ));
+    }
+
+    #[test]
+    fn a_torn_log_makes_a_journaled_exclusion_inconclusive() {
+        // The normal shape of a power-loss WAL: the tail did not end
+        // cleanly, so a cancellation may have been written and lost.
+        let mut context = context_at(1_000_000_000, 0);
+        context.exclude = Some(Box::new(ExcludeState {
+            definitions: Some(vec![ExcludeObjectDef::name_only("PART_A")]),
+            excluded: Vec::new(),
+            current: None,
+        }));
+        let mut scan = scan_of(vec![
+            WalRecord::Heartbeat(heartbeat_at(1_000_000_000, 10.0)),
+            WalRecord::Context(context),
+        ]);
+        scan.end = plr_wal::ScanEnd::TruncatedPayload;
+        let outcome = reconstruct(&inputs(&scan), &ReconstructConfig::default()).unwrap();
+        let Reconstruction::Recovery(recovery) = outcome else {
+            panic!("expected Recovery");
+        };
+        assert_eq!(
+            recovery.exclusions.provenance(),
+            ExclusionProvenance::Journaled
+        );
+        assert!(recovery.exclusions.requires_operator_confirmation());
+        let confirmation = recovery.exclusions.confirmation().expect("prompt");
+        assert!(confirmation
+            .causes
+            .iter()
+            .any(|c| matches!(c, UncertaintyCause::LogTailIncomplete { .. })));
+        // The prompt payload lists every object, not a yes/no.
+        assert_eq!(confirmation.objects.len(), 1);
+        assert_eq!(confirmation.objects[0].name, "PART_A");
     }
 
     #[test]
@@ -226,13 +287,14 @@ mod tests {
             panic!("expected Recovery");
         };
         assert_eq!(
-            recovery.exclusions.provenance,
+            recovery.exclusions.provenance(),
             ExclusionProvenance::RecordLost
         );
         assert_eq!(
-            recovery.exclusions.diagnostics,
-            vec![ExclusionDiagnostic::CancellationRecordLost {
-                objects: vec!["PART_A".to_owned(), "PART_B".to_owned()],
+            recovery.exclusions.diagnostics(),
+            [ExclusionDiagnostic::ExclusionStateUncertain {
+                cause: UncertaintyCause::NoRecord,
+                at_risk: vec!["PART_A".to_owned(), "PART_B".to_owned()],
             }]
         );
         assert!(recovery.exclusions.requires_operator_confirmation());

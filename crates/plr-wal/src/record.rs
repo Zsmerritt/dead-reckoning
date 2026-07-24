@@ -684,6 +684,17 @@ pub enum MarkerKind {
         /// Host-monotonic time (nanoseconds) when the gap ended.
         end_mono_ns: u64,
     },
+    /// A [`Context`] carrying an **exclude-object change** was dropped
+    /// before it reached the log (WAL channel backpressure).
+    ///
+    /// The socket reader must never block — Klipper disconnects
+    /// unresponsive clients — so context records are droppable. Markers
+    /// are not: this one exists so the loss of a cancellation leaves
+    /// hard evidence in the log even though the cancellation itself did
+    /// not make it. Reconstruction must refuse to call the excluded set
+    /// authoritative when this marker postdates the newest journaled
+    /// exclude state.
+    ExclusionUpdateLost,
     /// A marker kind written by a newer format revision; preserved as
     /// opaque. Never written by this version except when round-tripping.
     #[serde(other)]
@@ -1060,6 +1071,7 @@ mod tests {
                 start_mono_ns: 1,
                 end_mono_ns: 2,
             },
+            MarkerKind::ExclusionUpdateLost,
             MarkerKind::Unknown,
         ] {
             let record = WalRecord::Marker(Marker { mono_ns: 9, kind });
