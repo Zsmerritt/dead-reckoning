@@ -3,17 +3,23 @@
 //! The one Linux-shaped crate in the workspace: the always-on WAL
 //! recorder with real durability (`fdatasync` / `O_DSYNC` via rustix),
 //! the Klipper API-socket client, the 10 Hz heartbeat writer, and the
-//! recovery executor scaffold.
+//! gated recovery flow (`plrd recover`: WAL → reconstruction → validated
+//! plan; dry-run by default, operator-confirmed step-by-step execution
+//! via Moonraker — see `recover` for the full gate stack).
 //!
 //! # Platform split
 //!
 //! The **daemon** (`plrd run`) is Linux-only: its durability guarantees
 //! are made of Linux syscall semantics and are never mocked — on any
 //! other platform it refuses to run (exit code 3). The **offline tools**
-//! (`plrd scan`, `plrd version`) only *read* files and deliberately work
-//! everywhere, so a WAL directory copied off a printer can be analyzed
-//! on any machine. `cargo check -p plrd` stays green on Windows; Linux
-//! CI is the authority for this crate's lints and tests.
+//! (`plrd scan`, `plrd recover`, `plrd version`) deliberately work
+//! everywhere: `scan` only *reads* files, so a WAL directory copied off
+//! a printer can be analyzed on any machine, and `recover` defaults to
+//! a dry run that plans and prints without sending anything — the
+//! cross-platform-safe mode (its `--execute` path talks to Moonraker
+//! and is exercised by the Linux test suite). `cargo check -p plrd`
+//! stays green on Windows; Linux CI is the authority for this crate's
+//! lints and tests.
 //!
 //! # Exit codes (also in `cli::USAGE`)
 //!
