@@ -25,6 +25,13 @@
 //!   never on visible or excluded surfaces, with typed
 //!   [`contact::DeclineReason`]s (vase mode, single wall, no safe
 //!   zone) and typed refusals when `;TYPE:` annotations are missing.
+//! * [`structure`] — answers *"will the part survive being touched
+//!   there?"*: connected-component islands, bed-adhesion footprints
+//!   traced down the layer stack, and a per-criterion
+//!   [`structure::StructuralVerdict`] (adhesion, tipping, feature
+//!   width, edge margin, drag run). The selector filters on it; a
+//!   manual-jog UI validates hand-picked points against the same
+//!   [`structure::StructuralAnalysis`].
 //!
 //! # Totality
 //!
@@ -34,14 +41,16 @@
 //! (property-tested in `tests/properties.rs`).
 
 mod geom;
+mod raster;
 
 pub mod contact;
 pub mod matcher;
 pub mod model;
+pub mod structure;
 
 pub use contact::{
-    select_contact_zone, ContactConfig, ContactError, ContactOutcome, DeclineReason,
-    ProbeCandidate, SAMPLE_TS,
+    select_contact_zone, select_contact_zone_detailed, ContactConfig, ContactError, ContactOutcome,
+    ContactSelection, DeclineReason, ProbeCandidate, RejectedCandidate, SAMPLE_TS,
 };
 pub use matcher::{
     match_stop_point, ByteWindow, Interval, MatchCandidate, MatchConfidence, MatchConfig,
@@ -50,4 +59,9 @@ pub use matcher::{
 pub use model::{
     build_layer_model, classify_feature_type, FeatureClass, Layer, LayerModel, ModelConfig,
     ModelStop, MoveKind, SimMove, TypedPath, XySegment,
+};
+pub use structure::{
+    assess_contact_point, BoundingBox, ClearRun, ContactMode, CriterionCheck, FootprintTrace,
+    Island, StructuralAnalysis, StructuralAssessment, StructuralCriterion, StructuralOutcome,
+    StructuralVerdict, TraceStatus,
 };
