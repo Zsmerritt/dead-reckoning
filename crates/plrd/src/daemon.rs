@@ -50,6 +50,23 @@ pub fn run(config_path: &Path) -> u8 {
             return EXIT_RUNTIME;
         }
     };
+    // The control socket binds BEFORE anything else spawns: a daemon
+    // whose console-side contract (the Klipper plugin's PLR_STATUS /
+    // PLR_RECOVER) cannot come up must fail loudly at startup, not run
+    // half-featured. Stale-socket unlink + permission rationale:
+    // `ctrlsock::bind` docs.
+    let ctrl_listener = match crate::ctrlsock::bind(&config.control_socket) {
+        Ok(listener) => listener,
+        Err(e) => {
+            eprintln!("plrd: FATAL: {e}");
+            eprintln!(
+                "plrd: the control socket path comes from `control_socket` in the config \
+                 (and must match the [plr] section's `control_socket`)"
+            );
+            return EXIT_RUNTIME;
+        }
+    };
+
     // Boot-time pending-recovery detection runs BEFORE the WAL service
     // touches the directory, so it classifies exactly the previous
     // session's evidence. Bounded (newest segments only) and never
@@ -82,10 +99,30 @@ pub fn run(config_path: &Path) -> u8 {
         }
     };
 
+    // Register the already-bound control socket with the runtime's
+    // reactor. Failure here is as fatal as the bind itself: the daemon
+    // must not run with its console-side contract silently dead.
+    let ctrl_listener = {
+        let _guard = runtime.enter();
+        match tokio::net::UnixListener::from_std(ctrl_listener) {
+            Ok(listener) => listener,
+            Err(e) => {
+                eprintln!("plrd: FATAL: control socket cannot enter the runtime: {e}");
+                return EXIT_RUNTIME;
+            }
+        }
+    };
+    let ctrl_state = std::sync::Arc::new(crate::ctrlsock::CtrlState::new(config.clone()));
+
     let mut sender = WalSender::new(tx);
     let mut recorder = Recorder::new();
     let moonraker_url = config.moonraker_url.clone();
     let client_result = runtime.block_on(async {
+        // The control server runs beside the recorder. Its handlers do
+        // heavy work on spawn_blocking and its executions await
+        // Moonraker I/O, so it cannot starve the socket reader (see
+        // ctrlsock's module docs).
+        tokio::spawn(crate::ctrlsock::serve(ctrl_listener, ctrl_state));
         // Best-effort operator announcement, concurrent with recording;
         // it can never block, delay, or fail the recorder.
         if let Some(commands) = announcement {
@@ -101,6 +138,9 @@ pub fn run(config_path: &Path) -> u8 {
     // by its verdict.
     sender.shutdown();
     let wal_result = wal_thread.join();
+    // Best-effort tidy-up; a leftover socket file is harmless (the next
+    // start unlinks it) but confuses nobody if we remove it now.
+    let _ = std::fs::remove_file(&config.control_socket);
     match (client_result, wal_result) {
         (Ok(()), Ok(Ok(()))) => EXIT_OK,
         (client, wal) => {

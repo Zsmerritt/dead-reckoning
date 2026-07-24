@@ -292,6 +292,14 @@ pub enum TriggerSource {
         /// The configured probe `z_offset`, mm.
         z_offset: f64,
     },
+    /// Read `plr.last_drag_result.trigger_z` — the raw toolhead Z of
+    /// the first contacting drag pass, reported by the plugin's
+    /// `PLR_DRAG_PROBE` on the `plr` status object (alongside `passes`
+    /// and `confidence`). Already in raw toolhead coordinates (the
+    /// nozzle is the stylus; there is no probe `z_offset`), so it is
+    /// consumed like `last_z_result`. Used for
+    /// [`crate::machine::ProbeKind::AdxlDrag`].
+    DragResult,
 }
 
 /// The typed true-Z formula (design doc §8, step 6):
@@ -350,7 +358,7 @@ pub fn true_z_at_halt(
         return Err(RecoveryError::NonFinite { field: "halt_z" });
     }
     let trigger = match formula.trigger_source {
-        TriggerSource::RawLastZResult => trigger_reading,
+        TriggerSource::RawLastZResult | TriggerSource::DragResult => trigger_reading,
         TriggerSource::BedZPlusOffset { z_offset } => {
             if !z_offset.is_finite() {
                 return Err(RecoveryError::NonFinite { field: "z_offset" });
@@ -447,7 +455,7 @@ fn first_word(command: &str) -> String {
 fn is_motion_command(command: &str) -> bool {
     matches!(
         first_word(command).as_str(),
-        "G0" | "G1" | "G2" | "G3" | "G28" | "PROBE" | "FORCE_MOVE"
+        "G0" | "G1" | "G2" | "G3" | "G28" | "PROBE" | "FORCE_MOVE" | "PLR_DRAG_PROBE"
     )
 }
 
@@ -585,14 +593,28 @@ impl RecoveryPlan {
             self.resume_file, self.resume_offset
         );
         let p = self.envelope.params;
-        let _ = writeln!(
-            out,
-            "# envelope: gap {} + 0.15 x speed {} + margin {} = {} mm",
-            fmt_num(p.expected_gap),
-            fmt_num(p.probe_speed),
-            fmt_num(p.margin),
-            fmt_num(self.envelope.envelope),
-        );
+        match p.overshoot {
+            crate::envelope::OvershootTerm::PostTriggerTravel { probe_speed } => {
+                let _ = writeln!(
+                    out,
+                    "# envelope: gap {} + 0.15 x speed {} + margin {} = {} mm",
+                    fmt_num(p.expected_gap),
+                    fmt_num(probe_speed),
+                    fmt_num(p.margin),
+                    fmt_num(self.envelope.envelope),
+                );
+            }
+            crate::envelope::OvershootTerm::DragStep { drag_z_step } => {
+                let _ = writeln!(
+                    out,
+                    "# envelope: gap {} + drag_z_step {} + margin {} = {} mm",
+                    fmt_num(p.expected_gap),
+                    fmt_num(drag_z_step),
+                    fmt_num(p.margin),
+                    fmt_num(self.envelope.envelope),
+                );
+            }
+        }
         let _ = writeln!(
             out,
             "# shifted frame: Z declared {} above position_min {}",
@@ -705,6 +727,21 @@ mod tests {
         // bed_z reading 1.00 means raw trigger 0.90; halt 0.75.
         let z = true_z_at_halt(&f, 1.00, 0.75).unwrap();
         assert!((z - 12.25).abs() < 1e-12);
+    }
+
+    #[test]
+    fn true_z_drag_source_uses_the_reading_raw() {
+        // The drag trigger Z is already raw toolhead Z (nozzle as
+        // stylus, no probe z_offset): identical arithmetic to the raw
+        // last_z_result source.
+        let f = TrueZFormula {
+            z_prev_top: 12.4,
+            trigger_source: TriggerSource::DragResult,
+            frozen_z_adjust: None,
+        };
+        // Contact pass at shifted 0.90; the staircase halts there.
+        let z = true_z_at_halt(&f, 0.90, 0.90).unwrap();
+        assert!((z - 12.4).abs() < 1e-12);
     }
 
     #[test]

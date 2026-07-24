@@ -42,8 +42,32 @@ channel_capacity = 1024
 # announcement and by `plrd recover --execute`.
 moonraker_url = ws://127.0.0.1:7125/websocket
 
-# Machine snapshot for recovery planning (`plrd recover`). Recovery is
-# REFUSED until every prerequisite validates; keys mirror
+# Control socket served by `plrd run` (UNIX stream socket; the Klipper
+# plugin's PLR_STATUS / PLR_RECOVER commands connect here). The plugin
+# reads the SAME path from the `control_socket` key of printer.cfg's
+# [plr] section — the two must match; the install defaults keep them
+# aligned, so change both together or neither. Mode 0666 by default
+# (klippy runs as an unprivileged user the daemon cannot name; every
+# mutating command is confirm- and gate-checked — see
+# crates/plrd/src/ctrlsock.rs for the rationale and the group-based
+# tightening story for multi-user hosts).
+control_socket = /var/lib/plrd/plrd.sock
+
+# ----------------------------------------------------------------------
+# LEGACY machine snapshot ([machine]).
+#
+# PREFERRED SETUP: add a [plr] section to printer.cfg instead (see the
+# klippy plugin's documentation). When the running Klipper config has a
+# [plr] section, plrd sources the whole machine snapshot from the LIVE
+# config at recover time (probe method, position_min, probe z_offset,
+# force_move, attestations autosaved by PLR_SETUP, ...) and this
+# [machine] section is IGNORED with an info note. The
+# validated_config_hash blessing below is unnecessary in [plr] mode:
+# the values are re-read from the running config on every run.
+#
+# Keep (or add) this section only for installs that have not adopted
+# the plugin; everything below then behaves exactly as before.
+# Recovery is REFUSED until every prerequisite validates; keys mirror
 # plr-recovery's MachineConfig (see crates/plrd/src/config.rs for the
 # full table). All attestations default to false: recovery must be
 # consciously commissioned per machine.

@@ -6,14 +6,14 @@ mod common;
 
 use plr_analyzer::{ContactOutcome, DeclineReason, MatchConfidence};
 use plr_recovery::{
-    plan_recovery, select_resume_target, ExcludeObjectDef, FallbackReason, FileTemps, Phase,
-    PlanConfig, PlanInputs, PlanOutcome, RecoveryError, RecoveryPlan, RuntimeComputation,
-    TriggerSource,
+    plan_recovery, select_resume_target, ExcludeObjectDef, FallbackReason, FileTemps,
+    OvershootTerm, Phase, PlanConfig, PlanInputs, PlanOutcome, RecoveryError, RecoveryPlan,
+    RuntimeComputation, TriggerSource,
 };
 
 use common::{
-    clean_shutdown, contact_at, machine_load_cell, machine_tap, match_at, model, offset_of,
-    plain_transforms, recovery, stop_set, wal_context,
+    clean_shutdown, contact_at, machine_adxl_drag, machine_load_cell, machine_tap, match_at, model,
+    offset_of, plain_transforms, recovery, stop_set, wal_context,
 };
 
 /// The layer-1 resume line every scenario matches at.
@@ -152,6 +152,112 @@ fn normal_tap_recovery_matches_the_golden_plan() {
     }
     let golden = std::fs::read_to_string(golden_path).expect("golden file (run with PLR_BLESS=1)");
     assert_eq!(rendered, golden.replace("\r\n", "\n"));
+}
+
+#[test]
+fn adxl_drag_recovery_matches_the_golden_plan() {
+    let plan = build_plan(&machine_adxl_drag(), plain_transforms());
+
+    // Identical phase skeleton to the tap plan: the probe method
+    // changes the probe step's command and readback, nothing else.
+    let phases: Vec<Phase> = plan.steps.iter().map(|s| s.phase).collect();
+    assert_eq!(
+        phases,
+        vec![
+            Phase::IdleTimeout,
+            Phase::StepperEnable,
+            Phase::Preheat,
+            Phase::HomeXy,
+            Phase::ShiftedFrame,
+            Phase::ProbeApproach,
+            Phase::Probe,
+            Phase::TrueZDeclare,
+            Phase::FinalDeclare,
+            Phase::RestoreFrame,
+            Phase::Entry,
+            Phase::FileSelect,
+            Phase::ResumeStart,
+        ]
+    );
+
+    // Envelope: gap (0 span + 0.2 sag) + drag_z_step 0.05 + margin 0.5
+    // = 0.75 — no speed-proportional term (passes are fixed-Z).
+    assert_eq!(
+        plan.envelope.params.overshoot,
+        OvershootTerm::DragStep { drag_z_step: 0.05 }
+    );
+    assert!((plan.envelope.envelope - 0.75).abs() < 1e-12);
+    assert!((plan.envelope.shifted_declare_z - (-1.25)).abs() < 1e-12);
+
+    // The probe step emits PLR_DRAG_PROBE with every tunable as an
+    // explicit, auditable argument, and reads the plugin's drag result.
+    let probe = plan.steps_in_phase(Phase::Probe).next().expect("probe");
+    assert_eq!(
+        probe.commands,
+        vec!["PLR_DRAG_PROBE CHIP=adxl345 SPEED=20 Z_STEP=0.05 SENSITIVITY=30"]
+    );
+    assert!(probe
+        .verify
+        .iter()
+        .any(|v| v.object == "plr" && v.field == "last_drag_result.trigger_z"));
+    // The temperature interlock is method-independent.
+    assert!(plan.temp_verify_precedes_probe());
+
+    // The true-Z formula reads the drag trigger source.
+    let declare = plan
+        .steps_in_phase(Phase::TrueZDeclare)
+        .next()
+        .expect("true-z step");
+    let Some(RuntimeComputation::TrueZ(formula)) = declare.compute else {
+        panic!("true-z step must carry the formula");
+    };
+    assert_eq!(formula.trigger_source, TriggerSource::DragResult);
+
+    // Every structural invariant holds for the drag variant too.
+    assert!(plan.idle_timeout_first());
+    assert!(plan.steppers_enabled_before_motion());
+    assert!(plan.no_g28_after_shifted_declare());
+    assert_eq!(plan.m26_offset(), Some(plan.resume_offset));
+
+    // Golden snapshot of the rendered form. Regenerate with
+    // PLR_BLESS=1 after intentional changes.
+    let rendered = plan.render();
+    let golden_path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/golden/adxl_drag.txt");
+    if std::env::var("PLR_BLESS").is_ok() {
+        std::fs::write(golden_path, &rendered).expect("write golden");
+    }
+    let golden = std::fs::read_to_string(golden_path).expect("golden file (run with PLR_BLESS=1)");
+    assert_eq!(rendered, golden.replace("\r\n", "\n"));
+}
+
+#[test]
+fn drag_without_noise_floor_is_rejected_with_the_calibration_hint() {
+    let mut machine = machine_adxl_drag();
+    machine.noise_floor = None;
+    let reconstruction = recovery(stop_set(&[0.4]), wal_context(plain_transforms()));
+    let contact = contact_at(0.4);
+    let match_result = match_at(resume_offset());
+    let model = model();
+    let inputs = PlanInputs {
+        machine: &machine,
+        reconstruction: &reconstruction,
+        contact: &contact,
+        match_result: &match_result,
+        model: &model,
+        file_temps: FileTemps::default(),
+        exclude_objects: &[],
+    };
+    let Err(RecoveryError::MachineRejected { failures }) =
+        plan_recovery(&inputs, &PlanConfig::default())
+    else {
+        panic!("expected MachineRejected");
+    };
+    assert!(
+        failures
+            .iter()
+            .any(|f| f.to_string().contains("run PLR_NOISE_TEST first")),
+        "{failures:?}"
+    );
 }
 
 #[test]

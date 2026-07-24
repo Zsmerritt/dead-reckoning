@@ -12,13 +12,13 @@ use plr_analyzer::{MatchConfidence, MatchResult};
 use plr_gcode::LineIter;
 use plr_recovery::{
     compute_envelope, fmt_num, plan_recovery, sanitize_macro_text, scan_macro_text, true_z_at_halt,
-    EnvelopeParams, ExcludeObjectDef, FileTemps, GuardOutcome, Phase, PlanConfig, PlanInputs,
-    PlanOutcome, RecoveryError, RecoveryPlan, TriggerSource, TrueZFormula,
+    EnvelopeParams, ExcludeObjectDef, FileTemps, GuardOutcome, OvershootTerm, Phase, PlanConfig,
+    PlanInputs, PlanOutcome, RecoveryError, RecoveryPlan, TriggerSource, TrueZFormula,
 };
 
 use common::{
-    contact_at, machine_tap, model, offset_of, plain_transforms, recovery, stop_set, wal_context,
-    MODEL_TEXT,
+    contact_at, machine_adxl_drag, machine_tap, model, offset_of, plain_transforms, recovery,
+    stop_set, wal_context, MODEL_TEXT,
 };
 
 /// Every generated/rendered number must be finite: check that no token
@@ -74,6 +74,9 @@ struct Scenario {
     match_choice: u8,
     position_min: f64,
     exclude_count: usize,
+    /// `true` selects the ADXL drag machine; `false` the tap machine.
+    drag: bool,
+    drag_z_step: f64,
 }
 
 fn scenario_strategy() -> impl Strategy<Value = Scenario> {
@@ -102,12 +105,14 @@ fn scenario_strategy() -> impl Strategy<Value = Scenario> {
             -3.0..0.0_f64,
             0..3_usize,
         ),
+        (any::<bool>(), 0.005..=0.1_f64),
     )
         .prop_map(
             |(
                 (z_lo, hop, probe_speed, margin, sag, (px, py)),
                 (origin_z, speed_factor, extrude_factor, speed_raw, nozzle, bed),
                 (mesh, z_thermal, skew, match_choice, position_min, exclude_count),
+                (drag, drag_z_step),
             )| Scenario {
                 z_lo,
                 hop,
@@ -127,6 +132,8 @@ fn scenario_strategy() -> impl Strategy<Value = Scenario> {
                 match_choice,
                 position_min,
                 exclude_count,
+                drag,
+                drag_z_step,
             },
         )
 }
@@ -198,13 +205,18 @@ fn build_scenario(s: &Scenario) -> RecoveryPlan {
         })
         .collect();
 
-    let mut machine = machine_tap();
+    let mut machine = if s.drag {
+        machine_adxl_drag()
+    } else {
+        machine_tap()
+    };
     machine.z_position_min = Some(s.position_min);
 
     let config = PlanConfig {
         probe_speed: s.probe_speed,
         margin: s.margin,
         sag_allowance: s.sag,
+        drag_z_step: s.drag_z_step,
         ..PlanConfig::default()
     };
 
@@ -243,8 +255,9 @@ proptest! {
         margin_delta in 0.0..5.0_f64,
         position_min in -5.0..5.0_f64,
     ) {
+        let post = |probe_speed| OvershootTerm::PostTriggerTravel { probe_speed };
         let base = compute_envelope(
-            EnvelopeParams { expected_gap: gap, probe_speed: speed, margin },
+            EnvelopeParams { expected_gap: gap, overshoot: post(speed), margin },
             position_min,
         ).unwrap();
         // Exact formula.
@@ -252,26 +265,79 @@ proptest! {
         prop_assert!((base.shifted_declare_z - (position_min + base.envelope)).abs() < 1e-12);
         // Monotonic in gap (z_span growth ⇒ envelope growth).
         let wider = compute_envelope(
-            EnvelopeParams { expected_gap: gap + delta, probe_speed: speed, margin },
+            EnvelopeParams { expected_gap: gap + delta, overshoot: post(speed), margin },
             position_min,
         ).unwrap();
         prop_assert!(wider.envelope >= base.envelope);
         prop_assert!((wider.envelope - base.envelope - delta).abs() < 1e-9);
         // Monotonic in margin.
         let padded = compute_envelope(
-            EnvelopeParams { expected_gap: gap, probe_speed: speed, margin: margin + margin_delta },
+            EnvelopeParams { expected_gap: gap, overshoot: post(speed), margin: margin + margin_delta },
             position_min,
         ).unwrap();
         prop_assert!(padded.envelope >= base.envelope);
         // Monotonic in speed.
         let (lo, hi) = if speed <= speed_hi { (speed, speed_hi) } else { (speed_hi, speed) };
         let e_lo = compute_envelope(
-            EnvelopeParams { expected_gap: gap, probe_speed: lo, margin }, position_min,
+            EnvelopeParams { expected_gap: gap, overshoot: post(lo), margin }, position_min,
         ).unwrap();
         let e_hi = compute_envelope(
-            EnvelopeParams { expected_gap: gap, probe_speed: hi, margin }, position_min,
+            EnvelopeParams { expected_gap: gap, overshoot: post(hi), margin }, position_min,
         ).unwrap();
         prop_assert!(e_hi.envelope >= e_lo.envelope);
+    }
+
+    /// Drag envelope: exact (`gap + drag_z_step + margin` — no
+    /// speed-proportional term exists for fixed-Z passes), monotonic in
+    /// the staircase decrement, and hostile decrements are typed
+    /// errors.
+    #[test]
+    fn drag_envelope_is_exact_and_monotonic(
+        gap in 0.0..50.0_f64,
+        z_step in 0.001..0.5_f64,
+        step_delta in 0.0..0.5_f64,
+        margin in 0.0..5.0_f64,
+        position_min in -5.0..5.0_f64,
+    ) {
+        let drag = |drag_z_step| OvershootTerm::DragStep { drag_z_step };
+        let base = compute_envelope(
+            EnvelopeParams { expected_gap: gap, overshoot: drag(z_step), margin },
+            position_min,
+        ).unwrap();
+        prop_assert!((base.envelope - (gap + z_step + margin)).abs() < 1e-12);
+        prop_assert!((base.shifted_declare_z - (position_min + base.envelope)).abs() < 1e-12);
+        // Monotonic in the decrement: a coarser staircase needs a
+        // larger envelope.
+        let coarser = compute_envelope(
+            EnvelopeParams { expected_gap: gap, overshoot: drag(z_step + step_delta), margin },
+            position_min,
+        ).unwrap();
+        prop_assert!(coarser.envelope >= base.envelope);
+        prop_assert!((coarser.envelope - base.envelope - step_delta).abs() < 1e-9);
+    }
+
+    /// Non-positive or non-finite drag decrements are typed errors.
+    #[test]
+    fn drag_z_step_rejection_is_total(bad in prop_oneof![
+        -1000.0..=0.0_f64,
+        Just(f64::NAN),
+        Just(f64::INFINITY),
+        Just(f64::NEG_INFINITY),
+    ]) {
+        let err = compute_envelope(
+            EnvelopeParams {
+                expected_gap: 1.0,
+                overshoot: OvershootTerm::DragStep { drag_z_step: bad },
+                margin: 0.5,
+            },
+            0.0,
+        ).unwrap_err();
+        let typed = matches!(
+            err,
+            RecoveryError::NonFinite { field: "drag_z_step" }
+                | RecoveryError::InvalidPlanConfig { field: "drag_z_step" }
+        );
+        prop_assert!(typed);
     }
 
     /// The speed band is enforced for every out-of-band value.
@@ -284,7 +350,11 @@ proptest! {
         Just(f64::NEG_INFINITY),
     ]) {
         let err = compute_envelope(
-            EnvelopeParams { expected_gap: 1.0, probe_speed: speed, margin: 0.5 },
+            EnvelopeParams {
+                expected_gap: 1.0,
+                overshoot: OvershootTerm::PostTriggerTravel { probe_speed: speed },
+                margin: 0.5,
+            },
             0.0,
         ).unwrap_err();
         let out_of_range = matches!(err, RecoveryError::ProbeSpeedOutOfRange { .. });
@@ -350,6 +420,29 @@ proptest! {
             (plan.envelope.params.expected_gap - (s.hop + s.sag)).abs() < 1e-9,
             "gap must be span ({}) + sag ({})", s.hop, s.sag
         );
+
+        // The probe method drives the probe step, its readback, and
+        // the envelope's overshoot term.
+        let probe = plan.steps_in_phase(Phase::Probe).next().expect("probe step");
+        if s.drag {
+            prop_assert!(probe.commands[0].starts_with("PLR_DRAG_PROBE CHIP=adxl345 "));
+            prop_assert!(probe.verify.iter().any(
+                |v| v.object == "plr" && v.field == "last_drag_result.trigger_z"
+            ));
+            prop_assert_eq!(
+                plan.envelope.params.overshoot,
+                OvershootTerm::DragStep { drag_z_step: s.drag_z_step }
+            );
+        } else {
+            prop_assert!(probe.commands[0].starts_with("PROBE PROBE_SPEED="));
+            prop_assert!(probe.verify.iter().any(
+                |v| v.object == "probe" && v.field == "last_z_result"
+            ));
+            prop_assert_eq!(
+                plan.envelope.params.overshoot,
+                OvershootTerm::PostTriggerTravel { probe_speed: s.probe_speed }
+            );
+        }
     }
 
     /// Hostile numbers anywhere produce a typed error or a typed
@@ -418,7 +511,7 @@ proptest! {
     /// Hostile plan-config numbers are typed errors, never panics.
     #[test]
     fn hostile_config_is_rejected(
-        field in 0..4_u8,
+        field in 0..7_u8,
         bad in prop_oneof![Just(f64::NAN), Just(f64::INFINITY), Just(f64::NEG_INFINITY)],
     ) {
         let mut config = PlanConfig::default();
@@ -426,6 +519,9 @@ proptest! {
             0 => config.margin = bad,
             1 => config.sag_allowance = bad,
             2 => config.probe_speed = bad,
+            3 => config.drag_speed = bad,
+            4 => config.drag_z_step = bad,
+            5 => config.drag_sensitivity = bad,
             _ => config.idle_timeout_s = bad,
         }
         let reconstruction = recovery(stop_set(&[0.4]), wal_context(plain_transforms()));
