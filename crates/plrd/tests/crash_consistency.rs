@@ -10,8 +10,9 @@
 //! S <offset> <count>   fdatasync returned: prefix below <offset> durable
 //! ```
 //!
-//! The parent SIGKILLs the child at a random moment mid-stream, scans
-//! the segment file, and asserts the durable-prefix contract:
+//! The parent waits for the child's first durability ack, lets it run a
+//! randomized distance further, SIGKILLs it mid-stream, scans the
+//! segment file, and asserts the durable-prefix contract:
 //!
 //! 1. the scan yields a valid prefix whose end reason is an
 //!    expected-after-power-loss variant;
@@ -20,6 +21,23 @@
 //!    `count` records and `offset` bytes must survive;
 //! 3. recovered records are exactly the deterministic sequence the child
 //!    wrote (no reordering, no invention).
+//!
+//! # Why the kill point is chosen from acks, not from the clock
+//!
+//! The kill has to land while writes are in flight, *and* the child has
+//! to have acked something durable — otherwise the contract under test
+//! is vacuous. The second of those was originally assumed by sleeping a
+//! random 20–120 ms, which is a race against real `fdatasync` latency:
+//! it failed once under `cargo llvm-cov` (instrumentation slows the
+//! child several-fold) on a `/mnt/c` 9p mount (where an `fdatasync`
+//! costs tens of milliseconds), with a 25 ms draw.
+//!
+//! So the precondition is now observed rather than assumed: wait for the
+//! first ack with a generous budget, then advance a randomized number of
+//! further acks before killing. The kill is still unsynchronized with
+//! the child — which never stops writing — so it still lands mid-append,
+//! and the randomization now varies the *depth* of the tear in the log
+//! instead of a wall-clock instant.
 //!
 //! SIGKILL kills the process, not the kernel: page-cache contents
 //! survive, so this test proves the *process-death* half of the
@@ -63,9 +81,56 @@ fn pseudo_random(seed: u64) -> u64 {
         .wrapping_add(seed)
 }
 
+/// How long to wait for the child's **first** durability ack.
+///
+/// This is a precondition, not a timing assertion. The test needs the
+/// child to have acked something durable before it kills it; how long
+/// that takes is a property of the machine, not of the code under test.
+/// Assuming a fixed span is a race — it is how this test failed once
+/// under `cargo llvm-cov`, whose instrumentation slows the child
+/// several-fold, on a `/mnt/c` 9p mount where a single `fdatasync` can
+/// take tens of milliseconds. The budget below is never consumed on a
+/// healthy run, where the first ack lands in single-digit milliseconds.
+const FIRST_ACK_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How long to wait for each *further* ack while advancing to the kill
+/// point. Running out here is not a failure — the precondition is
+/// already satisfied and killing now is still mid-stream — so this only
+/// bounds how long a stalled child can delay the iteration.
+const NEXT_ACK_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Upper bound on how many acks past the first the kill may land, so the
+/// tear lands at a different depth in the log on each iteration.
+const MAX_EXTRA_ACKS: u64 = 64;
+
+/// Upper bound on the sub-cycle jitter before the kill (microseconds).
+/// Decorrelates the kill from the instant an `fdatasync` returned, so
+/// tears land mid-append as well as between appends.
+const MAX_KILL_JITTER_US: u64 = 5_000;
+
 struct Ack {
     offset: u64,
     count: u64,
+}
+
+/// Blocks until the child reports its first durability ack.
+///
+/// Fails with a diagnosis naming what was waited for and what happened
+/// instead — the two distinguishable outcomes are "the writer is stuck"
+/// and "the writer died", which need very different follow-up.
+fn await_first_ack(rx: &mpsc::Receiver<Ack>, iteration: u64) -> Ack {
+    match rx.recv_timeout(FIRST_ACK_TIMEOUT) {
+        Ok(ack) => ack,
+        Err(mpsc::RecvTimeoutError::Timeout) => panic!(
+            "iteration {iteration}: crash-writer child produced no durability ack within \
+             {FIRST_ACK_TIMEOUT:?}; it is stuck before its first fdatasync, or this \
+             environment cannot fdatasync at all"
+        ),
+        Err(mpsc::RecvTimeoutError::Disconnected) => panic!(
+            "iteration {iteration}: crash-writer child exited before acking anything \
+             durable (check its stderr above)"
+        ),
+    }
 }
 
 /// Runs one kill iteration; returns (records survived, records acked).
@@ -97,21 +162,30 @@ fn run_one(iteration: u64) -> (usize, u64) {
         }
     });
 
-    // Let the child run for a random 20–120 ms, tracking the last
-    // durability ack observed *before* the kill.
-    let deadline = Duration::from_millis(20 + pseudo_random(iteration) % 100);
-    let start = std::time::Instant::now();
-    let mut last_ack = Ack {
-        offset: 0,
-        count: 0,
-    };
-    while start.elapsed() < deadline {
-        match rx.recv_timeout(Duration::from_millis(5)) {
+    // The kill must land while writes are in flight, and the child must
+    // already have acked something durable for the contract to have any
+    // teeth. Both used to be assumed from a fixed 20–120 ms window; the
+    // ack is now *observed* and only then is the kill moment chosen.
+    let mut last_ack = await_first_ack(&rx, iteration);
+
+    // Advance a randomized distance further into the stream so the tear
+    // lands at a different depth each iteration. The child writes in an
+    // unbounded tight loop, so it is still mid-stream however far we go;
+    // exhausting the budget here is fine, not a failure.
+    let extra_acks = pseudo_random(iteration) % MAX_EXTRA_ACKS;
+    for _ in 0..extra_acks {
+        match rx.recv_timeout(NEXT_ACK_TIMEOUT) {
             Ok(ack) => last_ack = ack,
-            Err(mpsc::RecvTimeoutError::Timeout) => {}
-            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            Err(_) => break,
         }
     }
+    // Jitter inside one append/fsync cycle so the kill is not correlated
+    // with the instant an ack was printed. Purely a spread: a short
+    // sleep cannot make any assertion below fail.
+    std::thread::sleep(Duration::from_micros(
+        pseudo_random(iteration.wrapping_add(0x5a5a_5a5a)) % MAX_KILL_JITTER_US,
+    ));
+
     // SIGKILL: no cleanup, no flush — the closest a test can get to
     // yanking the process's power.
     child.kill().expect("SIGKILL child");
@@ -123,10 +197,11 @@ fn run_one(iteration: u64) -> (usize, u64) {
         last_ack = ack;
     }
 
+    // Guaranteed by `await_first_ack`; kept as an explicit statement of
+    // the precondition the assertions below rely on.
     assert!(
         last_ack.count > 0,
-        "iteration {iteration}: child produced no durability acks before the kill \
-         (deadline {deadline:?}) — test environment too slow?"
+        "iteration {iteration}: no durability ack survived to the assertions"
     );
 
     // Scan what survived.
