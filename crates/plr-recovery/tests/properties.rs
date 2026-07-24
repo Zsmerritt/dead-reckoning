@@ -11,9 +11,10 @@ use proptest::test_runner::FileFailurePersistence;
 use plr_analyzer::{MatchConfidence, MatchResult};
 use plr_gcode::LineIter;
 use plr_recovery::{
-    compute_envelope, fmt_num, plan_recovery, sanitize_macro_text, scan_macro_text, true_z_at_halt,
-    EnvelopeParams, ExcludeObjectDef, FileTemps, GuardOutcome, OvershootTerm, Phase, PlanConfig,
-    PlanInputs, PlanOutcome, RecoveryError, RecoveryPlan, TriggerSource, TrueZFormula,
+    compute_envelope, fmt_num, plan_recovery, preflight_itinerary, sanitize_macro_text,
+    scan_macro_text, true_z_at_halt, EnvelopeParams, ExcludeObjectDef, FileTemps, GuardOutcome,
+    ItineraryBounds, OvershootTerm, Phase, PlanConfig, PlanInputs, PlanOutcome, PlanRejection,
+    RecoveryError, RecoveryPlan, TriggerSource, TrueZFormula, ViolationKind,
 };
 
 use common::{
@@ -491,6 +492,86 @@ proptest! {
         prop_assert!(probe.pre_verify.iter().any(
             |v| v.object == "extruder" && v.field == "target"
         ));
+    }
+
+    /// The whole-itinerary pre-flight passes every validly-generated
+    /// plan, but a single corrupted absolute coordinate — the
+    /// probe-approach XY displaced off the contact anchor, or an
+    /// out-of-limit absolute travel move injected into a step — is
+    /// always caught as `ItineraryOutOfBounds` naming that coordinate's
+    /// axis. (The acceptance-criteria pre-flight proptest.)
+    #[test]
+    fn preflight_catches_a_single_corrupted_coordinate(
+        s in scenario_strategy(),
+        corrupt_axis in 0..2_u8,
+        mode in 0..2_u8,
+    ) {
+        let plan = build_scenario(&s);
+        // Generous, KNOWN limits so the axis checks are active; the
+        // contact point is the analyzer's selected probe site (s.point,
+        // which the approach travels to).
+        let bounds = ItineraryBounds {
+            x: Some((-10_000.0, 10_000.0)),
+            y: Some((-10_000.0, 10_000.0)),
+            z_max: Some(1.0e9),
+            position_min: plan.envelope.position_min,
+            contact_point: s.point,
+        };
+        // The clean, validly-generated plan passes.
+        prop_assert!(preflight_itinerary(&plan, &bounds).is_ok());
+
+        let axis = if corrupt_axis == 0 { 'X' } else { 'Y' };
+        let bad = 99_999.0_f64;
+        let [px, py] = s.point;
+        let mut corrupted = plan.clone();
+        let step_id;
+        if mode == 0 {
+            // Displace ONE probe-approach coordinate off the contact
+            // anchor (and beyond the limit); the other stays correct.
+            let approach = corrupted
+                .steps
+                .iter_mut()
+                .find(|st| st.phase == Phase::ProbeApproach)
+                .expect("approach step");
+            step_id = approach.id;
+            let (xw, yw) = if corrupt_axis == 0 { (bad, py) } else { (px, bad) };
+            approach.commands =
+                vec!["G90".to_owned(), format!("G0 X{} Y{} F6000", fmt_num(xw), fmt_num(yw))];
+        } else {
+            // Inject an out-of-limit ABSOLUTE travel move into the entry
+            // step (which runs in the absolute frame).
+            let entry = corrupted
+                .steps
+                .iter_mut()
+                .find(|st| st.phase == Phase::Entry)
+                .expect("entry step");
+            step_id = entry.id;
+            entry.commands.insert(0, "G90".to_owned());
+            entry
+                .commands
+                .push(format!("G1 {axis}{} F1200", fmt_num(bad)));
+        }
+
+        let Err(RecoveryError::ItineraryRejected(PlanRejection::ItineraryOutOfBounds {
+            violations,
+        })) = preflight_itinerary(&corrupted, &bounds).map_err(RecoveryError::from)
+        else {
+            prop_assert!(false, "corrupted plan must be rejected");
+            unreachable!();
+        };
+        // A violation names the corrupted axis at the corrupted step.
+        prop_assert!(
+            violations.iter().any(|v| v.axis == axis
+                && v.step_id == step_id
+                && matches!(
+                    v.kind,
+                    ViolationKind::AxisLimit | ViolationKind::ContactMismatch
+                )),
+            "violations {:?} do not name axis {} at step {}",
+            violations,
+            axis,
+            step_id
+        );
     }
 
     /// Hostile numbers anywhere produce a typed error or a typed

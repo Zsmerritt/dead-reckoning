@@ -158,6 +158,13 @@ pub fn detect(wal_dir: &Path, heartbeat_path: &Path, detected_wall_ns: u64) -> D
     // Fold the frame-invalid note into the crash class so the pending
     // announcement can surface it without the pending schema growing a
     // field (the marker is authoritative; this is display only).
+    //
+    // TODO(daemon-in-scope): this crash_class sentinel is a workaround
+    // because `announcement_commands(&PendingRecovery)` and its caller
+    // `daemon.rs::boot_detection` are out of this change's scope. When
+    // daemon.rs is next in scope, thread the frame-invalid flag through
+    // explicitly (e.g. pass it to the announcement builder) and drop
+    // both FRAME_INVALID_NOTE and this string fold.
     let mut crash_class = format!("{:?}", recovery.window.class);
     if read_frame_invalid(wal_dir).is_some() {
         crash_class.push_str("; ");

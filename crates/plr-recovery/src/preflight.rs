@@ -154,12 +154,19 @@ fn first_word(command: &str) -> String {
 /// `None` for a placeholder / missing / unparsable value.
 fn axis_literal(command: &str, axis: char) -> Option<f64> {
     let upper = axis.to_ascii_uppercase();
+    let lower = axis.to_ascii_lowercase();
     for word in command.split_whitespace().skip(1) {
-        let rest = word
+        // Skip words that are not this axis (e.g. `X20`, `F1800` when
+        // scanning for `Y`); only the requested axis letter is examined.
+        // NOTE: must `continue`, not `?` — a `?` here would abandon the
+        // scan at the first non-matching word and never reach a later
+        // coordinate (e.g. the `Y` in `G0 X.. Y..`).
+        let Some(rest) = word
             .strip_prefix(upper)
-            .or_else(|| word.strip_prefix(axis.to_ascii_lowercase()))?;
-        // Guard against matching e.g. `F1800` when axis is not `F`: the
-        // prefix stripping above only fires on the requested axis letter.
+            .or_else(|| word.strip_prefix(lower))
+        else {
+            continue;
+        };
         let value = rest.strip_prefix('=').unwrap_or(rest);
         if value.contains('{') {
             return None; // a placeholder, not a literal
@@ -392,7 +399,9 @@ fn check_absolute_travel(
 
 #[cfg(test)]
 mod tests {
-    use super::{preflight_itinerary, ItineraryBounds, PlanRejection, ViolationKind};
+    use super::{
+        preflight_itinerary, BoundsViolation, ItineraryBounds, PlanRejection, ViolationKind,
+    };
     use crate::envelope::{compute_envelope, EnvelopeParams, OvershootTerm};
     use crate::plan::{
         AbortReason, FailureAction, Phase, Predicate, RecoveryPlan, RecoveryStep, Verification,
@@ -514,6 +523,173 @@ mod tests {
     }
 
     #[test]
+    fn contact_mismatch_on_y_is_caught() {
+        let p = plan(
+            vec!["G90".to_owned(), "G0 X20 Y99 F6000".to_owned()],
+            "-1.15",
+        );
+        let Err(PlanRejection::ItineraryOutOfBounds { violations }) =
+            preflight_itinerary(&p, &bounds())
+        else {
+            panic!("expected rejection");
+        };
+        assert!(violations
+            .iter()
+            .any(|v| v.kind == ViolationKind::ContactMismatch && v.axis == 'Y'));
+    }
+
+    #[test]
+    fn contact_point_outside_the_y_limit_is_caught() {
+        // The contact point itself is beyond the Y travel limit; the
+        // approach faithfully travels to it, so only the AxisLimit fires
+        // (no ContactMismatch).
+        let mut b = bounds();
+        b.contact_point = [20.0, 250.0];
+        let p = plan(
+            vec!["G90".to_owned(), "G0 X20 Y250 F6000".to_owned()],
+            "-1.15",
+        );
+        let Err(PlanRejection::ItineraryOutOfBounds { violations }) = preflight_itinerary(&p, &b)
+        else {
+            panic!("expected rejection");
+        };
+        assert!(violations
+            .iter()
+            .any(|v| v.kind == ViolationKind::AxisLimit && v.axis == 'Y'));
+        assert!(!violations
+            .iter()
+            .any(|v| v.kind == ViolationKind::ContactMismatch));
+    }
+
+    #[test]
+    fn absolute_travel_out_of_x_y_and_z_bounds_all_caught() {
+        // A later absolute move breaches X, Y (above their maxes) and Z
+        // (below position_min and above z_max, tested separately).
+        let mut p = plan(
+            vec!["G90".to_owned(), "G0 X20 Y10 F6000".to_owned()],
+            "-1.15",
+        );
+        p.steps.push(bare_step(
+            3,
+            Phase::Entry,
+            vec![
+                "G90".to_owned(),
+                "G0 X999 Y999 F1200".to_owned(),
+                "G1 Z-99 F1200".to_owned(),
+            ],
+        ));
+        let Err(PlanRejection::ItineraryOutOfBounds { violations }) =
+            preflight_itinerary(&p, &bounds())
+        else {
+            panic!("expected rejection");
+        };
+        assert!(violations
+            .iter()
+            .any(|v| v.kind == ViolationKind::AxisLimit && v.axis == 'X' && v.step_id == 3));
+        assert!(violations
+            .iter()
+            .any(|v| v.kind == ViolationKind::AxisLimit && v.axis == 'Y' && v.step_id == 3));
+        // Z below the rail floor (position_min -2).
+        assert!(violations
+            .iter()
+            .any(|v| v.kind == ViolationKind::AxisLimit && v.axis == 'Z' && v.step_id == 3));
+
+        // And a Z above z_max is caught too.
+        let mut p2 = plan(
+            vec!["G90".to_owned(), "G0 X20 Y10 F6000".to_owned()],
+            "-1.15",
+        );
+        p2.steps.push(bare_step(
+            3,
+            Phase::Entry,
+            vec!["G90".to_owned(), "G1 Z9999 F1200".to_owned()],
+        ));
+        let Err(PlanRejection::ItineraryOutOfBounds { violations }) =
+            preflight_itinerary(&p2, &bounds())
+        else {
+            panic!("expected rejection for Z above z_max");
+        };
+        assert!(violations.iter().any(|v| v.axis == 'Z' && v.value > 9000.0));
+    }
+
+    #[test]
+    fn unknown_limits_skip_the_axis_checks() {
+        // With no XY limits and no z_max known, out-of-range XY/Z travel
+        // is NOT flagged (the "where known" contract), and only the
+        // contact anchor + shifted-frame checks run.
+        let b = ItineraryBounds {
+            x: None,
+            y: None,
+            z_max: None,
+            position_min: -2.0,
+            contact_point: [20.0, 10.0],
+        };
+        let mut p = plan(
+            vec!["G90".to_owned(), "G0 X20 Y10 F6000".to_owned()],
+            "-1.15",
+        );
+        p.steps.push(bare_step(
+            3,
+            Phase::Entry,
+            vec!["G90".to_owned(), "G0 X999 Y999 F1200".to_owned()],
+        ));
+        assert!(preflight_itinerary(&p, &b).is_ok());
+    }
+
+    #[test]
+    fn placeholder_z_in_the_shifted_frame_is_not_bounds_checked() {
+        // A shifted-frame declaration carrying a runtime placeholder is
+        // skipped by z_word (the value is not known at build time).
+        let p = plan(
+            vec!["G90".to_owned(), "G0 X20 Y10 F6000".to_owned()],
+            "{true_z}",
+        );
+        assert!(preflight_itinerary(&p, &bounds()).is_ok());
+    }
+
+    #[test]
+    fn violation_and_rejection_render_every_arm() {
+        // Cover BoundsViolation::describe over all four bound shapes and
+        // every ViolationKind tag, plus the PlanRejection Display.
+        let both = BoundsViolation {
+            step_id: 1,
+            axis: 'X',
+            value: 5.0,
+            min: Some(0.0),
+            max: Some(2.0),
+            kind: ViolationKind::AxisLimit,
+        };
+        assert!(both.describe().contains("[0, 2]"));
+        assert_eq!(ViolationKind::AxisLimit.tag(), "axis-limit");
+        assert_eq!(ViolationKind::ContactMismatch.tag(), "contact-mismatch");
+        assert_eq!(ViolationKind::ShiftedFrameZ.tag(), "shifted-frame-z");
+        let lo_only = BoundsViolation {
+            min: Some(-2.0),
+            max: None,
+            kind: ViolationKind::ShiftedFrameZ,
+            ..both.clone()
+        };
+        assert!(lo_only.describe().contains(">= -2"));
+        let hi_only = BoundsViolation {
+            min: None,
+            max: Some(9.0),
+            kind: ViolationKind::ContactMismatch,
+            ..both.clone()
+        };
+        assert!(hi_only.describe().contains("<= 9"));
+        let neither = BoundsViolation {
+            min: None,
+            max: None,
+            ..both.clone()
+        };
+        assert!(neither.describe().contains("the selected value"));
+        let rejection = PlanRejection::ItineraryOutOfBounds {
+            violations: vec![both, lo_only],
+        };
+        assert!(rejection.to_string().contains("2 violation(s)"));
+    }
+
+    #[test]
     fn relative_moves_and_placeholders_are_skipped() {
         // A relative lift (G91 Z1) and a placeholder Z must NOT trip the
         // absolute-frame Z floor.
@@ -534,6 +710,13 @@ mod tests {
             4,
             Phase::TrueZDeclare,
             vec!["SET_KINEMATIC_POSITION Z={true_z}".to_owned()],
+        ));
+        // An absolute G-code word carrying a runtime placeholder is a
+        // non-literal: axis_literal returns None and it is skipped.
+        p.steps.push(bare_step(
+            5,
+            Phase::Entry,
+            vec!["G90".to_owned(), "G1 Z={true_z} F1200".to_owned()],
         ));
         assert!(preflight_itinerary(&p, &bounds()).is_ok());
     }
