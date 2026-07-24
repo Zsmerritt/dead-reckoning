@@ -305,6 +305,12 @@ version = "0.1.0"
 [[package]]
 name = "plr-gcode"
 version = "0.1.0"
+dependencies = [
+ "proptest",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
 
 [[package]]
 name = "plr-klipper"
