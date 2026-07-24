@@ -29,12 +29,26 @@
 use serde::{Deserialize, Serialize};
 
 /// Which kind of nozzle-contact probe the machine carries.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// Not `Copy`: [`ProbeKind::AdxlDrag`] carries the accelerometer chip
+/// name, which is intrinsic probe identity (validation requires it
+/// non-empty and command-embeddable), so it lives here rather than as a
+/// separate optional field that could drift out of sync with the kind.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ProbeKind {
     /// Tap-style `[probe]` (nozzle-actuated switch).
     Tap,
     /// `[load_cell_probe]`.
     LoadCell,
+    /// ADXL drag probing: the nozzle is dragged across the part in
+    /// fixed-Z XY passes while an accelerometer listens for contact
+    /// (`PLR_DRAG_PROBE`). Requires a calibrated noise floor
+    /// ([`MachineConfig::noise_floor`], autosaved by `PLR_NOISE_TEST`).
+    AdxlDrag {
+        /// The accelerometer chip name (the `[plr]` `accel_chip`
+        /// setting), embedded verbatim in the `PLR_DRAG_PROBE` command.
+        chip: String,
+    },
 }
 
 /// One probe object from the Klipper config.
@@ -84,12 +98,26 @@ pub struct MachineConfig {
     /// minimum_z_position`), mm. `None` when neither is configured.
     pub z_position_min: Option<f64>,
     /// Hash of the running Klipper config.
+    ///
+    /// In `[plr]` mode (machine config sourced live from Klipper's
+    /// `configfile` settings) the change-detection role of this hash is
+    /// satisfied by construction — the values *are* the running config,
+    /// every run — so the daemon sets `config_hash` and
+    /// `validated_config_hash` to the same sentinel and this check
+    /// passes trivially. The field is kept so the legacy
+    /// `/etc/plrd.conf [machine]` path retains real change detection.
     pub config_hash: String,
     /// Hash of the config these prerequisites were last validated
     /// against; `None` when never validated.
     pub validated_config_hash: Option<String>,
     /// Root directory of `[virtual_sdcard]`; `None` when unknown.
     pub virtual_sdcard_root: Option<String>,
+    /// Calibrated ADXL noise floor (the representative RMS the
+    /// plugin's `PLR_NOISE_TEST` autosaves into `[plr]` as
+    /// `noise_floor_*`). Required — finite and positive — when the
+    /// probe kind is [`ProbeKind::AdxlDrag`]; ignored otherwise.
+    #[serde(default)]
+    pub noise_floor: Option<f64>,
 }
 
 /// One failed prerequisite check.
@@ -157,6 +185,25 @@ pub enum PrereqFailure {
     /// check cannot run.
     #[error("[virtual_sdcard] root directory is unknown")]
     SdcardRootUnknown,
+    /// The ADXL drag probe has no usable accelerometer chip name:
+    /// empty, or containing characters that cannot be embedded in the
+    /// `PLR_DRAG_PROBE` command line (whitespace, quotes, `=`,
+    /// control characters).
+    #[error("accel_chip {chip:?} is empty or cannot be embedded in a command")]
+    AccelChipInvalid {
+        /// The offending chip name.
+        chip: String,
+    },
+    /// ADXL drag probing without a calibrated noise floor is refused:
+    /// contact detection thresholds against it.
+    #[error("ADXL noise floor is not calibrated; run PLR_NOISE_TEST first")]
+    NoiseFloorMissing,
+    /// The calibrated noise floor is non-finite or non-positive.
+    #[error("ADXL noise floor {value} is not a finite positive number; re-run PLR_NOISE_TEST")]
+    NoiseFloorInvalid {
+        /// The rejected value.
+        value: f64,
+    },
 }
 
 /// The values recovery planning actually consumes, extracted from a
@@ -180,6 +227,21 @@ pub struct ValidatedMachine {
 pub struct MachineRejection {
     /// Every failed check.
     pub failures: Vec<PrereqFailure>,
+}
+
+/// `true` when a chip name can be embedded verbatim as a command
+/// argument (`PLR_DRAG_PROBE CHIP=<chip>`). Klipper's extended-command
+/// parameter parsing splits on whitespace and performs no unquoting, so
+/// whitespace, quotes, `=`, and control characters are all refused.
+/// Note this refuses multi-word chip names like `adxl345 hotend`
+/// (Klipper's `[adxl345 hotend]` sections) — a documented v1 limitation
+/// of the command transport, reported as a prerequisite failure rather
+/// than mangled at execution time.
+fn chip_embeddable(chip: &str) -> bool {
+    !chip.is_empty()
+        && !chip
+            .chars()
+            .any(|c| c.is_whitespace() || c.is_control() || matches!(c, '=' | '"' | '\''))
 }
 
 /// Validates every machine prerequisite (design doc §1), collecting
@@ -225,6 +287,18 @@ pub fn validate_machine(config: &MachineConfig) -> Result<ValidatedMachine, Mach
         }
         if !probe.deactivate_gcode_no_move {
             failures.push(PrereqFailure::ProbeDeactivateGcodeMoves);
+        }
+        if let ProbeKind::AdxlDrag { chip } = &probe.kind {
+            if !chip_embeddable(chip) {
+                failures.push(PrereqFailure::AccelChipInvalid { chip: chip.clone() });
+            }
+            match config.noise_floor {
+                None => failures.push(PrereqFailure::NoiseFloorMissing),
+                Some(value) if !(value.is_finite() && value > 0.0) => {
+                    failures.push(PrereqFailure::NoiseFloorInvalid { value });
+                }
+                Some(_) => {}
+            }
         }
     }
     match config.z_position_min {
@@ -295,6 +369,7 @@ mod tests {
             config_hash: "abc".to_owned(),
             validated_config_hash: Some("abc".to_owned()),
             virtual_sdcard_root: Some("/home/pi/gcodes".to_owned()),
+            noise_floor: None,
         }
     }
 
@@ -320,6 +395,7 @@ mod tests {
             config_hash: "abc".to_owned(),
             validated_config_hash: None,
             virtual_sdcard_root: None,
+            noise_floor: None,
         };
         let rejection = validate_machine(&config).unwrap_err();
         let f = &rejection.failures;
@@ -405,6 +481,99 @@ mod tests {
             rejection.failures,
             vec![PrereqFailure::PositionMinNonFinite]
         );
+    }
+
+    /// A drag config: the good config with the probe swapped for an
+    /// ADXL drag probe and a calibrated noise floor.
+    fn drag_config() -> MachineConfig {
+        let mut config = good_config();
+        config.probes = vec![ProbeConfig {
+            kind: ProbeKind::AdxlDrag {
+                chip: "adxl345".to_owned(),
+            },
+            z_offset: 0.0,
+            activate_gcode_no_move: true,
+            deactivate_gcode_no_move: true,
+        }];
+        config.noise_floor = Some(120.0);
+        config
+    }
+
+    #[test]
+    fn calibrated_drag_config_validates() {
+        let v = validate_machine(&drag_config()).unwrap();
+        assert_eq!(
+            v.probe.kind,
+            ProbeKind::AdxlDrag {
+                chip: "adxl345".to_owned()
+            }
+        );
+    }
+
+    #[test]
+    fn drag_without_noise_floor_demands_plr_noise_test() {
+        let mut config = drag_config();
+        config.noise_floor = None;
+        let rejection = validate_machine(&config).unwrap_err();
+        assert_eq!(rejection.failures, vec![PrereqFailure::NoiseFloorMissing]);
+        assert!(
+            rejection.failures[0]
+                .to_string()
+                .contains("run PLR_NOISE_TEST first"),
+            "{}",
+            rejection.failures[0]
+        );
+    }
+
+    #[test]
+    fn drag_with_invalid_noise_floor_is_refused() {
+        for bad in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            let mut config = drag_config();
+            config.noise_floor = Some(bad);
+            let rejection = validate_machine(&config).unwrap_err();
+            assert!(
+                matches!(
+                    rejection.failures.as_slice(),
+                    [PrereqFailure::NoiseFloorInvalid { .. }]
+                ),
+                "noise floor {bad}: {rejection:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn drag_chip_must_be_embeddable() {
+        for bad in ["", "adxl345 hotend", "a=b", "a\"b", "a'b", "a\nb"] {
+            let mut config = drag_config();
+            config.probes[0].kind = ProbeKind::AdxlDrag {
+                chip: bad.to_owned(),
+            };
+            let rejection = validate_machine(&config).unwrap_err();
+            assert!(
+                rejection
+                    .failures
+                    .iter()
+                    .any(|f| matches!(f, PrereqFailure::AccelChipInvalid { .. })),
+                "chip {bad:?}: {rejection:?}"
+            );
+        }
+        // Typical chip section names pass.
+        for ok in ["adxl345", "lis2dw", "adxl345_bed"] {
+            let mut config = drag_config();
+            config.probes[0].kind = ProbeKind::AdxlDrag {
+                chip: ok.to_owned(),
+            };
+            assert!(validate_machine(&config).is_ok(), "chip {ok:?}");
+        }
+    }
+
+    #[test]
+    fn noise_floor_is_irrelevant_to_contact_probes() {
+        // A tap machine with no noise floor stays valid: the field
+        // gates only the drag method.
+        let config = good_config();
+        assert!(config.noise_floor.is_none());
+        assert!(validate_machine(&config).is_ok());
     }
 
     #[test]

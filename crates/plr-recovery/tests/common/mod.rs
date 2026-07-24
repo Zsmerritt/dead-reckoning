@@ -230,6 +230,7 @@ pub fn machine_tap() -> MachineConfig {
         config_hash: "cfg-v1".to_owned(),
         validated_config_hash: Some("cfg-v1".to_owned()),
         virtual_sdcard_root: Some("/tmp".to_owned()),
+        noise_floor: None,
     }
 }
 
@@ -242,5 +243,22 @@ pub fn machine_load_cell() -> MachineConfig {
         activate_gcode_no_move: true,
         deactivate_gcode_no_move: true,
     }];
+    machine
+}
+
+/// The Tap machine with the probe swapped for the ADXL drag method
+/// (chip `adxl345`) and a calibrated noise floor.
+pub fn machine_adxl_drag() -> MachineConfig {
+    let mut machine = machine_tap();
+    machine.probes = vec![ProbeConfig {
+        kind: ProbeKind::AdxlDrag {
+            chip: "adxl345".to_owned(),
+        },
+        // The nozzle is the stylus: there is no probe z_offset.
+        z_offset: 0.0,
+        activate_gcode_no_move: true,
+        deactivate_gcode_no_move: true,
+    }];
+    machine.noise_floor = Some(120.0);
     machine
 }

@@ -35,7 +35,7 @@ use plr_reconstruct::Reconstruction;
 use plr_wal::Context;
 use serde::{Deserialize, Serialize};
 
-use crate::envelope::{compute_envelope, Envelope, EnvelopeParams};
+use crate::envelope::{compute_envelope, Envelope, EnvelopeParams, OvershootTerm};
 use crate::error::RecoveryError;
 use crate::machine::{validate_machine, MachineConfig, ProbeKind, ValidatedMachine};
 use crate::plan::{
@@ -88,6 +88,26 @@ pub struct PlanConfig {
     pub xy_epsilon: f64,
     /// Allowed Z deviation when verifying declarations, mm.
     pub z_epsilon: f64,
+    /// ADXL drag: XY speed of each fixed-Z drag pass, mm/s. Hard band
+    /// `[1, 10]`: fast enough that dragging across extrusion lines
+    /// excites the accelerometer well above the calibrated noise
+    /// floor, slow enough that a contacting pass shears warm plastic
+    /// gently instead of gouging it. Only consulted when the probe
+    /// kind is `AdxlDrag`, but always validated (an invalid config is
+    /// invalid regardless of which branch would read it).
+    pub drag_speed: f64,
+    /// ADXL drag: Z decrement between passes, mm. Hard band
+    /// `(0, 0.1]`: this value IS the descent overshoot — the first
+    /// contacting pass sits at most `drag_z_step` below the true
+    /// surface — so it must stay at layer-height scale; and it must be
+    /// strictly positive for the staircase to make progress.
+    pub drag_z_step: f64,
+    /// ADXL drag: contact threshold as a multiple of the calibrated
+    /// noise floor. Hard band `(1, 1000]`: a multiplier at or below 1
+    /// would trigger on the noise floor itself (false contact = wrong
+    /// datum), and the upper bound rejects nonsense values that could
+    /// never trigger.
+    pub drag_sensitivity: f64,
 }
 
 impl Default for PlanConfig {
@@ -108,6 +128,9 @@ impl Default for PlanConfig {
             prime_feed: 1_800.0,
             xy_epsilon: 0.25,
             z_epsilon: 0.05,
+            drag_speed: 5.0,
+            drag_z_step: 0.05,
+            drag_sensitivity: 3.0,
         }
     }
 }
@@ -121,7 +144,7 @@ impl PlanConfig {
     /// field. The probe speed band is enforced later by
     /// [`compute_envelope`].
     pub fn validate(&self) -> Result<(), RecoveryError> {
-        let checks: [(&'static str, f64, bool); 14] = [
+        let checks: [(&'static str, f64, bool); 17] = [
             ("margin", self.margin, self.margin >= 0.0),
             (
                 "sag_allowance",
@@ -161,6 +184,23 @@ impl PlanConfig {
             ("prime_feed", self.prime_feed, self.prime_feed > 0.0),
             ("xy_epsilon", self.xy_epsilon, self.xy_epsilon > 0.0),
             ("z_epsilon", self.z_epsilon, self.z_epsilon > 0.0),
+            // Drag tunable bands: see the field docs for each bound's
+            // rationale.
+            (
+                "drag_speed",
+                self.drag_speed,
+                self.drag_speed >= 1.0 && self.drag_speed <= 10.0,
+            ),
+            (
+                "drag_z_step",
+                self.drag_z_step,
+                self.drag_z_step > 0.0 && self.drag_z_step <= 0.1,
+            ),
+            (
+                "drag_sensitivity",
+                self.drag_sensitivity,
+                self.drag_sensitivity > 1.0 && self.drag_sensitivity <= 1000.0,
+            ),
         ];
         for (field, value, in_range) in checks {
             if !value.is_finite() {
@@ -676,17 +716,38 @@ fn step_probe_approach(ctx: &Ctx<'_>) -> RecoveryStep {
 }
 
 fn step_probe(ctx: &Ctx<'_>) -> RecoveryStep {
-    let trigger_field = match ctx.formula.trigger_source {
-        TriggerSource::RawLastZResult => "last_z_result",
-        TriggerSource::BedZPlusOffset { .. } => "last_probe_position.2",
+    // Trigger readback location per probe type. The drag result lives
+    // on the plugin's own `plr` status object, not on `probe`.
+    let (trigger_object, trigger_field) = match ctx.formula.trigger_source {
+        TriggerSource::RawLastZResult => ("probe", "last_z_result"),
+        TriggerSource::BedZPlusOffset { .. } => ("probe", "last_probe_position.2"),
+        TriggerSource::DragResult => ("plr", "last_drag_result.trigger_z"),
+    };
+    // Command + summary per probe type. The drag command carries every
+    // tunable as an explicit argument so the transcript is a complete,
+    // auditable record of what the plugin was asked to do.
+    let (summary, command) = match &ctx.machine.probe.kind {
+        ProbeKind::Tap | ProbeKind::LoadCell => (
+            "single-sample probe (SAMPLES=1: the toolhead rests exactly at the halt position)",
+            format!(
+                "PROBE PROBE_SPEED={} SAMPLES=1",
+                fmt_num(ctx.cfg.probe_speed)
+            ),
+        ),
+        ProbeKind::AdxlDrag { chip } => (
+            "ADXL drag probe (bounded fixed-Z staircase; the accelerometer hears the contact)",
+            format!(
+                "PLR_DRAG_PROBE CHIP={chip} SPEED={} Z_STEP={} SENSITIVITY={}",
+                fmt_num(ctx.cfg.drag_speed),
+                fmt_num(ctx.cfg.drag_z_step),
+                fmt_num(ctx.cfg.drag_sensitivity),
+            ),
+        ),
     };
     step(
         Phase::Probe,
-        "single-sample probe (SAMPLES=1: the toolhead rests exactly at the halt position)",
-        vec![format!(
-            "PROBE PROBE_SPEED={} SAMPLES=1",
-            fmt_num(ctx.cfg.probe_speed)
-        )],
+        summary,
+        vec![command],
         vec![
             // Mandatory, daemon-enforced: no probe type has a
             // temperature interlock.
@@ -721,7 +782,7 @@ fn step_probe(ctx: &Ctx<'_>) -> RecoveryStep {
             ),
         ],
         vec![Verification::new(
-            "probe",
+            trigger_object,
             trigger_field,
             Predicate::FinitePresent,
         )],
@@ -1018,11 +1079,12 @@ fn true_z_formula(
     candidate: &ProbeCandidate,
     context: &Context,
 ) -> TrueZFormula {
-    let trigger_source = match machine.probe.kind {
+    let trigger_source = match &machine.probe.kind {
         ProbeKind::Tap => TriggerSource::RawLastZResult,
         ProbeKind::LoadCell => TriggerSource::BedZPlusOffset {
             z_offset: machine.probe.z_offset,
         },
+        ProbeKind::AdxlDrag { .. } => TriggerSource::DragResult,
     };
     TrueZFormula {
         z_prev_top: candidate.z,
@@ -1133,10 +1195,22 @@ pub fn plan_recovery(
     let file_name = top_level_file_name(&vsd.file_path, &machine.sdcard_root)?;
 
     let z_span = recovery.stop_set.z_span().ok_or(RecoveryError::NoZSpan)?;
+    // Overshoot per probe method (see `envelope` for the derivations):
+    // continuous PROBE descents overshoot by 0.15 s of drip-move travel
+    // past the trigger; the drag staircase's passes are fixed-Z, so its
+    // only overshoot is the bounded Z decrement itself.
+    let overshoot = match &machine.probe.kind {
+        ProbeKind::Tap | ProbeKind::LoadCell => OvershootTerm::PostTriggerTravel {
+            probe_speed: config.probe_speed,
+        },
+        ProbeKind::AdxlDrag { .. } => OvershootTerm::DragStep {
+            drag_z_step: config.drag_z_step,
+        },
+    };
     let envelope = compute_envelope(
         EnvelopeParams {
             expected_gap: z_span.width() + config.sag_allowance,
-            probe_speed: config.probe_speed,
+            overshoot,
             margin: config.margin,
         },
         machine.z_position_min,
@@ -1205,8 +1279,57 @@ pub fn plan_recovery(
 
 #[cfg(test)]
 mod tests {
-    use super::{top_level_file_name, validate_command_name, validate_excludes, ExcludeObjectDef};
+    use super::{
+        top_level_file_name, validate_command_name, validate_excludes, ExcludeObjectDef, PlanConfig,
+    };
     use crate::error::RecoveryError;
+
+    fn check(
+        field: &'static str,
+        set: impl Fn(&mut PlanConfig, f64),
+        ok_values: &[f64],
+        bad_values: &[f64],
+    ) {
+        for &v in ok_values {
+            let mut config = PlanConfig::default();
+            set(&mut config, v);
+            assert!(config.validate().is_ok(), "{field} = {v} must pass");
+        }
+        for &v in bad_values {
+            let mut config = PlanConfig::default();
+            set(&mut config, v);
+            assert!(
+                matches!(
+                    config.validate(),
+                    Err(RecoveryError::InvalidPlanConfig { field: f }) if f == field
+                ),
+                "{field} = {v} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn drag_tunable_bands_are_hard() {
+        assert!(PlanConfig::default().validate().is_ok());
+        check(
+            "drag_speed",
+            |c, v| c.drag_speed = v,
+            &[1.0, 5.0, 10.0],
+            &[0.99, 10.01, 0.0, -1.0],
+        );
+        check(
+            "drag_z_step",
+            |c, v| c.drag_z_step = v,
+            &[0.005, 0.05, 0.1],
+            &[0.0, -0.01, 0.101, 1.0],
+        );
+        check(
+            "drag_sensitivity",
+            |c, v| c.drag_sensitivity = v,
+            &[1.01, 3.0, 1000.0],
+            &[1.0, 0.5, -3.0, 1000.5],
+        );
+    }
 
     #[test]
     fn top_level_names_are_extracted() {

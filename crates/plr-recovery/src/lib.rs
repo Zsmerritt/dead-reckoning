@@ -52,8 +52,8 @@ pub use build::{
     PlanOutcome, ResumeTarget,
 };
 pub use envelope::{
-    compute_envelope, Envelope, EnvelopeParams, POST_TRIGGER_TRAVEL_S, PROBE_SPEED_MAX,
-    PROBE_SPEED_MIN,
+    compute_envelope, Envelope, EnvelopeParams, OvershootTerm, POST_TRIGGER_TRAVEL_S,
+    PROBE_SPEED_MAX, PROBE_SPEED_MIN,
 };
 pub use error::RecoveryError;
 pub use guard::{

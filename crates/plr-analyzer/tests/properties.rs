@@ -236,12 +236,22 @@ proptest! {
     /// radius, and within coverage tolerance of a layer-N segment.
     #[test]
     fn selector_candidates_respect_geometry(
-        prev in proptest::collection::vec(segment_strategy(), 1..6),
+        mut prev in proptest::collection::vec(segment_strategy(), 1..6),
         cover in proptest::collection::vec(segment_strategy(), 0..6),
         crash_x in 0.0f64..100.0,
         crash_y in 0.0f64..100.0,
         radius in 0.0f64..30.0,
     ) {
+        // Force UNIQUE spans on the host layer: this test identifies a
+        // candidate's host segment by span, and the random strategy can
+        // collide two segments on the same offset (found by proptest:
+        // a degenerate and a real segment shared a span, so the lookup
+        // resolved to the wrong host). Real models cannot collide —
+        // each segment comes from a distinct file line.
+        for (index, segment) in prev.iter_mut().enumerate() {
+            let start = 20_000 + index as u64;
+            segment.span = ByteSpan { start, end: start + 1 };
+        }
         let model = synth_model(prev.clone(), cover.clone(), FeatureClass::InternalInfill);
         let config = ContactConfig {
             exclusion_radius: radius,
