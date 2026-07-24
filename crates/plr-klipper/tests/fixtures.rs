@@ -325,7 +325,12 @@ fn dump_trapq_extruder_fixture() {
 /// batch — extras/motion_report.py DumpStepper (api_resp header
 /// ('interval', 'count', 'add'); _process_batch payload keys data,
 /// start_position, start_mcu_position, step_distance, first_clock,
-/// first_step_time, last_clock, last_step_time).
+/// first_step_time, last_clock, last_step_time). Rows are the signed C
+/// history fields (chelper/stepcompress.h struct pull_history_steps):
+/// the batch mixes real captured values from a Trident-class triple-Z
+/// machine — a wrapped-u32 first interval (-2136919700), forward rows,
+/// and reverse-direction rows (count -40 and -1; stepcompress.c:372
+/// negates count when stepping in reverse, as every Z lift/lower does).
 #[test]
 fn dump_stepper_fixture() {
     let mut splitter = FrameSplitter::new();
@@ -333,7 +338,7 @@ fn dump_stepper_fixture() {
     stream.extend_from_slice(br#"{"id": 4, "result": {"header": ["interval", "count", "add"]}}"#);
     stream.push(3);
     stream.extend_from_slice(
-        br#"{"params": {"data": [[146258295, 1, 0], [10000, 976, 0], [9855, 5, 187]], "start_position": 5.2, "start_mcu_position": 2080, "step_distance": 0.0025, "first_clock": 146258295000, "first_step_time": 812.546, "last_clock": 146268110855, "last_step_time": 812.600}, "q": "stepper:stepper_z"}"#,
+        br#"{"params": {"data": [[-2136919700, 1, 0], [10000, 976, 0], [9855, -40, 187], [12000, -1, 0]], "start_position": 5.2, "start_mcu_position": 2080, "step_distance": 0.0025, "first_clock": 146258295000, "first_step_time": 812.546, "last_clock": 146268110855, "last_step_time": 812.600}, "q": "stepper:stepper_z"}"#,
     );
     stream.push(3);
     let events = splitter.feed(&stream);
@@ -355,9 +360,16 @@ fn dump_stepper_fixture() {
         Inbound::Notification(n) => n.stepper_batch().unwrap(),
         other => panic!("expected notification, got {other:?}"),
     };
-    assert_eq!(batch.data.len(), 3);
+    assert_eq!(batch.data.len(), 4);
+    // Wrapped u32 interval on the first row after an idle period.
+    assert_eq!(batch.data[0].interval, -2136919700);
+    assert_eq!(batch.data[0].interval_ticks(), 2_158_047_596);
     assert_eq!(batch.data[1].count, 976);
+    // Reverse-direction rows keep their magnitude in steps().
+    assert_eq!(batch.data[2].count, -40);
+    assert_eq!(batch.data[2].steps(), 40);
     assert_eq!(batch.data[2].add, 187);
+    assert_eq!(batch.data[3].count, -1);
     assert_eq!(batch.start_mcu_position, 2080);
     assert_eq!(batch.first_clock, 146_258_295_000);
     // Cross-check against the tick conversion: 180 MHz MCU.
