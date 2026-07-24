@@ -1,0 +1,40 @@
+# Python tooling configuration for the klippy plugin (klippy_plugin/plr).
+#
+# Placement: this file lives in klippy_plugin/, not the repo root, because
+# the repo root is a Rust workspace — the Python project is self-contained
+# here, and both ruff and pytest resolve this file automatically whether
+# invoked from the repo root (as the pre-commit hook does) or from this
+# directory (as scripts/coverage-py.sh does).
+#
+# No [project] table on purpose: the plugin is never built or installed
+# with pip — it is symlinked into klippy/extras — so this file carries
+# tool configuration only.
+#
+# Python-version split (project policy):
+#   * plr/ SOURCE stays Python 3.7 syntax-compatible: it runs inside
+#     klippy, and Klipper supports 3.7+.  ruff's target-version below
+#     pins the lint floor accordingly.
+#   * DEV TOOLING (tests, ruff, pytest, coverage) has a floor of Python
+#     3.9 — requirements-dev.txt is pinned for it, and CI runs 3.9+3.12.
+
+[tool.ruff]
+line-length = 88
+# The SOURCE floor, not the dev floor: keep py37 so lint never demands or
+# tolerates syntax newer than what klippy installations may run.
+target-version = "py37"
+
+[tool.ruff.lint]
+# F pyflakes, E/W pycodestyle, B flake8-bugbear, I isort ordering.
+# Deliberately no pyupgrade (UP): it would rewrite toward syntax newer
+# than the 3.7 source floor.
+select = ["F", "E", "W", "B", "I"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["plr"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# "." puts the plr package on sys.path; "tests" lets test modules import
+# the fake_klippy harness directly.
+pythonpath = [".", "tests"]
+addopts = "-ra --strict-markers --strict-config"

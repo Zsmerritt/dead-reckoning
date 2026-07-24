@@ -24,13 +24,27 @@ the quality bar is deliberately strict and enforced by tooling — most of
 
    This sets `core.hooksPath` to `.githooks`. Every commit then runs,
    fail-fast: `cargo fmt --all --check`, clippy with `-D warnings` (full
-   workspace on Linux, `--exclude plrd` elsewhere), `cargo test`, and the
-   ≥90% line-coverage gate. If a hook fails, fix the cause — do not bypass
-   hooks.
+   workspace on Linux, `--exclude plrd` elsewhere), `cargo test`, the
+   ≥90% line-coverage gate, then the klippy-plugin gates — `ruff check`,
+   `ruff format --check`, and pytest with its own ≥90% line-coverage
+   gate over `klippy_plugin/plr`. If a hook fails, fix the cause — do
+   not bypass hooks.
 
 3. Install the coverage tool once: `cargo install cargo-llvm-cov`.
 
-4. Working on `plrd` (the Linux-only daemon)? Develop under Linux or WSL2,
+4. **Set up the python dev environment (required, one-time):**
+
+   ```sh
+   sh scripts/setup-py.sh
+   ```
+
+   This creates `.venv` at the repo root with the pinned dev deps from
+   `klippy_plugin/requirements-dev.txt` (pytest, pytest-cov, coverage,
+   ruff). The pre-commit hook *fails* — it never skips — when `.venv`
+   is missing, so this step is not optional. Needs Python ≥ 3.9 on
+   PATH; works from Git Bash on Windows and from Linux/WSL.
+
+5. Working on `plrd` (the Linux-only daemon)? Develop under Linux or WSL2,
    with the clone **inside the WSL filesystem** (not `/mnt/c` — the 9p
    mount does not give real fsync semantics, and durability code is never
    tested against fakes). `cargo test --workspace` there includes the
@@ -51,6 +65,15 @@ know what you are signing up for:
 - **Coverage**: ≥ 90% line coverage over the workspace, no exclusions
   (`scripts/coverage.sh` locally, same gate in CI). Do not lower the
   threshold; raise coverage.
+- **Python (klippy_plugin)**: the same bar, python-shaped — `ruff check`
+  (pyflakes, pycodestyle, bugbear, isort) and `ruff format --check`,
+  plus pytest with ≥ 90% line coverage over `klippy_plugin/plr`
+  (`scripts/coverage-py.sh` locally, same gate in CI on 3.9 and 3.12).
+  Dev deps are pinned exactly (`klippy_plugin/requirements-dev.txt`).
+  Version split: plugin *source* stays Python 3.7 syntax-compatible
+  (it runs inside klippy); the *dev tooling* floor is 3.9. Tests fake
+  only klippy glue (`tests/fake_klippy.py`) — never physics, timing, or
+  durability.
 - **Tests**: unit tests beside the code, property tests (proptest) and
   golden tests under `tests/`. Conventions that matter:
   - **Proptest regression persistence**: failure seeds are persisted next
@@ -80,7 +103,8 @@ know what you are signing up for:
 - CI ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) must be
   green: fmt + clippy over the full workspace and `cargo test --workspace`
   on Linux (the authority for `plrd`), `cargo test` of the default members
-  on Windows, and the ≥90% coverage gate on Linux. The pinned toolchain
+  on Windows, the ≥90% coverage gate on Linux, and the klippy-plugin
+  job (ruff + pytest with its ≥90% gate, python 3.9 and 3.12). The pinned toolchain
   comes from `rust-toolchain.toml` in CI too, so "works locally" and
   "works in CI" mean the same compiler.
 - Safety-relevant changes (anything touching `plr-recovery` plan
