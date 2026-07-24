@@ -369,6 +369,9 @@ dependencies = [
 name = "plrd"
 version = "0.1.0"
 dependencies = [
+ "plr-klipper",
+ "plr-reconstruct",
+ "plr-wal",
  "rustix",
  "serde",
  "serde_json",

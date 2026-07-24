@@ -1,0 +1,45 @@
+# plrd — dead-reckoning power-loss recovery recorder.
+#
+# Install:
+#   sudo cp target/release/plrd /usr/local/bin/plrd
+#   sudo cp deploy/plrd.conf.example /etc/plrd.conf   # then edit
+#   sudo cp deploy/plrd.service /etc/systemd/system/plrd.service
+#   sudo systemctl daemon-reload && sudo systemctl enable --now plrd
+
+[Unit]
+Description=dead-reckoning power-loss recovery recorder (plrd)
+Documentation=https://github.com/zsmerritt/dead-reckoning
+# Start after Klipper when both are enabled, but do not require it: plrd
+# records around Klipper restarts and waits for the socket on its own.
+After=klipper.service
+Wants=klipper.service
+
+[Service]
+# plrd implements the readiness protocol itself (hand-rolled sd_notify:
+# one READY=1 datagram to $NOTIFY_SOCKET; src/sdnotify.rs).
+Type=notify
+ExecStart=/usr/local/bin/plrd run --config /etc/plrd.conf
+# The recorder must always be running; every exit (including WAL I/O
+# failures, which exit nonzero) gets a prompt restart.
+Restart=always
+RestartSec=2
+# WatchdogSec is intentionally not set: the daemon's own liveness proof
+# is the 10 Hz fdatasync'd heartbeat file, which is stronger evidence
+# than a watchdog ping and is what recovery actually consumes. Add
+# WatchdogSec (plus sd_notify WATCHDOG=1 in the poll loop) only if
+# process-level supervision is wanted on top.
+
+# Hardening. The WAL directory must stay writable; everything else is
+# locked down.
+NoNewPrivileges=true
+ProtectSystem=strict
+# /var/lib/plrd is created by systemd and passed as the writable state
+# directory (matches the default wal_dir = /var/lib/plrd/wal).
+StateDirectory=plrd
+# Reading the printed g-code file (offline scan / future executor) may
+# need the user's home; the recorder itself does not write there.
+ProtectHome=read-only
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
