@@ -139,6 +139,17 @@ pub(crate) fn drive(
     // Gate 1: dry run by default. This path provably cannot send: no
     // Moonraker client is ever constructed on it.
     if !options.execute {
+        // A fresh dry run over a newly-generated plan clears any
+        // frame-invalidation marker (deliverable 5): the operator is now
+        // reviewing a fresh plan that re-establishes the frame from
+        // scratch, so a conscious re-execute is safe to re-enable.
+        if crate::detect::read_frame_invalid(&config.wal_dir).is_some() {
+            crate::detect::clear_frame_invalid(&config.wal_dir);
+            say!(
+                "recover: cleared the stale frame-invalid marker; this fresh plan re-establishes \
+                 the Z frame from scratch, so --execute is re-enabled after review."
+            );
+        }
         say!("recover: DRY RUN — nothing was sent. Re-run with --execute --confirm");
         say!("         to execute after review.");
         return EXIT_OK;
@@ -238,6 +249,22 @@ pub(crate) async fn execute_with_gates(
     gate: &mut dyn StepGate,
     out: &mut (dyn Write + Send),
 ) -> u8 {
+    // Frame-invalidation refuse gate (deliverable 5): a prior recovery
+    // aborted at/after the shifted-frame declaration left Klipper's Z
+    // frame unknown. Refuse a re-execute — for BOTH the CLI and the
+    // control socket, since both drive through here — until a fresh dry
+    // run regenerates the plan and clears the marker. Refusal connects
+    // to nothing and sends no gcode.
+    if let Some(marker) = crate::detect::read_frame_invalid(&config.wal_dir) {
+        let _ = writeln!(
+            out,
+            "recover: REFUSED — the printer's Z frame is unknown after an aborted recovery \
+             (aborted at step {} [{}]: {}). Re-run a dry run (plrd scan / plrd recover without \
+             --execute) for a fresh plan before resuming.",
+            marker.step_id, marker.phase, marker.reason
+        );
+        return EXIT_RUNTIME;
+    }
     let mut client = match MoonrakerClient::connect(&config.moonraker_url, connect_timeout).await {
         Ok(client) => client,
         Err(e) => {
@@ -302,8 +329,10 @@ pub(crate) async fn execute_with_gates(
                 out,
                 "recover: COMPLETED — {steps} steps executed and verified."
             );
-            // The pending-recovery announcement is now stale.
+            // The pending-recovery announcement is now stale, and any
+            // frame-invalidation marker is superseded by a clean resume.
             let _ = std::fs::remove_file(config.wal_dir.join(crate::detect::PENDING_FILE_NAME));
+            crate::detect::clear_frame_invalid(&config.wal_dir);
             EXIT_OK
         }
         ExecOutcome::Aborted {
@@ -311,11 +340,15 @@ pub(crate) async fn execute_with_gates(
             phase,
             reason,
             cause,
+            frame_invalid,
         } => {
             let _ = writeln!(
                 out,
                 "recover: ABORTED at step {step_id} [{phase}]: {reason} ({cause:?})"
             );
+            if frame_invalid {
+                record_frame_invalid(&config.wal_dir, step_id, &phase, &reason, out);
+            }
             let _ = writeln!(
                 out,
                 "recover: the printer was left as-is; review the transcript before retrying."
@@ -323,6 +356,42 @@ pub(crate) async fn execute_with_gates(
             EXIT_RUNTIME
         }
     }
+}
+
+/// Records the frame-invalidation marker after an abort at/after the
+/// shifted-frame declare, so a re-execute is refused until a fresh plan
+/// is generated (deliverable 5). The abort landed after a
+/// `SET_KINEMATIC_POSITION`, leaving Klipper's Z frame unknown.
+fn record_frame_invalid(
+    wal_dir: &Path,
+    step_id: u32,
+    phase: &str,
+    reason: &str,
+    out: &mut (dyn Write + Send),
+) {
+    // Wall-clock ns since the epoch (cross-platform; the Linux-only
+    // hostclock is not available here).
+    let detected_wall_ns = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX));
+    let marker = crate::detect::FrameInvalid {
+        detected_wall_ns,
+        step_id,
+        phase: phase.to_owned(),
+        reason: reason.to_owned(),
+    };
+    if let Err(e) = crate::detect::write_frame_invalid(wal_dir, &marker) {
+        let _ = writeln!(
+            out,
+            "recover: WARNING — cannot write frame-invalid marker: {e}"
+        );
+    }
+    let _ = writeln!(
+        out,
+        "recover: the printer's Z frame is now UNKNOWN — re-run a dry run \
+         (plrd scan / plrd recover without --execute) for a fresh plan before \
+         any resume; --execute is refused until then."
+    );
 }
 
 /// Gate 4 predicate (see module docs for the exact fields, cited from
@@ -698,6 +767,138 @@ mod tests {
             &mut Vec::new(),
         );
         assert_eq!(code, crate::EXIT_RUNTIME);
+    }
+
+    #[test]
+    fn abort_at_the_shifted_frame_writes_the_marker() {
+        use super::{execute_with_gates, AutoGate};
+        use plr_recovery::{
+            AbortReason, FailureAction, Phase, Predicate, RecoveryPlan, RecoveryStep, Verification,
+        };
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        // A two-step plan whose shifted-frame declare (step 2) fails its
+        // post-verify: the abort lands AT the shifted frame.
+        let plan = RecoveryPlan {
+            steps: vec![
+                RecoveryStep {
+                    id: 1,
+                    phase: Phase::IdleTimeout,
+                    summary: "idle".to_owned(),
+                    commands: vec!["SET_IDLE_TIMEOUT TIMEOUT=86400".to_owned()],
+                    pre_verify: vec![],
+                    verify: vec![],
+                    compute: None,
+                    cleanup_commands: vec![],
+                    on_failure: FailureAction::Abort {
+                        reason: AbortReason::IdleTimeoutNotApplied,
+                    },
+                },
+                RecoveryStep {
+                    id: 2,
+                    phase: Phase::ShiftedFrame,
+                    summary: "declare shifted frame".to_owned(),
+                    commands: vec!["SET_KINEMATIC_POSITION Z=-1.15".to_owned()],
+                    pre_verify: vec![],
+                    // happy_handler's toolhead.position.2 is 0.75, never
+                    // within 0.05 of -1.15 → this fails → abort at step 2.
+                    verify: vec![Verification::new(
+                        "toolhead",
+                        "position.2",
+                        Predicate::NumWithin {
+                            expected: -1.15,
+                            epsilon: 0.05,
+                        },
+                    )],
+                    compute: None,
+                    cleanup_commands: vec![],
+                    on_failure: FailureAction::Abort {
+                        reason: AbortReason::ShiftedFrameNotDeclared,
+                    },
+                },
+            ],
+            ..test_plan()
+        };
+        let fake = rt.block_on(FakeMoonraker::spawn(happy_handler));
+        let config = test_config("writeabort", &fake.url());
+        let bundle = PlanBundle {
+            plan,
+            file_path: "/g/x.gcode".to_owned(),
+            machine: machine_config(&crate::config::MachineSection::default(), true, None),
+        };
+        let opts = fast_recover(true, true, false);
+        let mut out = Vec::new();
+        let code = rt.block_on(execute_with_gates(
+            &bundle,
+            &config,
+            &opts.exec_options,
+            opts.connect_timeout,
+            &mut AutoGate,
+            &mut out,
+        ));
+        assert_eq!(code, crate::EXIT_RUNTIME);
+        let output = String::from_utf8(out).unwrap();
+        assert!(output.contains("ABORTED at step 2"), "{output}");
+        assert!(output.contains("Z frame is now UNKNOWN"), "{output}");
+        // The marker is on disk, carrying the step and reason.
+        let marker = crate::detect::read_frame_invalid(&config.wal_dir).expect("marker");
+        assert_eq!(marker.step_id, 2);
+        assert_eq!(marker.reason, "shifted-frame-not-declared");
+    }
+
+    #[test]
+    fn frame_invalid_marker_refuses_execute_and_a_dry_run_clears_it() {
+        // Round trip: a frame-invalid marker (as an aborted recovery
+        // would leave) → a re-execute is REFUSED with zero gcode → a
+        // fresh dry run clears it → execute is no longer frame-refused.
+        let config = test_config("frameinv", DEAD_URL);
+        let marker = crate::detect::FrameInvalid {
+            detected_wall_ns: 1,
+            step_id: 7,
+            phase: "shifted-frame".to_owned(),
+            reason: "shifted-frame-not-declared".to_owned(),
+        };
+        crate::detect::write_frame_invalid(&config.wal_dir, &marker).unwrap();
+
+        // Execute attempt: refused by the frame gate, before any connect
+        // (DEAD_URL is never reached), and nothing is sent.
+        let (code, output) = run_drive(
+            &plan_outcome(),
+            &config,
+            &fast_recover(true, true, false),
+            "y\n",
+        );
+        assert_eq!(code, crate::EXIT_RUNTIME, "{output}");
+        assert!(output.contains("Z frame is unknown"), "{output}");
+        assert!(output.contains("step 7"), "{output}");
+        // The marker survives the refused execute.
+        assert!(crate::detect::read_frame_invalid(&config.wal_dir).is_some());
+
+        // A fresh dry run clears the marker.
+        let (code, output) = run_drive(
+            &plan_outcome(),
+            &config,
+            &fast_recover(false, false, false),
+            "",
+        );
+        assert_eq!(code, crate::EXIT_OK, "{output}");
+        assert!(
+            output.contains("cleared the stale frame-invalid"),
+            "{output}"
+        );
+        assert!(crate::detect::read_frame_invalid(&config.wal_dir).is_none());
+
+        // Now the frame gate no longer refuses: the execute proceeds far
+        // enough to fail on the (unreachable) Moonraker connection
+        // instead of the frame refusal.
+        let (code, output) = run_drive(
+            &plan_outcome(),
+            &config,
+            &fast_recover(true, true, false),
+            "y\n",
+        );
+        assert_eq!(code, crate::EXIT_RUNTIME, "{output}");
+        assert!(!output.contains("Z frame is unknown"), "{output}");
+        assert!(output.contains("cannot reach Moonraker"), "{output}");
     }
 
     #[test]

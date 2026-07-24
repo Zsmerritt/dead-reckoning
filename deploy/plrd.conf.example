@@ -67,6 +67,26 @@ control_socket = /var/lib/plrd/plrd.sock
 #
 # Keep (or add) this section only for installs that have not adopted
 # the plugin; everything below then behaves exactly as before.
+#
+# PROBE STEP — consensus touch vs. single PROBE. In [plr] mode the probe
+# step is a consensus multi-touch (`PLR_TOUCH`): several accel-clamped
+# touches with a retract between, a sliding-window best subset, and the
+# median as the trigger Z — far more robust than one sample. Its
+# tunables live in printer.cfg's [plr] section (NOT here), each with a
+# hard band plrd re-validates:
+#   touch_samples       agreeing samples for the median   [3, 7]   (3)
+#   touch_sample_range  acceptable spread, mm             (0,0.015] (0.010)
+#                       0.015 is a HARD cap — a wider band is REFUSED,
+#                       never clamped (mirrors Cartographer's ceiling).
+#   touch_retract       retract between/after touches, mm  >= 1.0   (2.0)
+#   touch_accel         max_accel clamp around the touch   [50,1000](100)
+# The plan also clamps max_accel to touch_accel with SET_VELOCITY_LIMIT
+# before the touch and restores it after — and on any abort, so a failed
+# recovery never leaves the printer at the touch accel.
+# This LEGACY [machine] path predates the plugin, so `PLR_TOUCH` may not
+# exist on the printer: it falls back to the stock single `PROBE
+# SAMPLES=1` (no consensus, no accel clamp). Adopt [plr] for the
+# consensus touch.
 # Recovery is REFUSED until every prerequisite validates; keys mirror
 # plr-recovery's MachineConfig (see crates/plrd/src/config.rs for the
 # full table). All attestations default to false: recovery must be

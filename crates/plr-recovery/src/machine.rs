@@ -70,6 +70,24 @@ pub struct ProbeConfig {
     pub deactivate_gcode_no_move: bool,
 }
 
+/// Known travel limits of the printer's axes, used by the
+/// whole-itinerary pre-flight ([`crate::preflight`]) to reject a plan
+/// that would command a coordinate outside the machine. Every field is
+/// optional: the legacy `/etc/plrd.conf [machine]` path knows none of
+/// them (its checks are skipped — "where known"), while the `[plr]`
+/// live-config path reads them from the Klipper stepper sections. `x`
+/// and `y` are `(min, max)` pairs; `z_max` complements the Z rail's
+/// `position_min` (already carried separately as the envelope anchor).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+pub struct AxisLimits {
+    /// `(position_min, position_max)` of the X axis, mm.
+    pub x: Option<(f64, f64)>,
+    /// `(position_min, position_max)` of the Y axis, mm.
+    pub y: Option<(f64, f64)>,
+    /// The Z rail's `position_max`, mm.
+    pub z_max: Option<f64>,
+}
+
 /// One Z stepper and the MCU its step pin lives on.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ZStepper {
@@ -132,6 +150,12 @@ pub struct MachineConfig {
     /// the operator re-runs `PLR_NOISE_TEST`).
     #[serde(default)]
     pub noise_floor_speed: Option<f64>,
+    /// Known axis travel limits for the whole-itinerary pre-flight
+    /// ([`crate::preflight`]). Default (all `None`) is the honest
+    /// "unknown" the legacy path carries; the `[plr]` path fills in what
+    /// the Klipper stepper sections expose.
+    #[serde(default)]
+    pub axis_limits: AxisLimits,
 }
 
 /// One failed prerequisite check.
@@ -237,6 +261,9 @@ pub struct ValidatedMachine {
     pub z_stepper_names: Vec<String>,
     /// Root directory of `[virtual_sdcard]`.
     pub sdcard_root: String,
+    /// Known axis travel limits (carried through for the
+    /// whole-itinerary pre-flight; all `None` when unknown).
+    pub axis_limits: AxisLimits,
 }
 
 /// All prerequisite failures of one validation pass.
@@ -366,6 +393,7 @@ pub fn validate_machine(config: &MachineConfig) -> Result<ValidatedMachine, Mach
         z_position_min: config.z_position_min.unwrap_or(0.0),
         z_stepper_names: config.z_steppers.iter().map(|s| s.name.clone()).collect(),
         sdcard_root: config.virtual_sdcard_root.clone().unwrap_or_default(),
+        axis_limits: config.axis_limits,
     })
 }
 
@@ -402,6 +430,7 @@ mod tests {
             virtual_sdcard_root: Some("/home/pi/gcodes".to_owned()),
             noise_floor: None,
             noise_floor_speed: None,
+            axis_limits: super::AxisLimits::default(),
         }
     }
 
@@ -429,6 +458,7 @@ mod tests {
             virtual_sdcard_root: None,
             noise_floor: None,
             noise_floor_speed: None,
+            axis_limits: super::AxisLimits::default(),
         };
         let rejection = validate_machine(&config).unwrap_err();
         let f = &rejection.failures;

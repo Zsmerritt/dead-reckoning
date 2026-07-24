@@ -256,12 +256,16 @@ fn machine_inputs(
                 type_annotations,
                 config.machine.klipper_config_path.as_deref(),
             );
-            Ok((
-                machine,
-                PlanConfig::default(),
-                ContactConfig::default(),
-                true,
-            ))
+            // The legacy [machine] path predates the Klipper plugin, so
+            // the plugin's `PLR_TOUCH` command may not exist on this
+            // printer: fall back to the stock single `PROBE` (the
+            // consensus touch is a [plr]-mode feature). See
+            // `PlanConfig::legacy_single_probe`.
+            let plan_config = PlanConfig {
+                legacy_single_probe: true,
+                ..PlanConfig::default()
+            };
+            Ok((machine, plan_config, ContactConfig::default(), true))
         }
     }
 }
@@ -649,6 +653,10 @@ pub(crate) fn machine_config(
         // there is never a noise floor here.
         noise_floor: None,
         noise_floor_speed: None,
+        // The legacy /etc/plrd.conf [machine] path has no axis-limit
+        // keys, so the whole-itinerary pre-flight's limit checks are
+        // skipped for it ("where known").
+        axis_limits: plr_recovery::AxisLimits::default(),
     }
 }
 
@@ -944,14 +952,24 @@ G1 X30 Y30 E1
             output.contains("[machine] is ignored while [plr] exists"),
             "{output}"
         );
-        // Tap method: the probe step is a PROBE with the [plr] speed.
+        // Tap method in [plr] mode: the consensus PLR_TOUCH path with
+        // the [plr] tunables, wrapped by an accel clamp/restore.
         let probe = bundle
             .plan
             .steps
             .iter()
             .find(|s| s.phase == plr_recovery::Phase::Probe)
             .expect("probe step");
-        assert_eq!(probe.commands, vec!["PROBE PROBE_SPEED=1 SAMPLES=1"]);
+        assert_eq!(
+            probe.commands,
+            vec!["PLR_TOUCH SAMPLES=3 SAMPLE_RANGE=0.01 SPEED=1 RETRACT=2 TOUCH_ACCEL=100"]
+        );
+        assert!(bundle
+            .plan
+            .first_index(plr_recovery::Phase::AccelClamp)
+            .is_some());
+        assert!(bundle.plan.accel_clamp_precedes_probe());
+        assert!(bundle.plan.accel_restore_follows_probe());
         // Live-config mode: the hash blessing is satisfied by
         // construction.
         assert_eq!(bundle.machine.config_hash, crate::plrcfg::LIVE_CONFIG_HASH);

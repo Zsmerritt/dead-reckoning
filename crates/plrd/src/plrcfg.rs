@@ -80,6 +80,15 @@ pub struct PlrSettings {
     pub drag_z_step: f64,
     /// Drag contact threshold as a multiple of the noise floor.
     pub drag_sensitivity: f64,
+    /// Consensus touch: number of agreeing samples (`PLR_TOUCH SAMPLES`).
+    pub touch_samples: f64,
+    /// Consensus touch: acceptable sample spread, mm (hard cap 0.015 in
+    /// [`PlanConfig::validate`]).
+    pub touch_sample_range: f64,
+    /// Consensus touch: retract distance between/after touches, mm.
+    pub touch_retract: f64,
+    /// Consensus touch: `max_accel` clamp around the touch, mm/s².
+    pub touch_accel: f64,
     /// Contact-selection exclusion radius around the crash point, mm.
     pub exclusion_radius: f64,
     /// Entry-move feedrate, mm/min.
@@ -184,6 +193,10 @@ impl PlrSettings {
             drag_speed: opt_f64(plr, "drag_speed", d.drag_speed)?,
             drag_z_step: opt_f64(plr, "drag_z_step", d.drag_z_step)?,
             drag_sensitivity: opt_f64(plr, "drag_sensitivity", d.drag_sensitivity)?,
+            touch_samples: opt_f64(plr, "touch_samples", d.touch_samples)?,
+            touch_sample_range: opt_f64(plr, "touch_sample_range", d.touch_sample_range)?,
+            touch_retract: opt_f64(plr, "touch_retract", d.touch_retract)?,
+            touch_accel: opt_f64(plr, "touch_accel", d.touch_accel)?,
             exclusion_radius: opt_f64(plr, "exclusion_radius", 5.0)?,
             entry_feedrate: opt_f64(plr, "entry_feedrate", d.entry_feed)?,
             self_locking_z,
@@ -219,6 +232,13 @@ impl PlrSettings {
             drag_speed: self.drag_speed,
             drag_z_step: self.drag_z_step,
             drag_sensitivity: self.drag_sensitivity,
+            touch_samples: self.touch_samples,
+            touch_sample_range: self.touch_sample_range,
+            touch_retract: self.touch_retract,
+            touch_accel: self.touch_accel,
+            // [plr] mode: the plugin (and its PLR_TOUCH command) is
+            // present, so the consensus touch is used.
+            legacy_single_probe: false,
             ..PlanConfig::default()
         }
     }
@@ -253,6 +273,25 @@ fn gcode_option_empty(section: &Map<String, Value>, key: &str) -> bool {
         .get(key)
         .and_then(Value::as_str)
         .is_none_or(|s| s.trim().is_empty())
+}
+
+/// Known axis travel limits from the Klipper stepper sections; absent
+/// values leave that axis unconstrained ("where known").
+fn axis_limits_from(settings: &Map<String, Value>) -> plr_recovery::AxisLimits {
+    let section = |name: &str| settings.get(name).and_then(Value::as_object);
+    let pair = |name: &str| -> Option<(f64, f64)> {
+        let s = section(name)?;
+        let lo = s.get("position_min").and_then(Value::as_f64)?;
+        let hi = s.get("position_max").and_then(Value::as_f64)?;
+        Some((lo, hi))
+    };
+    plr_recovery::AxisLimits {
+        x: pair("stepper_x"),
+        y: pair("stepper_y"),
+        z_max: section("stepper_z")
+            .and_then(|s| s.get("position_max"))
+            .and_then(Value::as_f64),
+    }
 }
 
 /// One probe-ish config section mapped onto [`ProbeConfig`].
@@ -321,6 +360,10 @@ pub fn machine_from_settings(
                 .and_then(|s| s.get("minimum_z_position"))
                 .and_then(Value::as_f64)
         });
+
+    // Known axis travel limits for the whole-itinerary pre-flight
+    // (plr_recovery::preflight), read from the Klipper stepper sections.
+    let axis_limits = axis_limits_from(settings);
 
     // Probes, per the [plr] probe_method (authoritative — see below).
     let probes = match plr.probe_method.as_str() {
@@ -391,6 +434,7 @@ pub fn machine_from_settings(
         virtual_sdcard_root,
         noise_floor: plr.representative_noise_floor(),
         noise_floor_speed: plr.noise_floor_speed,
+        axis_limits,
     };
     (machine, notes)
 }
@@ -896,6 +940,85 @@ pub(crate) mod tests {
         assert!(PlrSettings::parse(&section)
             .unwrap_err()
             .contains("probe_method is missing"));
+    }
+
+    #[test]
+    fn touch_tunables_parse_and_carry_into_plan_config() {
+        let (_, plr) = parse_fixture(&[
+            ("touch_samples", json!(5.0)),
+            ("touch_sample_range", json!(0.012)),
+            ("touch_retract", json!(3.0)),
+            ("touch_accel", json!(250.0)),
+        ]);
+        assert!((plr.touch_samples - 5.0).abs() < 1e-12);
+        assert!((plr.touch_sample_range - 0.012).abs() < 1e-12);
+        assert!((plr.touch_retract - 3.0).abs() < 1e-12);
+        assert!((plr.touch_accel - 250.0).abs() < 1e-12);
+        let config = plr.plan_config();
+        assert!((config.touch_samples - 5.0).abs() < 1e-12);
+        assert!((config.touch_sample_range - 0.012).abs() < 1e-12);
+        // [plr] mode uses the consensus touch (plugin present).
+        assert!(!config.legacy_single_probe);
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn touch_defaults_apply_when_keys_absent() {
+        let (_, plr) = parse_fixture(&[]);
+        let d = plr_recovery::PlanConfig::default();
+        assert!((plr.touch_samples - d.touch_samples).abs() < 1e-12);
+        assert!((plr.touch_sample_range - d.touch_sample_range).abs() < 1e-12);
+        assert!((plr.touch_retract - d.touch_retract).abs() < 1e-12);
+        assert!((plr.touch_accel - d.touch_accel).abs() < 1e-12);
+    }
+
+    #[test]
+    fn touch_sample_range_hard_cap_is_refused_at_plan_config() {
+        // A [plr] section is parsed tolerantly (values are not clamped),
+        // but the resulting plan config REFUSES a sample range above the
+        // 0.015 hard cap (Cartographer configuration.py:248).
+        let (_, plr) = parse_fixture(&[("touch_sample_range", json!(0.02))]);
+        assert!((plr.touch_sample_range - 0.02).abs() < 1e-12);
+        let err = plr.plan_config().validate().unwrap_err();
+        assert!(
+            matches!(
+                err,
+                plr_recovery::RecoveryError::InvalidPlanConfig {
+                    field: "touch_sample_range"
+                }
+            ),
+            "{err:?}"
+        );
+        // The 0.015 boundary itself is accepted.
+        let (_, ok) = parse_fixture(&[("touch_sample_range", json!(0.015))]);
+        assert!(ok.plan_config().validate().is_ok());
+    }
+
+    #[test]
+    fn axis_limits_come_from_the_stepper_sections() {
+        // The fixture has stepper_z position_min/max but no stepper_x/y,
+        // so z_max is known and x/y are unknown ("where known").
+        let (snapshot, plr) = parse_fixture(&[]);
+        let (machine, _) = machine_from_settings(&snapshot.settings, &plr, true);
+        assert_eq!(machine.axis_limits.z_max, Some(250.0));
+        assert_eq!(machine.axis_limits.x, None);
+        assert_eq!(machine.axis_limits.y, None);
+
+        // Add stepper_x/stepper_y sections: both limit pairs appear.
+        let result = query_result(configfile_status(&[]), plr_object());
+        let mut snapshot = KlippySnapshot::from_query_result(&result).unwrap();
+        snapshot.settings.insert(
+            "stepper_x".to_owned(),
+            json!({"position_min": 0.0, "position_max": 235.0}),
+        );
+        snapshot.settings.insert(
+            "stepper_y".to_owned(),
+            json!({"position_min": -1.0, "position_max": 235.0}),
+        );
+        let plr = PlrSettings::parse(snapshot.plr_section().unwrap()).unwrap();
+        let (machine, _) = machine_from_settings(&snapshot.settings, &plr, true);
+        assert_eq!(machine.axis_limits.x, Some((0.0, 235.0)));
+        assert_eq!(machine.axis_limits.y, Some((-1.0, 235.0)));
     }
 
     #[test]

@@ -35,6 +35,19 @@ use crate::scan;
 /// Name of the pending-recovery state file inside the WAL directory.
 pub const PENDING_FILE_NAME: &str = "pending_recovery.json";
 
+/// Name of the frame-invalidation marker file inside the WAL directory.
+///
+/// A separate file (not a field of [`PendingRecovery`]) so boot-time
+/// detection can regenerate the pending state freely while this marker
+/// persists independently until a fresh dry run consciously clears it.
+pub const FRAME_INVALID_FILE_NAME: &str = "frame_invalid.json";
+
+/// Sentinel folded into [`PendingRecovery::crash_class`] and surfaced in
+/// the operator announcement when the marker is present, so the pending
+/// announcement notes the invalid frame without growing the pending
+/// schema.
+pub const FRAME_INVALID_NOTE: &str = "Z FRAME UNKNOWN";
+
 /// How many newest segments detection reads. Bounds the startup cost
 /// regardless of how many segments have accumulated; classification
 /// only needs the WAL tail (see `scan::load_merged_tail`).
@@ -69,6 +82,47 @@ pub struct PendingRecovery {
     pub crash_class: String,
 }
 
+/// The frame-invalidation marker: a recovery aborted at or after the
+/// shifted-frame declaration, so Klipper's Z frame is in an unknown
+/// state and a re-execute of the (now stale) plan is refused until a
+/// fresh plan is generated. Written by the executor's caller on such an
+/// abort, cleared by a fresh dry run (or a completed recovery).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FrameInvalid {
+    /// Wall-clock time the frame was invalidated (ns since the epoch).
+    pub detected_wall_ns: u64,
+    /// The step id the recovery aborted at.
+    pub step_id: u32,
+    /// The phase name of that step.
+    pub phase: String,
+    /// The abort reason code.
+    pub reason: String,
+}
+
+/// Path of the frame-invalidation marker in `wal_dir`.
+#[must_use]
+pub fn frame_invalid_path(wal_dir: &Path) -> std::path::PathBuf {
+    wal_dir.join(FRAME_INVALID_FILE_NAME)
+}
+
+/// Reads the frame-invalidation marker, if present and parseable.
+#[must_use]
+pub fn read_frame_invalid(wal_dir: &Path) -> Option<FrameInvalid> {
+    let text = std::fs::read_to_string(frame_invalid_path(wal_dir)).ok()?;
+    serde_json::from_str(&text).ok()
+}
+
+/// Writes the frame-invalidation marker (overwrite).
+pub fn write_frame_invalid(wal_dir: &Path, marker: &FrameInvalid) -> std::io::Result<()> {
+    let json = serde_json::to_string_pretty(marker).map_err(std::io::Error::other)?;
+    std::fs::write(frame_invalid_path(wal_dir), json)
+}
+
+/// Removes any frame-invalidation marker (idempotent).
+pub fn clear_frame_invalid(wal_dir: &Path) {
+    let _ = std::fs::remove_file(frame_invalid_path(wal_dir));
+}
+
 /// Classifies the WAL directory. Read-only; total.
 #[must_use]
 pub fn detect(wal_dir: &Path, heartbeat_path: &Path, detected_wall_ns: u64) -> Detection {
@@ -101,13 +155,28 @@ pub fn detect(wal_dir: &Path, heartbeat_path: &Path, detected_wall_ns: u64) -> D
     let percent = file_size
         .filter(|size| *size > 0)
         .map(|size| (file_position.min(size) as f64 / size as f64) * 100.0);
+    // Fold the frame-invalid note into the crash class so the pending
+    // announcement can surface it without the pending schema growing a
+    // field (the marker is authoritative; this is display only).
+    //
+    // TODO(daemon-in-scope): this crash_class sentinel is a workaround
+    // because `announcement_commands(&PendingRecovery)` and its caller
+    // `daemon.rs::boot_detection` are out of this change's scope. When
+    // daemon.rs is next in scope, thread the frame-invalid flag through
+    // explicitly (e.g. pass it to the announcement builder) and drop
+    // both FRAME_INVALID_NOTE and this string fold.
+    let mut crash_class = format!("{:?}", recovery.window.class);
+    if read_frame_invalid(wal_dir).is_some() {
+        crash_class.push_str("; ");
+        crash_class.push_str(FRAME_INVALID_NOTE);
+    }
     Detection::Pending(PendingRecovery {
         detected_wall_ns,
         file,
         file_position,
         file_size,
         percent,
-        crash_class: format!("{:?}", recovery.window.class),
+        crash_class,
     })
 }
 
@@ -136,8 +205,16 @@ pub fn announcement_commands(pending: &PendingRecovery) -> (String, String) {
     let progress = pending
         .percent
         .map_or(String::new(), |p| format!(", ~{p:.0}% complete"));
+    // A prior recovery aborted after declaring the shifted frame: the
+    // announcement warns the operator the Z frame is unknown and a fresh
+    // dry run is required before resuming.
+    let frame_note = if pending.crash_class.contains(FRAME_INVALID_NOTE) {
+        "; Z frame is UNKNOWN after an aborted recovery — re-run a dry run (plrd scan / plrd recover) for a fresh plan before resuming"
+    } else {
+        ""
+    };
     let message =
-        format!("dead-reckoning: unfinished print '{name}' detected{progress}; run 'plrd recover' to inspect/resume");
+        format!("dead-reckoning: unfinished print '{name}' detected{progress}; run 'plrd recover' to inspect/resume{frame_note}");
     (
         format!("RESPOND PREFIX=dead-reckoning MSG=\"{message}\""),
         format!("M117 {message}"),
@@ -302,6 +379,62 @@ mod tests {
         };
         assert_eq!(pending.file_size, None);
         assert_eq!(pending.percent, None);
+    }
+
+    #[test]
+    fn frame_invalid_marker_round_trips_and_is_noted_in_the_announcement() {
+        use super::{
+            clear_frame_invalid, read_frame_invalid, write_frame_invalid, FrameInvalid,
+            FRAME_INVALID_NOTE,
+        };
+        let dir = temp_dir("frameinv");
+        let gcode_path = dir.join("part.gcode");
+        std::fs::write(&gcode_path, vec![b'G'; 2_000]).unwrap();
+        write_wal(
+            &dir,
+            &[
+                WalRecord::Heartbeat(heartbeat(1_000_000_000, 42.0)),
+                WalRecord::Context(context(1_000_000_000, gcode_path.to_str().unwrap(), 500)),
+            ],
+        );
+        // No marker: detection is a plain pending, no frame note.
+        let Detection::Pending(pending) = detect(&dir, &dir.join("hb"), 1) else {
+            panic!("expected pending");
+        };
+        assert!(!pending.crash_class.contains(FRAME_INVALID_NOTE));
+        let (primary, _) = announcement_commands(&pending);
+        assert!(!primary.contains("Z frame is UNKNOWN"), "{primary}");
+
+        // Write a marker: detection folds the note into the crash class,
+        // and the announcement warns about the unknown frame.
+        let marker = FrameInvalid {
+            detected_wall_ns: 9,
+            step_id: 7,
+            phase: "shifted-frame".to_owned(),
+            reason: "shifted-frame-not-declared".to_owned(),
+        };
+        write_frame_invalid(&dir, &marker).unwrap();
+        assert_eq!(read_frame_invalid(&dir).unwrap(), marker);
+        let Detection::Pending(pending) = detect(&dir, &dir.join("hb"), 1) else {
+            panic!("expected pending");
+        };
+        assert!(
+            pending.crash_class.contains(FRAME_INVALID_NOTE),
+            "{}",
+            pending.crash_class
+        );
+        let (primary, fallback) = announcement_commands(&pending);
+        assert!(primary.contains("Z frame is UNKNOWN"), "{primary}");
+        assert!(fallback.contains("Z frame is UNKNOWN"), "{fallback}");
+
+        // Clearing removes it; detection returns to a plain pending.
+        clear_frame_invalid(&dir);
+        assert!(read_frame_invalid(&dir).is_none());
+        clear_frame_invalid(&dir); // idempotent
+        let Detection::Pending(pending) = detect(&dir, &dir.join("hb"), 1) else {
+            panic!("expected pending");
+        };
+        assert!(!pending.crash_class.contains(FRAME_INVALID_NOTE));
     }
 
     #[test]

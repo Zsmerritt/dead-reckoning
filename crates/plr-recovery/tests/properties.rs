@@ -11,9 +11,10 @@ use proptest::test_runner::FileFailurePersistence;
 use plr_analyzer::{MatchConfidence, MatchResult};
 use plr_gcode::LineIter;
 use plr_recovery::{
-    compute_envelope, fmt_num, plan_recovery, sanitize_macro_text, scan_macro_text, true_z_at_halt,
-    EnvelopeParams, ExcludeObjectDef, FileTemps, GuardOutcome, OvershootTerm, Phase, PlanConfig,
-    PlanInputs, PlanOutcome, RecoveryError, RecoveryPlan, TriggerSource, TrueZFormula,
+    compute_envelope, fmt_num, plan_recovery, preflight_itinerary, sanitize_macro_text,
+    scan_macro_text, true_z_at_halt, EnvelopeParams, ExcludeObjectDef, FileTemps, GuardOutcome,
+    ItineraryBounds, OvershootTerm, Phase, PlanConfig, PlanInputs, PlanOutcome, PlanRejection,
+    RecoveryError, RecoveryPlan, TriggerSource, TrueZFormula, ViolationKind,
 };
 
 use common::{
@@ -405,6 +406,17 @@ proptest! {
         prop_assert!(plan.probe_step_precedes_mesh_load());
         prop_assert!(plan.mesh_load_precedes_final_declare());
         prop_assert!(plan.no_g28_after_shifted_declare());
+        // Accel clamp precedes the probe, restore follows on success,
+        // and the clamp declares an abort cleanup — for every valid
+        // plan (vacuously so on the drag path, which has no clamp).
+        prop_assert!(plan.accel_clamp_precedes_probe());
+        prop_assert!(plan.accel_restore_follows_probe());
+        prop_assert!(plan.accel_clamp_declares_cleanup());
+        // The accel-clamp steps exist exactly on the consensus-touch
+        // (tap/load-cell, non-legacy) path: present for tap, absent for
+        // drag.
+        prop_assert_eq!(plan.first_index(Phase::AccelClamp).is_some(), !s.drag);
+        prop_assert_eq!(plan.first_index(Phase::AccelRestore).is_some(), !s.drag);
 
         // z_thermal step present exactly when the module is configured.
         prop_assert_eq!(
@@ -464,15 +476,102 @@ proptest! {
                 OvershootTerm::DragStep { drag_z_step: s.drag_z_step }
             );
         } else {
-            prop_assert!(probe.commands[0].starts_with("PROBE PROBE_SPEED="));
+            // Tap consensus path: PLR_TOUCH, reading the consensus
+            // median off the plr status object.
+            prop_assert!(probe.commands[0].starts_with("PLR_TOUCH SAMPLES="));
             prop_assert!(probe.verify.iter().any(
-                |v| v.object == "probe" && v.field == "last_z_result"
+                |v| v.object == "plr" && v.field == "last_touch_result.median_z"
             ));
             prop_assert_eq!(
                 plan.envelope.params.overshoot,
                 OvershootTerm::PostTriggerTravel { probe_speed: s.probe_speed }
             );
         }
+        // The extruder-target temperature interlock is on every probe
+        // step (method-independent).
+        prop_assert!(probe.pre_verify.iter().any(
+            |v| v.object == "extruder" && v.field == "target"
+        ));
+    }
+
+    /// The whole-itinerary pre-flight passes every validly-generated
+    /// plan, but a single corrupted absolute coordinate — the
+    /// probe-approach XY displaced off the contact anchor, or an
+    /// out-of-limit absolute travel move injected into a step — is
+    /// always caught as `ItineraryOutOfBounds` naming that coordinate's
+    /// axis. (The acceptance-criteria pre-flight proptest.)
+    #[test]
+    fn preflight_catches_a_single_corrupted_coordinate(
+        s in scenario_strategy(),
+        corrupt_axis in 0..2_u8,
+        mode in 0..2_u8,
+    ) {
+        let plan = build_scenario(&s);
+        // Generous, KNOWN limits so the axis checks are active; the
+        // contact point is the analyzer's selected probe site (s.point,
+        // which the approach travels to).
+        let bounds = ItineraryBounds {
+            x: Some((-10_000.0, 10_000.0)),
+            y: Some((-10_000.0, 10_000.0)),
+            z_max: Some(1.0e9),
+            position_min: plan.envelope.position_min,
+            contact_point: s.point,
+        };
+        // The clean, validly-generated plan passes.
+        prop_assert!(preflight_itinerary(&plan, &bounds).is_ok());
+
+        let axis = if corrupt_axis == 0 { 'X' } else { 'Y' };
+        let bad = 99_999.0_f64;
+        let [px, py] = s.point;
+        let mut corrupted = plan.clone();
+        let step_id;
+        if mode == 0 {
+            // Displace ONE probe-approach coordinate off the contact
+            // anchor (and beyond the limit); the other stays correct.
+            let approach = corrupted
+                .steps
+                .iter_mut()
+                .find(|st| st.phase == Phase::ProbeApproach)
+                .expect("approach step");
+            step_id = approach.id;
+            let (xw, yw) = if corrupt_axis == 0 { (bad, py) } else { (px, bad) };
+            approach.commands =
+                vec!["G90".to_owned(), format!("G0 X{} Y{} F6000", fmt_num(xw), fmt_num(yw))];
+        } else {
+            // Inject an out-of-limit ABSOLUTE travel move into the entry
+            // step (which runs in the absolute frame).
+            let entry = corrupted
+                .steps
+                .iter_mut()
+                .find(|st| st.phase == Phase::Entry)
+                .expect("entry step");
+            step_id = entry.id;
+            entry.commands.insert(0, "G90".to_owned());
+            entry
+                .commands
+                .push(format!("G1 {axis}{} F1200", fmt_num(bad)));
+        }
+
+        let Err(RecoveryError::ItineraryRejected(PlanRejection::ItineraryOutOfBounds {
+            violations,
+        })) = preflight_itinerary(&corrupted, &bounds).map_err(RecoveryError::from)
+        else {
+            prop_assert!(false, "corrupted plan must be rejected");
+            unreachable!();
+        };
+        // A violation names the corrupted axis at the corrupted step.
+        prop_assert!(
+            violations.iter().any(|v| v.axis == axis
+                && v.step_id == step_id
+                && matches!(
+                    v.kind,
+                    ViolationKind::AxisLimit | ViolationKind::ContactMismatch
+                )),
+            "violations {:?} do not name axis {} at step {}",
+            violations,
+            axis,
+            step_id
+        );
     }
 
     /// Hostile numbers anywhere produce a typed error or a typed

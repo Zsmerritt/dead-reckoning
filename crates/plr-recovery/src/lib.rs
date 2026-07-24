@@ -45,6 +45,7 @@ pub mod error;
 pub mod guard;
 pub mod machine;
 pub mod plan;
+pub mod preflight;
 pub mod preheat;
 
 pub use build::{
@@ -60,12 +61,15 @@ pub use guard::{
     sanitize_macro_text, scan_macro_text, GuardHit, GuardOutcome, GuardScan, GUARDED_COMMANDS,
 };
 pub use machine::{
-    validate_machine, MachineConfig, MachineRejection, PrereqFailure, ProbeConfig, ProbeKind,
-    ValidatedMachine, ZStepper,
+    validate_machine, AxisLimits, MachineConfig, MachineRejection, PrereqFailure, ProbeConfig,
+    ProbeKind, ValidatedMachine, ZStepper,
 };
 pub use plan::{
     fmt_num, true_z_at_halt, AbortReason, FailureAction, Phase, PlanWarning, Predicate,
     RecoveryPlan, RecoveryStep, RuntimeComputation, TriggerSource, TrueZFormula, Verification,
-    TRUE_Z_PLACEHOLDER,
+    RESTORE_ACCEL_PLACEHOLDER, TRUE_Z_PLACEHOLDER,
+};
+pub use preflight::{
+    preflight_itinerary, BoundsViolation, ItineraryBounds, PlanRejection, ViolationKind,
 };
 pub use preheat::{derive_preheat, scan_file_temps, FileTemps, PreheatTargets};

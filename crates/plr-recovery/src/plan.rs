@@ -36,6 +36,15 @@ use crate::error::RecoveryError;
 /// value (see the module docs).
 pub const TRUE_Z_PLACEHOLDER: &str = "{true_z}";
 
+/// The placeholder substituted by the daemon with the machine's
+/// pre-clamp `toolhead.max_accel`, recorded by the
+/// [`Phase::AccelClamp`] step's [`RuntimeComputation::RecordMaxAccel`]
+/// (see the accel-clamp discussion on [`RuntimeComputation`]). It
+/// appears only in the [`Phase::AccelRestore`] step's command and in
+/// the accel-clamp step's [`RecoveryStep::cleanup_commands`]; the daemon
+/// substitutes the recorded value it captured before clamping.
+pub const RESTORE_ACCEL_PLACEHOLDER: &str = "{restore_accel}";
+
 /// Which §8 phase a step belongs to. The builder emits phases in
 /// exactly this declaration order; the ordering invariants
 /// ([`RecoveryPlan::idle_timeout_first`] and friends) verify it.
@@ -56,8 +65,21 @@ pub enum Phase {
     ShiftedFrame,
     /// §8.5b — XY travel to the selected contact point.
     ProbeApproach,
-    /// §8.5c — the single-sample probe.
+    /// §8.5b′ — clamp `toolhead.max_accel` to the touch accel around the
+    /// consensus-touch phase (Cartographer `touch_mode.py:262-274`
+    /// clamps `max_accel` before `z_probing_move` and restores it in a
+    /// `finally`). Emitted only for the consensus `PLR_TOUCH` path
+    /// (see [`crate::build`]); records the pre-clamp accel so the
+    /// restore step and the abort cleanup can put it back.
+    AccelClamp,
+    /// §8.5c — the probe (consensus `PLR_TOUCH`, or a single `PROBE`
+    /// on the legacy/load-cell path, or the ADXL drag staircase).
     Probe,
+    /// §8.5c′ — restore the pre-clamp `max_accel` on the success path
+    /// (the abort path restores via the accel-clamp step's
+    /// [`RecoveryStep::cleanup_commands`]). Present iff [`AccelClamp`]
+    /// is.
+    AccelRestore,
     /// §8.6 — true-Z arithmetic and kinematic re-declaration.
     TrueZDeclare,
     /// §8.7 — load the bed-mesh profile (probe already done).
@@ -86,7 +108,9 @@ impl Phase {
             Phase::TransformFreeze => "transform-freeze",
             Phase::ShiftedFrame => "shifted-frame",
             Phase::ProbeApproach => "probe-approach",
+            Phase::AccelClamp => "accel-clamp",
             Phase::Probe => "probe",
+            Phase::AccelRestore => "accel-restore",
             Phase::TrueZDeclare => "true-z-declare",
             Phase::MeshLoad => "mesh-load",
             Phase::FinalDeclare => "final-declare",
@@ -112,6 +136,16 @@ pub enum Predicate {
     NumAtLeast {
         /// Inclusive lower bound.
         min: f64,
+    },
+    /// Numeric field at most `max`. Used both for the consensus-touch
+    /// sample-range gate (`plr.last_touch_result.range` ≤
+    /// `touch_sample_range`) and the extruder-**target** temperature
+    /// interlock (`extruder.target` ≤ the probe band max — the
+    /// `max(current, target)` guard from Cartographer
+    /// `touch_mode.py:299-303`).
+    NumAtMost {
+        /// Inclusive upper bound.
+        max: f64,
     },
     /// Temperature in `[min, max]` °C (polled until it holds).
     TempWithin {
@@ -158,6 +192,7 @@ impl Predicate {
                 format!("within {} of {}", fmt_num(*epsilon), fmt_num(*expected))
             }
             Predicate::NumAtLeast { min } => format!(">= {}", fmt_num(*min)),
+            Predicate::NumAtMost { max } => format!("<= {}", fmt_num(*max)),
             Predicate::TempWithin { min, max } => {
                 format!("in [{}, {}] C", fmt_num(*min), fmt_num(*max))
             }
@@ -168,7 +203,7 @@ impl Predicate {
             Predicate::FinitePresent => "present and finite".to_owned(),
             Predicate::NonEmptyMatrix => "non-empty matrix".to_owned(),
             Predicate::NumWithinComputed { epsilon } => {
-                format!("within {} of the computed true Z", fmt_num(*epsilon))
+                format!("within {} of the step's computed value", fmt_num(*epsilon))
             }
         }
     }
@@ -217,6 +252,10 @@ pub enum AbortReason {
     ShiftedFrameNotDeclared,
     /// The XY approach did not reach the contact point.
     ApproachFailed,
+    /// The `SET_VELOCITY_LIMIT` accel clamp did not take effect.
+    AccelClampFailed,
+    /// Restoring the pre-clamp `max_accel` on the success path failed.
+    AccelRestoreFailed,
     /// `PROBE` reported no trigger over the full envelope ("No trigger
     /// on probe after full movement"): the part was never touched and
     /// remains untouched beyond the envelope. Manual recovery required.
@@ -249,6 +288,8 @@ impl AbortReason {
             AbortReason::TransformFreezeFailed => "transform-freeze-failed",
             AbortReason::ShiftedFrameNotDeclared => "shifted-frame-not-declared",
             AbortReason::ApproachFailed => "approach-failed",
+            AbortReason::AccelClampFailed => "accel-clamp-failed",
+            AbortReason::AccelRestoreFailed => "accel-restore-failed",
             AbortReason::ProbeNoTrigger => "probe-no-trigger",
             AbortReason::TrueZDeclareFailed => "true-z-declare-failed",
             AbortReason::MeshLoadFailed => "mesh-load-failed",
@@ -300,6 +341,26 @@ pub enum TriggerSource {
     /// consumed like `last_z_result`. Used for
     /// [`crate::machine::ProbeKind::AdxlDrag`].
     DragResult,
+    /// Read `plr.last_touch_result.median_z` — the consensus TRIGGER Z
+    /// of the multi-touch `PLR_TOUCH` sequence, reported by the plugin's
+    /// `PLR_TOUCH` on the `plr` status object (alongside `range`,
+    /// `samples_used`, `touches`). The plugin obtains each touch through
+    /// a klippy probe session (`pull_probed_results()[-1].bed_z`), so
+    /// `median_z` is in the **`z_offset`-subtracted** bed-probing frame
+    /// (`bed_z = trigger_z − z_offset`) — exactly like
+    /// [`TriggerSource::BedZPlusOffset`]. The formula therefore adds the
+    /// configured `z_offset` back to recover the raw trigger Z, for both
+    /// Tap and load-cell machines (the plugin uses the same probe-session
+    /// convention regardless of which contact mechanism underlies it).
+    /// The consensus median replaces the old single-`PROBE` halt=trigger
+    /// reading; the plugin's retract bookkeeping leaves the toolhead
+    /// resting retracted above it when the command returns. Used for the
+    /// consensus `PLR_TOUCH` path on Tap / load-cell machines.
+    TouchResult {
+        /// The configured probe `z_offset`, mm (added back to
+        /// `median_z` to recover the raw trigger Z).
+        z_offset: f64,
+    },
 }
 
 /// The typed true-Z formula (design doc §8, step 6):
@@ -359,7 +420,10 @@ pub fn true_z_at_halt(
     }
     let trigger = match formula.trigger_source {
         TriggerSource::RawLastZResult | TriggerSource::DragResult => trigger_reading,
-        TriggerSource::BedZPlusOffset { z_offset } => {
+        // Both the load-cell `bed_z` readback and the `PLR_TOUCH`
+        // consensus median arrive in the z_offset-subtracted bed-probing
+        // frame; add the offset back to recover the raw trigger Z.
+        TriggerSource::BedZPlusOffset { z_offset } | TriggerSource::TouchResult { z_offset } => {
             if !z_offset.is_finite() {
                 return Err(RecoveryError::NonFinite { field: "z_offset" });
             }
@@ -379,6 +443,16 @@ pub enum RuntimeComputation {
     /// Evaluate [`true_z_at_halt`] and substitute the result for
     /// [`TRUE_Z_PLACEHOLDER`] in the step's commands.
     TrueZ(TrueZFormula),
+    /// Read `toolhead.max_accel` **before** the step's commands run and
+    /// record it as the value the daemon substitutes for
+    /// [`RESTORE_ACCEL_PLACEHOLDER`] — in the [`Phase::AccelRestore`]
+    /// step and in this step's [`RecoveryStep::cleanup_commands`]. The
+    /// accel-clamp step carries this so the pre-clamp accel is captured
+    /// exactly once, before `SET_VELOCITY_LIMIT` overwrites it
+    /// (Cartographer `touch_mode.py:262-274` reads `get_max_accel()`
+    /// then `set_max_accel(TOUCH_ACCEL)`). The recorded value persists
+    /// across the intervening steps in the daemon's execution state.
+    RecordMaxAccel,
 }
 
 /// One strictly ordered recovery step.
@@ -399,6 +473,19 @@ pub struct RecoveryStep {
     pub verify: Vec<Verification>,
     /// Runtime computation feeding the command placeholder, if any.
     pub compute: Option<RuntimeComputation>,
+    /// Commands the daemon runs on the ABORT path only, after the
+    /// failure and after the abort reason is fixed — the plan-level
+    /// `finally` (Cartographer wraps the accel clamp in a `try/finally`,
+    /// `touch_mode.py:270-274`). They may carry
+    /// [`RESTORE_ACCEL_PLACEHOLDER`]. The daemon registers a step's
+    /// cleanup once the step's commands have been sent (its side effect
+    /// is in force), runs the registered cleanups in reverse order on
+    /// any subsequent abort, and — crucially — a cleanup failure is
+    /// logged but never masks or replaces the original abort reason.
+    /// On the success path the explicit [`Phase::AccelRestore`] step
+    /// does the restore instead, so cleanups never double-run.
+    #[serde(default)]
+    pub cleanup_commands: Vec<String>,
     /// What to do when any predicate fails.
     pub on_failure: FailureAction,
 }
@@ -503,7 +590,7 @@ fn first_word(command: &str) -> String {
 fn is_motion_command(command: &str) -> bool {
     matches!(
         first_word(command).as_str(),
-        "G0" | "G1" | "G2" | "G3" | "G28" | "PROBE" | "FORCE_MOVE" | "PLR_DRAG_PROBE"
+        "G0" | "G1" | "G2" | "G3" | "G28" | "PROBE" | "FORCE_MOVE" | "PLR_DRAG_PROBE" | "PLR_TOUCH"
     )
 }
 
@@ -563,6 +650,52 @@ impl RecoveryPlan {
             (Some(freeze), Some(shifted)) => freeze < shifted,
             (Some(_), None) => false,
         }
+    }
+
+    /// The accel clamp (when present) precedes the probe: the touch
+    /// accel must be in force before the consensus touches run. Vacuous
+    /// when no accel-clamp step exists (drag / legacy single-`PROBE`).
+    #[must_use]
+    pub fn accel_clamp_precedes_probe(&self) -> bool {
+        match (
+            self.first_index(Phase::AccelClamp),
+            self.first_index(Phase::Probe),
+        ) {
+            (None, _) => true,
+            (Some(clamp), Some(probe)) => clamp < probe,
+            (Some(_), None) => false,
+        }
+    }
+
+    /// The success-path accel restore (when present) follows the probe,
+    /// and an accel restore exists exactly when an accel clamp does (the
+    /// clamp is never left un-restored on the success path). Vacuous
+    /// when neither step exists.
+    #[must_use]
+    pub fn accel_restore_follows_probe(&self) -> bool {
+        let clamp = self.first_index(Phase::AccelClamp);
+        let restore = self.first_index(Phase::AccelRestore);
+        if clamp.is_some() != restore.is_some() {
+            return false;
+        }
+        match (self.first_index(Phase::Probe), restore) {
+            (_, None) => true,
+            (Some(probe), Some(restore)) => probe < restore,
+            (None, Some(_)) => false,
+        }
+    }
+
+    /// The abort cleanup for the accel clamp is declared: whenever an
+    /// accel-clamp step exists it carries a non-empty
+    /// [`RecoveryStep::cleanup_commands`] restoring the accel on abort.
+    #[must_use]
+    pub fn accel_clamp_declares_cleanup(&self) -> bool {
+        self.first_index(Phase::AccelClamp).is_none_or(|i| {
+            self.steps[i]
+                .cleanup_commands
+                .iter()
+                .any(|c| c.contains(TRUE_Z_PLACEHOLDER) || c.contains(RESTORE_ACCEL_PLACEHOLDER))
+        })
     }
 
     /// §8.7: the probe happens before the mesh is loaded (the probe
@@ -700,6 +833,9 @@ impl RecoveryPlan {
                     v.field,
                     v.predicate.describe()
                 );
+            }
+            for command in &step.cleanup_commands {
+                let _ = writeln!(out, "      undo: {command}");
             }
             let FailureAction::Abort { reason } = step.on_failure;
             let _ = writeln!(out, "      fail: abort ({})", reason.code());
@@ -865,6 +1001,7 @@ mod tests {
         );
         assert!(Predicate::NumWithinComputed { epsilon: 0.05 }
             .describe()
-            .contains("computed true Z"));
+            .contains("computed value"));
+        assert_eq!(Predicate::NumAtMost { max: 0.015 }.describe(), "<= 0.015");
     }
 }
