@@ -19,7 +19,13 @@
 //!   extruder velocity/accel limits, pressure advance, and input-shaper
 //!   effects — all unmodeled, again biasing toward underestimation;
 //! * lazy flushing: the simulation horizon always ends in a full stop,
-//!   so the last few moves of the window decelerate artificially.
+//!   so the last few moves of the window decelerate artificially; the
+//!   window also *starts* from zero velocity, while the real machine
+//!   was typically mid-motion at the resume offset (overestimates the
+//!   first move's duration by up to one accel ramp);
+//! * dwell and synchronization commands (G4, M400) pass through
+//!   untimed, as do heater waits (M109/M190) — another source of
+//!   underestimation if they occur inside the window.
 //!
 //! The bias direction is the safe one for windowing: because simulated
 //! durations are generally lower bounds, a `max_duration` of 2 s covers

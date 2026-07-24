@@ -39,6 +39,30 @@
 //! decoding, rejection of non-finite parameter values, an upper bound
 //! on arc segment count, and the timing-model simplifications listed in
 //! [`sim`].
+//!
+//! # Example
+//!
+//! ```no_run
+//! use plr_gcode::{scan_z_events, simulate, GcodeState, Line, LineIter,
+//!                 SimConfig, StopReason, ZScanConfig};
+//!
+//! // Bytes read from the print file starting at the WAL's last durable
+//! // file offset (here 0 for brevity).
+//! let tail = b"G1 X10 E1 F1800\nG1 E-0.8 F2100\nG1 Z0.6 F7200\nG1 X50\n";
+//! let lines: Vec<Line> = LineIter::new(tail, 0).collect();
+//!
+//! // Forward-simulate ~2 s of motion from the WAL-reconstructed state.
+//! let mut state = GcodeState::new();
+//! let sim = simulate(&mut state, &lines, &SimConfig::default());
+//! assert_eq!(sim.stop, StopReason::EndOfInput);
+//! assert_eq!(sim.resume_offset, Some(tail.len() as u64)); // M26-safe
+//!
+//! // Exact scan of upcoming Z-touching moves (z-hop up at Z0.6).
+//! let mut zstate = GcodeState::new();
+//! let scan = scan_z_events(&mut zstate, &lines, &ZScanConfig::default());
+//! assert_eq!(scan.events.len(), 1);
+//! assert_eq!(scan.events[0].z_to, 0.6);
+//! ```
 
 pub mod arc;
 pub mod parse;
