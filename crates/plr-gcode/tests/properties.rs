@@ -4,6 +4,7 @@
 #![allow(clippy::float_cmp)] // exactness properties are intentional
 
 use proptest::prelude::*;
+use proptest::test_runner::FileFailurePersistence;
 
 use plr_gcode::{
     parse_line, plan_arc, scan_z_events, simulate, ArcPlane, ArcRequest, ByteSpan, GcodeState,
@@ -21,6 +22,19 @@ fn parse(s: &str) -> Line {
 }
 
 proptest! {
+    // Persist shrunk counterexamples to the checked-in file
+    // tests/properties.proptest-regressions. The default
+    // (SourceParallel) cannot locate lib.rs/main.rs from an
+    // integration test and only worked here via a warning-emitting
+    // fallback; WithSource pins the exact same path explicitly so
+    // regressions are reliably replayed on every run.
+    #![proptest_config(ProptestConfig {
+        failure_persistence: Some(Box::new(FileFailurePersistence::WithSource(
+            "proptest-regressions",
+        ))),
+        ..ProptestConfig::default()
+    })]
+
     /// The parser and state machine are total: no input bytes — valid,
     /// garbage, or non-UTF-8 — may panic, and spans always tile the
     /// buffer.
@@ -35,27 +49,44 @@ proptest! {
             expect = line.span.end;
             // Applying must never panic (errors are fine).
             let _ = state.apply(&line);
-            // Display must never panic either.
-            let _ = line.to_string();
+            // Serialization reaches a reparse fixpoint by the second
+            // round even for byte soup. Round 1 alone is not enough for
+            // exotic Unicode: characters whose uppercase form has a
+            // different length (U+0390 -> 3 chars, etc.) shift the
+            // index arithmetic of get_raw_command_parameters — a quirk
+            // Klipper's own Python has, faithfully replicated. Round-1
+            // output is case-stable in its command region (the name is
+            // built from the uppercased text), so its reparse takes the
+            // head-match path deterministically and is a fixpoint. For
+            // printable ASCII — all real g-code — round 1 is already
+            // stable (see serialize_reparse_stable_on_arbitrary_ascii).
+            let out1 = line.to_string();
+            let l2 = plr_gcode::parse_line(out1.as_bytes(), line.span);
+            let out2 = l2.to_string();
+            let l3 = plr_gcode::parse_line(out2.as_bytes(), line.span);
+            prop_assert_eq!(&l3.body, &l2.body, "round-2 not a fixpoint for {:?}", out1);
+            prop_assert_eq!(&out2, &l3.to_string());
         }
         prop_assert_eq!(expect, base + data.len() as u64);
     }
 
-    /// serialize/reparse converges for arbitrary input: by the second
-    /// round the representation is a fixpoint. (Exact first-round
-    /// stability cannot hold for garbage like `n0n[a`, whose residual
-    /// command name `N[` re-tokenizes as a line-number prefix; Klipper
-    /// treats both spellings as unknown-command no-ops. First-round
-    /// stability for valid lines is covered by the generated-commands
-    /// property below and by unit tests.)
+    /// serialize/reparse is a first-round fixpoint for arbitrary input:
+    /// parsing the serialized form reproduces the same body, and
+    /// serializing again reproduces the same string. This holds
+    /// universally because `Display` emits an `N0 ` line-number guard
+    /// for garbage command names that would otherwise re-tokenize as a
+    /// line number (see `needs_line_number_guard` in parse.rs). Without
+    /// the guard no fixed convergence bound exists at all: inputs like
+    /// `N0 N1 N2 ... X1` shed one `N<digits>` word per round, so the
+    /// round count scales with input length (pinned as unit
+    /// regressions in parse.rs).
     #[test]
-    fn serialize_reparse_converges_on_arbitrary_ascii(s in "[ -~]{0,80}") {
+    fn serialize_reparse_stable_on_arbitrary_ascii(s in "[ -~]{0,80}") {
         let l1 = parse(&s);
-        let l2 = parse(&l1.to_string());
-        let out2 = l2.to_string();
-        let l3 = parse(&out2);
-        prop_assert_eq!(&l3.body, &l2.body, "no fixpoint: {:?} -> {:?} -> {:?}", s, l1.to_string(), out2);
-        prop_assert_eq!(out2.clone(), l3.to_string());
+        let out1 = l1.to_string();
+        let l2 = parse(&out1);
+        prop_assert_eq!(&l2.body, &l1.body, "body changed: {:?} -> {:?}", s, out1);
+        prop_assert_eq!(out1.clone(), l2.to_string(), "string not a fixpoint for {:?}", s);
     }
 
     /// serialize/reparse stability on realistic generated command lines.
