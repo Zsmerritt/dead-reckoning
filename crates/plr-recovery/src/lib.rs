@@ -51,8 +51,8 @@ pub mod resume_file;
 
 pub use build::{
     plan_recovery, preflight_generated_file, select_resume_target, ExcludeObjectDef,
-    FallbackReason, PlanConfig, PlanInputs, PlanOutcome, ResumeTarget, PROBE_HOLD_BAND,
-    PROBE_TEMP_HEADROOM, PROBE_TEMP_MEASURED_TOLERANCE,
+    FallbackReason, PlanConfig, PlanInputs, PlanOutcome, ResumeTarget, DRAG_TEMP_FLOOR,
+    PROBE_HOLD_BAND, PROBE_TEMP_HEADROOM, PROBE_TEMP_MEASURED_TOLERANCE,
 };
 pub use envelope::{
     compute_envelope, Envelope, EnvelopeParams, OvershootTerm, POST_TRIGGER_TRAVEL_S,

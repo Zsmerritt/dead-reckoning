@@ -200,6 +200,17 @@ pub struct PlanConfig {
     /// mm. `None` keeps the elevated park Z already in effect; setting it
     /// lets an operator purge low over a defined spot instead of dropping
     /// filament from mid-air.
+    ///
+    /// **Must be `>= 0`.** This is the ONE raw operator-chosen absolute Z
+    /// in the generated file, and the file runs in the TRUE frame, where
+    /// `Z = 0` is the bed surface — so a negative value drives the nozzle
+    /// into the bed at print temperature and extrudes into it. It cannot
+    /// be validated against the Z RAIL's `position_min`, which this design
+    /// deliberately places BELOW the bed (typically −2 mm) so the
+    /// shifted-frame probe envelope has room; that check would accept
+    /// `purge_z = -1.9`. [`PlanConfig::validate`] refuses negatives
+    /// outright, and the builder warns when the value sits below the
+    /// resume Z (i.e. below the part's current top).
     pub purge_z: Option<f64>,
     /// FROZEN `[plr]` key `purge_retract` — filament retracted after the
     /// built-in purge, mm, to help break the string. Range `[0, 10]`;
@@ -288,6 +299,22 @@ pub const PROBE_TEMP_HEADROOM: f64 = 5.0;
 /// before any frame declaration, so a refusal there is a clean early
 /// abort with nothing to unwind.
 pub const PROBE_TEMP_MEASURED_TOLERANCE: f64 = 2.0;
+
+/// Refusal floor, °C, for a NONZERO [`PlanConfig::drag_nozzle_temp`].
+///
+/// A nonzero drag temperature makes the plan emit a blocking `M109`, and
+/// on a PID hotend that waits in BOTH directions — so a low target means
+/// waiting for a PASSIVE COOLDOWN. On the enclosed / heated-chamber
+/// machines this project targets, 30–60 °C is at or below chamber
+/// ambient: the nozzle can take longer than the executor's 15-minute
+/// `temp_timeout` to get there, and if ambient EXCEEDS the target it can
+/// never converge at all — every retry burns the full timeout before
+/// aborting.
+///
+/// So sub-50 °C targets are refused, and the honest way to ask for a cold
+/// drag is `drag_nozzle_temp = 0`: the documented opt-out, which emits no
+/// heat command and no wait at all.
+pub const DRAG_TEMP_FLOOR: f64 = 50.0;
 
 /// Half-width, °C, of the band the [`Phase::ProbeTempHold`] step verifies
 /// the held nozzle temperature landed inside.
@@ -560,6 +587,26 @@ impl PlanConfig {
                 headroom: PROBE_TEMP_HEADROOM,
             });
         }
+        // A nonzero target below the floor means waiting for a passive
+        // cooldown that may never converge on a heated-chamber machine
+        // (see DRAG_TEMP_FLOOR). `0` — the cold-drag opt-out — is exempt
+        // precisely because it emits no wait at all.
+        if self.drag_nozzle_temp > 0.0 && self.drag_nozzle_temp < DRAG_TEMP_FLOOR {
+            return Err(RecoveryError::DragTempBelowFloor {
+                drag_nozzle_temp: self.drag_nozzle_temp,
+                floor: DRAG_TEMP_FLOOR,
+            });
+        }
+        // purge_z is the only raw operator-chosen ABSOLUTE Z in the
+        // generated file, and that file runs in the TRUE frame where zero
+        // is the bed surface. The Z rail's position_min is NOT a usable
+        // floor here — this design puts it below the bed on purpose (see
+        // the field docs) — so negatives are refused outright.
+        if let Some(z) = self.purge_z {
+            if z.is_finite() && z < 0.0 {
+                return Err(RecoveryError::PurgeZBelowBed { purge_z: z });
+            }
+        }
         // Optional reheat park coordinates: finite when present (axis
         // bounds are checked by the whole-itinerary pre-flight).
         for (field, v) in [
@@ -726,8 +773,14 @@ pub struct PlanInputs<'a> {
     pub clean_nozzle_macro_present: bool,
     /// `true` when the configured `purge_macro` exists as a
     /// `[gcode_macro <purge_macro>]` section (only consulted when
-    /// `purge_macro` is set). When `false`, the recovery file falls back
-    /// to the built-in purge.
+    /// `purge_macro` is set).
+    ///
+    /// When `purge_macro` is set and this is `false`, planning is
+    /// **REFUSED** ([`RecoveryError::PurgeMacroMissing`]) — it does NOT
+    /// fall back to the built-in purge. See the precedence table on
+    /// [`resolve_purge`] for the full mapping and why this asymmetry with
+    /// `clean_nozzle_macro` (which degrades to asking the operator) is
+    /// deliberate.
     pub purge_macro_present: bool,
 }
 
@@ -1997,6 +2050,23 @@ pub fn plan_recovery(
             warnings.push(PlanWarning::PurgeInsidePart {
                 point,
                 configured: config.purge_x.is_some() || config.purge_y.is_some(),
+                // Carried so the warning can distinguish "drops filament
+                // from the parked height" from "DESCENDS into the part".
+                purge_z: config.purge_z,
+            });
+        }
+    }
+    // A purge Z below the resume Z is below the top of what is already
+    // printed. Not a refusal (the purge point may be over bare bed, where
+    // a low Z is exactly right) but the operator should see it.
+    if let Some(z) = config.purge_z {
+        // Both in the file's g-code frame (the frame the recovery file's
+        // own absolute moves run in), so they are directly comparable.
+        let resume_z = resume.position[2] - ctx.gcode.origin[2];
+        if resume_z.is_finite() && z < resume_z {
+            warnings.push(PlanWarning::PurgeZBelowResume {
+                purge_z: z,
+                resume_z,
             });
         }
     }
@@ -2010,6 +2080,8 @@ pub fn plan_recovery(
         purge,
         park,
         park_feed: config.travel_feed,
+        // The purge descent is a near-part move: slow entry feedrate.
+        descend_feed: config.entry_feed,
         entry_commands,
         header_cap: RECOVERY_HEADER_CAP,
     };

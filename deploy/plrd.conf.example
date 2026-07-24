@@ -164,6 +164,21 @@ control_socket = /var/lib/plrd/plrd.sock
 #                          it may never reach. At 0 the plan emits no M104,
 #                          no M109 and no hold step at all; the contact
 #                          ceiling still applies. ***
+#                          *** FLOOR: a NONZERO value must be >= 50 C. ***
+#                          THE CHAMBER-AMBIENT TRAP: a nonzero target makes
+#                          the plan WAIT (M109), and on a PID hotend that
+#                          includes waiting to COOL. On an enclosed or
+#                          heated-chamber printer a 30-60 C target is at or
+#                          below chamber ambient: the nozzle takes longer
+#                          than the 15-minute step timeout to reach it, or
+#                          NEVER reaches it — every retry burns the full
+#                          timeout before aborting. If you want a cold
+#                          drag, say 0 (no wait at all); do not approximate
+#                          it with a low target.
+#                          If the hold does time out, the abort is CLEAN:
+#                          this step runs before the Z frame is declared,
+#                          so no frame-invalid marker is written and you
+#                          can simply retry after fixing the thermal issue.
 #                          The hold is an M109, which Klipper blocks on. On
 #                          a PID-controlled extruder M109 waits for the
 #                          heater to SETTLE in BOTH directions, so a nozzle
@@ -207,6 +222,24 @@ control_socket = /var/lib/plrd/plrd.sock
 #                          DEFAULT: the elevated park Z already in effect.
 #                          Set it to purge low over a defined spot instead
 #                          of dropping filament from mid-air.
+#                          *** FLOOR: purge_z MUST be >= 0. *** This is the
+#                          only raw absolute Z you supply, and the recovery
+#                          file runs in the TRUE frame where Z = 0 IS THE
+#                          BED SURFACE. A negative value drives the nozzle
+#                          into the bed at print temperature and extrudes
+#                          into it, so plrd refuses it outright. Do NOT
+#                          reason from stepper_z's position_min: that is
+#                          deliberately BELOW the bed (typically -2) to give
+#                          the probe envelope room, and is not a usable
+#                          floor here.
+#                          GUIDANCE: pick a height clear of the part. plrd
+#                          warns if purge_z is below the resume Z (the top
+#                          of what is already printed) — safe only if the
+#                          purge point is over bare bed — and warns with a
+#                          COLLISION RISK if the purge point is inside the
+#                          part footprint AND purge_z is set, because the
+#                          file descends to that Z over printed geometry.
+#                          The descent runs at the slow entry feedrate.
 #   purge_amount           built-in purge extrusion length, mm [0,100] (5)
 #   purge_speed            built-in purge extrusion feedrate,
 #                          mm/min (0,3000] (300)
@@ -225,10 +258,13 @@ control_socket = /var/lib/plrd/plrd.sock
 # The recovery no longer seeks the original file with M26. It writes a
 # generated <original>_RECOVERY.gcode into the virtual_sdcard root and
 # selects it with M23/M24. That file reheats to print temperature, re-homes
-# XY, travels BACK to a known part-clear point (G28 discards the park
-# position, and purging at the homed XY would leave a nozzle-attached
-# string the entry moves drag over the print), purges, does the entry
-# moves, then streams the original's verbatim tail — structured so no part-directed move can
+# XY, travels BACK to a known destination (G28 discards the park position,
+# and purging at the homed XY would leave a nozzle-attached string the
+# entry moves drag over the print), purges, does the entry moves, then
+# streams the original's verbatim tail. That destination is the built-in
+# purge point when you set purge_x/purge_y, else the reheat park point.
+# The park point is computed to clear the part; a purge point YOU set is
+# only warned about, not moved, if it lands inside the part — structured so no part-directed move can
 # precede the blocking M190/M109 heat waits (the heating gate). The tail is
 # copied byte-for-byte, so non-UTF-8 slicer metadata and binary thumbnails
 # survive intact. An existing file is never overwritten: the writer claims

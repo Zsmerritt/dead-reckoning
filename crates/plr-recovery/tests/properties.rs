@@ -785,6 +785,8 @@ proptest! {
         bed in proptest::option::of(40.0..110.0_f64),
         nozzle in 170.0..300.0_f64,
         purge_on in any::<bool>(),
+        purge_amount in 0.0..60.0_f64,
+        purge_retract in 0.0..10.0_f64,
     ) {
         #[allow(
             clippy::cast_possible_truncation,
@@ -802,13 +804,17 @@ proptest! {
             purge: purge_on.then_some(plr_recovery::PurgePlan::BuiltIn {
                 point: [180.0, 20.0],
                 z: None,
-                amount: 5.0,
+                amount: purge_amount,
                 speed: 300.0,
-                retract: 0.0,
+                // NONZERO retracts are the shape the absolute-E blocker
+                // got wrong; the generator must handle them for any
+                // amount/retract pair.
+                retract: purge_retract,
                 travel_feed: 6000.0,
             }),
             park: [180.0, 20.0],
             park_feed: 6000.0,
+            descend_feed: 1200.0,
             entry_commands: vec!["G90".to_owned(), "G0 X30 Y30 F1200".to_owned()],
             header_cap: 200,
         };

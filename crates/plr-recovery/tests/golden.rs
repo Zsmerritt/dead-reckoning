@@ -1257,6 +1257,39 @@ fn plugin_touch_temperature_epsilon() -> Result<f64, String> {
         .map_err(|e| format!("{CONST_NAME} value {value:?} is not a number: {e}"))
 }
 
+/// The cross-language tolerance pin, as a test that can be SEEN not to
+/// have run.
+///
+/// `probe_temperature_bounds_stay_in_lockstep_with_the_plugin` asserts the
+/// pin whenever the plugin constant is readable, but when it is not that
+/// assertion silently has nothing to do — and a gate that cannot be seen
+/// to have not-run is the same class of problem as a guard that cannot
+/// fire. This test therefore FAILS whenever the pin is unverifiable, and
+/// carries `#[ignore]` while `klippy_plugin` has no
+/// `MAX_TOUCH_TEMPERATURE_EPSILON` (it lands with `feat/recovery-wizard`),
+/// so every `cargo test` run reports it as `ignored` rather than `ok`.
+///
+/// **When the wizard branch merges, delete the `#[ignore]`.** The test
+/// then passes on its own, and the pin is enforced from both directions.
+#[test]
+#[ignore = "klippy_plugin has no MAX_TOUCH_TEMPERATURE_EPSILON yet (lands with \
+            feat/recovery-wizard); remove this #[ignore] once it does"]
+fn plugin_tolerance_pin_is_live() {
+    match plugin_touch_temperature_epsilon() {
+        Ok(plugin_epsilon) => assert!(
+            (plr_recovery::PROBE_TEMP_MEASURED_TOLERANCE - plugin_epsilon).abs() < 1e-12,
+            "TOLERANCE DIVERGENCE: plrd {} vs plugin {plugin_epsilon}",
+            plr_recovery::PROBE_TEMP_MEASURED_TOLERANCE
+        ),
+        Err(reason) => panic!(
+            "the cross-language tolerance pin is NOT verifiable: {reason}. \
+             plr-recovery's PROBE_TEMP_MEASURED_TOLERANCE is {}, and nothing currently \
+             checks it against the plugin's MAX_TOUCH_TEMPERATURE_EPSILON.",
+            plr_recovery::PROBE_TEMP_MEASURED_TOLERANCE
+        ),
+    }
+}
+
 /// Finding 10 (cross-language contract): the Probe step's MEASURED
 /// temperature bound must equal `max_probe_nozzle_temp +
 /// PROBE_TEMP_MEASURED_TOLERANCE`, and its TARGET bound exactly
@@ -1272,8 +1305,12 @@ fn plugin_touch_temperature_epsilon() -> Result<f64, String> {
 /// a hotter commanded target is not.
 #[test]
 fn probe_temperature_bounds_stay_in_lockstep_with_the_plugin() {
-    match plugin_touch_temperature_epsilon() {
-        Ok(plugin_epsilon) => assert!(
+    // When the plugin defines the constant, the pin is LIVE and bites
+    // here automatically — no flag to flip, no test to un-ignore. When it
+    // does not, `plugin_tolerance_pin_is_live` (below, `#[ignore]`d)
+    // reports the pending state visibly in every `cargo test` summary.
+    if let Ok(plugin_epsilon) = plugin_touch_temperature_epsilon() {
+        assert!(
             (plr_recovery::PROBE_TEMP_MEASURED_TOLERANCE - plugin_epsilon).abs() < 1e-12,
             "TOLERANCE DIVERGENCE: plr-recovery's PROBE_TEMP_MEASURED_TOLERANCE is {} \
              (crates/plr-recovery/src/build.rs) but the plugin's \
@@ -1282,14 +1319,7 @@ fn probe_temperature_bounds_stay_in_lockstep_with_the_plugin() {
              ceiling and MUST use the same tolerance, or one will refuse where the other \
              allows. Update whichever is wrong.",
             plr_recovery::PROBE_TEMP_MEASURED_TOLERANCE
-        ),
-        Err(reason) => eprintln!(
-            "SKIP: the cross-language tolerance pin was NOT verified — {reason}. \
-             plr-recovery's PROBE_TEMP_MEASURED_TOLERANCE is {}; once the plugin \
-             defines MAX_TOUCH_TEMPERATURE_EPSILON this test pins the two together \
-             and fails loudly if they diverge.",
-            plr_recovery::PROBE_TEMP_MEASURED_TOLERANCE
-        ),
+        );
     }
 
     let ceiling = PlanConfig::default().max_probe_nozzle_temp;
@@ -1677,6 +1707,194 @@ fn a_purge_inside_the_part_warns() {
         rendered.contains("configured via purge_x/purge_y"),
         "{rendered}"
     );
+}
+
+/// A golden for the fully-configured built-in purge, so the RETRACT and
+/// the `M83` that makes it correct are both visible in a checked-in
+/// artifact (the default golden has `purge_retract = 0`).
+#[test]
+fn a_configured_purge_matches_its_golden() {
+    let config = PlanConfig {
+        purge_x: Some(150.0),
+        purge_y: Some(12.0),
+        purge_z: Some(5.0),
+        purge_amount: 9.0,
+        purge_speed: 240.0,
+        purge_retract: 2.0,
+        ..PlanConfig::default()
+    };
+    let mut machine = machine_tap();
+    machine.axis_limits = plr_recovery::AxisLimits {
+        x: Some((0.0, 200.0)),
+        y: Some((0.0, 200.0)),
+        z_max: Some(250.0),
+    };
+    let plan = build_plan_with(&machine, plain_transforms(), &config);
+    let file =
+        plr_recovery::build_recovery_file(&plan.recovery_file, common::MODEL_TEXT.as_bytes(), "TS");
+    assert!(plr_recovery::verify_heating_gate(&file, &plan.recovery_file).is_ok());
+
+    let golden_path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/golden/recovery_file_purge.gcode"
+    );
+    if std::env::var("PLR_BLESS").is_ok() {
+        std::fs::write(golden_path, &file.content).expect("write golden");
+    }
+    let golden = std::fs::read_to_string(golden_path).expect("golden file (run with PLR_BLESS=1)");
+    assert_eq!(
+        String::from_utf8(file.content).expect("ASCII fixture"),
+        golden.replace("\r\n", "\n")
+    );
+    // The retract is present, and the M83 that makes its magnitude
+    // correct precedes it.
+    assert!(golden.contains("G1 E-2 F240"));
+    let m83 = golden.find("M83").expect("relative E");
+    assert!(m83 < golden.find("G1 E-2 F240").unwrap());
+}
+
+/// Item 4 regression: `purge_z` is the one raw operator-chosen absolute Z
+/// in the generated file, and the file runs in the TRUE frame where Z=0
+/// is the bed. A negative value must be REFUSED — the Z rail's
+/// `position_min` is deliberately below the bed (goldens use −2), so the
+/// rail check accepts `-1.9` and cannot be the floor here.
+#[test]
+fn a_negative_purge_z_is_refused() {
+    for bad in [-0.001, -1.9, -50.0] {
+        let config = PlanConfig {
+            purge_z: Some(bad),
+            ..PlanConfig::default()
+        };
+        let err = config.validate().unwrap_err();
+        assert!(
+            matches!(err, RecoveryError::PurgeZBelowBed { purge_z } if (purge_z - bad).abs() < 1e-12),
+            "purge_z {bad} must be refused, got {err:?}"
+        );
+        let msg = err.to_string();
+        assert!(msg.contains("bed"), "{msg}");
+    }
+    // The rail floor really is below the bed in the fixture, which is why
+    // the rail check alone would have accepted -1.9.
+    assert!(machine_tap().z_position_min.unwrap() < 0.0);
+    // Zero and positive are accepted.
+    for ok in [0.0, 0.2, 50.0] {
+        assert!(PlanConfig {
+            purge_z: Some(ok),
+            ..PlanConfig::default()
+        }
+        .validate()
+        .is_ok());
+    }
+}
+
+/// Item 4 (second half): a `purge_z` below the resume Z warns — the
+/// descent may drive the nozzle into the part, but a purge over bare bed
+/// legitimately wants a low Z, so this is a warning not a refusal.
+#[test]
+fn a_purge_z_below_the_resume_z_warns() {
+    // The fixture resumes at Z 0.4 in the WAL frame with a 0.05 origin,
+    // so the file-frame resume Z is 0.35.
+    let config = PlanConfig {
+        purge_z: Some(0.1),
+        ..PlanConfig::default()
+    };
+    let plan = build_plan_with(&machine_tap(), plain_transforms(), &config);
+    assert!(
+        plan.warnings.iter().any(|w| matches!(
+            w,
+            plr_recovery::PlanWarning::PurgeZBelowResume { purge_z, .. }
+                if (purge_z - 0.1).abs() < 1e-12
+        )),
+        "{:?}",
+        plan.warnings
+    );
+    assert!(plan.render().contains("below the resume Z"));
+    // Above the resume Z: no such warning.
+    let config = PlanConfig {
+        purge_z: Some(5.0),
+        ..PlanConfig::default()
+    };
+    let plan = build_plan_with(&machine_tap(), plain_transforms(), &config);
+    assert!(!plan
+        .warnings
+        .iter()
+        .any(|w| matches!(w, plr_recovery::PlanWarning::PurgeZBelowResume { .. })));
+}
+
+/// Item 5 regression: with `purge_z` set, a purge inside the footprint is
+/// a COLLISION (the file descends to that Z over the part), and the
+/// warning must say so rather than describing a cosmetic blob.
+#[test]
+fn a_purge_inside_the_part_with_a_low_z_warns_about_collision() {
+    let config = PlanConfig {
+        purge_x: Some(20.0),
+        purge_y: Some(20.0),
+        purge_z: Some(0.2),
+        ..PlanConfig::default()
+    };
+    let plan = build_plan_with(&machine_tap(), plain_transforms(), &config);
+    let rendered = plan.render();
+    assert!(
+        plan.warnings.iter().any(|w| matches!(
+            w,
+            plr_recovery::PlanWarning::PurgeInsidePart {
+                purge_z: Some(_),
+                ..
+            }
+        )),
+        "{:?}",
+        plan.warnings
+    );
+    assert!(rendered.contains("COLLISION RISK"), "{rendered}");
+    assert!(rendered.contains("descends to that Z"), "{rendered}");
+
+    // WITHOUT purge_z the same point is the milder deposit warning.
+    let config = PlanConfig {
+        purge_x: Some(20.0),
+        purge_y: Some(20.0),
+        ..PlanConfig::default()
+    };
+    let plan = build_plan_with(&machine_tap(), plain_transforms(), &config);
+    let rendered = plan.render();
+    assert!(!rendered.contains("COLLISION RISK"), "{rendered}");
+    assert!(rendered.contains("drop filament onto"), "{rendered}");
+}
+
+/// Item 8 regression: a nonzero `drag_nozzle_temp` below the floor is
+/// refused — it would make `M109` wait for a passive cooldown that a
+/// heated-chamber machine may never reach. `0` stays exempt.
+#[test]
+fn a_sub_floor_drag_temperature_is_refused() {
+    for bad in [1.0, 30.0, 49.9] {
+        let config = PlanConfig {
+            drag_nozzle_temp: bad,
+            ..PlanConfig::default()
+        };
+        let err = config.validate().unwrap_err();
+        assert!(
+            matches!(err, RecoveryError::DragTempBelowFloor { floor, .. }
+                if (floor - plr_recovery::DRAG_TEMP_FLOOR).abs() < 1e-12),
+            "drag_nozzle_temp {bad} must be refused, got {err:?}"
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("chamber ambient") || msg.contains("cool"),
+            "{msg}"
+        );
+        assert!(msg.contains("drag_nozzle_temp = 0"), "{msg}");
+    }
+    // The opt-out and the floor itself are accepted.
+    for ok in [0.0, plr_recovery::DRAG_TEMP_FLOOR, 145.0] {
+        assert!(
+            PlanConfig {
+                drag_nozzle_temp: ok,
+                ..PlanConfig::default()
+            }
+            .validate()
+            .is_ok(),
+            "{ok} must be accepted"
+        );
+    }
 }
 
 /// Range refusals for each new purge knob.

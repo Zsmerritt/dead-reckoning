@@ -98,9 +98,26 @@ pub enum Phase {
     /// Klipper's `M109` waits for the heater to SETTLE, not merely to
     /// rise: with a PID-controlled extruder a nozzle currently HOTTER
     /// than the target will wait while it cools. With bang-bang control
-    /// it only waits while heating. Either way the contact ceiling gate
-    /// on the probe step still applies, so a nozzle that never settles
-    /// low enough is refused rather than dragged hot.
+    /// it only waits while heating.
+    ///
+    /// # What bounds the wait (and why it cannot wedge)
+    ///
+    /// Klipper's own wait is UNBOUNDED — it will sit there indefinitely
+    /// if the target is unreachable (a chamber hotter than the requested
+    /// temperature, a failed heater). The bound is plrd's: the executor
+    /// sends this step's command with the `temp_timeout` call deadline
+    /// (`ExecOptions::temp_timeout`, 15 minutes by default, applied to
+    /// the Moonraker client in `recover::execute_with_gates`), and a
+    /// timeout is a step failure that aborts the recovery.
+    ///
+    /// That abort is CLEAN: this phase precedes [`Phase::ShiftedFrame`],
+    /// so no `SET_KINEMATIC_POSITION` has been issued, the executor's
+    /// `frame_invalid` stays false, no frame-invalidation marker is
+    /// written, and a re-run after fixing the thermal problem is
+    /// immediately possible. (The probe step's contact-ceiling gate is a
+    /// different guard for a different failure — it never sees a nozzle
+    /// stuck at this step, because `M109` blocks long before the probe
+    /// step is reached.)
     ProbeTempHold,
     /// 6 — call the operator's clean-nozzle macro when it exists; when
     /// it does not, emit no command and set
@@ -629,6 +646,21 @@ pub enum PlanWarning {
         /// `true` when the operator set `purge_x`/`purge_y` explicitly;
         /// `false` when it defaulted to the reheat park point.
         configured: bool,
+        /// The explicit `purge_z` in force, when one is set. With a low
+        /// `purge_z` inside the footprint this is not merely "deposits
+        /// filament on the part" — the file DESCENDS to that Z first, so
+        /// it is a COLLISION with printed geometry.
+        purge_z: Option<f64>,
+    },
+    /// `purge_z` sits below the resume Z — i.e. below the top of what has
+    /// already been printed — so the descent to it may drive the nozzle
+    /// into the part. Not a refusal: the purge point may be clear of the
+    /// footprint (a bare patch of bed), where a low Z is exactly right.
+    PurgeZBelowResume {
+        /// The configured purge Z, mm.
+        purge_z: f64,
+        /// The resume Z (the part's current top at the resume point), mm.
+        resume_z: f64,
     },
     /// The reheat park point lies INSIDE the part's XY bounding box: the
     /// nozzle will reheat to print temperature (and purge) over printed
@@ -693,15 +725,44 @@ impl PlanWarning {
                 fmt_num(point[0]),
                 fmt_num(point[1])
             ),
-            PlanWarning::PurgeInsidePart { point, configured } => format!(
-                "the built-in purge point ({}, {}) is INSIDE the part bounding box{} — the purge                  will deposit filament onto printed geometry; move it clear unless this is a                  deliberate sacrificial area",
-                fmt_num(point[0]),
-                fmt_num(point[1]),
-                if *configured {
+            PlanWarning::PurgeInsidePart {
+                point,
+                configured,
+                purge_z,
+            } => {
+                let source = if *configured {
                     " (configured via purge_x/purge_y)"
                 } else {
                     " (defaulted to the reheat park point)"
+                };
+                match purge_z {
+                    // With an explicit purge_z the file DESCENDS to it
+                    // before extruding: over the part that is a crash,
+                    // not a cosmetic blob.
+                    Some(z) => format!(
+                        "COLLISION RISK: the built-in purge point ({}, {}) is INSIDE the part \
+                         bounding box{source} AND purge_z is set to {}: the file descends to \
+                         that Z over printed geometry before extruding. Move the purge clear \
+                         of the part, or raise purge_z above the part's top",
+                        fmt_num(point[0]),
+                        fmt_num(point[1]),
+                        fmt_num(*z)
+                    ),
+                    None => format!(
+                        "the built-in purge point ({}, {}) is INSIDE the part bounding \
+                         box{source}: purging at the parked height will drop filament onto \
+                         printed geometry; move it clear unless this is a deliberate \
+                         sacrificial area",
+                        fmt_num(point[0]),
+                        fmt_num(point[1])
+                    ),
                 }
+            }
+            PlanWarning::PurgeZBelowResume { purge_z, resume_z } => format!(
+                "purge_z {} is below the resume Z {} (the top of what is already printed); the \
+                 descent is safe only if the purge point is clear of the part",
+                fmt_num(*purge_z),
+                fmt_num(*resume_z)
             ),
             PlanWarning::ReheatParkInsidePart { point, configured } => format!(
                 "the reheat park point ({}, {}) is INSIDE the part bounding box{} — the nozzle \

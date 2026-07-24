@@ -490,6 +490,15 @@ fn write_recovery_file(
                         "recover: recovery file name was taken since planning; wrote {new_name} \
                          ({patched} M23 command(s) repointed)"
                     );
+                    let _ = writeln!(
+                        transcript_file,
+                        "{}",
+                        serde_json::json!({
+                            "event": "recovery-file-renamed",
+                            "name": new_name,
+                            "m23_repointed": patched,
+                        })
+                    );
                     bundle.recovery_file_path.clone_from(&path);
                 }
                 let _ = writeln!(
@@ -551,8 +560,9 @@ fn write_recovery_file(
 /// old name: an exact-match loop silently no-ops if the two ever drift,
 /// which would leave `M23` naming the squatter file this retry just
 /// refused to overwrite — the recovery would then resume someone else's
-/// g-code. Returns how many `M23` commands were repointed so the caller
-/// can assert the plan actually carried one.
+/// g-code. Returns how many `M23` commands were repointed; the caller
+/// reports the count in its operator message and the transcript so a plan
+/// that carried none is visible after the fact.
 fn retarget_recovery_file(bundle: &mut PlanBundle, new_name: &str) -> usize {
     let mut patched = 0;
     for step in &mut bundle.plan.steps {

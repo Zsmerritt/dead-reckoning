@@ -171,6 +171,10 @@ pub struct RecoveryFileSpec {
     pub park: [f64; 2],
     /// Feedrate of the post-`G28` re-park travel, mm/min.
     pub park_feed: f64,
+    /// Feedrate of the purge-Z DESCENT, mm/min — the slow entry feedrate,
+    /// not the travel feedrate: a descent toward the bed is a near-part
+    /// move and every other one in this file is speed-limited.
+    pub descend_feed: f64,
     /// The entry-move commands (travel above the part, descend, prime,
     /// restore modes/feedrate), pre-built by the plan builder so the
     /// file and the old plan share one derivation.
@@ -311,9 +315,12 @@ pub fn build_recovery_file(
         fmt_num(travel_feed)
     );
     // An explicit purge Z descends only AFTER the XY travel completes, so
-    // the nozzle never sweeps low across whatever lies in between.
+    // the nozzle never sweeps low across whatever lies in between — and
+    // at the SLOW entry feedrate, not the travel feedrate: this is a
+    // descent toward the bed, the same class of near-part move as the
+    // entry moves, all of which are deliberately speed-limited.
     if let Some(z) = dest_z {
-        let _ = writeln!(pre, "G1 Z{} F{}", fmt_num(z), fmt_num(travel_feed));
+        let _ = writeln!(pre, "G1 Z{} F{}", fmt_num(z), fmt_num(spec.descend_feed));
     }
 
     // (e) Purge, at the destination reached above (only when enabled).
@@ -330,6 +337,20 @@ pub fn build_recovery_file(
             retract,
             ..
         }) => {
+            // RELATIVE E is asserted FIRST and is load-bearing. Klipper
+            // powers up in ABSOLUTE extrusion (`gcode_move.py:29`, applied
+            // at 141-151), and the extrusion mode in force here is
+            // otherwise UNKNOWABLE — the operator's CLEAN_NOZZLE macro may
+            // have left either mode set. In absolute E, `G1 E-<retract>`
+            // after `G1 E<amount>` does not retract by `retract`: it moves
+            // the axis TO `-retract`, a retraction of `amount + retract`.
+            // At `purge_amount = 50` that is a 51 mm pull, which yanks
+            // filament clear of a direct-drive extruder's gears and the
+            // rest of the print extrudes nothing.
+            //
+            // `build_entry_commands` already obeys this rule (it emits its
+            // own `M83` before the prime); the purge must too.
+            pre.push_str("M83\n");
             pre.push_str("G92 E0\n");
             let _ = writeln!(pre, "G1 E{} F{}", fmt_num(*amount), fmt_num(*speed));
             if *retract > 0.0 {
@@ -452,10 +473,24 @@ pub enum HeatingGateViolation {
         /// Y of the plan's park point.
         park_y: String,
     },
-    /// An extruder-moving command (the built-in purge) appears between
-    /// the re-home and the re-park, so it would purge at the homed XY.
+    /// An extruder-moving command (the built-in purge) appears before the
+    /// post-`G28` re-park travel, so it would extrude at the homed XY (or
+    /// at the parked position, if it precedes the re-home).
     #[error("purge command {command:?} precedes the post-G28 re-park travel")]
     PurgeBeforeRePark {
+        /// The offending command.
+        command: String,
+    },
+    /// The post-`G28` re-park is a RELATIVE move. Its X/Y words are then
+    /// deltas from wherever homing left the toolhead, not a destination,
+    /// so it cannot be shown to reach the part-clear point — and the
+    /// recovery-file pre-flight skips relative moves too, so both guards
+    /// would fail open together.
+    #[error(
+        "the post-G28 re-park {command:?} runs in RELATIVE mode (G91); it must be an \
+         absolute move so its target is a real destination"
+    )]
+    RelativeRePark {
         /// The offending command.
         command: String,
     },
@@ -486,6 +521,12 @@ pub enum ZIntent {
 }
 
 /// Classifies a preamble command line.
+///
+/// The several booleans are independent, orthogonal facts about ONE
+/// parsed line (does it carry XY, is it the re-home, does it touch E,
+/// what mode is it in) that the gate's rules read individually; folding
+/// them into an enum would only re-expand at every use site.
+#[allow(clippy::struct_excessive_bools)]
 struct PreLine {
     name: String,
     has_xy: bool,
@@ -497,6 +538,8 @@ struct PreLine {
     y: Option<f64>,
     /// The command carries an `E` word (the built-in purge does).
     touches_e: bool,
+    /// `true` when the command executes in ABSOLUTE coordinate mode.
+    absolute: bool,
 }
 
 /// Tolerance, mm, when matching the emitted re-park coordinates against
@@ -547,6 +590,7 @@ fn classify_preamble(preamble: &[u8]) -> Vec<PreLine> {
             x,
             y,
             touches_e,
+            absolute,
         });
     }
     out
@@ -627,10 +671,19 @@ pub fn verify_heating_gate(
         return Err(HeatingGateViolation::ReHomeBeforeTempWait);
     }
 
-    // Rule 3: positioning moves follow the re-home.
+    // Rule 3: positioning moves AND extrusion follow the re-home. The
+    // extrusion half matters independently: a `G1 E5` between the
+    // temperature waits and the re-home would purge at the parked
+    // position, which is exactly the deposit-then-drag hazard rule 4
+    // exists to prevent — it just happens earlier.
     for line in lines.iter().take(g28_idx) {
         if is_motion(&line.name) && line.has_xy {
             return Err(HeatingGateViolation::EntryBeforeReHome {
+                command: line.name.clone(),
+            });
+        }
+        if line.touches_e {
+            return Err(HeatingGateViolation::PurgeBeforeRePark {
                 command: line.name.clone(),
             });
         }
@@ -665,6 +718,18 @@ pub fn verify_heating_gate(
     };
     if !re_park.has_xy {
         return Err(HeatingGateViolation::MissingRePark);
+    }
+    // The re-park must be an ABSOLUTE move. In relative mode the same
+    // `X`/`Y` words are deltas from wherever `G28` left the toolhead, so
+    // they do NOT identify a destination and the coordinate match below
+    // would be meaningless. This also closes a fail-open pair: the
+    // recovery-file pre-flight skips relative moves (their coordinates
+    // are not positions), so without this check a `G91` slipped in ahead
+    // of the re-park would defeat BOTH guards at once.
+    if !re_park.absolute {
+        return Err(HeatingGateViolation::RelativeRePark {
+            command: re_park.name.clone(),
+        });
     }
     match (re_park.x, re_park.y) {
         (Some(x), Some(y))
@@ -781,6 +846,7 @@ mod tests {
             purge: Some(built_in_purge()),
             park: PARK,
             park_feed: 6000.0,
+            descend_feed: 1200.0,
             entry_commands: vec![
                 "G90".to_owned(),
                 "M83".to_owned(),
@@ -826,6 +892,105 @@ mod tests {
             file.tail_bytes(),
             &original[usize::try_from(s.tail_offset).unwrap()..]
         );
+    }
+
+    /// Replays a generated preamble through this repo's own Klipper
+    /// mirror ([`plr_gcode::GcodeState`]) and returns the NET filament
+    /// delta in mm, plus the single most-negative move (the deepest
+    /// retraction).
+    ///
+    /// Text assertions cannot see extrusion-MODE bugs: `G1 E-2` reads the
+    /// same whether it retracts 2 mm or 7 mm. Only a replay that honors
+    /// `M82`/`M83`/`G92` the way Klipper does can tell them apart, which
+    /// is why the purge is tested this way.
+    fn replay_filament(preamble: &str) -> (f64, f64) {
+        use plr_gcode::{GcodeState, Line, LineIter};
+        let mut state = GcodeState::new();
+        let mut net = 0.0;
+        let mut deepest = 0.0_f64;
+        for line in LineIter::new(preamble.as_bytes(), 0).collect::<Vec<Line>>() {
+            let before = state.last_position[3];
+            let _ = state.apply(&line);
+            // G92 re-frames the axis without moving filament.
+            if line.command().map(|c| c.name.as_str()) == Some("G92") {
+                continue;
+            }
+            let delta = state.last_position[3] - before;
+            net += delta;
+            deepest = deepest.min(delta);
+        }
+        (net, deepest)
+    }
+
+    /// BLOCKER regression: the built-in purge must extrude and retract by
+    /// the CONFIGURED amounts, in every extrusion mode it could inherit.
+    ///
+    /// Klipper powers up in ABSOLUTE E, and the mode on entry to the
+    /// purge is unknowable (a `CLEAN_NOZZLE` macro may have set either).
+    /// Without an `M83`, `G1 E-{retract}` after `G1 E{amount}` moves the
+    /// axis TO `-retract` — a retraction of `amount + retract`, which at
+    /// `purge_amount = 50` pulls filament clear of a direct-drive
+    /// extruder's gears. This asserts by REPLAY, not string match.
+    #[test]
+    fn the_built_in_purge_extrudes_and_retracts_exactly_the_configured_amounts() {
+        for (amount, retract) in [(5.0, 2.0), (50.0, 1.0), (5.0, 0.0), (0.5, 0.5)] {
+            let s = RecoveryFileSpec {
+                purge: Some(PurgePlan::BuiltIn {
+                    point: PARK,
+                    z: None,
+                    amount,
+                    speed: 300.0,
+                    retract,
+                    travel_feed: 6000.0,
+                }),
+                // No entry moves: isolate the purge's own filament.
+                entry_commands: vec![],
+                ..spec()
+            };
+            let file = build_recovery_file(&s, b"; h\n", "TS");
+            let (net, deepest) = replay_filament(&file.preamble_text());
+            assert!(
+                (net - (amount - retract)).abs() < 1e-9,
+                "amount {amount} retract {retract}: net filament {net} must be \
+                 {} (extrude minus retract), preamble:\n{}",
+                amount - retract,
+                file.preamble_text()
+            );
+            // The retraction MOVE itself must be exactly `retract` — this
+            // is what the absolute-mode bug got catastrophically wrong.
+            assert!(
+                (deepest + retract).abs() < 1e-9,
+                "amount {amount} retract {retract}: deepest single retraction was {deepest}, \
+                 must be -{retract} (an absolute-E purge would retract amount+retract)"
+            );
+        }
+    }
+
+    /// The purge is immune to the extrusion mode it inherits: the same
+    /// filament result whether the preceding (macro) g-code left the
+    /// machine in absolute or relative E.
+    #[test]
+    fn the_purge_result_is_independent_of_the_inherited_e_mode() {
+        let s = RecoveryFileSpec {
+            purge: Some(PurgePlan::BuiltIn {
+                point: PARK,
+                z: None,
+                amount: 5.0,
+                speed: 300.0,
+                retract: 2.0,
+                travel_feed: 6000.0,
+            }),
+            entry_commands: vec![],
+            ..spec()
+        };
+        let preamble = build_recovery_file(&s, b"; h\n", "TS")
+            .preamble_text()
+            .into_owned();
+        let absolute_first = replay_filament(&format!("M82\n{preamble}"));
+        let relative_first = replay_filament(&format!("M83\n{preamble}"));
+        assert!((absolute_first.0 - relative_first.0).abs() < 1e-9);
+        assert!((absolute_first.0 - 3.0).abs() < 1e-9, "{absolute_first:?}");
+        assert!((absolute_first.1 + 2.0).abs() < 1e-9, "{absolute_first:?}");
     }
 
     /// Finding 1 regression: the built-in purge must never run at the
@@ -924,7 +1089,13 @@ mod tests {
         let file = build_recovery_file(&s, b"; h\nG1 X1 Y1\n", "TS");
         let text = file.preamble_text().into_owned();
         let travel = text.find("G0 X12.5 Y7.5 F4200").expect("purge travel");
-        let descend = text.find("G1 Z0.6 F4200").expect("purge Z descent");
+        // The DESCENT uses the slow entry feedrate, not the travel
+        // feedrate: it is a near-part move toward the bed.
+        let descend = text.find("G1 Z0.6 F1200").expect("purge Z descent");
+        assert!(
+            !text.contains("G1 Z0.6 F4200"),
+            "the descent must not use the fast travel feedrate: {text}"
+        );
         let zero = text.find("G92 E0").expect("E zero");
         let push = text.find("G1 E8 F250").expect("purge extrusion");
         let retract = text.find("G1 E-1.5 F250").expect("purge retract");
@@ -1245,6 +1416,65 @@ mod tests {
             matches!(&err, HeatingGateViolation::ReParkMismatch { found_x, park_x, .. }
                 if found_x == "5" && park_x == "180"),
             "{err:?}"
+        );
+    }
+
+    /// Item 9(a) regression, on the REAL preamble: flipping the `G90`
+    /// before the re-park to `G91` must fire.
+    ///
+    /// This mutation previously defeated BOTH guards at once — the gate
+    /// ignored coordinate mode when matching the re-park XY, and
+    /// `preflight_recovery_file` skips relative moves entirely because
+    /// their coordinates are deltas rather than positions.
+    #[test]
+    fn a_relative_re_park_is_caught() {
+        let s = spec();
+        let mutated = mutate_real_preamble(&s, b"; h\nG1 X1 Y1 E1\n", |lines| {
+            let mut seen_home = false;
+            lines
+                .into_iter()
+                .map(|l| {
+                    if l == "G28 X Y" {
+                        seen_home = true;
+                        l
+                    } else if seen_home && l == "G90" {
+                        seen_home = false; // only the first one after G28
+                        "G91".to_owned()
+                    } else {
+                        l
+                    }
+                })
+                .collect()
+        });
+        assert_eq!(
+            verify_heating_gate(&mutated, &s),
+            Err(HeatingGateViolation::RelativeRePark {
+                command: "G0".to_owned()
+            }),
+            "preamble:\n{}",
+            mutated.preamble_text()
+        );
+    }
+
+    /// Item 9(b) regression: an extrusion between the temperature waits
+    /// and the re-home slips past the XY-only positioning rule, but must
+    /// still be refused — it would purge at the parked position.
+    #[test]
+    fn an_extrusion_before_the_re_home_is_caught() {
+        let file = hand_built("M104 S210\nM109 S210\nG1 E5 F300\nG28 X Y\nG0 X180 Y20\n");
+        assert_eq!(
+            verify_heating_gate(&file, &park_only_spec()),
+            Err(HeatingGateViolation::PurgeBeforeRePark {
+                command: "G1".to_owned()
+            })
+        );
+        // A bare `G92 E0` there is caught too.
+        let file = hand_built("M104 S210\nM109 S210\nG92 E0\nG28 X Y\nG0 X180 Y20\n");
+        assert_eq!(
+            verify_heating_gate(&file, &park_only_spec()),
+            Err(HeatingGateViolation::PurgeBeforeRePark {
+                command: "G92".to_owned()
+            })
         );
     }
 
