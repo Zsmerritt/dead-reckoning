@@ -83,7 +83,8 @@
 //! The drag staircase has no descent speed (passes are fixed-Z), so
 //! [`OvershootTerm::DragStep`] carries no speed. Its `drag_z_step` must
 //! be finite and strictly positive here (totality); the tighter
-//! operational band `(0, 0.1]` mm is enforced by
+//! operational band `(0, 0.2]` mm — the FIXED `[plr]` schema band
+//! shared with the Klipper plugin — is enforced by
 //! [`crate::build::PlanConfig::validate`], which owns all drag
 //! tunables.
 

@@ -96,8 +96,9 @@ pub struct PlrSettings {
     /// make an uncalibrated machine look calibrated.
     pub noise_floor: BTreeMap<String, f64>,
     /// OPTIONAL: drag speed the noise floor was measured at, mm/s
-    /// (`noise_floor_speed` — not yet staged by the plugin; tolerated
-    /// here for forward compatibility, absent → no speed check).
+    /// (`noise_floor_speed`, staged by the plugin's `PLR_NOISE_TEST`;
+    /// absent — a calibration from before the key existed — means no
+    /// speed check, tolerant back-compat).
     pub noise_floor_speed: Option<f64>,
 }
 

@@ -20,6 +20,10 @@ ruff==0.16.0
 # against its pure-python fallback (plr/classifier.py); at runtime numpy
 # stays optional inside klippy.  No single numpy pin covers the whole
 # dev range: 2.0.x is the last line supporting Python 3.9 (the tooling
-# floor) but ships no 3.13 wheels, hence the split by interpreter.
+# floor) but ships no 3.13 wheels, and 2.2.x ships no 3.14 wheels
+# (cp314 wheels start at numpy 2.3.3), hence the three-way split by
+# interpreter.  numpy 2.5.1 is the newest release with cp314 wheels as
+# of 2026-07-24.
 numpy==2.0.2 ; python_version < "3.13"
-numpy==2.2.6 ; python_version >= "3.13"
+numpy==2.2.6 ; python_version == "3.13"
+numpy==2.5.1 ; python_version >= "3.14"
