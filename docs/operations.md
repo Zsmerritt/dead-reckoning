@@ -1,10 +1,11 @@
 # Operations
 
 Day-2 usage of a deployed `plrd`: understanding its logs, reading scan
-reports, disk expectations, the post-power-loss procedure for v1, and
-troubleshooting. Companion documents: [install](install.md) ·
-[architecture](architecture.md) ·
-[worked example](../examples/recovery-walkthrough.md).
+reports, disk expectations, the post-power-loss procedure for v1, the
+drag-oracle operating notes, and troubleshooting. Companion documents:
+[install](install.md) · [architecture](architecture.md) ·
+[klippy_plugin/README.md](../klippy_plugin/README.md) (console command
+reference) · [worked example](../examples/recovery-walkthrough.md).
 
 ## Understanding plrd's logs
 
@@ -210,6 +211,10 @@ its own.
 
 ## After a real power loss
 
+The whole procedure runs from the **printer console** (Mainsail/Fluidd);
+every step has an equal CLI alternative on the printer host, noted
+inline.
+
 1. **Do not home anything yet.** Do not run `G28`. On a moving-bed-Z
    machine, homing Z (or letting the idle timeout's `M84` clear state and
    then homing) can drive the bed into the nozzle or the nozzle through the
@@ -221,32 +226,43 @@ its own.
    announces on the printer console (via `RESPOND`/`M117`):
    `unfinished print detected: <file> at byte <n> (~NN%); run 'plrd
    recover'`. Detection never executes anything.
-3. **Scan for the evidence** (optional but recommended before executing):
-   `plrd scan --wal <wal_dir>` — on the printer host, so the printed
-   G-code file is readable and the forward extension can run. Read the
-   report against the [section above](#reading-plrd-scan-reports).
+3. **Check the state**: type **`PLR_STATUS`**. The daemon half of the
+   report shows the pending recovery (file, byte offset, rough %, crash
+   class), WAL segment count, heartbeat age, and the machine-config
+   mode + validation summary — refusal reasons show up here *before*
+   you attempt anything. (CLI: `plrd scan --wal <wal_dir>` gives the
+   deeper evidence report — the full possible-stop set, degradations,
+   Z candidates; read it against the
+   [section above](#reading-plrd-scan-reports). `plrd scan` also runs
+   off-host if the printer host died.)
    - `CLEAN SHUTDOWN` → nothing to recover, you are done.
    - `not possible` or `extension_unavailable` → fix the missing input
      (usually the print file path) before trusting anything.
-4. **Dry-run the recovery**: `plrd recover --config /etc/plrd.conf`. This
-   runs the whole pipeline and prints the full plan and every command
-   that would be sent — and sends nothing. See
-   [the next section](#recovering-with-plrd-recover) for reading it.
-   Typed declines (vase mode, single wall, layer-only match, no safe
-   contact zone…) mean automation refuses for this part — that is the
-   system being honest, not a bug; recover manually using the rendered
-   plan phases as the checklist (below).
-5. **Execute**: `plrd recover --config /etc/plrd.conf --execute --confirm`
-   (add `--step` for your first recoveries — it asks before every step).
-   Supervise it: the printer must already be ready and idle, the nozzle
-   will approach the part at probing temperature, and any failed
-   verification aborts and leaves the printer as-is with a transcript to
-   review.
+4. **Dry-run the recovery**: type **`PLR_RECOVER`** (CLI:
+   `plrd recover --config /etc/plrd.conf`). Both run the identical
+   pipeline and gate stack, print the full plan and every command that
+   would be sent — and send nothing. See
+   [the next section](#recovering-with-plr_recover--plrd-recover) for
+   reading the plan. Typed declines (vase mode, single wall, layer-only
+   match, no safe contact zone…) mean automation refuses for this part
+   — that is the system being honest, not a bug; recover manually using
+   the rendered plan phases as the checklist (below).
+5. **Execute**: **`PLR_RECOVER EXECUTE=1 CONFIRM=YES`** — both
+   arguments required verbatim, anything less refuses (CLI:
+   `plrd recover --config /etc/plrd.conf --execute --confirm`, which
+   additionally asks an interactive yes). For your first recoveries
+   prefer the CLI with `--step` — it pauses before every plan step;
+   per-step mode is deliberately CLI-only (the console protocol is
+   one-shot and has no multi-round confirmation dialogue). Supervise
+   it: the printer must already be ready and idle, the nozzle will
+   approach the part at probing temperature, and any failed
+   verification aborts and leaves the printer as-is with a transcript
+   to review.
 
 ### Manual fallback
 
 When the pipeline declines — or the machine is not
-[commissioned](install.md#commissioning-the-machine-section) — execution
+[commissioned](install.md#commissioning-from-the-console) — execution
 is a human job, guided by the same plan structure
 ([architecture](architecture.md#the-plan-is-data-the-trust-model)).
 Respect the phase order and verify each step's outcome before the next
@@ -267,11 +283,17 @@ non-negotiables:
   stopped). The plan format has no "continue past a failure" action, and
   neither should you.
 
-## Recovering with `plrd recover`
+## Recovering with `PLR_RECOVER` / `plrd recover`
 
-`plrd recover --config <path>` runs WAL → reconstruction → stop-point
-match → contact selection → validated plan, then a gate stack. A complete
-real transcript of everything below is in the
+Console `PLR_RECOVER` and CLI `plrd recover --config <path>` are the
+same machinery: the console command calls the daemon's control socket,
+which runs the identical pipeline (WAL → reconstruction → stop-point
+match → contact selection → validated plan) and the identical gate
+stack — the plugin adds a client-side consent check on top, it replaces
+nothing. The one difference: the CLI's interactive TTY prompt is
+replaced by the explicit `EXECUTE=1 CONFIRM=YES` arguments, and
+`--step` (pause before every step) is CLI-only. A complete real
+transcript of everything below is in the
 [walkthrough](../examples/recovery-walkthrough.md#from-evidence-to-a-plan-plrd-recover).
 
 **Reading a dry run.** The default invocation prints, in order: pipeline
@@ -323,6 +345,61 @@ rough %, crash class, detection time) — safe to read, never required by
 the pipeline, cleared automatically on a clean shutdown or completed
 recovery.
 
+## Operating the ADXL drag oracle
+
+Notes for `probe_method: adxl_drag` day-2 use (the command reference is
+[klippy_plugin/README.md](../klippy_plugin/README.md); the design is in
+[architecture](architecture.md#the-adxl-drag-oracle)). Honest status
+up front: the oracle's safety bounds are tested, but its detection
+quality is **bench-unvalidated (E5)** — supervise it.
+
+**The sensitivity knob (`drag_sensitivity`, 0–100).** The knob maps to
+a contact threshold as a multiplier over the measured noise floor,
+log-interpolated: 0 → 8.0× (least sensitive), 50 → 4.0×, 100 → 1.5×
+(most sensitive). **Wobbly or noisy machines should run low numbers** —
+a higher multiplier means fewer false triggers, at the cost of needing
+a firmer contact signature. Rigid, quiet machines can run high numbers
+to catch fainter contact. Tune it like any tunable
+(`PLR_SET PARAM=drag_sensitivity VALUE=…`, then `SAVE_CONFIG`), and
+read your current headroom off the `PLR_NOISE_TEST` report — it shows
+the measured peak against the threshold at your current sensitivity.
+
+**Re-run `PLR_NOISE_TEST` after changing `drag_speed`** (or anything
+mechanical: accel-chip mount, toolhead mass, belt tension). The noise
+floor is measured *while moving* at the configured drag speed precisely
+because stepper harmonics and frame vibration must be inside the
+baseline; a floor captured at one speed does not transfer to another.
+The system nags for you on the speed half: `PLR_NOISE_TEST` persists
+the capture speed (`noise_floor_speed`), and a recovery plan whose
+`drag_speed` strays more than 20% from it carries a
+`NoiseFloorSpeedMismatch` **warning** (never a refusal) telling you to
+recalibrate. Mechanical changes it cannot see — recalibrating after
+those stays on you.
+The test also refuses obvious foot-guns: run it with the toolhead well
+away from any printed part (a pass that touches one corrupts the floor
+in the dangerous direction — real contact becomes invisible).
+
+**`trigger_z` brackets, it does not measure.** A drag probe reports the
+Z of the **last clean pass**; the surface lies somewhere in
+`(trigger_z − drag_z_step, trigger_z]`. That conservative endpoint is
+what the recovery arithmetic consumes — overshoot is bounded by one
+`drag_z_step` by construction (each pass runs at fixed Z; only the
+staircase decrement can put the nozzle below the surface). Smaller
+`drag_z_step` = tighter bracket and more passes; the default 0.05 mm is
+a first-layer-scale bracket. Expect *bounded, by-design* nozzle contact
+with the part surface — the last pass drags across it.
+
+**When a drag probe aborts** (`last_drag_error` in `get_status`, error
+text on the console): unclassifiable passes (too few samples, frozen
+signal, collapsed sample rate) and staircase exhaustion (travel floor
+reached with no contact) abort rather than guess — the starting Z is
+restored. An exhaustion abort usually means the surface is not where
+the reconstruction expected it, or the sensitivity is too low to see
+contact: check the noise-floor calibration before re-running, and treat
+"reconstruction and reality disagree" with the same stop-and-think the
+no-trigger probe rule gets in the
+[manual fallback](#manual-fallback) list.
+
 ## Troubleshooting
 
 **`plrd: cannot connect to <socket>: No such file or directory` (or
@@ -332,6 +409,49 @@ argument, or Klipper is not running. Find the real path in the klipper
 service definition (Moonraker installs: `~/printer_data/comms/klippy.sock`).
 The retry loop (capped exponential backoff, 250 ms → 8 s) is normal
 behavior, not a crash — plrd is designed to wait for Klipper.
+
+**Klipper errors on startup with `Section 'plr' is not a valid config
+section` (or `PLR_SETUP` is an unknown command).**
+The `[plr]` section is in printer.cfg but klippy cannot load the plugin
+— the `klippy/extras/plr` symlink is missing or dangling. Re-run
+`scripts/install.sh` (it repairs the link; `--klipper <path>` if your
+checkout is not `~/klipper`) or link manually:
+`ln -sfn ~/dead-reckoning/klippy_plugin/plr ~/klipper/klippy/extras/plr`,
+then restart Klipper. The reverse also holds: after
+`scripts/uninstall.sh`, remove the `[plr]` section (and its autosaved
+`#*# [plr]` block) before the next Klipper restart.
+
+**Console: `plrd not reachable at /var/lib/plrd/plrd.sock — is the
+service running? (systemctl status plrd)`.**
+The plugin's `PLR_STATUS` / `PLR_RECOVER` could not connect to the
+daemon's control socket. `PLR_STATUS` still prints the plugin half of
+its report; the daemon half needs `plrd run` up. Check
+`systemctl status plrd` and `journalctl -u plrd -n 50`. If the service
+is running, the paths disagree: `control_socket` in `/etc/plrd.conf`
+(where the daemon binds) must equal `control_socket` in the `[plr]`
+section (where the plugin connects) — the defaults match; if you
+changed one, change both and restart both sides. A related message,
+`plrd did not answer '<cmd>' within <n>s`, means the daemon is up but
+slow (a long pipeline run on a big WAL can push `recover_dryrun`
+toward its 120 s budget on slow media — prune old segments, see
+[disk sizing](#disk-sizing-and-write-load)).
+
+**Control-socket permissions (mode 0666) — and how to tighten them.**
+The daemon deliberately creates `/var/lib/plrd/plrd.sock` world-writable:
+the stock install runs plrd as root while klippy — the socket's one
+intended client — runs as an unprivileged user whose identity plrd
+cannot know at bind time, so any same-user or fixed-group mode would
+break the plugin out of the box. This is acceptable on a
+single-operator printer host because the socket's mutating surface is
+narrow and gated: `recover_execute` demands an explicit confirm, still
+passes machine validation, the klippy-ready + printer-idle gate, and
+transcript-or-refuse, and can only ever execute the deterministic
+pipeline plan — there is no arbitrary-G-code or configuration surface.
+On a multi-user host, tighten it: run plrd as the klippy user (systemd
+`User=`), or add a drop-in with
+`ExecStartPost=chgrp <group> %S/plrd/plrd.sock` + `chmod 0660` (plrd
+itself keeps no group-database dependency). The full rationale lives in
+`crates/plrd/src/ctrlsock.rs`.
 
 **Klipper log shows `Closing unresponsive client`, WAL has `SocketLost` /
 `Resubscribed` markers.**
@@ -370,12 +490,17 @@ with a named, saved mesh profile. Similarly, `SkewProfileUnknown` means
 skew was active but unnamed and is not restored.
 
 **`recover: REFUSED — machine prerequisites failed` (list of checks).**
-Working as designed: the `[machine]` section is not (fully) commissioned,
-or printer.cfg changed since the last blessing
-(`config changed since validation`). Fix the listed items per the
-[commissioning guide](install.md#commissioning-the-machine-section); on a
-hash mismatch, re-verify the checklist against the *current* printer.cfg,
-then paste the printed `crc32c:` value into `validated_config_hash`.
+Working as designed: the machine is not (fully) commissioned. In `[plr]`
+mode, fix the listed items from the console
+([commissioning guide](install.md#commissioning-from-the-console) —
+usually a missing `PLR_SETUP ACCEPT_SELF_LOCKING_Z=1` + `SAVE_CONFIG`,
+or an uncalibrated noise floor for `adxl_drag`); `PLR_SETUP` shows the
+same derivations the daemon checks. On the legacy `[machine]` path the
+extra cause is printer.cfg changing since the last blessing
+(`config changed since validation`): re-verify the checklist against the
+*current* printer.cfg, then paste the printed `crc32c:` value into
+`validated_config_hash`
+([legacy guide](install.md#legacy-commissioning-the-machine-section)).
 
 **`recover: cannot reach Moonraker: …` (after answering yes).**
 The `moonraker_url` in `/etc/plrd.conf` is wrong or Moonraker is down.

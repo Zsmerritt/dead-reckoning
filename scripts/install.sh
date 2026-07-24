@@ -11,7 +11,10 @@
 # Safety: this script NEVER talks to the Klipper socket and never
 # touches the klipper or moonraker services. The only Moonraker-related
 # changes (moonraker.conf / moonraker.asvc edits) are opt-in, backed up
-# first, and you restart Moonraker yourself. plrd itself is a read-only
+# first, and you restart Moonraker yourself. The Klipper console plugin
+# is installed as a single symlink into the klipper checkout's
+# klippy/extras; printer.cfg is NEVER edited (adding [plr] and
+# restarting Klipper are yours to do). plrd itself is a read-only
 # observer of Klipper; the installer is equally inert toward the printer.
 set -euo pipefail
 
@@ -45,6 +48,7 @@ FORCE_CONFIG=0
 REFRESH_MODE=0
 REPO_DIR=""
 PRINTER_DATA=""
+KLIPPER_DIR=""
 
 usage() {
     cat <<'EOF'
@@ -58,6 +62,9 @@ OPTIONS:
                            or the enclosing repo when run from a clone)
     --printer-data <path>  Klipper printer_data directory
                            (default: ~/printer_data)
+    --klipper <path>       Klipper source checkout, used to symlink the
+                           console plugin into <path>/klippy/extras
+                           (default: auto-detect, ~/klipper first)
     --moonraker            Register plrd with Moonraker's update manager
                            (moonraker.conf + moonraker.asvc, backed up first).
                            Without this flag you are asked interactively;
@@ -89,6 +96,9 @@ while [[ $# -gt 0 ]]; do
         --printer-data)
             [[ $# -ge 2 ]] || { echo "error: --printer-data requires a value" >&2; exit 2; }
             PRINTER_DATA="$2"; shift 2 ;;
+        --klipper)
+            [[ $# -ge 2 ]] || { echo "error: --klipper requires a value" >&2; exit 2; }
+            KLIPPER_DIR="$2"; shift 2 ;;
         --moonraker)    WANT_MOONRAKER=1; shift ;;
         --force-config) FORCE_CONFIG=1; shift ;;
         --no-service)   NO_SERVICE=1; shift ;;
@@ -145,6 +155,92 @@ run_root() {
     fi
 }
 
+# --- klippy console plugin symlink ------------------------------------------
+#
+# The Klipper console plugin (klippy_plugin/plr — the PLR_* commands)
+# loads like any other klippy extras module, via one symlink:
+#     <klipper>/klippy/extras/plr -> <repo>/klippy_plugin/plr
+# Creating it needs no sudo (the klipper checkout belongs to the printer
+# user) and is idempotent (ln -sfn re-points our own link; anything that
+# is not ours is never touched). printer.cfg is never edited and Klipper
+# is never restarted — activating the plugin ([plr] section in
+# printer.cfg + RESTART) is deliberately left to you.
+
+PLUGIN_LINK=""    # set once the symlink exists (used by the summary)
+
+# Prints the klipper checkout to use. --klipper wins; otherwise
+# <home>/klipper (the standard KIAUH/kiauh-like layout). A candidate
+# qualifies only if klippy/extras exists — that is the directory klippy
+# scans for extras modules, and its presence is what distinguishes a
+# source checkout from, say, a bare printer_data directory.
+detect_klipper_dir() {
+    local home="$1"
+    if [[ -n "$KLIPPER_DIR" ]]; then
+        if [[ -d "$KLIPPER_DIR/klippy/extras" ]]; then
+            echo "$KLIPPER_DIR"
+            return 0
+        fi
+        warn "--klipper $KLIPPER_DIR has no klippy/extras directory (not a Klipper source checkout?)"
+        return 1
+    fi
+    if [[ -d "$home/klipper/klippy/extras" ]]; then
+        echo "$home/klipper"
+        return 0
+    fi
+    return 1
+}
+
+# ensure_plugin_symlink <home> [quiet] — create or repair the extras
+# symlink. Never fatal: a missing klipper checkout gets manual
+# instructions and the install continues ("quiet" suppresses those —
+# used by --refresh, which runs on every service restart and must not
+# spam the journal). Only OUR link is ever (re)written — an existing
+# regular file/directory, or a live symlink resolving outside this
+# repo, is warned about and left alone.
+ensure_plugin_symlink() {
+    local home="$1" quiet="${2:-}" plugin_src="$REPO_DIR/klippy_plugin/plr" klipper link target
+    if [[ ! -d "$plugin_src" ]]; then
+        [[ -n "$quiet" ]] \
+            || warn "no klippy plugin at $plugin_src (checkout predates the console plugin?); skipping the plugin symlink"
+        return 0
+    fi
+    if ! klipper="$(detect_klipper_dir "$home")"; then
+        if [[ -z "$quiet" ]]; then
+            warn "no Klipper source checkout found (looked for klippy/extras under ${KLIPPER_DIR:-$home/klipper})."
+            warn "The PLR_* console commands need the plugin linked into klippy. Once you know the path, run:"
+            warn "    ln -sfn $plugin_src <klipper>/klippy/extras/plr"
+            warn "or re-run this installer with --klipper <path-to-klipper>."
+        fi
+        return 0
+    fi
+    link="$klipper/klippy/extras/plr"
+    if [[ -e "$link" && ! -L "$link" ]]; then
+        warn "$link exists and is not a symlink — leaving it alone."
+        warn "If it is a stale copy of the plugin, remove it, then run: ln -sfn $plugin_src $link"
+        return 0
+    fi
+    if [[ -L "$link" ]]; then
+        target="$(readlink "$link")"
+        # A live symlink into some other tree is not ours to replace
+        # (it may be a different plugin that happens to be named plr).
+        # A dangling one, or one pointing anywhere inside this repo, is
+        # ours to fix.
+        if [[ -e "$link" && "$target" != "$REPO_DIR"/* ]]; then
+            warn "$link points to $target (outside $REPO_DIR) — leaving it alone."
+            warn "To use this checkout's plugin instead: ln -sfn $plugin_src $link"
+            return 0
+        fi
+    fi
+    ln -sfn "$plugin_src" "$link"
+    # In --refresh mode this runs as root inside the user's klipper
+    # checkout; hand the (new) symlink to the directory's owner.
+    if [[ $(id -u) -eq 0 ]]; then
+        chown -h --reference="$klipper/klippy/extras" "$link" 2>/dev/null || true
+    fi
+    PLUGIN_LINK="$link"
+    log "klippy plugin linked: $link -> $plugin_src"
+}
+
 # --- refresh mode (called from the systemd drop-in, as root) ----------------
 #
 # Moonraker's update manager pulls the repo and then restarts the plrd
@@ -162,6 +258,12 @@ refresh() {
     local head owner owner_home
     owner="$(stat -c %U "$REPO_DIR")"
     owner_home="$(getent passwd "$owner" | cut -d: -f6)"
+    # Keep the klippy plugin symlink healthy across updates (an update
+    # that first ships the plugin, or a repaired dangling link). Cheap,
+    # best-effort, and independent of whether a rebuild is needed.
+    if [[ -n "$owner_home" ]]; then
+        ensure_plugin_symlink "$owner_home" quiet
+    fi
     # git refuses to read a repo owned by another user ("dubious
     # ownership"), so ask git as the repo's owner.
     if [[ "$owner" != "root" ]]; then
@@ -689,16 +791,36 @@ summary() {
     echo "   service  : plrd.service (systemctl status plrd)"
     echo "   WAL      : $WAL_DIR"
     echo "   source   : $REPO_DIR"
+    if [[ -n "$PLUGIN_LINK" ]]; then
+        echo "   plugin   : $PLUGIN_LINK"
+    else
+        echo "   plugin   : NOT linked (no Klipper checkout found — see the"
+        echo "              warning above for the manual ln -sfn command)"
+    fi
     echo
     echo " plrd only *reads* from Klipper (its API socket) and writes its"
     echo " own WAL — it never sends commands, so it is safe to run alongside"
     echo " prints, including right now."
     echo
-    echo " Next steps:"
+    echo " Activate the console plugin (the PLR_* commands). This installer"
+    echo " never edits printer.cfg and never restarts Klipper, so both"
+    echo " steps are yours:"
+    echo "   1. add a [plr] section to printer.cfg — minimal starter:"
+    echo
+    echo "        [plr]"
+    echo "        probe_method: tap   # or load_cell; adxl_drag needs accel_chip too"
+    echo
+    echo "      (commented starter block: examples/printer-plr-section.cfg;"
+    echo "       full reference: klippy_plugin/README.md)"
+    echo "   2. RESTART Klipper (console RESTART, or your web UI), then"
+    echo "   3. type PLR_SETUP in the console and follow its report."
+    echo
+    echo " Other next steps:"
     echo "   * review the config:        sudo nano $CONF_PATH"
     echo "     (then: sudo systemctl restart plrd — restarting plrd is safe)"
     echo "   * watch it attach:          journalctl -u plrd -f"
-    echo "   * after a power loss:       plrd scan --wal $WAL_DIR"
+    echo "   * after a power loss:       type PLR_RECOVER in the console"
+    echo "                               (or: plrd scan --wal $WAL_DIR)"
     if [[ $DID_MOONRAKER -eq 1 ]]; then
         echo "   * restart Moonraker to show plrd in the update UI:"
         echo "                               sudo systemctl restart moonraker"
@@ -745,10 +867,13 @@ main() {
         [[ -n "$GENERATED_CONF" ]] && echo "      config : $staged (destination: $CONF_PATH)"
         echo "      unit   : $REPO_DIR/deploy/plrd.service (destination: $UNIT_PATH)"
         echo "    Manual install commands are in the header of deploy/plrd.service."
+        echo "    The klippy console plugin was also NOT linked; do it yourself with:"
+        echo "      ln -sfn $REPO_DIR/klippy_plugin/plr <klipper>/klippy/extras/plr"
         return 0
     fi
 
     install_files
+    ensure_plugin_symlink "$HOME"
 
     if [[ $WANT_MOONRAKER -eq 1 ]] || confirm "Register plrd with Moonraker's update manager (edits moonraker.conf + moonraker.asvc, with backups)?" n; then
         setup_moonraker

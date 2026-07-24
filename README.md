@@ -15,12 +15,18 @@ not depend on motors that lost their reference), re-heat, and resume from
 the right line of G-code. No Klipper patches, no custom firmware — it talks
 to Klipper's existing API socket.
 
+You set it up and drive it **from the printer console**: a small
+Klipper plugin adds `PLR_*` commands (`PLR_SETUP`, `PLR_STATUS`,
+`PLR_RECOVER`, …) that walk you through commissioning and recovery
+without leaving Mainsail/Fluidd's console.
+
 **Honest status (v1):** the whole chain is implemented and tested —
 recording, reconstruction, plan generation, and gated execution via
-Moonraker (`plrd recover`). Execution sits behind a deliberate stack of
-safety gates: per-machine commissioning attestations that default to
-"not commissioned", a printer.cfg change-detection hash, dry-run by
-default, a double consent flag plus an interactive prompt, and
+Moonraker (console `PLR_RECOVER`, or the equivalent CLI
+`plrd recover`). Execution sits behind a deliberate stack of safety
+gates: per-machine commissioning that defaults to "not commissioned"
+(console attestations read from the live Klipper config), dry-run by
+default, a double consent flag, and
 abort-on-any-failed-verification. Treat your first execution as a
 supervised commissioning run on a scrap print — the empirical hardware
 validation tasks (E1–E5) are still open. See
@@ -41,11 +47,32 @@ Prefer to read before you pipe? So do we —
 [scripts/install.sh](scripts/install.sh) is short and commented; download
 it, read it, then run it. It installs build prerequisites, clones the repo,
 builds `plrd`, generates `/etc/plrd.conf` from your detected `printer_data`
-(socket path, Z steppers), and installs + starts the systemd service. It
-never talks to Klipper and never restarts the klipper or moonraker
-services. Add `--moonraker` to also register plrd in Moonraker's update
-manager, so Mainsail/Fluidd's update panel shows and updates it. There is a
-matching [scripts/uninstall.sh](scripts/uninstall.sh).
+(socket path, Z steppers), installs + starts the systemd service, and
+symlinks the Klipper console plugin into your klipper checkout
+(`~/klipper/klippy/extras/plr`; override with `--klipper <path>`). It
+never talks to Klipper, never edits `printer.cfg`, and never restarts the
+klipper or moonraker services. Add `--moonraker` to also register plrd in
+Moonraker's update manager, so Mainsail/Fluidd's update panel shows and
+updates it. There is a matching
+[scripts/uninstall.sh](scripts/uninstall.sh).
+
+Then finish from the printer console:
+
+1. add a `[plr]` section to `printer.cfg` — minimally
+   `[plr]` + `probe_method: tap` (commented starter:
+   [examples/printer-plr-section.cfg](examples/printer-plr-section.cfg))
+   — and `RESTART` Klipper;
+2. type **`PLR_SETUP`** and follow its report: it checks every machine
+   prerequisite with `[PASS]`/`[WARN]`/`[FAIL]` markers and tells you
+   the remediation for each;
+3. attest the one thing software cannot check — a self-locking Z —
+   with `PLR_SETUP ACCEPT_SELF_LOCKING_Z=1`;
+4. calibrate your probe method: `PLR_PROBE_TEST START=1` (tap /
+   load-cell repeatability) or `PLR_NOISE_TEST START=1` (adxl_drag
+   noise floor);
+5. `SAVE_CONFIG`. After the restart `PLR_SETUP` reports
+   `COMMISSIONED`, and `PLR_STATUS` shows both the plugin and the
+   daemon state.
 
 Manual alternative (what the script automates):
 
@@ -61,15 +88,18 @@ sudo systemctl daemon-reload && sudo systemctl enable --now plrd
 
 Then check it is recording (`systemctl status plrd`, WAL files appearing
 under `/var/lib/plrd/wal`) and, after any unclean stop, inspect what the
-journal knows:
+journal knows — from the console (`PLR_STATUS`, then `PLR_RECOVER` for a
+dry-run plan) or from a shell:
 
 ```sh
 plrd scan --wal /var/lib/plrd/wal      # evidence report
 plrd recover --config /etc/plrd.conf   # recovery plan (dry run by default)
 ```
 
-**The full guide — commissioning checklist, config editing, first-run
-verification, cross-compiling — is [docs/install.md](docs/install.md).**
+**The full guide — commissioning checklist, console commissioning
+walkthrough, config editing, first-run verification, cross-compiling —
+is [docs/install.md](docs/install.md).** The `PLR_*` command reference
+is [klippy_plugin/README.md](klippy_plugin/README.md).
 A complete worked example (record → power cut → scan → `plrd recover`,
 with real tool output at every step) is
 [examples/recovery-walkthrough.md](examples/recovery-walkthrough.md).
@@ -83,15 +113,24 @@ every failed check). You need:
 - **A moving-bed-Z printer** (bed rises into a fixed gantry — Voron
   2.4/Trident class). Recovery **never re-homes Z**; the whole safety story
   is built around that.
-- **A nozzle-contact probe: a Tap-style `[probe]` or a
-  `[load_cell_probe]`** — required in v1. The probe must trigger on nozzle
-  contact so it can reference the printed part; inductive-only probes do not
-  qualify. **ADXL "drag probing" is NOT supported yet** (explicitly
-  deferred). Probe `activate_gcode`/`deactivate_gcode` must be empty or
-  verified move-free.
+- **A contact oracle that can reference the printed part** — one of:
+  - a Tap-style **`[probe]`** (`probe_method: tap`) or a
+    **`[load_cell_probe]`** (`probe_method: load_cell`): the probe must
+    trigger on nozzle contact; inductive-only probes do not qualify.
+    Probe `activate_gcode`/`deactivate_gcode` must be empty or verified
+    move-free.
+  - an **accelerometer drag oracle** (`probe_method: adxl_drag` + an
+    `accel_chip`): the nozzle drags short lateral passes down a bounded
+    Z staircase and the accelerometer detects contact
+    (`PLR_DRAG_PROBE`). Honest note: its safety **bounds** (staircase
+    travel floor, abort-on-unclassifiable, one-`drag_z_step` overshoot)
+    are tested, but **bench validation of detection quality on real
+    hardware is still open (E5)** — treat detection as unproven until
+    then.
 - **`[force_move]` with `enable_force_move: True`** in `printer.cfg`.
 - **Self-locking Z leadscrews** (the bed must hold position unpowered) —
-  an operator attestation; software cannot check this.
+  an operator attestation; software cannot check this. You attest it from
+  the console: `PLR_SETUP ACCEPT_SELF_LOCKING_Z=1`.
 - **All Z steppers on the primary MCU** (multi-MCU Z is refused).
 - **Slicer `;TYPE:` feature annotations** in your G-code — OrcaSlicer and
   PrusaSlicer (and SuperSlicer/Cura) emit them by default; recovery refuses
@@ -104,21 +143,28 @@ Out of scope in v1: multi-extruder machines.
 
 ## Configuration
 
-Two configs matter — the daemon's and Klipper's:
+Two configs matter — Klipper's and the daemon's:
 
-- **`/etc/plrd.conf`** (flat `key = value` plus a `[machine]` section):
-  every key, default, and valid range is tabulated in
+- **`printer.cfg` `[plr]` section** — the plugin's config and the
+  **authoritative machine config for recovery**: probe method, tunables,
+  and the values the console commands persist via `SAVE_CONFIG`
+  (attestation, probe resolution, noise floor). plrd reads it from the
+  live Klipper config at recover time, so there is no separate snapshot
+  to keep in sync — and no config-hash blessing ritual. Commented
+  starter: [examples/printer-plr-section.cfg](examples/printer-plr-section.cfg);
+  full key table: [klippy_plugin/README.md](klippy_plugin/README.md).
+  What each *machine prerequisite* looks like in the rest of your Klipper
+  config: [docs/install.md → Where each prerequisite lives](docs/install.md#where-each-prerequisite-lives).
+- **`/etc/plrd.conf`** (flat `key = value`): the recorder daemon's own
+  config — socket paths, WAL location and durability knobs; every key,
+  default, and valid range is tabulated in
   [docs/install.md → Editing /etc/plrd.conf](docs/install.md#editing-etcplrdconf).
   A fully commented example for a Voron-style multi-Z machine:
   [examples/plrd.conf](examples/plrd.conf). Recording works with only
-  `klipper_socket` (and, multi-Z, `z_steppers`) changed; **recovery
-  execution additionally requires commissioning the `[machine]` section**
-  — its attestations default to false and `plrd recover` refuses until
-  every prerequisite validates
-  ([docs/install.md → Commissioning the machine section](docs/install.md#commissioning-the-machine-section)).
-- **`printer.cfg` prerequisites**: what each requirement above looks like in
-  your Klipper config, and where to find it —
-  [docs/install.md → Where each prerequisite lives](docs/install.md#where-each-prerequisite-lives).
+  `klipper_socket` (and, multi-Z, `z_steppers`) changed. Its `[machine]`
+  section is the **legacy** (pre-plugin) commissioning path —
+  deprecated-but-working, and ignored whenever a `[plr]` section exists
+  ([docs/install.md → Legacy commissioning](docs/install.md#legacy-commissioning-the-machine-section)).
 
 ## Understanding the logs
 
@@ -162,7 +208,7 @@ flowchart LR
         SCAN --> R["plr-reconstruct<br/>possible-stop set"]
         R --> A["plr-analyzer<br/>stop match + contact zone"]
         A --> P["plr-recovery<br/>typed, verifiable plan"]
-        P --> X["plrd recover<br/>(dry run by default;<br/>gated execution via Moonraker)"]
+        P --> X["PLR_RECOVER (console)<br/>or plrd recover (CLI)<br/>(dry run by default;<br/>gated execution via Moonraker)"]
     end
 ```
 
@@ -208,9 +254,12 @@ summary, stated as honestly as the code states it:
   poll timeout, or non-finite computation aborts with a typed reason).
   There is no "retry and hope" path in v1, and everything sent and checked
   is transcribed to a JSONL file.
-- **Consent-gated execution.** `plrd recover` is a dry run unless you pass
-  `--execute --confirm` *and* answer an interactive prompt; the machine
-  must be commissioned (attestations + config-hash blessing) and the
+- **Consent-gated execution.** Recovery is a dry run unless you
+  explicitly consent twice — console: `PLR_RECOVER EXECUTE=1
+  CONFIRM=YES`; CLI: `plrd recover --execute --confirm` plus an
+  interactive prompt. The machine must be commissioned (console
+  attestations read from the live `[plr]` config — or, legacy mode,
+  `[machine]` attestations plus the config-hash blessing) and the
   printer ready and idle before a single command is sent.
 - **Honest degradation.** Subscription gaps, missing file tails, adaptive
   (non-restorable) bed meshes, unparseable lines — all surface as typed flags
@@ -254,17 +303,27 @@ Implemented and tested:
   the previous session's WAL, writes `pending_recovery.json`, and announces
   the pending recovery on the printer console (`RESPOND`, falling back to
   `M117`).
-- **Recovery execution** (`plrd recover`): the full pipeline from WAL to a
-  validated plan, then gated execution via Moonraker. The gate stack, in
-  order: machine prerequisites must validate (the `[machine]` attestations
-  **default to not-commissioned**, and the printer.cfg checksum must match
-  the blessed `validated_config_hash`); **dry run is the default** — the
+- **Recovery execution** (`plrd recover`, console `PLR_RECOVER`): the full
+  pipeline from WAL to a validated plan, then gated execution via
+  Moonraker. The gate stack, in order: machine prerequisites must validate
+  (commissioning **defaults to not-commissioned**; in `[plr]` mode the
+  snapshot is re-read from the live Klipper config every run, in legacy
+  `[machine]` mode the printer.cfg checksum must additionally match the
+  blessed `validated_config_hash`); **dry run is the default** — the
   dry path provably cannot send (no network client is ever constructed);
-  `--execute` requires `--confirm` *and* an interactive yes; the printer
-  must be ready and idle; `--step` asks again before every step. During
-  execution every step's verifications must pass — any failure aborts with
-  a typed reason — and everything sent, received, and evaluated is written
-  to a JSONL transcript in the WAL directory.
+  `--execute` requires `--confirm` *and* an interactive yes (console:
+  `EXECUTE=1 CONFIRM=YES`); the printer must be ready and idle; `--step`
+  asks again before every step (CLI-only). During execution every step's
+  verifications must pass — any failure aborts with a typed reason — and
+  everything sent, received, and evaluated is written to a JSONL
+  transcript in the WAL directory.
+- **The Klipper console plugin** (`klippy_plugin/plr`, the `[plr]`
+  section): `PLR_SETUP` commissioning checks + attestation, `PLR_SET`
+  tunables with `SAVE_CONFIG` staging, `PLR_PROBE_TEST` /
+  `PLR_NOISE_TEST` calibration, `PLR_STATUS`, `PLR_RECOVER`, and the
+  `PLR_DRAG_PROBE` staircase drag oracle — talking to the daemon over
+  its control socket. Command reference:
+  [klippy_plugin/README.md](klippy_plugin/README.md).
 
 Known limits, stated plainly:
 
@@ -273,7 +332,9 @@ Known limits, stated plainly:
   infill, WAL write-load measurement — are open. Commission on a scrap
   print with your hand near the power switch, using `--step`:
   [docs/install.md](docs/install.md#commissioning-checklist).
-- ADXL drag probing is deferred; multi-extruder machines are out of scope.
+- ADXL drag probing is implemented with tested safety bounds, but its
+  detection quality is **bench-unvalidated (E5)**; multi-extruder
+  machines are out of scope.
 - The MCU `CLOCK_FREQ` is not journaled yet, so reconstruction falls back to
   Klipper-converted step times (reported as a `NoMcuFrequency` anomaly).
 - Automation declines rather than guesses: vase mode, single-wall parts,

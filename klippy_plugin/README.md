@@ -9,16 +9,19 @@ reconstruction, recovery planning, motion) stays in the Rust daemon
 ## Install
 
 The plugin ships as a python package that klippy loads like any other
-extras module. Symlink it into your Klipper checkout and restart:
+extras module. `scripts/install.sh` (repo root) creates the symlink
+for you; manually it is:
 
 ```sh
-ln -s /path/to/dead-reckoning/klippy_plugin/plr ~/klipper/klippy/extras/plr
+ln -sfn /path/to/dead-reckoning/klippy_plugin/plr ~/klipper/klippy/extras/plr
 sudo systemctl restart klipper
 ```
 
 Then add a `[plr]` section to `printer.cfg` (all options below have
-defaults; an empty `[plr]` section is valid) and install/enable the
-`plrd` service (see `docs/install.md` at the repo root).
+defaults; an empty `[plr]` section is valid — a commented starter block
+is `examples/printer-plr-section.cfg` at the repo root) and
+install/enable the `plrd` service (see `docs/install.md` at the repo
+root).
 
 ## `[plr]` reference
 
@@ -60,8 +63,8 @@ Values the plugin persists itself (never hand-edit; they live in the
 `SAVE_CONFIG` autosave block under `[plr]`): `self_locking_z` (operator
 attestation staged by `PLR_SETUP ACCEPT_SELF_LOCKING_Z=1`),
 `probe_resolution` (measured by `PLR_PROBE_TEST`), and
-`noise_floor_rms` / `noise_floor_still_rms` / `noise_floor_peak`
-(measured by `PLR_NOISE_TEST`).
+`noise_floor_rms` / `noise_floor_still_rms` / `noise_floor_peak` /
+`noise_floor_speed` (measured by `PLR_NOISE_TEST`).
 
 ## Command reference
 
@@ -141,14 +144,17 @@ Power-loss recovery, driven by plrd:
   required verbatim; anything less refuses client-side. plrd still
   enforces every gate server-side (machine validation, klippy
   ready+idle, transcript), so the console consent is additive.
-- `STEP=1` — single-step mode (pause between plan steps).
+- `STEP=1` is accepted syntax but the daemon **refuses** it over the
+  control socket (`per-step mode is CLI-only`): the one-shot socket
+  protocol has no multi-round confirmation dialogue. For a step-by-step
+  recovery use the CLI: `plrd recover --execute --confirm --step`.
 
 ### `PLR_NOISE_TEST [CHIP=] [SPEED=] [DURATION=2.0] START=1`
 
 Measures the accelerometer noise floor the drag oracle thresholds
 against. Two captures: ~2 s standing still, then four no-contact
 lateral passes at the drag `SPEED` at the current Z (the same pass
-geometry `PLR_DRAG_PROBE` uses). Stages three keys for `SAVE_CONFIG`:
+geometry `PLR_DRAG_PROBE` uses). Stages four keys for `SAVE_CONFIG`:
 
 - `noise_floor_rms` — the **moving** capture's RMS. This is the
   reference the threshold is built from, deliberately not the still
@@ -160,6 +166,10 @@ geometry `PLR_DRAG_PROBE` uses). Stages three keys for `SAVE_CONFIG`:
 - `noise_floor_peak` — the moving capture's max windowed RMS, the exact
   statistic the classifier thresholds, so the report can show your
   headroom at the current sensitivity.
+- `noise_floor_speed` — the `SPEED` the moving baseline was captured
+  at. The noise floor is speed-specific, so recovery plans **warn**
+  (never refuse) when their `drag_speed` strays more than 20% from this
+  calibration speed — the nudge to re-run `PLR_NOISE_TEST`.
 
 **This command moves the toolhead** — without `START=1` it only prints
 the plan. It refuses while printing or unhomed.
