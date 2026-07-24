@@ -272,7 +272,9 @@ non-negotiables:
 - `SET_IDLE_TIMEOUT TIMEOUT=86400` **first** — the default idle timeout
   runs `M84`, and any motor-off clears ALL homed state.
 - Never `G28` after declaring the shifted frame. Home **XY only**, ever.
-- Probe at 1–2 mm/s, `SAMPLES=1`, only after declaring the shifted frame
+- Probe at 1–2 mm/s, `SAMPLES=1` (with the plugin installed, prefer a
+  `PLR_TOUCH` consensus — same speed rules), only after declaring the
+  shifted frame
   (`SET_KINEMATIC_POSITION Z = position_min + envelope`), with the
   nozzle in the 140–160 °C band (warm enough not to plough cold plastic,
   cool enough not to ooze).
@@ -345,6 +347,139 @@ rough %, crash class, detection time) — safe to read, never required by
 the pipeline, cleared automatically on a clean shutdown or completed
 recovery.
 
+**What an abort leaves behind.** Every abort record (console and
+transcript) carries a typed failure classification alongside the step's
+abort reason: `probe-triggered-early` (the probe fired before the
+descent — usually debris or a probe fault), `no-trigger` (full travel
+with no contact, which also covers a `PLR_TOUCH` consensus that could
+not assemble an agreeing subset), `move-out-of-range`, or `unknown`.
+Before the abort is recorded, any registered **cleanup commands** run
+(today: restoring the pre-clamp `max_accel` after an abort inside the
+consensus-touch bracket) — each transcribed, and a cleanup failure
+never masks the original reason. If the abort happened **at or after
+the shifted-frame declaration**, the printer's Z frame is unknown:
+`frame_invalid.json` is written next to the WAL and any further
+`--execute` (CLI or console) is refused —
+
+```text
+recover: REFUSED — the printer's Z frame is unknown after an aborted recovery
+(aborted at step 9 [probe]: probe-no-trigger). Re-run a dry run (plrd scan /
+plrd recover without --execute) for a fresh plan before resuming.
+```
+
+— until a fresh dry run regenerates the plan and clears the marker.
+That is deliberate: the stale plan's coordinates were computed for a
+frame that no longer exists.
+
+**Itinerary pre-flight.** Also note the failure mode you should *never*
+see at execution time: every coordinate a plan commands is validated
+before the plan is returned (travel limits, probe-site anchoring, the
+shifted-frame Z), and a violation is a typed rejection listing **every**
+offending coordinate at once — a plan that would move out of bounds is
+refused at planning, not discovered mid-recovery. If Klipper itself
+still reports `Move out of range` during execution, that is the typed
+`move-out-of-range` abort above, and worth reporting as a bug with the
+transcript.
+
+## Touch consensus day-2: `PLR_TOUCH` and `PLR_PROBE_TEST`
+
+(Tap / load-cell machines; full parameter reference in
+[klippy_plugin/README.md](../klippy_plugin/README.md).)
+
+**`PLR_TOUCH`** is the same consensus sampler recovery plans use, run
+by hand at the current XY — useful to sanity-check the probe on the
+actual part surface class you care about before trusting a recovery.
+Captured through the plugin's own test harness (one noisy first touch,
+then three agreeing):
+
+```text
+PLR_TOUCH consensus at X:120.000 Y:120.000 (want 3 touches within 0.010, window 5, budget 10, speed 1.50)
+PLR_TOUCH: median 0.405100, range 0.002, min 0.404900, max 0.406200
+  4 touches used of 10 (window 5, limit 0.010)
+```
+
+Read the last line: it took 4 touches to find 3 contemporaneous ones
+agreeing within 10 µm (the noisy first touch fell out of the window's
+best subset). Many touches used — or exhaustion — means a noisy probe
+or a bad surface. Exhaustion names the failed criteria, lists every
+sample, and prints a **copy-pasteable retry** with the touch budget
+escalated 1.5×:
+
+```text
+PLR_TOUCH failed: could not find 3 touches within 0.010 of each other in a sliding window of 5, after 6 touches.
+  samples taken: [0.420000, 0.380000, 0.440000, 0.360000, 0.460000, 0.340000]
+Retry with a larger touch budget:
+  PLR_TOUCH START=1 SAMPLES=3 MAX_SAMPLES=9 SAMPLE_RANGE=0.010 SPEED=1.50 RETRACT=2.00 TOUCH_ACCEL=100
+```
+
+Run the retry as printed, or take the hint and investigate the probe
+instead of loosening `SAMPLE_RANGE` (its 0.015 mm cap is a refusal, not
+a suggestion).
+
+**`PLR_PROBE_TEST START=1`** is the verification tier: it runs
+`SEQUENCES` (default 5) *full* consensus sequences and requires the
+per-sequence **medians** to agree within `VERIFY_RANGE` (default 2× the
+per-sequence `SAMPLE_RANGE`), early-exiting the moment they cannot. On
+success it stages `probe_resolution` — recovery's trust radius for your
+probe — for `SAVE_CONFIG`. Re-run it (and `SAVE_CONFIG`) after any
+change to the probe or Z hardware; the
+[staleness machinery below](#calibration-staleness-when-recovery-stops-trusting-your-numbers)
+will insist anyway.
+
+## Calibration staleness: when recovery stops trusting your numbers
+
+Every calibration the console stages (`probe_resolution`, the
+`noise_floor_*` group) is stamped with a **fingerprint of the hardware
+config it was measured under** plus the plugin/Klipper versions
+([architecture](architecture.md#stamped-calibrations-fingerprints-and-three-tier-validation)).
+On every restart the stamps are re-checked, three ways:
+
+- **VALID** — used normally; nothing to see.
+- **LEGACY** — the value predates stamping (an older install). It still
+  works, with a one-time console warning; the stamps appear when you
+  next re-run the calibration + `SAVE_CONFIG`.
+- **INVALID** — the fingerprint no longer matches (or the plugin was
+  downgraded below the staging version). The value is **treated as
+  absent everywhere**: drag commands refuse with "calibrated under a
+  different hardware configuration — re-run PLR_NOISE_TEST", `PLR_SETUP`
+  shows a `[FAIL]` row with the old-vs-new fingerprints, `get_status`
+  reports `calibrations_valid: false`, and plrd independently reaches
+  the same verdict (it recomputes the fingerprint itself), so recovery
+  planning refuses too.
+
+**"I changed my Z motors — why is recovery refusing?"** Because that is
+the design: the fingerprint covers every `stepper_z*` section and the
+active probe/accel-chip section, so a Z-kinematics or probe-hardware
+change invalidates exactly the calibrations that depended on it. The
+fix is never to edit anything by hand — re-run the calibration on the
+new hardware:
+
+```text
+G28
+PLR_PROBE_TEST START=1        ; tap / load_cell (probe_resolution group)
+PLR_NOISE_TEST START=1        ; adxl_drag (noise-floor group; away from parts!)
+PLR_DRAG_CALIBRATE START=1    ; optional: re-pick sensitivity too
+SAVE_CONFIG
+```
+
+Notes on the mechanics, so nothing surprises you:
+
+- The two groups invalidate **independently** — a new accelerometer
+  invalidates the noise floor but not `probe_resolution`; new Z
+  steppers invalidate both (both fingerprints cover `stepper_z*`).
+- Unrelated printer.cfg churn (`[fan]`, macros, `[display]`) never
+  invalidates anything, and neither does re-formatting a covered
+  section (the fingerprint canonicalizes whitespace and numeric
+  spelling).
+- The stale option text stays in printer.cfg until the re-calibration
+  overwrites it (Klipper gives plugins no way to delete an autosave
+  option) — it is ignored, not honored. Do not hand-edit `cal_*` keys
+  to "fix" a mismatch: the values would still be measurements of
+  hardware you no longer have.
+- Staging refuses entirely when the running Klipper version cannot be
+  determined (nothing is written, no partial stamps) — retry once
+  Klipper has fully started.
+
 ## Operating the ADXL drag oracle
 
 Notes for `probe_method: adxl_drag` day-2 use (the command reference is
@@ -389,18 +524,64 @@ staircase decrement can put the nozzle below the surface). Smaller
 a first-layer-scale bracket. Expect *bounded, by-design* nozzle contact
 with the part surface — the last pass drags across it.
 
+**Pick the sensitivity empirically: `PLR_DRAG_CALIBRATE START=1`.**
+Rather than guessing a knob value, run the clear-air sweep after
+`PLR_NOISE_TEST` (same session works): it finds the most sensitive
+knob that produces zero false contacts — entirely at a Z where contact
+is impossible (it refuses to descend; `CLEAR_Z` must be ≥ 5 mm above
+the Z floor) — and stages `drag_sensitivity = accepted − MARGIN` for
+`SAVE_CONFIG`. If even the least sensitive knob false-triggers, that is
+diagnosis, not error: your moving noise floor is bad — re-run
+`PLR_NOISE_TEST` (away from any part!) or fix the accelerometer
+mounting, then retry with the printed command.
+
 **When a drag probe aborts** (`last_drag_error` in `get_status`, error
-text on the console): unclassifiable passes (too few samples, frozen
-signal, collapsed sample rate) and staircase exhaustion (travel floor
-reached with no contact) abort rather than guess — the starting Z is
-restored. An exhaustion abort usually means the surface is not where
-the reconstruction expected it, or the sensitivity is too low to see
-contact: check the noise-floor calibration before re-running, and treat
-"reconstruction and reality disagree" with the same stop-and-think the
-no-trigger probe rule gets in the
-[manual fallback](#manual-fallback) list.
+text on the console): every abort restores the starting Z, and the
+hardened aborts carry a stable `[code]` token in the error text —
+
+| Token | What happened | What to do |
+| --- | --- | --- |
+| `[drag_envelope_exhausted]` | The staircase reached the travel floor with no contact | The surface is not where reconstruction expected, or sensitivity is too low to hear contact. Stop and think ("reconstruction and reality disagree" — same rule as a no-trigger probe in the [manual fallback](#manual-fallback) list); check the noise floor and sensitivity before re-running |
+| `[drag_time_budget]` | Wall-clock budget (`MAX_SECONDS`, default 120 s) exhausted mid-staircase | Something is slower than it should be (huge envelope, tiny `drag_z_step`, slow captures). Re-check the envelope in the dry run; raise `MAX_SECONDS` only after understanding *why* it was slow |
+| `[drag_stalled]` | Many consecutive flat clean passes with real descent and no rising signal (warns once at half budget, aborts at full) | The signal is not approaching contact at all — likely a wrong site or a stale/corrupt noise floor. Re-run `PLR_NOISE_TEST`; verify the probe site over actual part |
+| `[drag_implausible_signal]` | A substantial signal (≥ 50% of threshold) *fell* monotonically across three descending passes | Physically backwards (vibration should rise approaching the part): the baseline drifted or the site is wrong. Re-run `PLR_NOISE_TEST` or move; do not chase it down |
+| `invalid pass (coverage_gap: …)` | A pass's accel samples did not bracket the pass motion | A capture that starts late or ends early could hide the contact burst — the pass is refused, never trusted. Usually a transient; if persistent, check the accel chip's sample rate and comms (the other `invalid pass` reasons — `too_few_samples`, non-finite, constant signal, rate collapse — share this shape) |
+
+Unclassifiable passes (too few samples, frozen signal, collapsed sample
+rate) abort the same way — a pass is never assumed clean.
+
+**Temperature drift.** If `[plr] noise_floor_temp_sensor` is set and
+`PLR_NOISE_TEST` staged a baseline temperature, a drag probe run more
+than ±15 °C away widens its threshold (+2%/°C past the band, cap +50%)
+and says so on the console. Widening costs detection margin — treat the
+warning as a nudge to re-run `PLR_NOISE_TEST` at the temperature you
+actually print at. No sensor configured = no covariate (nothing is
+guessed).
 
 ## Troubleshooting
+
+**`recover: REFUSED — the printer's Z frame is unknown after an aborted
+recovery …`.**
+A previous `--execute` aborted at or after the shifted-frame
+declaration, so the Z frame Klipper believes in is not one anybody
+declared deliberately (`frame_invalid.json` in the WAL directory
+records the step/phase/reason). This is not a fault to clear by
+deleting the file: run a fresh dry run (`plrd recover` without
+`--execute`, or console `PLR_RECOVER`) — a newly generated plan clears
+the marker — review it, then execute. A completed recovery also clears
+it. See
+[what an abort leaves behind](#recovering-with-plr_recover--plrd-recover).
+
+**A drag command refuses with `calibrated under a different hardware
+configuration — re-run PLR_NOISE_TEST`, or `PLR_SETUP` shows a
+fingerprint `[FAIL]` after a config change.**
+The calibration-staleness defense: the persisted value was measured on
+hardware whose config slice no longer matches (the report shows the
+staged vs current fingerprints). Re-run the named calibration and
+`SAVE_CONFIG` — the full workflow, including which changes invalidate
+which group, is
+[Calibration staleness](#calibration-staleness-when-recovery-stops-trusting-your-numbers).
+Do not hand-edit `cal_*` keys.
 
 **`plrd: cannot connect to <socket>: No such file or directory` (or
 `Connection refused`), repeating.**

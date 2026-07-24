@@ -182,12 +182,20 @@ refuses and prints the computed printer.cfg checksum:
 
 ```text
 pipeline: stop window t_a 21.200s .. t_b 21.950s, class HostDeathOrPowerLoss { torn_tail: true }
+pipeline: machine config from /etc/plrd.conf [machine] (legacy mode)
+pipeline: note: klippy is unreachable (cannot connect to klippy at /tmp/klippy_uds: No such file or directory (os error 2)); trusting the commissioned legacy [machine] snapshot — its config-hash blessing still detects a printer.cfg changed since blessing (including one that grew [plr])
 pipeline: machine hash computed: crc32c:658a94bb
 recover: REFUSED — machine prerequisites failed:
   - machine prerequisites have never been validated
   Fix the machine/config, set machine.validated_config_hash to the
   computed hash printed above once re-validated, and retry.
 ```
+
+(The `klippy is unreachable` note is this walkthrough's synthetic
+environment — no Klipper is running. The legacy `[machine]` path is
+built for exactly that case; a `[plr]`-mode recovery would instead
+refuse without a reachable klippy, since its machine snapshot is read
+from the live config.)
 
 After re-walking the [commissioning checklist](../docs/install.md#commissioning-checklist)
 and pasting `validated_config_hash = crc32c:658a94bb` into the config
@@ -203,10 +211,12 @@ dry path never constructs a network client (the `moonraker_url` in this
 test config points at a port with nothing listening, on purpose):
 
 ```console
-$ plrd recover --config /tmp/plrd-recover2.conf
+$ plrd recover --config /tmp/r2.conf
 pipeline: 21 WAL records, tail: torn frame payload at end of log
 pipeline: print file /home/pi/printer_data/gcodes/hatch_xl.gcode (1141 bytes)
 pipeline: stop window t_a 21.200s .. t_b 21.950s, class HostDeathOrPowerLoss { torn_tail: true }
+pipeline: machine config from /etc/plrd.conf [machine] (legacy mode)
+pipeline: note: klippy is unreachable (cannot connect to klippy at /tmp/klippy_uds: No such file or directory (os error 2)); trusting the commissioned legacy [machine] snapshot — its config-hash blessing still detects a printer.cfg changed since blessing (including one that grew [plr])
 pipeline: machine prerequisites validated
 pipeline: layer model from byte 0: 2 layers
 pipeline: match confidence AmbiguousWindow { offsets: [918, 943, 961, 986, 1004, 1046, 1063, 1087] } (8 candidates)
@@ -215,7 +225,7 @@ pipeline: 5 probe candidate(s); best at (108.00, 132.00)
 # resume: hatch_xl.gcode @ byte 1087
 # envelope: gap 0.2 + 0.15 x speed 1 + margin 0.5 = 0.85 mm
 # shifted frame: Z declared 0.85 above position_min -2
-# warning: ResumeNotOnInfill
+# warning: the resume point is not on infill; the seam may be visible
  1. [idle-timeout] disarm the idle timeout FIRST (its default M84 would clear all homed state)
       send: SET_IDLE_TIMEOUT TIMEOUT=86400
       ok?:  idle_timeout.idle_timeout within 0.5 of 86400
@@ -248,6 +258,7 @@ pipeline: 5 probe candidate(s); best at (108.00, 132.00)
       fail: abort (approach-failed)
  7. [probe] single-sample probe (SAMPLES=1: the toolhead rests exactly at the halt position)
       pre:  extruder.temperature in [140, 160] C
+      pre:  extruder.target <= 160
       pre:  toolhead.homed_axes contains "x"
       pre:  toolhead.homed_axes contains "y"
       pre:  toolhead.homed_axes contains "z"
@@ -256,12 +267,12 @@ pipeline: 5 probe candidate(s); best at (108.00, 132.00)
       fail: abort (probe-no-trigger)
  8. [true-z-declare] true-Z arithmetic and kinematic re-declaration (never a gcode offset)
       send: SET_KINEMATIC_POSITION Z={true_z}
-      ok?:  toolhead.position.2 within 0.05 of the computed true Z
+      ok?:  toolhead.position.2 within 0.05 of the step's computed value
       fail: abort (true-z-declare-failed)
  9. [final-declare] final true-frame declaration after all transforms are in place
       send: SET_KINEMATIC_POSITION Z={true_z}
       ok?:  toolhead.homed_axes contains "z"
-      ok?:  toolhead.position.2 within 0.05 of the computed true Z
+      ok?:  toolhead.position.2 within 0.05 of the step's computed value
       fail: abort (final-declare-failed)
 10. [restore-frame] lift off the part, then replay offsets, factors, skew, print temperatures, fans, feedrate
       send: G91
@@ -316,8 +327,9 @@ What to notice, mapped to the [trust model](../docs/architecture.md#the-plan-is-
   evidence; skip-forward is the conservative direction (resuming earlier
   would double-extrude over printed geometry), so the resume target is
   the **latest** offset (1087 — the start of layer-2's outer wall), and
-  the plan says so in a warning: `ResumeNotOnInfill` (the seam of the
-  resume will land on a wall, not hidden in infill).
+  the plan says so in a warning
+  (`# warning: the resume point is not on infill; the seam may be
+  visible`).
 - **The probe point (108, 132)** is the midpoint of a layer-1 sparse
   infill diagonal — plastic that exists, that layer 2 will rebury, well
   away from the crash region. Five ranked candidates were found.
@@ -331,13 +343,25 @@ What to notice, mapped to the [trust model](../docs/architecture.md#the-plan-is-
   0.85 mm of envelope-sized travel, probe trusted for measurement only.
   The envelope header shows the arithmetic: Z span 0 (single trusted
   plateau) + sag 0.2 + 0.15 × 1 mm/s + margin 0.5.
-- **`{true_z}` is the only placeholder**: the executor computes
-  `true_Z = z_prev_top + (halt − trigger)` from the live probe result and
-  substitutes it; a non-finite result aborts, never substitutes. This
-  Tap-probe plan reads the raw trigger from `probe.last_z_result`; a
-  `[load_cell_probe]` plan differs in exactly one principled way — it
-  reads `probe.last_probe_position[2]` (`bed_z`) and adds the configured
-  `z_offset` back.
+- **Step 7's pre-checks include the heater TARGET**
+  (`pre: extruder.target <= 160`): a nozzle *commanded* to print
+  temperature but transiently inside the probe band would heat while
+  pressed against the part — so the interlock checks both the current
+  temperature and the target before any touch.
+- **This is the legacy `[machine]`-mode plan**, so the probe is a
+  single `PROBE SAMPLES=1` — that path cannot assume the Klipper
+  plugin's `PLR_TOUCH` command exists. On a `[plr]`-mode install the
+  probe step is instead a **consensus multi-touch** (`PLR_TOUCH`,
+  sliding-window agreeing subset, median trigger) bracketed by
+  accel-clamp / accel-restore steps — see the checked-in golden plan
+  `crates/plr-recovery/tests/golden/normal_tap.txt` and
+  [architecture](../docs/architecture.md#the-touch-itself-consensus-not-a-single-sample).
+- **`{true_z}` computes** as `true_Z = z_prev_top + (halt − trigger)`
+  from the live probe result; a non-finite result aborts, never
+  substitutes. This Tap-probe plan reads the raw trigger from
+  `probe.last_z_result`; a `[load_cell_probe]` plan differs in exactly
+  one principled way — it reads `probe.last_probe_position[2]` (`bed_z`)
+  and adds the configured `z_offset` back.
 - **Step 10 lifts off the part before heating to print temperature** —
   the nozzle must not dwell pressed into layer-1 plastic while the
   temperature verification polls.

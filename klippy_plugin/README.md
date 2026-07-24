@@ -29,6 +29,7 @@ root).
 [plr]
 probe_method: tap
 #accel_chip:
+#noise_floor_temp_sensor:
 #wal_dir: /var/lib/plrd/wal
 #control_socket: /var/lib/plrd/plrd.sock
 #probe_speed: 1.5
@@ -423,7 +424,10 @@ SAVE_CONFIG                        ; 5. persist attestation + resolution
 ```
 
 After the restart, `PLR_SETUP` should print `COMMISSIONED` and
-`PLR_STATUS` should show plrd armed.
+`PLR_STATUS` should show plrd armed. (`adxl_drag` machines calibrate
+with `PLR_NOISE_TEST` + `PLR_DRAG_CALIBRATE` instead of
+`PLR_PROBE_TEST` — the full flow is
+[docs/install.md → Commissioning from the console](../docs/install.md#commissioning-from-the-console).)
 
 ## The SAVE_CONFIG workflow
 
