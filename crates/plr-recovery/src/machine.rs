@@ -233,8 +233,9 @@ pub struct MachineRejection {
 /// argument (`PLR_DRAG_PROBE CHIP=<chip>`). Klipper's extended-command
 /// parameter parsing splits on whitespace and performs no unquoting, so
 /// whitespace, quotes, `=`, and control characters are all refused.
-/// Note this refuses multi-word chip names like `adxl345 hotend`
-/// (Klipper's `[adxl345 hotend]` sections) — a documented v1 limitation
+/// Note this refuses multi-word chip names like `adxl345 bed`
+/// (Klipper's `[adxl345 bed]` sections), which the plugin's own
+/// `accel_chip` option otherwise permits — a documented v1 limitation
 /// of the command transport, reported as a prerequisite failure rather
 /// than mangled at execution time.
 fn chip_embeddable(chip: &str) -> bool {

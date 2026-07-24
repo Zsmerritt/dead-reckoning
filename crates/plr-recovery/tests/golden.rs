@@ -194,7 +194,7 @@ fn adxl_drag_recovery_matches_the_golden_plan() {
     let probe = plan.steps_in_phase(Phase::Probe).next().expect("probe");
     assert_eq!(
         probe.commands,
-        vec!["PLR_DRAG_PROBE CHIP=adxl345 SPEED=5 Z_STEP=0.05 SENSITIVITY=3"]
+        vec!["PLR_DRAG_PROBE CHIP=adxl345 SPEED=20 Z_STEP=0.05 SENSITIVITY=30"]
     );
     assert!(probe
         .verify

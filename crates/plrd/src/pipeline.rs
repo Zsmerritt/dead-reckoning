@@ -319,7 +319,14 @@ pub(crate) fn resolve_machine_source(config: &Config) -> MachineSource {
                     let mut notes = Vec::new();
                     match &snapshot.plr_object {
                         Some(object) => {
-                            let reported = object.get("method").and_then(serde_json::Value::as_str);
+                            // The plugin's get_status key is
+                            // `probe_method` (klippy_plugin/plr/
+                            // plugin.py); `method` kept as a fallback
+                            // for older builds.
+                            let reported = object
+                                .get("probe_method")
+                                .or_else(|| object.get("method"))
+                                .and_then(serde_json::Value::as_str);
                             if reported.is_some_and(|m| m != plr.probe_method) {
                                 notes.push(format!(
                                     "plr status object reports method {reported:?} but \

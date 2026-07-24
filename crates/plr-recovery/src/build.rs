@@ -89,24 +89,29 @@ pub struct PlanConfig {
     /// Allowed Z deviation when verifying declarations, mm.
     pub z_epsilon: f64,
     /// ADXL drag: XY speed of each fixed-Z drag pass, mm/s. Hard band
-    /// `[1, 10]`: fast enough that dragging across extrusion lines
-    /// excites the accelerometer well above the calibrated noise
-    /// floor, slow enough that a contacting pass shears warm plastic
-    /// gently instead of gouging it. Only consulted when the probe
-    /// kind is `AdxlDrag`, but always validated (an invalid config is
-    /// invalid regardless of which branch would read it).
+    /// `(0, 100]` — the FIXED `[plr]` schema band shared with the
+    /// Klipper plugin (`klippy_plugin/plr/tunables.py`); plrd and the
+    /// plugin must accept exactly the same values or a config the
+    /// console accepted would be refused at recover time. The pass
+    /// speed does not affect the descent bound: passes are fixed-Z and
+    /// the envelope's overshoot is `drag_z_step` alone. Only consulted
+    /// when the probe kind is `AdxlDrag`, but always validated (an
+    /// invalid config is invalid regardless of which branch would read
+    /// it).
     pub drag_speed: f64,
     /// ADXL drag: Z decrement between passes, mm. Hard band
-    /// `(0, 0.1]`: this value IS the descent overshoot — the first
-    /// contacting pass sits at most `drag_z_step` below the true
-    /// surface — so it must stay at layer-height scale; and it must be
-    /// strictly positive for the staircase to make progress.
+    /// `(0, 0.2]` (the shared `[plr]` schema band): this value IS the
+    /// descent overshoot — the first contacting pass sits at most
+    /// `drag_z_step` below the true surface — so it is capped at
+    /// layer-height scale (and grows the envelope one-for-one); it
+    /// must be strictly positive for the staircase to make progress.
     pub drag_z_step: f64,
-    /// ADXL drag: contact threshold as a multiple of the calibrated
-    /// noise floor. Hard band `(1, 1000]`: a multiplier at or below 1
-    /// would trigger on the noise floor itself (false contact = wrong
-    /// datum), and the upper bound rejects nonsense values that could
-    /// never trigger.
+    /// ADXL drag: unitless 0–100 sensitivity knob, mapped by the
+    /// plugin onto a detection threshold over the calibrated noise
+    /// floor. Hard band `[0, 100]` (the shared `[plr]` schema band);
+    /// plrd passes it verbatim to `PLR_DRAG_PROBE` — the knob's
+    /// mapping is the plugin's contract, the descent bound never
+    /// depends on it (the shifted frame limits travel structurally).
     pub drag_sensitivity: f64,
 }
 
@@ -128,9 +133,10 @@ impl Default for PlanConfig {
             prime_feed: 1_800.0,
             xy_epsilon: 0.25,
             z_epsilon: 0.05,
-            drag_speed: 5.0,
+            // The [plr] schema defaults (klippy_plugin/plr/tunables.py).
+            drag_speed: 20.0,
             drag_z_step: 0.05,
-            drag_sensitivity: 3.0,
+            drag_sensitivity: 30.0,
         }
     }
 }
@@ -184,22 +190,22 @@ impl PlanConfig {
             ("prime_feed", self.prime_feed, self.prime_feed > 0.0),
             ("xy_epsilon", self.xy_epsilon, self.xy_epsilon > 0.0),
             ("z_epsilon", self.z_epsilon, self.z_epsilon > 0.0),
-            // Drag tunable bands: see the field docs for each bound's
-            // rationale.
+            // Drag tunable bands: the FIXED [plr] schema shared with
+            // the Klipper plugin (see the field docs).
             (
                 "drag_speed",
                 self.drag_speed,
-                self.drag_speed >= 1.0 && self.drag_speed <= 10.0,
+                self.drag_speed > 0.0 && self.drag_speed <= 100.0,
             ),
             (
                 "drag_z_step",
                 self.drag_z_step,
-                self.drag_z_step > 0.0 && self.drag_z_step <= 0.1,
+                self.drag_z_step > 0.0 && self.drag_z_step <= 0.2,
             ),
             (
                 "drag_sensitivity",
                 self.drag_sensitivity,
-                self.drag_sensitivity > 1.0 && self.drag_sensitivity <= 1000.0,
+                self.drag_sensitivity >= 0.0 && self.drag_sensitivity <= 100.0,
             ),
         ];
         for (field, value, in_range) in checks {
@@ -1311,23 +1317,25 @@ mod tests {
     #[test]
     fn drag_tunable_bands_are_hard() {
         assert!(PlanConfig::default().validate().is_ok());
+        // The bands mirror the [plr] schema in
+        // klippy_plugin/plr/tunables.py, including its defaults.
         check(
             "drag_speed",
             |c, v| c.drag_speed = v,
-            &[1.0, 5.0, 10.0],
-            &[0.99, 10.01, 0.0, -1.0],
+            &[0.5, 20.0, 100.0],
+            &[0.0, -1.0, 100.01],
         );
         check(
             "drag_z_step",
             |c, v| c.drag_z_step = v,
-            &[0.005, 0.05, 0.1],
-            &[0.0, -0.01, 0.101, 1.0],
+            &[0.005, 0.05, 0.2],
+            &[0.0, -0.01, 0.201, 1.0],
         );
         check(
             "drag_sensitivity",
             |c, v| c.drag_sensitivity = v,
-            &[1.01, 3.0, 1000.0],
-            &[1.0, 0.5, -3.0, 1000.5],
+            &[0.0, 30.0, 100.0],
+            &[-0.01, 100.5, -3.0],
         );
     }
 

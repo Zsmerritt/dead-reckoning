@@ -527,9 +527,9 @@ pub(crate) mod tests {
             "probe_speed": 1.0,
             "envelope_margin": 0.5,
             "sag_allowance": 0.2,
-            "drag_speed": 5.0,
+            "drag_speed": 20.0,
             "drag_z_step": 0.05,
-            "drag_sensitivity": 3.0,
+            "drag_sensitivity": 30.0,
             "exclusion_radius": 5.0,
             "entry_feedrate": 1200.0,
             // SAVE_CONFIG-persisted: merged into settings after
@@ -651,7 +651,7 @@ pub(crate) mod tests {
 
     pub(crate) fn plr_object() -> Value {
         json!({
-            "method": "tap",
+            "probe_method": "tap",
             "configured": true,
             "attested": true,
             "probe_resolution": 0.0125,

@@ -39,7 +39,7 @@
       pre:  toolhead.homed_axes contains "x"
       pre:  toolhead.homed_axes contains "y"
       pre:  toolhead.homed_axes contains "z"
-      send: PLR_DRAG_PROBE CHIP=adxl345 SPEED=5 Z_STEP=0.05 SENSITIVITY=3
+      send: PLR_DRAG_PROBE CHIP=adxl345 SPEED=20 Z_STEP=0.05 SENSITIVITY=30
       ok?:  plr.last_drag_result.trigger_z present and finite
       fail: abort (probe-no-trigger)
  8. [true-z-declare] true-Z arithmetic and kinematic re-declaration (never a gcode offset)
