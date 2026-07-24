@@ -209,6 +209,33 @@ def test_z_position_min_non_finite_fails(fake_printer):
     assert "not finite" in res.detail
 
 
+def test_z_position_min_accessor_prefers_stepper_z(fake_printer):
+    """The (value, source) accessor the drag oracle's Z floor uses."""
+    config = make_config(
+        fake_printer,
+        {
+            "stepper_z": {"position_min": "-2"},
+            "printer": {"minimum_z_position": "-9"},
+        },
+    )
+    assert setup_checks.z_position_min(config) == (-2.0, "[stepper_z] position_min")
+
+
+def test_z_position_min_accessor_printer_fallback(fake_printer):
+    config = make_config(
+        fake_printer,
+        {"stepper_z": {}, "printer": {"minimum_z_position": "-1.5"}},
+    )
+    value, source = setup_checks.z_position_min(config)
+    assert value == -1.5
+    assert source == "[printer] minimum_z_position"
+
+
+def test_z_position_min_accessor_none_when_absent(fake_printer):
+    config = make_config(fake_printer, {})
+    assert setup_checks.z_position_min(config) == (None, None)
+
+
 # --- recorder heartbeat ------------------------------------------------
 
 

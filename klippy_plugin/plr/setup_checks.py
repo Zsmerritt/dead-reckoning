@@ -230,26 +230,34 @@ def check_probe_gcode_empty(config, probe_method):
     return CheckResult("probe gcode", "pass", "activate/deactivate g-code empty", "")
 
 
-def check_z_position_min(config):
-    """A finite lower Z bound must exist for the probing descent.
+def z_position_min(config):
+    """The configured lower Z bound as ``(value, source)``.
 
     Mirrors the spirit of klippy/extras/probe.py:188-193
     ``lookup_minimum_z``: prefer the Z endstop section's position_min,
-    else [printer] minimum_z_position.  Simplification vs klippy: we
-    read [stepper_z] directly instead of resolving which stepper owns
-    the Z endstop (klippy walks endstop_pin via
-    manual_probe.lookup_z_endstop_config); for multi-Z gantries all
-    stepper_z* share [stepper_z]'s endstop config, so this matches in
-    practice and is documented as a heuristic.
+    else [printer] minimum_z_position; ``(None, None)`` when neither
+    exists.  Simplification vs klippy: we read [stepper_z] directly
+    instead of resolving which stepper owns the Z endstop (klippy walks
+    endstop_pin via manual_probe.lookup_z_endstop_config); for multi-Z
+    gantries all stepper_z* share [stepper_z]'s endstop config, so this
+    matches in practice and is documented as a heuristic.  Shared by
+    the commissioning check below and the drag oracle's Z-floor
+    computation (plugin.__init__ caches it; drag_probe consumes it).
     """
-    value = None
-    source = None
     if config.has_section("stepper_z"):
         value = config.getsection("stepper_z").getfloat("position_min", None)
-        source = "[stepper_z] position_min"
-    if value is None and config.has_section("printer"):
+        if value is not None:
+            return value, "[stepper_z] position_min"
+    if config.has_section("printer"):
         value = config.getsection("printer").getfloat("minimum_z_position", None)
-        source = "[printer] minimum_z_position"
+        if value is not None:
+            return value, "[printer] minimum_z_position"
+    return None, None
+
+
+def check_z_position_min(config):
+    """A finite lower Z bound must exist for the probing descent."""
+    value, source = z_position_min(config)
     if value is None:
         return CheckResult(
             "z position_min",
