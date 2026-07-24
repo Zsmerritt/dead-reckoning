@@ -97,6 +97,7 @@ fn normal_tap_recovery_matches_the_golden_plan() {
             Phase::ImmediateBedHeat,
             Phase::BelievedZDeclare,
             Phase::HomeXy,
+            Phase::ProbeTempHold,
             Phase::CleanNozzle,
             Phase::ShiftedFrame,
             Phase::ProbeApproach,
@@ -183,17 +184,35 @@ fn normal_tap_recovery_matches_the_golden_plan() {
         park.compute,
         Some(RuntimeComputation::ParkZ { delta_z, .. }) if (delta_z - 2.0).abs() < 1e-12
     ));
-    // The blocking heat waits (M109/M190) are the recovery file's
-    // heating gate — never in the plan. (The plan's ImmediateBedHeat
-    // does a NON-blocking M104 toward the probe temp, which is fine.)
+    // The PRINT-temperature waits belong to the recovery file's heating
+    // gate, never to the plan: no M190 anywhere (the bed is only ever
+    // nudged non-blocking here), and the only blocking M109 is the
+    // probe-temperature hold — which waits for the PROBE temp, not the
+    // print temp.
     assert!(
         !plan
             .steps
             .iter()
             .flat_map(|s| s.commands.iter())
-            .any(|c| c.starts_with("M109") || c.starts_with("M190")),
-        "blocking heat waits must live in the recovery file, not the plan"
+            .any(|c| c.starts_with("M190")),
+        "the blocking bed wait belongs to the recovery file, not the plan"
     );
+    let m109_phases: Vec<Phase> = plan
+        .steps
+        .iter()
+        .filter(|s| s.commands.iter().any(|c| c.starts_with("M109")))
+        .map(|s| s.phase)
+        .collect();
+    assert_eq!(
+        m109_phases,
+        vec![Phase::ProbeTempHold],
+        "the only blocking nozzle wait in the plan is the probe-temp hold"
+    );
+    let hold = plan
+        .steps_in_phase(Phase::ProbeTempHold)
+        .next()
+        .expect("hold step");
+    assert_eq!(hold.commands, vec!["M109 S145"]);
     // The recovery file itself carries the print-temperature reheat
     // behind the heating gate.
     let file = plr_recovery::build_recovery_file(
@@ -201,7 +220,7 @@ fn normal_tap_recovery_matches_the_golden_plan() {
         common::MODEL_TEXT.as_bytes(),
         "TEST-TS",
     );
-    assert!(plr_recovery::verify_heating_gate(&file).is_ok());
+    assert!(plr_recovery::verify_heating_gate(&file, &plan.recovery_file).is_ok());
     let file_text = file.preamble_text().into_owned();
     assert!(file_text.contains("M109 S210"));
     assert!(file_text.contains("M190 S60"));
@@ -249,6 +268,7 @@ fn adxl_drag_recovery_matches_the_golden_plan() {
             Phase::ImmediateBedHeat,
             Phase::BelievedZDeclare,
             Phase::HomeXy,
+            Phase::ProbeTempHold,
             Phase::CleanNozzle,
             Phase::ShiftedFrame,
             Phase::ProbeApproach,
@@ -773,7 +793,7 @@ fn recovery_file_matches_the_golden_and_holds_the_heating_gate() {
 
     // Heating gate: no XY move precedes the blocking waits; G28 X Y then
     // entry follow.
-    assert!(plr_recovery::verify_heating_gate(&file).is_ok());
+    assert!(plr_recovery::verify_heating_gate(&file, &plan.recovery_file).is_ok());
 
     // The verbatim tail is byte-identical to the original from the
     // matched offset.
@@ -1198,26 +1218,79 @@ fn probe_target_leaves_headroom_below_the_contact_ceiling() {
     );
 }
 
+/// Reads `MAX_TOUCH_TEMPERATURE_EPSILON` out of the Klipper plugin's
+/// `setup_checks.py`, so the cross-language pin compares against the
+/// PLUGIN's real value rather than a local copy of it.
+///
+/// `Err(reason)` distinguishes the two ways this can be unavailable —
+/// file absent vs. constant not yet present in it — so the skip message
+/// states which, instead of guessing.
+fn plugin_touch_temperature_epsilon() -> Result<f64, String> {
+    const CONST_NAME: &str = "MAX_TOUCH_TEMPERATURE_EPSILON";
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../klippy_plugin/plr/setup_checks.py");
+    let text = std::fs::read_to_string(&path)
+        .map_err(|e| format!("{} could not be read: {e}", path.display()))?;
+    // `MAX_TOUCH_TEMPERATURE_EPSILON = 2.0` (tolerate spacing/comments).
+    let line = text
+        .lines()
+        .find(|l| l.trim_start().starts_with(CONST_NAME))
+        .ok_or_else(|| {
+            format!(
+                "{} exists but defines no {CONST_NAME} (the plugin's temperature gate \
+                 lands with the recovery-wizard branch)",
+                path.display()
+            )
+        })?;
+    let rhs = line
+        .split('=')
+        .nth(1)
+        .ok_or_else(|| format!("{CONST_NAME} line has no assignment: {line:?}"))?;
+    let value = rhs
+        .split('#')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .trim_end_matches(|c: char| !(c.is_ascii_digit() || c == '.'));
+    value
+        .parse::<f64>()
+        .map_err(|e| format!("{CONST_NAME} value {value:?} is not a number: {e}"))
+}
+
 /// Finding 10 (cross-language contract): the Probe step's MEASURED
 /// temperature bound must equal `max_probe_nozzle_temp +
 /// PROBE_TEMP_MEASURED_TOLERANCE`, and its TARGET bound exactly
 /// `max_probe_nozzle_temp`.
 ///
 /// The tolerance mirrors the Klipper plugin's
-/// `MAX_TOUCH_TEMPERATURE_EPSILON` (Cartographer
-/// `probe/touch_mode.py:34`, value 2). plrd and the plugin must refuse at
-/// the IDENTICAL boundary — if either side changes its tolerance, this
-/// test is what fails first. The asymmetry is deliberate: measured
-/// overshoot is forgiven, a hotter commanded target is not.
+/// `MAX_TOUCH_TEMPERATURE_EPSILON` in `klippy_plugin/plr/setup_checks.py`
+/// (itself following Cartographer `probe/touch_mode.py:34`). plrd and the
+/// plugin must refuse at the IDENTICAL boundary, so this test READS the
+/// plugin's constant from the repo rather than restating it — a local
+/// copy compared to a local copy would stay green while the two sides
+/// diverged. The asymmetry is deliberate: measured overshoot is forgiven,
+/// a hotter commanded target is not.
 #[test]
 fn probe_temperature_bounds_stay_in_lockstep_with_the_plugin() {
-    // Keep in sync with klippy_plugin's MAX_TOUCH_TEMPERATURE_EPSILON.
-    const PLUGIN_MAX_TOUCH_TEMPERATURE_EPSILON: f64 = 2.0;
-    assert!(
-        (plr_recovery::PROBE_TEMP_MEASURED_TOLERANCE - PLUGIN_MAX_TOUCH_TEMPERATURE_EPSILON).abs()
-            < 1e-12,
-        "plrd's measured tolerance must equal the plugin's MAX_TOUCH_TEMPERATURE_EPSILON"
-    );
+    match plugin_touch_temperature_epsilon() {
+        Ok(plugin_epsilon) => assert!(
+            (plr_recovery::PROBE_TEMP_MEASURED_TOLERANCE - plugin_epsilon).abs() < 1e-12,
+            "TOLERANCE DIVERGENCE: plr-recovery's PROBE_TEMP_MEASURED_TOLERANCE is {} \
+             (crates/plr-recovery/src/build.rs) but the plugin's \
+             MAX_TOUCH_TEMPERATURE_EPSILON is {plugin_epsilon} \
+             (klippy_plugin/plr/setup_checks.py). Both sides gate contact on the same \
+             ceiling and MUST use the same tolerance, or one will refuse where the other \
+             allows. Update whichever is wrong.",
+            plr_recovery::PROBE_TEMP_MEASURED_TOLERANCE
+        ),
+        Err(reason) => eprintln!(
+            "SKIP: the cross-language tolerance pin was NOT verified — {reason}. \
+             plr-recovery's PROBE_TEMP_MEASURED_TOLERANCE is {}; once the plugin \
+             defines MAX_TOUCH_TEMPERATURE_EPSILON this test pins the two together \
+             and fails loudly if they diverge.",
+            plr_recovery::PROBE_TEMP_MEASURED_TOLERANCE
+        ),
+    }
 
     let ceiling = PlanConfig::default().max_probe_nozzle_temp;
     // Both probe paths carry the same bounds (the drag path's measured
@@ -1237,8 +1310,9 @@ fn probe_temperature_bounds_stay_in_lockstep_with_the_plugin() {
             })
             .expect("measured temperature bound");
         assert!(
-            (measured_max - (ceiling + PLUGIN_MAX_TOUCH_TEMPERATURE_EPSILON)).abs() < 1e-12,
-            "measured bound {measured_max} must be the ceiling {ceiling} + {PLUGIN_MAX_TOUCH_TEMPERATURE_EPSILON}"
+            (measured_max - (ceiling + plr_recovery::PROBE_TEMP_MEASURED_TOLERANCE)).abs() < 1e-12,
+            "measured bound {measured_max} must be the ceiling {ceiling} + {}",
+            plr_recovery::PROBE_TEMP_MEASURED_TOLERANCE
         );
 
         let target_max = probe
@@ -1261,6 +1335,379 @@ fn probe_temperature_bounds_stay_in_lockstep_with_the_plugin() {
             "the measured bound must be the forgiving one"
         );
     }
+}
+
+// ---- drag temperature hold (item 5) ---------------------------------
+
+/// The hold phase exists on BOTH probe paths and sits between homing and
+/// the clean, so heat-up ooze is wiped rather than deposited.
+#[test]
+fn the_probe_temp_hold_precedes_the_clean_on_both_paths() {
+    for machine in [machine_tap(), machine_adxl_drag()] {
+        let plan = build_plan(&machine, plain_transforms());
+        assert!(
+            plan.probe_temp_hold_precedes_clean_nozzle(),
+            "hold must sit between HomeXy and CleanNozzle"
+        );
+        let hold = plan.first_index(Phase::ProbeTempHold).expect("hold step");
+        let home = plan.first_index(Phase::HomeXy).expect("home");
+        let clean = plan.first_index(Phase::CleanNozzle).expect("clean");
+        assert!(home < hold && hold < clean);
+        // The hold blocks natively and confirms the band afterwards.
+        let step = &plan.steps[hold];
+        assert!(step.commands[0].starts_with("M109 S"));
+        assert!(step.verify.iter().any(|v| v.object == "extruder"
+            && v.field == "temperature"
+            && matches!(v.predicate, plr_recovery::Predicate::TempWithin { .. })));
+    }
+}
+
+/// A drag machine commands AND holds `drag_nozzle_temp` — the early
+/// non-blocking `M104` and the blocking `M109` both carry it.
+#[test]
+fn a_drag_machine_commands_and_holds_the_drag_temperature() {
+    let config = PlanConfig {
+        drag_nozzle_temp: 120.0,
+        ..PlanConfig::default()
+    };
+    let plan = build_plan_with(&machine_adxl_drag(), plain_transforms(), &config);
+    let heat = plan
+        .steps_in_phase(Phase::ImmediateBedHeat)
+        .next()
+        .expect("heat step");
+    assert!(
+        heat.commands.iter().any(|c| c == "M104 S120"),
+        "the early non-blocking heat must target the DRAG temp: {:?}",
+        heat.commands
+    );
+    let hold = plan
+        .steps_in_phase(Phase::ProbeTempHold)
+        .next()
+        .expect("hold step");
+    assert_eq!(hold.commands, vec!["M109 S120"]);
+    // The band is the documented constant, not a knob.
+    assert!(hold.verify.iter().any(|v| matches!(
+        v.predicate,
+        plr_recovery::Predicate::TempWithin { min, max }
+            if (min - (120.0 - plr_recovery::PROBE_HOLD_BAND)).abs() < 1e-12
+                && (max - (120.0 + plr_recovery::PROBE_HOLD_BAND)).abs() < 1e-12
+    )));
+    // A touch machine is unaffected by drag_nozzle_temp.
+    let tap = build_plan_with(&machine_tap(), plain_transforms(), &config);
+    let tap_hold = tap
+        .steps_in_phase(Phase::ProbeTempHold)
+        .next()
+        .expect("hold");
+    assert_eq!(tap_hold.commands, vec!["M109 S145"]);
+}
+
+/// `drag_nozzle_temp = 0` is the cold-drag opt-out: no `M104`, no `M109`,
+/// no hold phase at all — and the contact CEILING still gates the probe.
+#[test]
+fn a_zero_drag_temperature_opts_out_of_heating_entirely() {
+    let config = PlanConfig {
+        drag_nozzle_temp: 0.0,
+        ..PlanConfig::default()
+    };
+    let plan = build_plan_with(&machine_adxl_drag(), plain_transforms(), &config);
+    assert!(
+        plan.first_index(Phase::ProbeTempHold).is_none(),
+        "no hold phase on an opted-out cold drag"
+    );
+    assert!(
+        plan.probe_temp_hold_precedes_clean_nozzle(),
+        "vacuously true"
+    );
+    let all: Vec<&String> = plan.steps.iter().flat_map(|s| s.commands.iter()).collect();
+    assert!(
+        !all.iter().any(|c| c.starts_with("M104")),
+        "a cold drag must not be nudged warm: {all:?}"
+    );
+    assert!(!all.iter().any(|c| c.starts_with("M109")));
+    // The ceiling gate is still on the probe step.
+    let probe = plan.steps_in_phase(Phase::Probe).next().expect("probe");
+    assert!(probe.pre_verify.iter().any(|v| v.object == "extruder"
+        && v.field == "temperature"
+        && matches!(v.predicate, plr_recovery::Predicate::NumAtMost { .. })));
+    assert!(probe
+        .pre_verify
+        .iter()
+        .any(|v| v.object == "extruder" && v.field == "target"));
+    // A touch machine still holds even with drag_nozzle_temp = 0.
+    let tap = build_plan_with(&machine_tap(), plain_transforms(), &config);
+    assert!(tap.first_index(Phase::ProbeTempHold).is_some());
+}
+
+/// `drag_nozzle_temp` obeys the same headroom interlock as the probe temp.
+#[test]
+fn an_out_of_range_drag_temperature_is_refused() {
+    // Above ceiling - headroom (150 - 5 = 145).
+    for bad in [146.0, 150.0, 200.0] {
+        let config = PlanConfig {
+            drag_nozzle_temp: bad,
+            ..PlanConfig::default()
+        };
+        let err = config.validate().unwrap_err();
+        assert!(
+            matches!(err, RecoveryError::DragTempOutOfRange { .. }),
+            "{bad}: {err:?}"
+        );
+        let msg = err.to_string();
+        assert!(msg.contains("drag_nozzle_temp"), "{msg}");
+        assert!(msg.contains("max_probe_nozzle_temp"), "{msg}");
+    }
+    // Negative is refused; 0 and the boundary are accepted.
+    assert!(matches!(
+        PlanConfig {
+            drag_nozzle_temp: -1.0,
+            ..PlanConfig::default()
+        }
+        .validate(),
+        Err(RecoveryError::DragTempOutOfRange { .. })
+    ));
+    for ok in [0.0, 100.0, 145.0] {
+        assert!(
+            PlanConfig {
+                drag_nozzle_temp: ok,
+                ..PlanConfig::default()
+            }
+            .validate()
+            .is_ok(),
+            "{ok} must be accepted"
+        );
+    }
+}
+
+// ---- purge precedence (item 6) --------------------------------------
+
+/// Path 1: `purge_enable = false` emits no purge of any kind.
+#[test]
+fn purge_disabled_emits_nothing() {
+    let config = PlanConfig {
+        purge_enable: false,
+        ..PlanConfig::default()
+    };
+    let plan = build_plan_with(&machine_tap(), plain_transforms(), &config);
+    assert!(plan.recovery_file.purge.is_none());
+    let file =
+        plr_recovery::build_recovery_file(&plan.recovery_file, common::MODEL_TEXT.as_bytes(), "TS");
+    let text = file.preamble_text().into_owned();
+    // `G92 E0` is purge-only (the entry's own E-frame reset is `G92 E<n>`
+    // with the file's E value), so its absence proves no purge ran. The
+    // entry prime `G1 E0.4` is a different thing and legitimately stays.
+    assert!(!text.contains("G92 E0"), "{text}");
+    assert!(!text.contains("F300"), "no purge extrusion: {text}");
+    assert!(plr_recovery::verify_heating_gate(&file, &plan.recovery_file).is_ok());
+}
+
+/// Path 2: a present macro owns the purge entirely.
+#[test]
+fn purge_macro_present_owns_the_purge() {
+    let config = PlanConfig {
+        purge_macro: Some("MY_PURGE".to_owned()),
+        ..PlanConfig::default()
+    };
+    let reconstruction = recovery(stop_set(&[0.4]), wal_context(plain_transforms()));
+    let contact = contact_at(0.4);
+    let match_result = match_at(resume_offset());
+    let model = model();
+    let inputs = PlanInputs {
+        machine: &machine_tap(),
+        reconstruction: &reconstruction,
+        contact: &contact,
+        match_result: &match_result,
+        model: &model,
+        file_temps: FileTemps::default(),
+        exclude_objects: &[],
+        clean_nozzle_macro_present: true,
+        purge_macro_present: true,
+    };
+    let PlanOutcome::Plan(plan) = plan_recovery(&inputs, &config).unwrap() else {
+        panic!("expected plan");
+    };
+    assert!(matches!(
+        plan.recovery_file.purge,
+        Some(plr_recovery::PurgePlan::Macro { ref call }) if call == "MY_PURGE"
+    ));
+    let file =
+        plr_recovery::build_recovery_file(&plan.recovery_file, common::MODEL_TEXT.as_bytes(), "TS");
+    let text = file.preamble_text().into_owned();
+    assert!(text.contains("MY_PURGE"));
+    assert!(!text.contains("G92 E0"), "the macro owns everything");
+}
+
+/// Path 3: a MISSING purge macro REFUSES to plan — never a silent
+/// downgrade to the built-in purge.
+#[test]
+fn a_missing_purge_macro_refuses_to_plan() {
+    let config = PlanConfig {
+        purge_macro: Some("NOPE".to_owned()),
+        ..PlanConfig::default()
+    };
+    // build_plan_with passes purge_macro_present: false.
+    let reconstruction = recovery(stop_set(&[0.4]), wal_context(plain_transforms()));
+    let contact = contact_at(0.4);
+    let match_result = match_at(resume_offset());
+    let model = model();
+    let inputs = PlanInputs {
+        machine: &machine_tap(),
+        reconstruction: &reconstruction,
+        contact: &contact,
+        match_result: &match_result,
+        model: &model,
+        file_temps: FileTemps::default(),
+        exclude_objects: &[],
+        clean_nozzle_macro_present: true,
+        purge_macro_present: false,
+    };
+    let err = plan_recovery(&inputs, &config).unwrap_err();
+    assert!(
+        matches!(&err, RecoveryError::PurgeMacroMissing { name } if name == "NOPE"),
+        "{err:?}"
+    );
+    // Zero commands emitted: there is no plan at all.
+    let msg = err.to_string();
+    assert!(msg.contains("NOPE"), "{msg}");
+    assert!(
+        msg.contains("refusing to substitute the built-in purge"),
+        "{msg}"
+    );
+}
+
+/// Path 4: the built-in purge defaults to the park point and honors
+/// every explicit knob.
+#[test]
+fn the_built_in_purge_defaults_to_the_park_and_honors_knobs() {
+    // Defaults: purge point == reheat park point.
+    let plan = build_plan(&machine_tap(), plain_transforms());
+    let park = plan.recovery_file.park;
+    assert!(matches!(
+        plan.recovery_file.purge,
+        Some(plr_recovery::PurgePlan::BuiltIn { point, .. })
+            if point.iter().zip(park).all(|(a, b)| (a - b).abs() < 1e-12)
+    ));
+
+    // Explicit knobs.
+    let config = PlanConfig {
+        purge_x: Some(150.0),
+        purge_y: Some(12.0),
+        purge_z: Some(0.8),
+        purge_amount: 9.0,
+        purge_speed: 240.0,
+        purge_retract: 2.0,
+        ..PlanConfig::default()
+    };
+    let mut machine = machine_tap();
+    machine.axis_limits = plr_recovery::AxisLimits {
+        x: Some((0.0, 200.0)),
+        y: Some((0.0, 200.0)),
+        z_max: Some(250.0),
+    };
+    let plan = build_plan_with(&machine, plain_transforms(), &config);
+    assert!(matches!(
+        plan.recovery_file.purge,
+        Some(plr_recovery::PurgePlan::BuiltIn {
+            point, z: Some(z), amount, speed, retract, ..
+        }) if (point[0] - 150.0).abs() < 1e-12 && (point[1] - 12.0).abs() < 1e-12
+            && (z - 0.8).abs() < 1e-12
+            && (amount - 9.0).abs() < 1e-12
+            && (speed - 240.0).abs() < 1e-12
+            && (retract - 2.0).abs() < 1e-12
+    ));
+    let file =
+        plr_recovery::build_recovery_file(&plan.recovery_file, common::MODEL_TEXT.as_bytes(), "TS");
+    let text = file.preamble_text().into_owned();
+    assert!(text.contains("G0 X150 Y12"));
+    assert!(text.contains("G1 Z0.8"));
+    assert!(text.contains("G1 E9 F240"));
+    assert!(text.contains("G1 E-2 F240"));
+    assert!(plr_recovery::verify_heating_gate(&file, &plan.recovery_file).is_ok());
+}
+
+/// Every purge coordinate flows through the generated-file pre-flight.
+#[test]
+fn an_out_of_bounds_purge_point_is_refused_at_plan_time() {
+    let mut machine = machine_tap();
+    machine.axis_limits = plr_recovery::AxisLimits {
+        x: Some((0.0, 200.0)),
+        y: Some((0.0, 200.0)),
+        z_max: Some(250.0),
+    };
+    let config = PlanConfig {
+        purge_x: Some(9_999.0),
+        purge_y: Some(12.0),
+        ..PlanConfig::default()
+    };
+    let plan = build_plan_with(&machine, plain_transforms(), &config);
+    let file =
+        plr_recovery::build_recovery_file(&plan.recovery_file, common::MODEL_TEXT.as_bytes(), "TS");
+    let err = plr_recovery::preflight_generated_file(&file, &machine, [20.0, 10.0])
+        .expect_err("an out-of-range purge X must be refused");
+    assert!(
+        matches!(err, RecoveryError::ItineraryRejected(_)),
+        "{err:?}"
+    );
+}
+
+/// A purge landing on printed geometry warns (never refuses — a
+/// sacrificial area is legitimate).
+#[test]
+fn a_purge_inside_the_part_warns() {
+    // The fixture part spans X 10..30, Y 10..30.
+    let config = PlanConfig {
+        purge_x: Some(20.0),
+        purge_y: Some(20.0),
+        ..PlanConfig::default()
+    };
+    let plan = build_plan_with(&machine_tap(), plain_transforms(), &config);
+    assert!(
+        plan.warnings.iter().any(|w| matches!(
+            w,
+            plr_recovery::PlanWarning::PurgeInsidePart {
+                configured: true,
+                ..
+            }
+        )),
+        "{:?}",
+        plan.warnings
+    );
+    let rendered = plan.render();
+    assert!(rendered.contains("built-in purge point"), "{rendered}");
+    assert!(
+        rendered.contains("configured via purge_x/purge_y"),
+        "{rendered}"
+    );
+}
+
+/// Range refusals for each new purge knob.
+#[test]
+fn purge_knob_ranges_are_hard() {
+    type Mutate = fn(&mut PlanConfig);
+    let cases: [(&str, Mutate); 4] = [
+        ("purge_amount", |c| c.purge_amount = 101.0),
+        ("purge_speed", |c| c.purge_speed = 3001.0),
+        ("purge_speed", |c| c.purge_speed = 0.0),
+        ("purge_retract", |c| c.purge_retract = 10.1),
+    ];
+    for (field, set) in cases {
+        let mut config = PlanConfig::default();
+        set(&mut config);
+        assert!(
+            matches!(
+                config.validate(),
+                Err(RecoveryError::InvalidPlanConfig { field: f }) if f == field
+            ),
+            "{field} must be refused"
+        );
+    }
+    // Boundaries accepted.
+    let config = PlanConfig {
+        purge_amount: 100.0,
+        purge_speed: 3000.0,
+        purge_retract: 10.0,
+        ..PlanConfig::default()
+    };
+    assert!(config.validate().is_ok());
 }
 
 #[test]

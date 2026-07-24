@@ -81,7 +81,28 @@ pub enum Phase {
     /// 4 — home XY only (now AFTER the believed-Z lift). Never bare
     /// `G28`, never Z.
     HomeXy,
-    /// 5 — call the operator's clean-nozzle macro when it exists; when
+    /// 5 — heat to the probe/drag temperature and HOLD for it (`M109`,
+    /// which Klipper blocks on natively) before any contact operation.
+    ///
+    /// Placed after [`Phase::HomeXy`] and before [`Phase::CleanNozzle`],
+    /// and that order is physical rather than cosmetic: reaching
+    /// temperature BEFORE the clean means any ooze the heat-up produces
+    /// is wiped away by the clean, instead of being deposited on the
+    /// nozzle during the probe and corrupting the Z reference.
+    ///
+    /// Absent entirely on a drag machine with `drag_nozzle_temp = 0` (the
+    /// documented cold-drag opt-out: never wait for the nozzle to cool).
+    ///
+    /// # `M109` waits in BOTH directions on a PID hotend
+    ///
+    /// Klipper's `M109` waits for the heater to SETTLE, not merely to
+    /// rise: with a PID-controlled extruder a nozzle currently HOTTER
+    /// than the target will wait while it cools. With bang-bang control
+    /// it only waits while heating. Either way the contact ceiling gate
+    /// on the probe step still applies, so a nozzle that never settles
+    /// low enough is refused rather than dragged hot.
+    ProbeTempHold,
+    /// 6 — call the operator's clean-nozzle macro when it exists; when
     /// it does not, emit no command and set
     /// [`RecoveryPlan::requires_clean_nozzle_confirmation`].
     CleanNozzle,
@@ -136,6 +157,7 @@ impl Phase {
             Phase::ImmediateBedHeat => "immediate-bed-heat",
             Phase::BelievedZDeclare => "believed-z-declare",
             Phase::HomeXy => "home-xy",
+            Phase::ProbeTempHold => "probe-temp-hold",
             Phase::CleanNozzle => "clean-nozzle",
             Phase::TransformFreeze => "transform-freeze",
             Phase::ShiftedFrame => "shifted-frame",
@@ -280,6 +302,8 @@ pub enum AbortReason {
     BelievedZDeclareFailed,
     /// XY homing failed.
     HomingFailed,
+    /// The nozzle did not reach and hold the probe/drag temperature.
+    ProbeTempHoldFailed,
     /// The clean-nozzle macro call failed.
     CleanNozzleFailed,
     /// `z_thermal_adjust` could not be frozen.
@@ -320,6 +344,7 @@ impl AbortReason {
             AbortReason::ImmediateBedHeatFailed => "immediate-bed-heat-failed",
             AbortReason::BelievedZDeclareFailed => "believed-z-declare-failed",
             AbortReason::HomingFailed => "homing-failed",
+            AbortReason::ProbeTempHoldFailed => "probe-temp-hold-failed",
             AbortReason::CleanNozzleFailed => "clean-nozzle-failed",
             AbortReason::TransformFreezeFailed => "transform-freeze-failed",
             AbortReason::ShiftedFrameNotDeclared => "shifted-frame-not-declared",
@@ -587,6 +612,24 @@ pub enum PlanWarning {
         /// The computed park point `[x, y]`, mm.
         point: [f64; 2],
     },
+    /// No `reheat_park_x`/`reheat_park_y` was configured AND the model
+    /// carries no part geometry to check against, so the park point is a
+    /// bare fallback that could NOT be verified clear of the part.
+    ReheatParkUnverified {
+        /// The fallback park point `[x, y]`, mm.
+        point: [f64; 2],
+    },
+    /// The resolved BUILT-IN PURGE point lies inside the part's XY
+    /// bounding box, so the purge deposits filament onto printed
+    /// geometry. A warning, not a refusal: an operator may be purging
+    /// onto a sacrificial area (a prime tower, a skirt region) on purpose.
+    PurgeInsidePart {
+        /// The purge point `[x, y]`, mm.
+        point: [f64; 2],
+        /// `true` when the operator set `purge_x`/`purge_y` explicitly;
+        /// `false` when it defaulted to the reheat park point.
+        configured: bool,
+    },
     /// The reheat park point lies INSIDE the part's XY bounding box: the
     /// nozzle will reheat to print temperature (and purge) over printed
     /// geometry. Either the operator configured it there, or no side of
@@ -643,6 +686,22 @@ impl PlanWarning {
                  the part bounding box — set an explicit park position",
                 fmt_num(point[0]),
                 fmt_num(point[1])
+            ),
+            PlanWarning::ReheatParkUnverified { point } => format!(
+                "no reheat_park_x/y configured and no part geometry available; parking at \
+                 ({}, {}) — NOT verified against the part — set an explicit park position",
+                fmt_num(point[0]),
+                fmt_num(point[1])
+            ),
+            PlanWarning::PurgeInsidePart { point, configured } => format!(
+                "the built-in purge point ({}, {}) is INSIDE the part bounding box{} — the purge                  will deposit filament onto printed geometry; move it clear unless this is a                  deliberate sacrificial area",
+                fmt_num(point[0]),
+                fmt_num(point[1]),
+                if *configured {
+                    " (configured via purge_x/purge_y)"
+                } else {
+                    " (defaulted to the reheat park point)"
+                }
             ),
             PlanWarning::ReheatParkInsidePart { point, configured } => format!(
                 "the reheat park point ({}, {}) is INSIDE the part bounding box{} — the nozzle \
@@ -939,6 +998,26 @@ impl RecoveryPlan {
             .first_index(Phase::ShiftedFrame)
             .is_some_and(|shifted| clean < shifted);
         after_home && before_shifted
+    }
+
+    /// The probe-temperature hold (when present) sits after XY homing and
+    /// before the clean-nozzle step, so heat-up ooze is wiped by the
+    /// clean instead of being deposited during the probe.
+    ///
+    /// Vacuously true when there is no hold step — the documented
+    /// cold-drag opt-out (`drag_nozzle_temp = 0`).
+    #[must_use]
+    pub fn probe_temp_hold_precedes_clean_nozzle(&self) -> bool {
+        let Some(hold) = self.first_index(Phase::ProbeTempHold) else {
+            return true;
+        };
+        let after_home = self
+            .first_index(Phase::HomeXy)
+            .is_some_and(|home| home < hold);
+        let before_clean = self
+            .first_index(Phase::CleanNozzle)
+            .is_some_and(|clean| hold < clean);
+        after_home && before_clean
     }
 
     /// The reheat park precedes the frame restore (park first, so the

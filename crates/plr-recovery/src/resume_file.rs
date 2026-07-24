@@ -24,20 +24,24 @@
 //!    part-directed motion may precede these waits.
 //! 3. **`G28 X Y`** — the final re-home, done at the parked Z with Z
 //!    untouched (safe: XY homes at the park height).
-//! 4. **Re-park** — `G0 X<park> Y<park>` back to the part-clear park
-//!    point. `G28` in step 3 drives the toolhead to the machine's homing
-//!    XY, DISCARDING the part-clear park position the plan established
-//!    and verified. The purge below must not run there: at the homed XY
-//!    the nozzle may sit over the part (or, at the park Z which is
-//!    `resume_z + delta`, in mid-air above it), so extruding would drop a
-//!    string that is still attached to the tip — which the entry moves
-//!    would then drag across the print, defeating the `CLEAN_NOZZLE` the
-//!    plan ran minutes earlier precisely to guarantee a clean tip. The
-//!    park point is already computed, part-clear and bounds-checked, so
-//!    the file simply travels back to it.
-//! 5. **Purge** — a configured `purge_macro` call, or the built-in purge
-//!    (`G92 E0` / `G1 E<amount> F<slow>` / `G92 E0`); only when enabled.
-//!    Runs at the re-parked, part-clear position (step 4).
+//! 4. **Re-park / purge travel** — `G0 X.. Y..` (then an optional
+//!    `G1 Z..`) to a KNOWN destination. `G28` in step 3 drives the
+//!    toolhead to the machine's homing XY, DISCARDING the part-clear park
+//!    position the plan established and verified. Nothing may extrude or
+//!    enter the part from there: at the homed XY the nozzle may sit over
+//!    the part (or, at the park Z which is `resume_z + delta`, in mid-air
+//!    above it), so extruding would drop a string still attached to the
+//!    tip — which the entry moves would then drag across the print,
+//!    defeating the `CLEAN_NOZZLE` the plan ran minutes earlier precisely
+//!    to guarantee a clean tip. The destination is
+//!    [`RecoveryFileSpec::post_home_target`]: the built-in purge location
+//!    when one is configured, else the park point.
+//! 5. **Purge** — per the resolved [`PurgePlan`]: a `purge_macro` call
+//!    (which owns its own positioning, amount and speed — plr emits
+//!    nothing else and does not reposition for it), or the built-in
+//!    `G92 E0` / `G1 E<amount> F<speed>` / optional
+//!    `G1 E-<retract> F<speed>` / `G92 E0` at the location reached in
+//!    step 4. Absent entirely when `purge_enable = false`.
 //! 6. **Entry moves** — travel above the part interior, descend, prime,
 //!    restore modes/feedrate (the plan builder pre-computes these).
 //! 7. **The original file's byte tail** from the matched line-boundary
@@ -67,25 +71,73 @@ use serde::{Deserialize, Serialize};
 
 use crate::plan::fmt_num;
 
-/// Motion commands for the heating gate. Mirrors
-/// `crate::plan::is_motion_command`'s g-code set (arcs included: `G2`/`G3`
-/// position the toolhead exactly as `G0`/`G1` do, and a gate that ignored
-/// them would let an arc walk to the part before the waits).
-const MOTION_COMMANDS: [&str; 4] = ["G0", "G1", "G2", "G3"];
+/// Positioning g-codes: the ONE motion-command set shared by the heating
+/// gate ([`verify_heating_gate`]) and the recovery-file pre-flight
+/// ([`crate::preflight::preflight_recovery_file`]), so their coverage
+/// cannot drift apart. Mirrors `crate::plan::is_motion_command`'s set.
+///
+/// Arcs are included deliberately: `G2`/`G3` position the toolhead
+/// exactly as `G0`/`G1` do, so a gate that ignored them would let an arc
+/// walk to the part before the temperature waits, and a bounds check that
+/// ignored them would miss an out-of-range arc endpoint.
+pub const MOTION_COMMANDS: [&str; 4] = ["G0", "G1", "G2", "G3"];
 
-/// The built-in / configured purge behaviour of a recovery file.
+/// `true` when `name` (already uppercased) is a positioning move.
+#[must_use]
+pub fn is_motion_command(name: &str) -> bool {
+    MOTION_COMMANDS.contains(&name)
+}
+
+/// How the recovery file purges, once the `[plr]` precedence table has
+/// been resolved by the plan builder.
+///
+/// The three coherent paths an operator can be on — hand it to a macro,
+/// fully specify the built-in, or turn it off — map onto
+/// `Some(Macro)` / `Some(BuiltIn)` / `None`. A fourth situation,
+/// "`purge_macro` set but the macro does not exist", is not representable
+/// here at all: the builder REFUSES to plan
+/// ([`crate::RecoveryError::PurgeMacroMissing`]) rather than silently
+/// substituting the built-in.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct PurgeSpec {
-    /// A configured purge macro to CALL instead of the built-in purge —
-    /// present only when `purge_macro` is set AND that macro exists on
-    /// the machine (existence is resolved by the daemon; the plan
-    /// builder is told the result).
-    pub macro_call: Option<String>,
-    /// Built-in purge extrusion length, mm (used when `macro_call` is
-    /// `None`).
-    pub amount: f64,
-    /// Built-in purge feedrate, mm/min (deliberately slow).
-    pub feed: f64,
+pub enum PurgePlan {
+    /// A configured `purge_macro` that exists on the machine owns the
+    /// purge ENTIRELY: its own positioning, amount and speed. plr emits
+    /// the call and nothing else, and never repositions the toolhead for
+    /// it — the macro's motion is unknowable here, exactly as with
+    /// `CLEAN_NOZZLE`.
+    Macro {
+        /// The macro name to call.
+        call: String,
+    },
+    /// The built-in purge, fully specified.
+    BuiltIn {
+        /// Where to purge, mm. Defaults to the reheat park point (already
+        /// computed, part-clear and bounds-checked).
+        point: [f64; 2],
+        /// Absolute Z to purge at, mm. `None` keeps whatever height the
+        /// park lift left in effect (the elevated park Z).
+        z: Option<f64>,
+        /// Extrusion length, mm.
+        amount: f64,
+        /// Extrusion feedrate, mm/min.
+        speed: f64,
+        /// Filament retracted after purging, mm, to help break the
+        /// string. `0` disables the retract.
+        retract: f64,
+        /// Travel feedrate used to reach `point`/`z`, mm/min.
+        travel_feed: f64,
+    },
+}
+
+impl PurgePlan {
+    /// The built-in purge's location, when this is a built-in purge.
+    #[must_use]
+    pub fn built_in_point(&self) -> Option<[f64; 2]> {
+        match self {
+            PurgePlan::BuiltIn { point, .. } => Some(*point),
+            PurgePlan::Macro { .. } => None,
+        }
+    }
 }
 
 /// Everything the generator needs to emit a recovery file EXCEPT the raw
@@ -110,8 +162,9 @@ pub struct RecoveryFileSpec {
     pub bed: Option<f64>,
     /// Nozzle print target, °C.
     pub nozzle: f64,
-    /// Purge behaviour, or `None` when purging is disabled.
-    pub purge: Option<PurgeSpec>,
+    /// Purge behaviour, or `None` when purging is disabled
+    /// (`purge_enable = false`).
+    pub purge: Option<PurgePlan>,
     /// The part-clear reheat park point `[x, y]`, mm — the same point the
     /// plan's park step travelled to. The file travels BACK to it after
     /// `G28 X Y` (which discards it) so the purge runs clear of the part.
@@ -124,6 +177,28 @@ pub struct RecoveryFileSpec {
     pub entry_commands: Vec<String>,
     /// Cap on leading comment lines copied from the original file.
     pub header_cap: usize,
+}
+
+impl RecoveryFileSpec {
+    /// Where the single post-`G28` travel goes, and at what Z.
+    ///
+    /// `G28 X Y` discards the part-clear park position, so the file must
+    /// travel somewhere known before it extrudes or enters the part. That
+    /// destination is the BUILT-IN PURGE LOCATION when one is configured
+    /// (there is no reason to visit the park point and then immediately
+    /// leave it), and the park point otherwise — including when a purge
+    /// macro owns the purge, since plr does not reposition for a macro.
+    ///
+    /// One resolver, used by both the emitter and the heating gate, so
+    /// the guard can never check a different destination than the file
+    /// actually travels to.
+    #[must_use]
+    pub fn post_home_target(&self) -> ([f64; 2], Option<f64>) {
+        match &self.purge {
+            Some(PurgePlan::BuiltIn { point, z, .. }) => (*point, *z),
+            Some(PurgePlan::Macro { .. }) | None => (self.park, None),
+        }
+    }
 }
 
 /// A generated recovery file plus the offset into `content` at which the
@@ -218,30 +293,51 @@ pub fn build_recovery_file(
     // moves would then drag across the print, undoing the plan's
     // CLEAN_NOZZLE. Absolute mode is asserted first: the file's own entry
     // moves may later switch to relative.
+    // The destination is the built-in purge location when one is
+    // configured (no reason to visit the park point then immediately
+    // leave), else the park point — including for a purge MACRO, since
+    // plr does not reposition for a macro.
+    let (dest, dest_z) = spec.post_home_target();
+    let travel_feed = match &spec.purge {
+        Some(PurgePlan::BuiltIn { travel_feed, .. }) => *travel_feed,
+        Some(PurgePlan::Macro { .. }) | None => spec.park_feed,
+    };
     pre.push_str("G90\n");
     let _ = writeln!(
         pre,
         "G0 X{} Y{} F{}",
-        fmt_num(spec.park[0]),
-        fmt_num(spec.park[1]),
-        fmt_num(spec.park_feed)
+        fmt_num(dest[0]),
+        fmt_num(dest[1]),
+        fmt_num(travel_feed)
     );
+    // An explicit purge Z descends only AFTER the XY travel completes, so
+    // the nozzle never sweeps low across whatever lies in between.
+    if let Some(z) = dest_z {
+        let _ = writeln!(pre, "G1 Z{} F{}", fmt_num(z), fmt_num(travel_feed));
+    }
 
-    // (e) Purge, at the re-parked part-clear position (only when enabled).
-    if let Some(purge) = &spec.purge {
-        if let Some(macro_call) = &purge.macro_call {
-            pre.push_str(macro_call);
+    // (e) Purge, at the destination reached above (only when enabled).
+    match &spec.purge {
+        // A macro owns its own positioning, amount and speed: emit the
+        // call and NOTHING else.
+        Some(PurgePlan::Macro { call }) => {
+            pre.push_str(call);
             pre.push('\n');
-        } else {
+        }
+        Some(PurgePlan::BuiltIn {
+            amount,
+            speed,
+            retract,
+            ..
+        }) => {
             pre.push_str("G92 E0\n");
-            let _ = writeln!(
-                pre,
-                "G1 E{} F{}",
-                fmt_num(purge.amount),
-                fmt_num(purge.feed)
-            );
+            let _ = writeln!(pre, "G1 E{} F{}", fmt_num(*amount), fmt_num(*speed));
+            if *retract > 0.0 {
+                let _ = writeln!(pre, "G1 E-{} F{}", fmt_num(*retract), fmt_num(*speed));
+            }
             pre.push_str("G92 E0\n");
         }
+        None => {}
     }
 
     // (f) Entry moves (from above the part interior into the resume
@@ -332,9 +428,37 @@ pub enum HeatingGateViolation {
         command: String,
     },
     /// The post-`G28` re-park travel back to the part-clear park point is
-    /// missing, so the purge/entry would run at the machine's homing XY.
-    #[error("the preamble does not travel back to the park point after G28 X Y")]
+    /// missing: the first motion after the re-home is not an XY travel
+    /// (or there is none at all), so the purge/entry would run at the
+    /// machine's homing XY.
+    #[error(
+        "the first motion after G28 X Y is not an XY travel back to the park point \
+         (the purge/entry would run at the homed XY)"
+    )]
     MissingRePark,
+    /// The first motion after `G28` IS an XY travel, but not to the
+    /// part-clear park point the plan computed and bounds-checked.
+    #[error(
+        "the post-G28 re-park travels to ({found_x}, {found_y}) but the plan's \
+         part-clear park point is ({park_x}, {park_y})"
+    )]
+    ReParkMismatch {
+        /// X the preamble travels to.
+        found_x: String,
+        /// Y the preamble travels to.
+        found_y: String,
+        /// X of the plan's park point.
+        park_x: String,
+        /// Y of the plan's park point.
+        park_y: String,
+    },
+    /// An extruder-moving command (the built-in purge) appears between
+    /// the re-home and the re-park, so it would purge at the homed XY.
+    #[error("purge command {command:?} precedes the post-G28 re-park travel")]
+    PurgeBeforeRePark {
+        /// The offending command.
+        command: String,
+    },
 }
 
 /// What a motion command's Z word does, as far as the gate can prove it
@@ -367,7 +491,19 @@ struct PreLine {
     has_xy: bool,
     is_g28: bool,
     z_intent: ZIntent,
+    /// Literal X target, when the command carries a parsable one.
+    x: Option<f64>,
+    /// Literal Y target, when the command carries a parsable one.
+    y: Option<f64>,
+    /// The command carries an `E` word (the built-in purge does).
+    touches_e: bool,
 }
+
+/// Tolerance, mm, when matching the emitted re-park coordinates against
+/// the spec's park point. Commands render coordinates at five decimals
+/// ([`fmt_num`]), so a re-parsed value can differ by half an ulp of that
+/// quantization.
+const PARK_MATCH_EPSILON: f64 = 1e-4;
 
 fn classify_preamble(preamble: &[u8]) -> Vec<PreLine> {
     let mut out = Vec::new();
@@ -395,21 +531,28 @@ fn classify_preamble(preamble: &[u8]) -> Vec<PreLine> {
             Some(Ok(v)) if !absolute && v > 0.0 => ZIntent::Lift,
             Some(_) => ZIntent::MaybeDescent,
         };
+        // Literal XY targets, for the re-park coordinate check. `G28 X Y`
+        // carries flag params with no value, which do not parse — exactly
+        // right: the re-home is not a positioning move.
+        let x = command.get("X").and_then(|v| v.parse::<f64>().ok());
+        let y = command.get("Y").and_then(|v| v.parse::<f64>().ok());
+        // Any command that changes the extruder axis: the built-in purge
+        // (`G92 E0`, `G1 E<amt>`). The re-park must precede all of these.
+        let touches_e = command.get("E").is_some();
         out.push(PreLine {
             name,
             has_xy,
             is_g28,
             z_intent,
+            x,
+            y,
+            touches_e,
         });
     }
     out
 }
 
-/// `true` when the command is a toolhead-positioning move. Includes the
-/// arcs `G2`/`G3` (see [`MOTION_COMMANDS`]).
-fn is_motion(name: &str) -> bool {
-    MOTION_COMMANDS.contains(&name)
-}
+use is_motion_command as is_motion;
 
 /// Verifies the heating-gate invariant on a generated recovery file:
 ///
@@ -418,9 +561,16 @@ fn is_motion(name: &str) -> bool {
 ///    blocking temperature waits;
 /// 2. the `G28 X Y` re-home exists and follows those waits;
 /// 3. no positioning move precedes the re-home;
-/// 4. the preamble travels BACK to the park point after `G28` (so the
-///    purge and entry never run at the machine's homing XY — see the
-///    module docs, layout step 4).
+/// 4. the FIRST motion after `G28` is an XY travel back to `park` — the
+///    plan's part-clear, bounds-checked reheat park point — and no
+///    extruder-moving command precedes it (so the purge and entry never
+///    run at the machine's homing XY; see the module docs, layout step 4).
+///
+/// The expected destination comes from `spec`
+/// ([`RecoveryFileSpec::post_home_target`] — the built-in purge location
+/// when one is configured, else the park point), passed in rather than
+/// read back out of the file: a file that certified its own coordinate
+/// would prove nothing.
 ///
 /// Only the generated PREAMBLE ([`GeneratedRecoveryFile::preamble`]) is
 /// checked — the verbatim tail is the operator's own file and is out of
@@ -429,7 +579,11 @@ fn is_motion(name: &str) -> bool {
 /// # Errors
 ///
 /// A [`HeatingGateViolation`] naming the first structural problem.
-pub fn verify_heating_gate(file: &GeneratedRecoveryFile) -> Result<(), HeatingGateViolation> {
+pub fn verify_heating_gate(
+    file: &GeneratedRecoveryFile,
+    spec: &RecoveryFileSpec,
+) -> Result<(), HeatingGateViolation> {
+    let (park, _) = spec.post_home_target();
     let lines = classify_preamble(file.preamble());
 
     // Was a bed target set? Then M190 is required.
@@ -482,14 +636,48 @@ pub fn verify_heating_gate(file: &GeneratedRecoveryFile) -> Result<(), HeatingGa
         }
     }
 
-    // Rule 4: the re-park travel exists after the re-home. Without it the
-    // purge would run at the homing XY the G28 just moved to.
-    let re_parked = lines
-        .iter()
-        .skip(g28_idx + 1)
-        .any(|l| is_motion(&l.name) && l.has_xy);
-    if !re_parked {
+    // Rule 4: the FIRST motion after the re-home is the re-park travel,
+    // and it goes to the plan's part-clear park point.
+    //
+    // "First motion", not "any motion": the entry moves always contain an
+    // XY travel, so an "any" test could never fail for a generated file —
+    // it would pass just as happily with the re-park deleted, or moved
+    // after the purge. Anchoring on the first motion makes both of those
+    // fire, because the purge's `G1 E<amt>` and the entry's `G0 Z<hop>`
+    // are themselves motion commands carrying no XY.
+    //
+    // Caveat, documented rather than pretended away: a configured
+    // `purge_macro` is an opaque macro call (like `CLEAN_NOZZLE`), so its
+    // internal motion is unknowable here — the same limit the plan's
+    // clean-nozzle step carries.
+    let after_home = &lines[g28_idx + 1..];
+    // The built-in purge must not sneak in ahead of the re-park.
+    let first_motion_idx = after_home.iter().position(|l| is_motion(&l.name));
+    if let Some(purge_idx) = after_home.iter().position(|l| l.touches_e) {
+        if first_motion_idx.is_none_or(|m| purge_idx < m) {
+            return Err(HeatingGateViolation::PurgeBeforeRePark {
+                command: after_home[purge_idx].name.clone(),
+            });
+        }
+    }
+    let Some(re_park) = first_motion_idx.map(|i| &after_home[i]) else {
         return Err(HeatingGateViolation::MissingRePark);
+    };
+    if !re_park.has_xy {
+        return Err(HeatingGateViolation::MissingRePark);
+    }
+    match (re_park.x, re_park.y) {
+        (Some(x), Some(y))
+            if (x - park[0]).abs() <= PARK_MATCH_EPSILON
+                && (y - park[1]).abs() <= PARK_MATCH_EPSILON => {}
+        (x, y) => {
+            return Err(HeatingGateViolation::ReParkMismatch {
+                found_x: x.map_or_else(|| "?".to_owned(), fmt_num),
+                found_y: y.map_or_else(|| "?".to_owned(), fmt_num),
+                park_x: fmt_num(park[0]),
+                park_y: fmt_num(park[1]),
+            })
+        }
     }
     Ok(())
 }
@@ -546,8 +734,21 @@ pub fn recovery_file_name(original_name: &str, taken: &dyn Fn(&str) -> bool) -> 
 mod tests {
     use super::{
         build_recovery_file, recovery_file_name, sanitize_name, verify_heating_gate,
-        GeneratedRecoveryFile, HeatingGateViolation, PurgeSpec, RecoveryFileSpec,
+        GeneratedRecoveryFile, HeatingGateViolation, PurgePlan, RecoveryFileSpec,
     };
+
+    /// The park point every fixture in this module uses.
+    const PARK: [f64; 2] = [180.0, 20.0];
+
+    /// A spec whose `post_home_target` is `PARK` (no purge), for the
+    /// hand-built hostile-shape gate tests.
+    fn park_only_spec() -> RecoveryFileSpec {
+        RecoveryFileSpec {
+            park: PARK,
+            purge: None,
+            ..spec()
+        }
+    }
 
     /// Wraps hand-written preamble text as a generated file with an empty
     /// tail (hostile-shape tests for the heating gate).
@@ -555,6 +756,17 @@ mod tests {
         GeneratedRecoveryFile {
             content: preamble.as_bytes().to_vec(),
             tail_start: preamble.len(),
+        }
+    }
+
+    fn built_in_purge() -> PurgePlan {
+        PurgePlan::BuiltIn {
+            point: PARK,
+            z: None,
+            amount: 5.0,
+            speed: 300.0,
+            retract: 0.0,
+            travel_feed: 6000.0,
         }
     }
 
@@ -566,12 +778,8 @@ mod tests {
             tail_offset: 0,
             bed: Some(60.0),
             nozzle: 210.0,
-            purge: Some(PurgeSpec {
-                macro_call: None,
-                amount: 5.0,
-                feed: 300.0,
-            }),
-            park: [180.0, 20.0],
+            purge: Some(built_in_purge()),
+            park: PARK,
             park_feed: 6000.0,
             entry_commands: vec![
                 "G90".to_owned(),
@@ -593,19 +801,16 @@ mod tests {
             u64::try_from(b"; slicer 1.0\n; filament PLA\nG28\nG1 X10 Y10 E1\n".len()).unwrap();
         let file = build_recovery_file(&s, original, "TS");
         let c = file.preamble_text().into_owned();
-        // Header carries the metadata and the original slicer comments.
         assert!(c.contains("; generated-by dead-reckoning"));
         assert!(c.contains("; generated-at TS"));
         assert!(c.contains("; source-file part.gcode"));
         assert!(c.contains("; slicer 1.0"));
         assert!(c.contains("; filament PLA"));
-        // Temps in order: set then block.
         let m140 = c.find("M140 S60").unwrap();
         let m104 = c.find("M104 S210").unwrap();
         let m190 = c.find("M190 S60").unwrap();
         let m109 = c.find("M109 S210").unwrap();
         assert!(m140 < m104 && m104 < m190 && m190 < m109);
-        // Re-home, then the RE-PARK travel, then purge, then entry.
         let g28 = c.find("G28 X Y").unwrap();
         let repark = c.find("G0 X180 Y20 F6000").unwrap();
         let purge = c.find("G1 E5 F300").unwrap();
@@ -614,10 +819,9 @@ mod tests {
         assert!(g28 < repark, "the re-park follows the re-home");
         assert!(
             repark < purge,
-            "the purge must run AFTER travelling back to the part-clear park point"
+            "the purge must run AFTER travelling back to the part-clear point"
         );
         assert!(purge < entry);
-        // The verbatim tail is byte-identical to the original slice.
         assert_eq!(
             file.tail_bytes(),
             &original[usize::try_from(s.tail_offset).unwrap()..]
@@ -628,24 +832,156 @@ mod tests {
     /// homed XY that `G28 X Y` leaves the toolhead at.
     #[test]
     fn purge_never_runs_at_the_homed_xy() {
-        let file = build_recovery_file(&spec(), b"; h\nG1 X1 Y1 E1\n", "TS");
+        let s = spec();
+        let file = build_recovery_file(&s, b"; h\nG1 X1 Y1 E1\n", "TS");
         let text = file.preamble_text().into_owned();
         let g28 = text.find("G28 X Y").expect("re-home");
         let purge = text.find("G1 E5 F300").expect("purge");
-        let between = &text[g28..purge];
         assert!(
-            between.contains("G0 X180 Y20"),
-            "a travel back to the park point must sit between G28 and the purge: {between}"
+            text[g28..purge].contains("G0 X180 Y20"),
+            "a travel to the purge point must sit between G28 and the purge"
         );
-        // ...and the gate agrees.
-        assert!(verify_heating_gate(&file).is_ok());
+        assert!(verify_heating_gate(&file, &s).is_ok());
     }
 
-    /// Finding 2 regression: non-UTF-8 tails survive byte-for-byte.
+    // ---- purge precedence (all four paths) ---------------------------
+
+    /// Path 1: `purge_enable = false` → nothing emitted, but the file
+    /// still re-parks so the entry starts from a known clear point.
+    #[test]
+    fn purge_path_disabled_emits_nothing() {
+        let s = park_only_spec();
+        let file = build_recovery_file(&s, b"; h\nG1 X1 Y1\n", "TS");
+        let text = file.preamble_text().into_owned();
+        assert!(!text.contains("G92 E0"));
+        assert!(!text.contains("G1 E"));
+        assert!(text.contains("G0 X180 Y20"), "the re-park is unconditional");
+        assert!(verify_heating_gate(&file, &s).is_ok());
+    }
+
+    /// Path 2: a macro owns the purge — the call and NOTHING else, and
+    /// plr does not reposition for it (the travel goes to the park point,
+    /// not to any purge location).
+    #[test]
+    fn purge_path_macro_emits_only_the_call() {
+        let s = RecoveryFileSpec {
+            purge: Some(PurgePlan::Macro {
+                call: "CLEAN_AND_PURGE".to_owned(),
+            }),
+            ..spec()
+        };
+        let file = build_recovery_file(&s, b"; h\nG1 X1 Y1\n", "TS");
+        let text = file.preamble_text().into_owned();
+        assert!(text.contains("CLEAN_AND_PURGE"));
+        // No built-in purge commands at all.
+        assert!(!text.contains("G92 E0"));
+        assert!(!text.contains("G1 E5"));
+        // The post-home travel is the park point (plr does not
+        // reposition for a macro).
+        assert!(s
+            .post_home_target()
+            .0
+            .iter()
+            .zip(PARK)
+            .all(|(a, b)| (a - b).abs() < 1e-12));
+        assert!(text.find("G0 X180 Y20").unwrap() < text.find("CLEAN_AND_PURGE").unwrap());
+        assert!(verify_heating_gate(&file, &s).is_ok());
+    }
+
+    /// Path 4 defaults: with no explicit coordinates the built-in purge
+    /// happens at the reheat park point, and the travel goes there.
+    #[test]
+    fn purge_path_built_in_defaults_to_the_park_point() {
+        let s = spec();
+        let (pt, z) = s.post_home_target();
+        assert!(pt.iter().zip(PARK).all(|(a, b)| (a - b).abs() < 1e-12));
+        assert!(z.is_none());
+        let file = build_recovery_file(&s, b"; h\nG1 X1 Y1\n", "TS");
+        let text = file.preamble_text().into_owned();
+        assert!(text.contains("G0 X180 Y20 F6000"));
+        assert!(verify_heating_gate(&file, &s).is_ok());
+    }
+
+    /// Path 4 explicit: coordinates, Z, amount, speed and retract are all
+    /// honored, in the documented order.
+    #[test]
+    fn purge_path_built_in_honors_every_knob() {
+        let s = RecoveryFileSpec {
+            purge: Some(PurgePlan::BuiltIn {
+                point: [12.5, 7.5],
+                z: Some(0.6),
+                amount: 8.0,
+                speed: 250.0,
+                retract: 1.5,
+                travel_feed: 4200.0,
+            }),
+            ..spec()
+        };
+        // The post-home travel now targets the PURGE point, not the park.
+        let (pt, z) = s.post_home_target();
+        assert!((pt[0] - 12.5).abs() < 1e-12 && (pt[1] - 7.5).abs() < 1e-12);
+        assert!((z.unwrap() - 0.6).abs() < 1e-12);
+        let file = build_recovery_file(&s, b"; h\nG1 X1 Y1\n", "TS");
+        let text = file.preamble_text().into_owned();
+        let travel = text.find("G0 X12.5 Y7.5 F4200").expect("purge travel");
+        let descend = text.find("G1 Z0.6 F4200").expect("purge Z descent");
+        let zero = text.find("G92 E0").expect("E zero");
+        let push = text.find("G1 E8 F250").expect("purge extrusion");
+        let retract = text.find("G1 E-1.5 F250").expect("purge retract");
+        // Travel, THEN descend, then zero/extrude/retract/zero.
+        assert!(travel < descend, "descend only after the XY travel lands");
+        assert!(descend < zero && zero < push && push < retract);
+        // The trailing G92 E0 re-zeroes after the retract.
+        assert!(text.rfind("G92 E0").unwrap() > retract);
+        assert!(verify_heating_gate(&file, &s).is_ok());
+    }
+
+    /// A zero retract emits no retract line at all.
+    #[test]
+    fn purge_retract_zero_emits_no_retract() {
+        let file = build_recovery_file(&spec(), b"; h\nG1 X1 Y1\n", "TS");
+        assert!(!file.preamble_text().contains("G1 E-"));
+    }
+
+    /// The gate follows the purge location: with a configured purge point
+    /// the first post-`G28` motion must reach THAT point, not the park.
+    #[test]
+    fn the_gate_requires_travel_to_the_configured_purge_point() {
+        let s = RecoveryFileSpec {
+            purge: Some(PurgePlan::BuiltIn {
+                point: [12.5, 7.5],
+                z: None,
+                amount: 5.0,
+                speed: 300.0,
+                retract: 0.0,
+                travel_feed: 6000.0,
+            }),
+            ..spec()
+        };
+        let file = build_recovery_file(&s, b"; h\nG1 X1 Y1\n", "TS");
+        assert!(verify_heating_gate(&file, &s).is_ok());
+        // Checked against a spec whose purge point differs: mismatch.
+        let other = RecoveryFileSpec {
+            purge: Some(PurgePlan::BuiltIn {
+                point: [99.0, 99.0],
+                z: None,
+                amount: 5.0,
+                speed: 300.0,
+                retract: 0.0,
+                travel_feed: 6000.0,
+            }),
+            ..spec()
+        };
+        assert!(matches!(
+            verify_heating_gate(&file, &other),
+            Err(HeatingGateViolation::ReParkMismatch { .. })
+        ));
+    }
+
+    // ---- byte fidelity ----------------------------------------------
+
     #[test]
     fn tail_is_byte_verbatim_for_non_utf8_originals() {
-        // A latin-1 e-acute (0xE9) in a slicer comment, plus a stray 0xFF:
-        // a lossy decode would rewrite both as EF BF BD and change the len.
         let original: Vec<u8> = b"; caf\xE9 \xFF\nG1 X1 Y1 E1\nG1 X2 Y2 E2\n".to_vec();
         let mut s = spec();
         s.tail_offset = u64::try_from(original.iter().position(|&b| b == b'\n').unwrap() + 1)
@@ -653,13 +989,11 @@ mod tests {
         let file = build_recovery_file(&s, &original, "TS");
         let expected = &original[usize::try_from(s.tail_offset).unwrap()..];
         assert_eq!(file.tail_bytes(), expected);
-        // Byte-for-byte: no replacement characters were introduced.
         assert!(!file
             .tail_bytes()
             .windows(3)
             .any(|w| w == [0xEF, 0xBF, 0xBD]));
 
-        // A tail that IS the non-UTF-8 region round-trips too.
         let mut s2 = spec();
         s2.tail_offset = 0;
         let file2 = build_recovery_file(&s2, &original, "TS");
@@ -694,29 +1028,33 @@ mod tests {
         let mut s = spec();
         s.header_cap = 200;
         let file = build_recovery_file(&s, original.as_bytes(), "TS");
-        let copied = file.preamble_text().matches("; meta ").count();
-        assert_eq!(copied, 200);
+        assert_eq!(file.preamble_text().matches("; meta ").count(), 200);
     }
+
+    // ---- heating gate -----------------------------------------------
 
     #[test]
     fn heating_gate_holds_for_a_normal_file() {
-        let file = build_recovery_file(&spec(), b"; h\nG1 X1 Y1 E1\n", "TS");
-        assert!(verify_heating_gate(&file).is_ok());
+        let s = spec();
+        let file = build_recovery_file(&s, b"; h\nG1 X1 Y1 E1\n", "TS");
+        assert!(verify_heating_gate(&file, &s).is_ok());
     }
 
     #[test]
     fn heating_gate_holds_without_a_bed() {
-        let mut s = spec();
-        s.bed = None;
+        let s = RecoveryFileSpec {
+            bed: None,
+            ..spec()
+        };
         let file = build_recovery_file(&s, b"; h\nG1 X1 Y1\n", "TS");
-        assert!(verify_heating_gate(&file).is_ok());
+        assert!(verify_heating_gate(&file, &s).is_ok());
     }
 
     #[test]
     fn heating_gate_catches_an_xy_move_before_the_wait() {
-        let file = hand_built("M104 S210\nG1 X5 Y5\nM109 S210\nG28 X Y\nG0 X1 Y1\n");
+        let file = hand_built("M104 S210\nG1 X5 Y5\nM109 S210\nG28 X Y\nG0 X180 Y20\n");
         assert_eq!(
-            verify_heating_gate(&file),
+            verify_heating_gate(&file, &park_only_spec()),
             Err(HeatingGateViolation::XyBeforeTempWait {
                 command: "G1".to_owned()
             })
@@ -728,132 +1066,238 @@ mod tests {
     fn heating_gate_catches_arc_moves_before_the_wait() {
         for arc in ["G2", "G3"] {
             let file = hand_built(&format!(
-                "M104 S210\n{arc} X5 Y5 I1 J1\nM109 S210\nG28 X Y\nG0 X1 Y1\n"
+                "M104 S210\n{arc} X5 Y5 I1 J1\nM109 S210\nG28 X Y\nG0 X180 Y20\n"
             ));
             assert_eq!(
-                verify_heating_gate(&file),
+                verify_heating_gate(&file, &park_only_spec()),
                 Err(HeatingGateViolation::XyBeforeTempWait {
                     command: arc.to_owned()
                 }),
                 "{arc} must be treated as motion"
             );
         }
-        // An arc between the waits and the re-home is caught too.
-        let file = hand_built("M104 S210\nM109 S210\nG3 X5 Y5 I1 J1\nG28 X Y\nG0 X1 Y1\n");
+        let file = hand_built("M104 S210\nM109 S210\nG3 X5 Y5 I1 J1\nG28 X Y\nG0 X180 Y20\n");
         assert_eq!(
-            verify_heating_gate(&file),
+            verify_heating_gate(&file, &park_only_spec()),
             Err(HeatingGateViolation::EntryBeforeReHome {
                 command: "G3".to_owned()
             })
         );
     }
 
-    /// Finding 5 regression: a Z-only DESCENT before the waits is a
-    /// violation; only a provable relative lift is tolerated.
+    /// Finding 5 regression: a Z DESCENT before the waits is a violation;
+    /// only a provable relative lift is tolerated.
     #[test]
     fn heating_gate_catches_a_z_descent_before_the_wait() {
-        // Absolute Z: direction unknowable without the runtime Z, refused.
-        let file = hand_built("M104 S210\nG90\nG1 Z-20\nM109 S210\nG28 X Y\nG0 X1 Y1\n");
+        let s = park_only_spec();
+        // Absolute Z: direction unknowable without the runtime Z.
+        let file = hand_built("M104 S210\nG90\nG1 Z-20\nM109 S210\nG28 X Y\nG0 X180 Y20\n");
         assert_eq!(
-            verify_heating_gate(&file),
+            verify_heating_gate(&file, &s),
             Err(HeatingGateViolation::ZDescentBeforeTempWait {
                 command: "G1".to_owned()
             })
         );
-        // Relative negative Z: an unambiguous descent, refused.
-        let file = hand_built("M104 S210\nG91\nG1 Z-20\nM109 S210\nG28 X Y\nG0 X1 Y1\n");
+        // Relative negative Z: an unambiguous descent.
+        let file = hand_built("M104 S210\nG91\nG1 Z-20\nM109 S210\nG28 X Y\nG0 X180 Y20\n");
         assert_eq!(
-            verify_heating_gate(&file),
+            verify_heating_gate(&file, &s),
             Err(HeatingGateViolation::ZDescentBeforeTempWait {
                 command: "G1".to_owned()
             })
         );
         // A relative LIFT is the documented carve-out and passes.
-        let file = hand_built("M104 S210\nG91\nG1 Z5\nG90\nM109 S210\nG28 X Y\nG0 X1 Y1\n");
-        assert!(verify_heating_gate(&file).is_ok());
+        let file = hand_built("M104 S210\nG91\nG1 Z5\nG90\nM109 S210\nG28 X Y\nG0 X180 Y20\n");
+        assert!(
+            verify_heating_gate(&file, &s).is_ok(),
+            "a provable relative lift must pass: {}",
+            file.preamble_text()
+        );
         // An absolute Z even in the "up" direction is still unprovable.
-        let file = hand_built("M104 S210\nG90\nG1 Z200\nM109 S210\nG28 X Y\nG0 X1 Y1\n");
+        let file = hand_built("M104 S210\nG90\nG1 Z200\nM109 S210\nG28 X Y\nG0 X180 Y20\n");
         assert_eq!(
-            verify_heating_gate(&file),
+            verify_heating_gate(&file, &s),
             Err(HeatingGateViolation::ZDescentBeforeTempWait {
                 command: "G1".to_owned()
             })
         );
     }
 
-    /// Finding 1 regression at the gate level: a file that forgets to
-    /// travel back to the park point after G28 is refused.
+    /// Rebuilds a generated file from a mutated copy of its REAL preamble.
+    /// Used to prove the re-park guard bites on files this generator
+    /// actually produces — a hand-built stub could pass a rule that is
+    /// vacuous in practice.
+    fn mutate_real_preamble(
+        s: &RecoveryFileSpec,
+        original: &[u8],
+        edit: impl Fn(Vec<String>) -> Vec<String>,
+    ) -> GeneratedRecoveryFile {
+        let built = build_recovery_file(s, original, "TS");
+        let lines: Vec<String> = built.preamble_text().lines().map(str::to_owned).collect();
+        let mut preamble = edit(lines).join("\n");
+        preamble.push('\n');
+        let tail_start = preamble.len();
+        let mut content = preamble.into_bytes();
+        content.extend_from_slice(built.tail_bytes());
+        GeneratedRecoveryFile {
+            content,
+            tail_start,
+        }
+    }
+
+    /// Finding 1 regression on the REAL generated preamble: deleting just
+    /// the re-park line must fire.
+    ///
+    /// The earlier "any XY motion after G28" formulation could never fail
+    /// here — the entry moves always contain `G0 X.. Y..` — so this is
+    /// what proves the guard is real. With the purge DISABLED the first
+    /// motion after the re-home becomes the entry's Z hop (no XY), which
+    /// is `MissingRePark`.
+    #[test]
+    fn deleting_the_re_park_from_a_real_file_is_caught() {
+        let s = park_only_spec();
+        let original = b"; h\nG1 X1 Y1 E1\n";
+        assert!(verify_heating_gate(&build_recovery_file(&s, original, "TS"), &s).is_ok());
+
+        let mutated = mutate_real_preamble(&s, original, |lines| {
+            lines
+                .into_iter()
+                .filter(|l| !l.starts_with("G0 X180 Y20"))
+                .collect()
+        });
+        assert_eq!(
+            verify_heating_gate(&mutated, &s),
+            Err(HeatingGateViolation::MissingRePark),
+            "preamble:\n{}",
+            mutated.preamble_text()
+        );
+    }
+
+    /// Same deletion with the built-in purge ENABLED: the purge is now
+    /// the first thing after the re-home, which is the more precise
+    /// `PurgeBeforeRePark` — it would extrude at the homed XY.
+    #[test]
+    fn deleting_the_re_park_with_a_purge_is_caught_as_purge_first() {
+        let s = spec();
+        let mutated = mutate_real_preamble(&s, b"; h\nG1 X1 Y1 E1\n", |lines| {
+            lines
+                .into_iter()
+                .filter(|l| !l.starts_with("G0 X180 Y20"))
+                .collect()
+        });
+        assert_eq!(
+            verify_heating_gate(&mutated, &s),
+            Err(HeatingGateViolation::PurgeBeforeRePark {
+                command: "G92".to_owned()
+            }),
+            "preamble:\n{}",
+            mutated.preamble_text()
+        );
+    }
+
+    /// Finding 1 regression: moving the re-park to AFTER the purge fires.
+    #[test]
+    fn moving_the_re_park_after_the_purge_is_caught() {
+        let s = spec();
+        let mutated = mutate_real_preamble(&s, b"; h\nG1 X1 Y1 E1\n", |lines| {
+            let mut out: Vec<String> = lines
+                .iter()
+                .filter(|l| !l.starts_with("G0 X180 Y20"))
+                .cloned()
+                .collect();
+            let after_purge = out
+                .iter()
+                .rposition(|l| l == "G92 E0")
+                .expect("built-in purge")
+                + 1;
+            out.insert(after_purge, "G0 X180 Y20 F6000".to_owned());
+            out
+        });
+        assert_eq!(
+            verify_heating_gate(&mutated, &s),
+            Err(HeatingGateViolation::PurgeBeforeRePark {
+                command: "G92".to_owned()
+            }),
+            "preamble:\n{}",
+            mutated.preamble_text()
+        );
+    }
+
+    /// Finding 1 regression: a re-park to the WRONG point is caught with
+    /// both coordinates named.
+    #[test]
+    fn a_re_park_to_the_wrong_point_is_caught() {
+        let s = spec();
+        let mutated = mutate_real_preamble(&s, b"; h\nG1 X1 Y1 E1\n", |lines| {
+            lines
+                .into_iter()
+                .map(|l| {
+                    if l.starts_with("G0 X180 Y20") {
+                        "G0 X5 Y5 F6000".to_owned()
+                    } else {
+                        l
+                    }
+                })
+                .collect()
+        });
+        let err = verify_heating_gate(&mutated, &s).unwrap_err();
+        assert!(
+            matches!(&err, HeatingGateViolation::ReParkMismatch { found_x, park_x, .. }
+                if found_x == "5" && park_x == "180"),
+            "{err:?}"
+        );
+    }
+
     #[test]
     fn heating_gate_catches_a_missing_re_park() {
+        let file = hand_built("M104 S210\nM109 S210\nG28 X Y\n");
+        assert_eq!(
+            verify_heating_gate(&file, &park_only_spec()),
+            Err(HeatingGateViolation::MissingRePark)
+        );
         let file = hand_built("M104 S210\nM109 S210\nG28 X Y\nG92 E0\nG1 E5 F300\n");
         assert_eq!(
-            verify_heating_gate(&file),
-            Err(HeatingGateViolation::MissingRePark)
+            verify_heating_gate(&file, &spec()),
+            Err(HeatingGateViolation::PurgeBeforeRePark {
+                command: "G92".to_owned()
+            })
         );
     }
 
     #[test]
     fn heating_gate_catches_missing_and_early_rehome() {
+        let s = park_only_spec();
         let no_wait = hand_built("M104 S210\nG28 X Y\n");
         assert_eq!(
-            verify_heating_gate(&no_wait),
+            verify_heating_gate(&no_wait, &s),
             Err(HeatingGateViolation::MissingNozzleWait)
         );
         let no_bed_wait = hand_built("M140 S60\nM104 S210\nM109 S210\nG28 X Y\n");
         assert_eq!(
-            verify_heating_gate(&no_bed_wait),
+            verify_heating_gate(&no_bed_wait, &s),
             Err(HeatingGateViolation::MissingBedWait)
         );
         let early = hand_built("M104 S210\nG28 X Y\nM109 S210\n");
         assert_eq!(
-            verify_heating_gate(&early),
+            verify_heating_gate(&early, &s),
             Err(HeatingGateViolation::ReHomeBeforeTempWait)
         );
         let no_home = hand_built("M104 S210\nM109 S210\n");
         assert_eq!(
-            verify_heating_gate(&no_home),
+            verify_heating_gate(&no_home, &s),
             Err(HeatingGateViolation::MissingReHome)
         );
     }
 
     #[test]
     fn heating_gate_catches_entry_before_rehome() {
-        let file = hand_built("M104 S210\nM109 S210\nG1 X5 Y5\nG28 X Y\nG0 X1 Y1\n");
+        let file = hand_built("M104 S210\nM109 S210\nG1 X5 Y5\nG28 X Y\nG0 X180 Y20\n");
         assert_eq!(
-            verify_heating_gate(&file),
+            verify_heating_gate(&file, &park_only_spec()),
             Err(HeatingGateViolation::EntryBeforeReHome {
                 command: "G1".to_owned()
             })
         );
-    }
-
-    #[test]
-    fn purge_macro_is_called_when_configured() {
-        let mut s = spec();
-        s.purge = Some(PurgeSpec {
-            macro_call: Some("CLEAN_AND_PURGE".to_owned()),
-            amount: 5.0,
-            feed: 300.0,
-        });
-        let file = build_recovery_file(&s, b"; h\nG1 X1 Y1\n", "TS");
-        let text = file.preamble_text().into_owned();
-        assert!(text.contains("CLEAN_AND_PURGE"));
-        assert!(!text.contains("G92 E0"));
-        // Even a macro purge runs after the re-park.
-        assert!(text.find("G0 X180 Y20").unwrap() < text.find("CLEAN_AND_PURGE").unwrap());
-    }
-
-    #[test]
-    fn purge_disabled_emits_no_purge_but_still_re_parks() {
-        let mut s = spec();
-        s.purge = None;
-        let file = build_recovery_file(&s, b"; h\nG1 X1 Y1\n", "TS");
-        let text = file.preamble_text().into_owned();
-        assert!(!text.contains("G92 E0"));
-        // The re-park is unconditional: the entry moves start from a
-        // known, part-clear position either way.
-        assert!(text.contains("G0 X180 Y20"));
-        assert!(verify_heating_gate(&file).is_ok());
     }
 
     #[test]

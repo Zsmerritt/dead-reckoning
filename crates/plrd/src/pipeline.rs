@@ -624,7 +624,7 @@ fn finalize_recovery_file(
 
     // The heating gate is a build-time invariant: refuse to proceed if it
     // ever fails to hold (defense in depth over the generator).
-    if let Err(violation) = plr_recovery::verify_heating_gate(&generated) {
+    if let Err(violation) = plr_recovery::verify_heating_gate(&generated, &plan.recovery_file) {
         return Err(format!(
             "generated recovery file violates the heating gate: {violation}"
         ));

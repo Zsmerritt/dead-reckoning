@@ -70,6 +70,42 @@ pub enum RecoveryError {
         /// ([`crate::build::PROBE_TEMP_HEADROOM`]).
         headroom: f64,
     },
+    /// `drag_nozzle_temp` is negative, or sits within
+    /// [`crate::build::PROBE_TEMP_HEADROOM`] of the contact ceiling —
+    /// which would let the plan command a drag temperature the Klipper
+    /// plugin's ceiling gate then refuses, aborting after the Z frame is
+    /// declared and wedging the recovery. `0` (the cold-drag opt-out) is
+    /// always accepted.
+    #[error(
+        "drag_nozzle_temp {drag_nozzle_temp} C is outside [0, {ceiling} - {headroom}]: it must \
+         leave {headroom} C of headroom below the contact ceiling {ceiling} C \
+         (= min(probe_temp_max, max_probe_nozzle_temp)), or be exactly 0 to opt out of \
+         heating for the drag. Lower drag_nozzle_temp, or raise probe_temp_max / \
+         max_probe_nozzle_temp"
+    )]
+    DragTempOutOfRange {
+        /// The rejected drag hold temperature, °C.
+        drag_nozzle_temp: f64,
+        /// The effective contact ceiling, °C.
+        ceiling: f64,
+        /// The required headroom, °C.
+        headroom: f64,
+    },
+    /// `purge_macro` names a `[gcode_macro ...]` that does not exist on
+    /// the machine. Planning refuses rather than silently substituting
+    /// the built-in purge: the operator asked for specific behaviour, and
+    /// quietly extruding filament at a different place and rate is not an
+    /// acceptable substitute (unlike the clean-nozzle macro, which
+    /// degrades safely to asking the operator).
+    #[error(
+        "purge_macro names {name:?} but no [gcode_macro {name}] exists in the printer config; \
+         refusing to substitute the built-in purge. Add the macro, correct purge_macro, or \
+         unset purge_macro to use the built-in purge (or set purge_enable = False)"
+    )]
+    PurgeMacroMissing {
+        /// The configured macro name that was not found.
+        name: String,
+    },
     /// One or more machine prerequisites failed
     /// ([`crate::machine::validate_machine`]). Recovery must not be
     /// attempted on this machine until every failure is resolved.

@@ -414,9 +414,17 @@ proptest! {
         // park before restore, file-select last.
         prop_assert!(plan.bed_heat_precedes_motion());
         prop_assert!(plan.believed_z_precedes_home_xy());
+        prop_assert!(plan.probe_temp_hold_precedes_clean_nozzle());
         prop_assert!(plan.clean_nozzle_between_home_and_shifted());
         prop_assert!(plan.park_precedes_restore());
         prop_assert!(plan.recovery_file_select_last());
+        // The hold phase exists on every path here (the generator never
+        // opts out of drag heating), and always blocks with an M109.
+        let hold = plan
+            .steps_in_phase(Phase::ProbeTempHold)
+            .next()
+            .expect("probe-temp hold step");
+        prop_assert!(hold.commands[0].starts_with("M109 S"));
         // Accel clamp precedes the probe, restore follows on success,
         // and the clamp declares an abort cleanup — for every valid
         // plan (vacuously so on the drag path, which has no clamp).
@@ -456,7 +464,7 @@ proptest! {
             MODEL_TEXT.as_bytes(),
             "TS",
         );
-        prop_assert!(plr_recovery::verify_heating_gate(&file).is_ok());
+        prop_assert!(plr_recovery::verify_heating_gate(&file, &plan.recovery_file).is_ok());
         prop_assert_eq!(
             file.tail_bytes(),
             &MODEL_TEXT.as_bytes()[usize::try_from(plan.resume_offset).unwrap()..]
@@ -791,10 +799,13 @@ proptest! {
             tail_offset: offset as u64,
             bed,
             nozzle,
-            purge: purge_on.then_some(plr_recovery::PurgeSpec {
-                macro_call: None,
+            purge: purge_on.then_some(plr_recovery::PurgePlan::BuiltIn {
+                point: [180.0, 20.0],
+                z: None,
                 amount: 5.0,
-                feed: 300.0,
+                speed: 300.0,
+                retract: 0.0,
+                travel_feed: 6000.0,
             }),
             park: [180.0, 20.0],
             park_feed: 6000.0,
@@ -808,7 +819,7 @@ proptest! {
         // The whole file is preamble ++ tail, with nothing lost between.
         prop_assert_eq!(file.content.len(), file.tail_start + original.len() - offset);
         // The heating gate holds regardless of what the original carried.
-        prop_assert!(plr_recovery::verify_heating_gate(&file).is_ok());
+        prop_assert!(plr_recovery::verify_heating_gate(&file, &spec).is_ok());
     }
 
     /// Finding 9 (cross-component interlock): for ANY valid `[plr]`

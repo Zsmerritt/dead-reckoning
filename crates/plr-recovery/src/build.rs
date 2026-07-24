@@ -177,19 +177,70 @@ pub struct PlanConfig {
     /// when known.
     pub pre_home_z_lift: f64,
     /// FROZEN `[plr]` key `purge_enable` — whether the recovery file
-    /// purges before resuming.
+    /// purges before resuming. `false` means no purge of ANY kind.
     pub purge_enable: bool,
     /// FROZEN `[plr]` key `purge_amount` — built-in purge extrusion
-    /// length, mm. Range `[0, 50]`.
+    /// length, mm. Range `[0, 100]`.
     pub purge_amount: f64,
-    /// FROZEN `[plr]` key `purge_macro` — when set AND the macro exists,
-    /// the recovery file calls it instead of the built-in purge.
+    /// FROZEN `[plr]` key `purge_macro` — when set, the macro OWNS the
+    /// purge entirely (its own positioning, amount and speed).
+    ///
+    /// If it is set but the macro does not exist on the machine, planning
+    /// is REFUSED ([`RecoveryError::PurgeMacroMissing`]) — never silently
+    /// downgraded to the built-in purge. See the precedence table on
+    /// [`resolve_purge`].
     pub purge_macro: Option<String>,
+    /// FROZEN `[plr]` key `purge_x` — X of the built-in purge, mm.
+    /// `None` defaults to the reheat park point's X.
+    pub purge_x: Option<f64>,
+    /// FROZEN `[plr]` key `purge_y` — Y of the built-in purge, mm.
+    /// `None` defaults to the reheat park point's Y.
+    pub purge_y: Option<f64>,
+    /// FROZEN `[plr]` key `purge_z` — ABSOLUTE Z of the built-in purge,
+    /// mm. `None` keeps the elevated park Z already in effect; setting it
+    /// lets an operator purge low over a defined spot instead of dropping
+    /// filament from mid-air.
+    pub purge_z: Option<f64>,
+    /// FROZEN `[plr]` key `purge_retract` — filament retracted after the
+    /// built-in purge, mm, to help break the string. Range `[0, 10]`;
+    /// `0` disables it.
+    pub purge_retract: f64,
     /// FROZEN `[plr]` key `clean_nozzle_macro` — the macro the
     /// clean-nozzle step calls when it exists (default `CLEAN_NOZZLE`).
     pub clean_nozzle_macro: String,
-    /// Built-in purge feedrate, mm/min (deliberately slow).
-    pub purge_feed: f64,
+    /// FROZEN `[plr]` key `drag_nozzle_temp` — the nozzle temperature, °C,
+    /// the ADXL drag path heats to AND HOLDS FOR before dragging.
+    ///
+    /// Closes a real asymmetry: the touch path commands a probe
+    /// temperature and effectively holds for it (its band `pre_verify`
+    /// polls until satisfied), while the drag path historically carried
+    /// only an upper ceiling — so a drag probe could reference at any
+    /// temperature from ambient upward, and two runs of the same machine
+    /// could take their Z reference at different thermal states. Nozzle
+    /// thermal expansion moves the effective reference by tens of microns
+    /// across a 100 °C swing, so that inconsistency is a systematic Z
+    /// error, not noise.
+    ///
+    /// Default 145.0 — deliberately equal to the touch path's commanded
+    /// probe temperature, so both oracles reference at the same thermal
+    /// state.
+    ///
+    /// **`0` is an explicit opt-out**: "do not heat for dragging, and do
+    /// not hold". A cold drag is legitimate (see the drag path's
+    /// temperature gate), and an operator who wants one must not be left
+    /// waiting for the nozzle to cool to ambient — which it may never
+    /// reach. At `0` the plan emits no drag `M104`, no `M109`, and no
+    /// [`Phase::ProbeTempHold`] step at all; the contact ceiling still
+    /// applies.
+    ///
+    /// Valid range `[0, clamped_probe_max - PROBE_TEMP_HEADROOM]`: the
+    /// same headroom rule as [`Self::probe_nozzle_temp`], so plrd can
+    /// never command a temperature the plugin's ceiling gate would then
+    /// refuse (the finding-9 interlock).
+    pub drag_nozzle_temp: f64,
+    /// FROZEN `[plr]` key `purge_speed` — built-in purge extrusion
+    /// feedrate, mm/min. Range `(0, 3000]`; deliberately slow by default.
+    pub purge_speed: f64,
 }
 
 /// Headroom, °C, between the nozzle temperature the plan COMMANDS for
@@ -238,6 +289,17 @@ pub const PROBE_TEMP_HEADROOM: f64 = 5.0;
 /// abort with nothing to unwind.
 pub const PROBE_TEMP_MEASURED_TOLERANCE: f64 = 2.0;
 
+/// Half-width, °C, of the band the [`Phase::ProbeTempHold`] step verifies
+/// the held nozzle temperature landed inside.
+///
+/// Deliberately a named constant, not another config knob: `M109` already
+/// blocks natively until Klipper is satisfied, so this verification is
+/// belt-and-braces confirmation that the temperature really landed — not
+/// a control parameter an operator should be tuning. ±5 °C comfortably
+/// covers steady-state PID ripple on a settled hotend while still
+/// catching a heater that never converged (or converged somewhere else).
+pub const PROBE_HOLD_BAND: f64 = 5.0;
+
 impl PlanConfig {
     /// The effective probe-temperature ceiling: `probe_temp_max` clamped
     /// down to `max_probe_nozzle_temp`. Both the current-temperature band
@@ -258,6 +320,23 @@ impl PlanConfig {
     pub fn commanded_probe_temp(&self) -> f64 {
         let ceiling = self.clamped_probe_max() - PROBE_TEMP_HEADROOM;
         self.probe_nozzle_temp.clamp(self.probe_temp_min, ceiling)
+    }
+
+    /// The nozzle temperature this machine heats to AND HOLDS FOR before
+    /// the probe, or `None` when no hold applies.
+    ///
+    /// * ADXL drag → [`Self::drag_nozzle_temp`], or `None` when that is
+    ///   `0` (the documented cold-drag opt-out: never wait for the nozzle
+    ///   to cool to ambient).
+    /// * Tap / load-cell → [`Self::commanded_probe_temp`].
+    #[must_use]
+    pub fn probe_hold_target(&self, kind: &ProbeKind) -> Option<f64> {
+        match kind {
+            ProbeKind::AdxlDrag { .. } => {
+                (self.drag_nozzle_temp > 0.0).then_some(self.drag_nozzle_temp)
+            }
+            ProbeKind::Tap | ProbeKind::LoadCell => Some(self.commanded_probe_temp()),
+        }
     }
 }
 
@@ -299,8 +378,15 @@ impl Default for PlanConfig {
             purge_enable: true,
             purge_amount: 5.0,
             purge_macro: None,
+            purge_x: None,
+            purge_y: None,
+            purge_z: None,
+            purge_retract: 0.0,
             clean_nozzle_macro: "CLEAN_NOZZLE".to_owned(),
-            purge_feed: 300.0,
+            // Matches commanded_probe_temp() under the default ceiling, so
+            // drag and touch reference at the same thermal state.
+            drag_nozzle_temp: 145.0,
+            purge_speed: 300.0,
         }
     }
 }
@@ -315,7 +401,7 @@ impl PlanConfig {
     /// [`compute_envelope`].
     #[allow(clippy::too_many_lines)] // one flat table of field-bound checks
     pub fn validate(&self) -> Result<(), RecoveryError> {
-        let checks: [(&'static str, f64, bool); 26] = [
+        let checks: [(&'static str, f64, bool); 27] = [
             ("margin", self.margin, self.margin >= 0.0),
             (
                 "sag_allowance",
@@ -416,9 +502,18 @@ impl PlanConfig {
             (
                 "purge_amount",
                 self.purge_amount,
-                self.purge_amount >= 0.0 && self.purge_amount <= 50.0,
+                self.purge_amount >= 0.0 && self.purge_amount <= 100.0,
             ),
-            ("purge_feed", self.purge_feed, self.purge_feed > 0.0),
+            (
+                "purge_speed",
+                self.purge_speed,
+                self.purge_speed > 0.0 && self.purge_speed <= 3000.0,
+            ),
+            (
+                "purge_retract",
+                self.purge_retract,
+                self.purge_retract >= 0.0 && self.purge_retract <= 10.0,
+            ),
         ];
         for (field, value, in_range) in checks {
             if !value.is_finite() {
@@ -449,11 +544,30 @@ impl PlanConfig {
                 headroom: PROBE_TEMP_HEADROOM,
             });
         }
+        // The drag hold temperature obeys the SAME interlock: plrd must
+        // never command a temperature the plugin's ceiling gate would
+        // then refuse. `0` is the documented cold-drag opt-out.
+        if !self.drag_nozzle_temp.is_finite() {
+            return Err(RecoveryError::NonFinite {
+                field: "drag_nozzle_temp",
+            });
+        }
+        if self.drag_nozzle_temp < 0.0 || self.drag_nozzle_temp > clamped_max - PROBE_TEMP_HEADROOM
+        {
+            return Err(RecoveryError::DragTempOutOfRange {
+                drag_nozzle_temp: self.drag_nozzle_temp,
+                ceiling: clamped_max,
+                headroom: PROBE_TEMP_HEADROOM,
+            });
+        }
         // Optional reheat park coordinates: finite when present (axis
         // bounds are checked by the whole-itinerary pre-flight).
         for (field, v) in [
             ("reheat_park_x", self.reheat_park_x),
             ("reheat_park_y", self.reheat_park_y),
+            ("purge_x", self.purge_x),
+            ("purge_y", self.purge_y),
+            ("purge_z", self.purge_z),
         ] {
             if let Some(v) = v {
                 if !v.is_finite() {
@@ -862,16 +976,30 @@ fn step_immediate_bed_heat(ctx: &Ctx<'_>) -> RecoveryStep {
     // plugin refuses contact when max(current, target) exceeds the
     // ceiling, and a target ON the ceiling trips that refusal on ordinary
     // PID overshoot — wedging the recovery (see PROBE_TEMP_HEADROOM).
-    let probe_temp = ctx.cfg.commanded_probe_temp();
-    commands.push(format!("M104 S{}", fmt_num(probe_temp)));
-    verify.push(Verification::new(
-        "extruder",
-        "target",
-        Predicate::NumWithin {
-            expected: probe_temp,
-            epsilon: 1.0,
-        },
-    ));
+    //
+    // Method-aware: a drag machine heads for `drag_nozzle_temp` (the
+    // temperature it will later HOLD for), a touch/load-cell machine for
+    // the commanded probe temp. A drag machine that opted out
+    // (`drag_nozzle_temp = 0`) gets NO nozzle command at all here — the
+    // cold-drag path must not be nudged warm behind the operator's back.
+    //
+    // These verifications stay as they are — confirming the TARGETS were
+    // accepted, not that they were reached. Convergence is now the
+    // explicit job of the ProbeTempHold step's blocking M109; making this
+    // step also wait would double the heat-up serialization for no gain,
+    // and it runs before any frame declaration where a stall is merely a
+    // clean early abort.
+    if let Some(target) = ctx.cfg.probe_hold_target(&ctx.machine.probe.kind) {
+        commands.push(format!("M104 S{}", fmt_num(target)));
+        verify.push(Verification::new(
+            "extruder",
+            "target",
+            Predicate::NumWithin {
+                expected: target,
+                epsilon: 1.0,
+            },
+        ));
+    }
     step(
         Phase::ImmediateBedHeat,
         "FIRST heating action (non-blocking): bed toward target (the long pole) + nozzle toward the clamped probe temp",
@@ -925,6 +1053,44 @@ fn step_believed_z_declare(ctx: &Ctx<'_>) -> RecoveryStep {
         None,
         AbortReason::BelievedZDeclareFailed,
     )
+}
+
+/// The probe-temperature HOLD step, or `None` on a drag machine that has
+/// opted out (`drag_nozzle_temp = 0`).
+///
+/// `M109` blocks natively until Klipper is satisfied the heater settled,
+/// so this step is where the recovery actually WAITS for temperature —
+/// closing the asymmetry where the drag path had only an upper ceiling
+/// and could therefore reference at any temperature from ambient upward.
+/// The band verification below is belt-and-braces: `M109` already
+/// returned, so a failure here means the reading disagrees with what
+/// Klipper concluded.
+fn step_probe_temp_hold(ctx: &Ctx<'_>) -> Option<RecoveryStep> {
+    let target = ctx.cfg.probe_hold_target(&ctx.machine.probe.kind)?;
+    let summary = match &ctx.machine.probe.kind {
+        ProbeKind::AdxlDrag { .. } => {
+            "heat to the drag temperature and HOLD (M109 blocks; a PID hotend also waits to COOL)"
+        }
+        ProbeKind::Tap | ProbeKind::LoadCell => {
+            "heat to the probe temperature and HOLD (M109 blocks; a PID hotend also waits to COOL)"
+        }
+    };
+    Some(step(
+        Phase::ProbeTempHold,
+        summary,
+        vec![format!("M109 S{}", fmt_num(target))],
+        vec![],
+        vec![Verification::new(
+            "extruder",
+            "temperature",
+            Predicate::TempWithin {
+                min: target - PROBE_HOLD_BAND,
+                max: target + PROBE_HOLD_BAND,
+            },
+        )],
+        None,
+        AbortReason::ProbeTempHoldFailed,
+    ))
 }
 
 fn step_clean_nozzle(ctx: &Ctx<'_>) -> RecoveryStep {
@@ -1644,8 +1810,12 @@ fn build_steps(ctx: &Ctx<'_>) -> Result<Vec<RecoveryStep>, RecoveryError> {
         step_immediate_bed_heat(ctx),
         step_believed_z_declare(ctx),
         step_home_xy(),
-        step_clean_nozzle(ctx),
     ];
+    // The temperature HOLD goes between homing and the clean: reaching
+    // temperature first means heat-up ooze is wiped by the clean rather
+    // than deposited during the probe. Absent on an opted-out cold drag.
+    steps.extend(step_probe_temp_hold(ctx));
+    steps.push(step_clean_nozzle(ctx));
     // 6: the probe envelope machinery (unchanged content).
     if transforms.z_thermal_adjust_enabled.is_some() {
         steps.push(step_transform_freeze());
@@ -1817,7 +1987,19 @@ pub fn plan_recovery(
     // the print-temperature reheat / purge live there behind the heating
     // gate. Built from the same ctx so the derivation is shared.
     let entry_commands = build_entry_commands(&ctx)?;
-    let purge = build_purge(config, inputs.purge_macro_present);
+    // Purge precedence (see `resolve_purge`): disabled / macro-owned /
+    // REFUSE on a missing macro / built-in at the resolved location.
+    let purge = resolve_purge(config, inputs.purge_macro_present, park)?;
+    // A built-in purge that lands on printed geometry warns (never
+    // refuses — a sacrificial area is a legitimate target).
+    if let Some(point) = purge.as_ref().and_then(crate::PurgePlan::built_in_point) {
+        if part_bbox(inputs.model).is_some_and(|bb| inside_bbox(point, bb)) {
+            warnings.push(PlanWarning::PurgeInsidePart {
+                point,
+                configured: config.purge_x.is_some() || config.purge_y.is_some(),
+            });
+        }
+    }
     let recovery_file = crate::resume_file::RecoveryFileSpec {
         name: recovery_name.clone(),
         source_name: file_name.clone(),
@@ -1882,23 +2064,65 @@ pub fn preflight_generated_file(
 /// original (slicer metadata header).
 const RECOVERY_HEADER_CAP: usize = 200;
 
-/// The purge behaviour for the recovery file: `None` when disabled, else
-/// a macro call (when configured AND the macro exists) or the built-in
-/// purge.
-fn build_purge(config: &PlanConfig, purge_macro_present: bool) -> Option<crate::PurgeSpec> {
+/// Resolves the `[plr]` purge precedence table into a [`PurgePlan`].
+///
+/// | `purge_enable` | `purge_macro` | macro exists | result |
+/// |---|---|---|---|
+/// | `false` | *(any)* | *(any)* | `None` — no purge of any kind |
+/// | `true` | set | yes | [`PurgePlan::Macro`] — the macro owns everything |
+/// | `true` | set | **no** | **REFUSE** ([`RecoveryError::PurgeMacroMissing`]) |
+/// | `true` | unset | — | [`PurgePlan::BuiltIn`] at the resolved location |
+///
+/// # Why a missing purge macro REFUSES rather than degrading
+///
+/// The clean-nozzle path degrades to asking the operator, and that is
+/// safe: a human confirming a clean tip is a real substitute for a macro
+/// that wipes it. A purge has no equivalent human fallback — substituting
+/// the built-in would extrude filament at a location and rate the
+/// operator never asked for, which is precisely how a nozzle ends up
+/// purging somewhere unintended. So the asymmetry is deliberate: the
+/// clean-nozzle macro degrades, the purge macro refuses.
+///
+/// # Errors
+///
+/// [`RecoveryError::PurgeMacroMissing`] when `purge_macro` names a macro
+/// that does not exist on the machine.
+fn resolve_purge(
+    config: &PlanConfig,
+    purge_macro_present: bool,
+    park: [f64; 2],
+) -> Result<Option<crate::PurgePlan>, RecoveryError> {
     if !config.purge_enable {
-        return None;
+        return Ok(None);
     }
-    let macro_call = config
+    let configured_macro = config
         .purge_macro
         .as_deref()
-        .filter(|m| purge_macro_present && !m.is_empty())
-        .map(str::to_owned);
-    Some(crate::PurgeSpec {
-        macro_call,
+        .map(str::trim)
+        .filter(|m| !m.is_empty());
+    if let Some(name) = configured_macro {
+        if !purge_macro_present {
+            return Err(RecoveryError::PurgeMacroMissing {
+                name: name.to_owned(),
+            });
+        }
+        return Ok(Some(crate::PurgePlan::Macro {
+            call: name.to_owned(),
+        }));
+    }
+    // Built-in: each coordinate defaults to the already-computed,
+    // part-clear, bounds-checked park point.
+    Ok(Some(crate::PurgePlan::BuiltIn {
+        point: [
+            config.purge_x.unwrap_or(park[0]),
+            config.purge_y.unwrap_or(park[1]),
+        ],
+        z: config.purge_z,
         amount: config.purge_amount,
-        feed: config.purge_feed,
-    })
+        speed: config.purge_speed,
+        retract: config.purge_retract,
+        travel_feed: config.travel_feed,
+    }))
 }
 
 /// Margin, mm, by which a computed park point clears the part's XY
@@ -1987,12 +2211,14 @@ fn reheat_park(
         return ParkChoice { point, warning };
     }
 
-    // No footprint known: park at a modest corner offset and say so.
+    // No footprint known: park at a modest corner offset. There is
+    // nothing to verify the point against, so say exactly that rather
+    // than claiming a clearance that was never checked.
     let Some(bb) = bbox else {
         let point = clamp(PART_MARGIN, PART_MARGIN);
         return ParkChoice {
             point,
-            warning: Some(PlanWarning::ReheatParkComputed { point }),
+            warning: Some(PlanWarning::ReheatParkUnverified { point }),
         };
     };
     let [mnx, mny, mxx, mxy] = bb;

@@ -136,11 +136,23 @@ pub struct PlrSettings {
     pub purge_enable: bool,
     /// FROZEN `purge_amount` — built-in purge extrusion length, mm.
     pub purge_amount: f64,
-    /// FROZEN `purge_macro` — optional macro to call instead of the
-    /// built-in purge.
+    /// FROZEN `purge_macro` — optional macro that OWNS the purge.
     pub purge_macro: Option<String>,
+    /// FROZEN `purge_x` — built-in purge X, mm (default: park point).
+    pub purge_x: Option<f64>,
+    /// FROZEN `purge_y` — built-in purge Y, mm (default: park point).
+    pub purge_y: Option<f64>,
+    /// FROZEN `purge_z` — built-in purge absolute Z, mm (default: park Z).
+    pub purge_z: Option<f64>,
+    /// FROZEN `purge_speed` — built-in purge extrusion feedrate, mm/min.
+    pub purge_speed: f64,
+    /// FROZEN `purge_retract` — retract after the built-in purge, mm.
+    pub purge_retract: f64,
     /// FROZEN `clean_nozzle_macro` — clean-nozzle macro name.
     pub clean_nozzle_macro: String,
+    /// FROZEN `drag_nozzle_temp` — nozzle temperature the ADXL drag path
+    /// heats to AND HOLDS for, °C. `0` opts out (cold drag, no wait).
+    pub drag_nozzle_temp: f64,
     /// Operator attestation autosaved by the plugin's `PLR_SETUP`.
     pub self_locking_z: bool,
     /// Autosaved probe resolution, mm; `None` before first calibration.
@@ -301,7 +313,13 @@ impl PlrSettings {
                 Some(s) if !s.trim().is_empty() => Some(s.trim().to_owned()),
                 _ => None,
             },
+            purge_x: opt_opt_f64(plr, "purge_x"),
+            purge_y: opt_opt_f64(plr, "purge_y"),
+            purge_z: opt_opt_f64(plr, "purge_z"),
+            purge_speed: opt_f64(plr, "purge_speed", d.purge_speed)?,
+            purge_retract: opt_f64(plr, "purge_retract", d.purge_retract)?,
             clean_nozzle_macro: opt_str(plr, "clean_nozzle_macro", &d.clean_nozzle_macro)?,
+            drag_nozzle_temp: opt_f64(plr, "drag_nozzle_temp", d.drag_nozzle_temp)?,
             self_locking_z,
             probe_resolution,
             noise_floor,
@@ -356,7 +374,13 @@ impl PlrSettings {
             purge_enable: self.purge_enable,
             purge_amount: self.purge_amount,
             purge_macro: self.purge_macro.clone(),
+            purge_x: self.purge_x,
+            purge_y: self.purge_y,
+            purge_z: self.purge_z,
+            purge_speed: self.purge_speed,
+            purge_retract: self.purge_retract,
             clean_nozzle_macro: self.clean_nozzle_macro.clone(),
+            drag_nozzle_temp: self.drag_nozzle_temp,
             // [plr] mode: the plugin (and its PLR_TOUCH command) is
             // present, so the consensus touch is used.
             legacy_single_probe: false,
@@ -1325,6 +1349,50 @@ pub(crate) mod tests {
         // An empty purge_macro string is treated as unset.
         let (_, plr) = parse_fixture(&[("purge_macro", json!("  "))]);
         assert_eq!(plr.purge_macro, None);
+    }
+
+    #[test]
+    fn purge_and_drag_temp_keys_parse_and_carry_through() {
+        let (_, plr) = parse_fixture(&[
+            ("drag_nozzle_temp", json!(120.0)),
+            ("purge_x", json!(150.0)),
+            ("purge_y", json!(12.0)),
+            ("purge_z", json!(0.8)),
+            ("purge_speed", json!(240.0)),
+            ("purge_retract", json!(2.0)),
+            ("purge_amount", json!(9.0)),
+        ]);
+        assert!((plr.drag_nozzle_temp - 120.0).abs() < 1e-12);
+        assert!((plr.purge_x.unwrap() - 150.0).abs() < 1e-12);
+        assert!((plr.purge_y.unwrap() - 12.0).abs() < 1e-12);
+        assert!((plr.purge_z.unwrap() - 0.8).abs() < 1e-12);
+        let config = plr.plan_config();
+        assert!((config.drag_nozzle_temp - 120.0).abs() < 1e-12);
+        assert!((config.purge_speed - 240.0).abs() < 1e-12);
+        assert!((config.purge_retract - 2.0).abs() < 1e-12);
+        assert!((config.purge_amount - 9.0).abs() < 1e-12);
+        assert_eq!(config.purge_x, plr.purge_x);
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn purge_and_drag_temp_keys_default_tolerantly() {
+        let (_, plr) = parse_fixture(&[]);
+        // Defaults match the plan builder's.
+        let d = plr_recovery::PlanConfig::default();
+        assert!((plr.drag_nozzle_temp - d.drag_nozzle_temp).abs() < 1e-12);
+        assert!((plr.purge_speed - d.purge_speed).abs() < 1e-12);
+        assert!((plr.purge_retract - d.purge_retract).abs() < 1e-12);
+        assert_eq!(plr.purge_x, None);
+        assert_eq!(plr.purge_y, None);
+        assert_eq!(plr.purge_z, None);
+        // Wrong-typed OPTIONAL coordinates degrade to None, never error.
+        let (_, plr) = parse_fixture(&[("purge_x", json!("oops"))]);
+        assert_eq!(plr.purge_x, None);
+        // The cold-drag opt-out rides through.
+        let (_, plr) = parse_fixture(&[("drag_nozzle_temp", json!(0.0))]);
+        assert!((plr.drag_nozzle_temp - 0.0).abs() < 1e-12);
+        assert!(plr.plan_config().validate().is_ok());
     }
 
     #[test]

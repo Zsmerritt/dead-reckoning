@@ -484,11 +484,12 @@ fn write_recovery_file(
                         .file_name()
                         .map(|n| n.to_string_lossy().into_owned())
                         .unwrap_or_default();
+                    let patched = retarget_recovery_file(bundle, &new_name);
                     let _ = writeln!(
                         out,
-                        "recover: recovery file name was taken since planning; wrote {new_name}"
+                        "recover: recovery file name was taken since planning; wrote {new_name} \
+                         ({patched} M23 command(s) repointed)"
                     );
-                    retarget_recovery_file(bundle, &new_name);
                     bundle.recovery_file_path.clone_from(&path);
                 }
                 let _ = writeln!(
@@ -545,17 +546,26 @@ fn write_recovery_file(
 }
 
 /// Points the plan's `M23` (and the plan/spec name fields) at `new_name`.
-fn retarget_recovery_file(bundle: &mut PlanBundle, new_name: &str) {
-    let old = bundle.plan.recovery_file.name.clone();
+///
+/// Retargets EVERY `M23`, not only one whose argument still equals the
+/// old name: an exact-match loop silently no-ops if the two ever drift,
+/// which would leave `M23` naming the squatter file this retry just
+/// refused to overwrite — the recovery would then resume someone else's
+/// g-code. Returns how many `M23` commands were repointed so the caller
+/// can assert the plan actually carried one.
+fn retarget_recovery_file(bundle: &mut PlanBundle, new_name: &str) -> usize {
+    let mut patched = 0;
     for step in &mut bundle.plan.steps {
         for command in &mut step.commands {
-            if command.strip_prefix("M23 ") == Some(old.as_str()) {
+            if command.starts_with("M23 ") {
                 *command = format!("M23 {new_name}");
+                patched += 1;
             }
         }
     }
     new_name.clone_into(&mut bundle.plan.recovery_file.name);
     new_name.clone_into(&mut bundle.plan.resume_file);
+    patched
 }
 
 /// Gate 4 predicate (see module docs for the exact fields, cited from
@@ -859,7 +869,27 @@ mod tests {
         let squatter = rec_dir.join("x_RECOVERY.gcode");
         std::fs::write(&squatter, b"PRECIOUS DO NOT CLOBBER").unwrap();
 
-        let outcome = plan_outcome_in(&rec_dir);
+        // The plan carries a real M23 selecting the PLANNED name, so the
+        // retry's repoint has something to patch (a fixture without one
+        // would let a silent no-op pass).
+        let PipelineOutcome::Plan(mut bundle) = plan_outcome_in(&rec_dir) else {
+            panic!("expected plan");
+        };
+        bundle.plan.steps.push(plr_recovery::RecoveryStep {
+            id: u32::try_from(bundle.plan.steps.len() + 1).unwrap(),
+            phase: plr_recovery::Phase::RecoveryFileSelect,
+            summary: "select the recovery file".to_owned(),
+            commands: vec!["M23 x_RECOVERY.gcode".to_owned(), "M24".to_owned()],
+            pre_verify: vec![],
+            verify: vec![],
+            compute: None,
+            cleanup_commands: vec![],
+            on_failure: plr_recovery::FailureAction::Abort {
+                reason: plr_recovery::AbortReason::RecoveryFileSelectFailed,
+            },
+        });
+        bundle.plan.recovery_file.name = "x_RECOVERY.gcode".to_owned();
+        let outcome = PipelineOutcome::Plan(bundle);
         let (code, output) = run_drive(&outcome, &config, &fast_recover(true, true, false), "y\n");
         assert_eq!(code, crate::EXIT_OK, "{output}");
 
@@ -875,6 +905,18 @@ mod tests {
             .unwrap()
             .contains("G28 X Y"));
         assert!(output.contains("name was taken since planning"), "{output}");
+        // The M23 actually sent names the file that was WRITTEN — not the
+        // squatter the retry refused to overwrite.
+        let sent = fake.gcode_sent();
+        assert!(
+            sent.iter().any(|c| c == "M23 x_RECOVERY-2.gcode"),
+            "M23 must name the written file, got {sent:?}"
+        );
+        assert!(
+            !sent.iter().any(|c| c == "M23 x_RECOVERY.gcode"),
+            "M23 must NOT name the squatter file: {sent:?}"
+        );
+        assert!(output.contains("1 M23 command(s) repointed"), "{output}");
         // The transcript records the path actually written.
         let transcript = std::fs::read_dir(&config.wal_dir)
             .unwrap()

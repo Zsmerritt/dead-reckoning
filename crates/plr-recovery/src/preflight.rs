@@ -455,10 +455,13 @@ pub fn preflight_recovery_file(
     let mut absolute = true;
     for line in String::from_utf8_lossy(file.preamble()).lines() {
         let command = line.trim();
-        match first_word(command).as_str() {
+        let word = first_word(command);
+        match word.as_str() {
             "G90" => absolute = true,
             "G91" => absolute = false,
-            "G0" | "G1" if absolute => {
+            // The SHARED motion set (arcs included), so this walk and the
+            // heating gate cannot drift apart on which g-codes move.
+            _ if absolute && crate::resume_file::is_motion_command(&word) => {
                 check_absolute_command(command, RECOVERY_FILE_STEP_ID, bounds, &mut v);
             }
             _ => {}
