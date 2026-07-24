@@ -41,7 +41,7 @@ use plr_wal::{
     TrapqSegment, VirtualSdState, WalRecord, WalWriter,
 };
 use proptest::prelude::*;
-use proptest::test_runner::Reason;
+use proptest::test_runner::{FileFailurePersistence, Reason};
 
 /// Print-time origin of the synthetic job.
 const T0: f64 = 100.0;
@@ -858,8 +858,16 @@ fn run_case(scenario: &Scenario) -> Result<(), TestCaseError> {
 proptest! {
     // Case count comes from ProptestConfig::default(), so
     // PROPTEST_CASES can crank it up for soak runs (256 by default).
+    // Shrunk counterexamples persist to the checked-in file
+    // tests/fault_injection.proptest-regressions: the SourceParallel
+    // default cannot locate lib.rs/main.rs from an integration test
+    // and only works via a warning-emitting fallback, so WithSource
+    // pins the exact same path explicitly.
     #![proptest_config(ProptestConfig {
         max_shrink_iters: 400,
+        failure_persistence: Some(Box::new(FileFailurePersistence::WithSource(
+            "proptest-regressions",
+        ))),
         ..ProptestConfig::default()
     })]
 
