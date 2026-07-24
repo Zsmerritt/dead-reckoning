@@ -281,12 +281,22 @@ control_socket = /var/lib/plrd/plrd.sock
 #   CONFIRMABLE  Stops, explains, and offers "continue anyway". (A
 #                marginal contact zone, a stale calibration, a purge Z
 #                below the top of the part, a drag temperature below the
-#                floor.) Answering happens over the control socket — the
-#                Klipper plugin's recovery prompts — so this is a CLICK,
-#                made while looking at the explanation. Callers that
-#                never asked to be consulted (`on_confirm` omitted or
-#                "abort") get an abort instead, which is what a
-#                non-interactive caller has always got.
+#                floor, a reheat park point nobody could verify is clear
+#                of the part.) Answering happens over the control socket —
+#                the Klipper plugin's recovery prompts — so this is a
+#                CLICK, made while looking at the explanation.
+#
+#                *** A CONFIRMABLE DIAGNOSIS ABORTS A NON-INTERACTIVE RUN.
+#                *** Callers that never asked to be consulted (`on_confirm`
+#                omitted or "abort" — which includes `plrd recover
+#                --execute` on the CLI) get an abort rather than a
+#                question. That is the intended fail-closed direction, but
+#                it has a visible consequence: a machine with no
+#                reheat_park_x/y configured AND no usable part geometry
+#                now ABORTS a CLI recovery where it previously proceeded
+#                with a warning. Configure reheat_park_x / reheat_park_y,
+#                or run the recovery through the plugin so you can answer
+#                the question.
 #
 #   HARD         Refuses. The only way past a Hard refusal is a pre-set
 #                UNSAFE_-prefixed key below, edited in printer.cfg while
@@ -357,11 +367,23 @@ control_socket = /var/lib/plrd/plrd.sock
 # where it would not. Writing it first means it survives all of them
 # without anything having to happen.
 #
-# And if that marker cannot be written, plrd does not declare the frame
-# at all — it refuses and leaves the printer untouched. A state we cannot
-# record that we are in is a state we must not enter. (In practice that
-# means: if wal_dir is unwritable, fix that first. It is also where your
-# transcript goes.)
+# And if that marker cannot be written, plrd does not declare the shifted
+# frame at all — it refuses. A state we cannot record that we are in is a
+# state we must not enter.
+#
+# BE CLEAR ABOUT WHAT THAT REFUSAL BUYS. It is narrow. By the time it
+# fires, the earlier steps have already run: the idle timeout is extended,
+# the Z steppers are energized, the CONSERVATIVE believed-Z frame has been
+# declared and lifted from, XY is homed, and the heaters have been
+# commanded (the nozzle may be sitting at probe temperature). What was
+# avoided is the shifted probing frame and the probe itself — the point
+# past which Z becomes a number nobody can re-derive. So the recovery is
+# safe to retry once the write works, and NO fresh dry run is needed —
+# but the printer is not parked, not cool, and will not shut itself down.
+# Do not walk away from it.
+#
+# (In practice: if wal_dir is unwritable, fix that first. It is also where
+# your transcript goes.)
 #
 # ----------------------------------------------------------------------
 # CONFIRM-POINTS — pause and ask, instead of guessing (both default False)

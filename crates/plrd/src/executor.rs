@@ -547,7 +547,7 @@ struct AccelSlots {
 ///
 /// # Why this is armed on entry rather than written on abort
 ///
-/// The Z frame stops being trustworthy the instant
+/// The Z frame stops being trustworthy the instant the **shifted-frame**
 /// `SET_KINEMATIC_POSITION` is *issued* — not when some later code
 /// decides an abort has happened. Anything that writes the interlock on
 /// the abort path is a code path that has to RUN, and the ways it can
@@ -556,6 +556,19 @@ struct AccelSlots {
 /// SIGKILL, or a second power loss. Every one of those would leave the
 /// frame fabricated and the interlock absent, and the next `--execute`
 /// would re-drive the plan against it.
+///
+/// # Why the believed-Z declare is deliberately outside the armed zone
+///
+/// [`Phase::BelievedZDeclare`] also issues a `SET_KINEMATIC_POSITION`,
+/// two phases earlier, and is NOT guarded. That is not an oversight: it
+/// declares the CONSERVATIVE believed Z (the upper bound of the
+/// possible-stop set) and then LIFTS, so every motion it enables moves
+/// away from the part, XY homing after it never touches Z, and the
+/// shifted-frame step re-declares Z absolutely rather than building on
+/// it. Re-running it after an interrupted attempt biases the subsequent
+/// probe toward a `NoTrigger` — the bounded, safe failure — rather than
+/// toward a collision. The shifted frame is where Z first becomes a
+/// number nobody can re-derive, so that is where the interlock belongs.
 ///
 /// So the marker is written on ENTRY to the danger zone and cleared only
 /// on a fully successful completion. Then it persists by construction:

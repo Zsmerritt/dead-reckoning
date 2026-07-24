@@ -422,19 +422,34 @@ fn report_abort(outcome: &ExecOutcome, config: &Config, out: &mut (dyn Write + S
         record_frame_invalid(&config.wal_dir, *step_id, phase, reason, out);
     }
     if let crate::executor::StopCause::FrameGuardUnwritable(why) = cause {
+        // Name BOTH sides. What this refusal buys is narrow — the shifted
+        // probing frame and the probe — and everything before it has
+        // already happened. Telling an operator the printer is
+        // "untouched" would send them away to fix a disk while a hot
+        // nozzle sits over their part with the idle timeout disarmed.
         let _ = writeln!(
             out,
             "recover: REFUSED to declare the shifted Z frame — the frame-invalid \
-             interlock could not be written ({why}). NOTHING was declared, so the \
-             printer is untouched and its Z frame is exactly as it was. Fix the WAL \
-             directory {} (it is also where the transcript lives) and retry.",
+             interlock could not be written ({why}).\n\
+             recover:   AVOIDED: the shifted probing frame was never declared and the \
+             probe never ran, so no fabricated Z reference exists and no fresh dry run \
+             is needed — retrying is safe once the write works.\n\
+             recover:   ALREADY DONE: everything before it, exactly as any abort at this \
+             point leaves it — the conservative believed-Z declaration and its lift, XY \
+             homing, and the commanded heater targets.\n\
+             recover:   *** THE HEATERS MAY STILL BE HOT AND THE IDLE TIMEOUT IS EXTENDED \
+             (motors stay energized; nothing will shut down on its own). Do not walk away \
+             from the machine. *** \n\
+             recover:   Fix the WAL directory {} (it also holds the transcript), then \
+             retry or cool the printer down by hand.",
             config.wal_dir.display()
         );
+    } else {
+        let _ = writeln!(
+            out,
+            "recover: the printer was left as-is; review the transcript before retrying."
+        );
     }
-    let _ = writeln!(
-        out,
-        "recover: the printer was left as-is; review the transcript before retrying."
-    );
     EXIT_RUNTIME
 }
 
@@ -1547,50 +1562,13 @@ mod tests {
         );
     }
 
-    /// BLOCKER 2: if the interlock cannot be written, the declare must
-    /// never be issued — and the next execute must still be refused,
-    /// because there is nothing to refuse it with except not having gone
-    /// in the first place.
-    #[test]
-    fn an_unwritable_interlock_refuses_before_any_kinematic_declare() {
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        let fake = rt.block_on(FakeMoonraker::spawn(happy_handler));
-        let config = test_config("interlock-blocked", &fake.url());
-        let bundle = framed_pausing_bundle(&config);
-        // Block ONLY the marker write, leaving the WAL directory writable
-        // so the transcript gate passes and execution really reaches the
-        // declare: a directory sitting on the staging path makes
-        // `File::create` fail there and nowhere else.
-        std::fs::create_dir(config.wal_dir.join(crate::detect::FRAME_INVALID_TEMP_NAME)).unwrap();
-
-        let opts = fast_recover(true, true, false);
-        let mut out = Vec::new();
-        let code = rt.block_on(super::execute_with_gates(
-            &bundle,
-            &config,
-            &opts.exec_options,
-            opts.connect_timeout,
-            &mut super::AutoGate,
-            &mut crate::executor::AbortConfirmer,
-            &mut out,
-        ));
-        let output = String::from_utf8(out).unwrap();
-        assert_eq!(code, crate::EXIT_RUNTIME, "{output}");
-        // The refusal happened BEFORE the frame was touched.
-        assert!(
-            !fake
-                .gcode_sent()
-                .iter()
-                .any(|c| c.starts_with("SET_KINEMATIC_POSITION")),
-            "a state we cannot record must never be entered: {:?}",
-            fake.gcode_sent()
-        );
-        assert!(
-            output.contains("REFUSED to declare the shifted Z frame"),
-            "{output}"
-        );
-        assert!(output.contains("NOTHING was declared"), "{output}");
-    }
+    // BLOCKER 2 (an unwritable interlock must refuse before the shifted
+    // frame) is exercised against a REAL pipeline-built plan in
+    // `ctrlsock::tests::an_unwritable_interlock_refuses_before_the_shifted_frame_declare`.
+    // A synthetic plan cannot pin that invariant honestly: the pipeline's
+    // plans declare a believed-Z frame two phases before the shifted one,
+    // so "no SET_KINEMATIC_POSITION was sent" is true only of a fixture
+    // that omits it, and false of every plan the machine actually runs.
 
     /// The complement: a successful completion clears the interlock, so
     /// arming it eagerly does not wedge every subsequent recovery.

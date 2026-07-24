@@ -1892,4 +1892,119 @@ mod tests {
             .expect("transcript file");
         std::fs::read_to_string(entry.path()).unwrap()
     }
+
+    /// An unwritable interlock refuses before the SHIFTED-frame declare —
+    /// against the plan the pipeline really builds.
+    ///
+    /// The invariant is narrower than "no `SET_KINEMATIC_POSITION` was
+    /// sent", and saying it that way would be false: a real plan declares
+    /// the conservative believed-Z frame two phases earlier, and that
+    /// declare has already run by the time this refusal fires. What the
+    /// fail-closed guard buys is precisely the shifted probing frame and
+    /// the probe — the point past which Z becomes a number nobody can
+    /// re-derive — so that is what this asserts.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_unwritable_interlock_refuses_before_the_shifted_frame_declare() {
+        use crate::pipeline::PipelineOutcome;
+        use plr_recovery::Phase;
+
+        let (_dir, mut config) = crate::pipeline::e2e_tests::plr_fixture("interlock-pipeline", &[]);
+        let sim = Arc::new(std::sync::Mutex::new(SimPrinter::new(
+            config.wal_dir.to_str().unwrap(),
+        )));
+        let fake = FakeMoonraker::spawn(sim_handler(Arc::clone(&sim))).await;
+        config.moonraker_url = fake.url();
+        // Block ONLY the marker write: a directory on the staging path
+        // makes `File::create` fail there and nowhere else, so the
+        // transcript gate still passes and execution really reaches the
+        // shifted-frame step.
+        std::fs::create_dir(config.wal_dir.join(crate::detect::FRAME_INVALID_TEMP_NAME)).unwrap();
+
+        // The real plan, from the real pipeline.
+        let mut pipeline_out: Vec<u8> = Vec::new();
+        let outcome = crate::pipeline::run_pipeline(&config, &mut pipeline_out).expect("pipeline");
+        let PipelineOutcome::Plan(bundle) = outcome else {
+            panic!(
+                "expected a plan, got {outcome:?}\n{}",
+                String::from_utf8_lossy(&pipeline_out)
+            );
+        };
+        let command_of = |phase: Phase| -> String {
+            let i = bundle
+                .plan
+                .first_index(phase)
+                .unwrap_or_else(|| panic!("{phase:?} missing from the pipeline plan"));
+            bundle.plan.steps[i]
+                .commands
+                .iter()
+                .find(|c| c.starts_with("SET_KINEMATIC_POSITION"))
+                .unwrap_or_else(|| panic!("{phase:?} has no kinematic declare"))
+                .clone()
+        };
+        let believed = command_of(Phase::BelievedZDeclare);
+        let shifted = command_of(Phase::ShiftedFrame);
+        assert_ne!(believed, shifted, "the fixture must distinguish the two");
+
+        let state = fast_state(config.clone());
+        let mut out: Vec<u8> = Vec::new();
+        let code = crate::recover::execute_with_gates(
+            &bundle,
+            &config,
+            &state.exec_options,
+            state.connect_timeout,
+            &mut crate::recover::AutoGate,
+            &mut crate::executor::AbortConfirmer,
+            &mut out,
+        )
+        .await;
+        let text = String::from_utf8(out).unwrap();
+        assert_eq!(code, crate::EXIT_RUNTIME, "{text}");
+
+        let sent = fake.gcode_sent();
+        // The earlier believed-Z declare DID run — this refusal does not
+        // and cannot undo it.
+        assert!(
+            sent.contains(&believed),
+            "the believed-Z declare should have run: {sent:?}"
+        );
+        // The shifted-frame declare specifically never went out...
+        assert!(
+            !sent.contains(&shifted),
+            "the shifted-frame declare must never be issued without the interlock: {sent:?}"
+        );
+        // ...and nothing downstream of it did either.
+        assert!(
+            !sent.iter().any(|c| {
+                c.starts_with("PLR_TOUCH")
+                    || c.starts_with("PROBE")
+                    || c.starts_with("PLR_DRAG_PROBE")
+            }),
+            "no contact operation may run: {sent:?}"
+        );
+        assert!(!sent.iter().any(|c| c == "M24"), "{sent:?}");
+
+        // No marker was written (that is the whole failure), and none is
+        // needed: the frame was never fabricated, so a retry is safe.
+        assert!(crate::detect::read_frame_invalid(&config.wal_dir).is_none());
+
+        // The operator message names BOTH sides honestly.
+        assert!(
+            text.contains("REFUSED to declare the shifted Z frame"),
+            "{text}"
+        );
+        assert!(text.contains("AVOIDED:"), "{text}");
+        assert!(text.contains("ALREADY DONE:"), "{text}");
+        assert!(text.contains("HEATERS MAY STILL BE HOT"), "{text}");
+        assert!(text.contains("IDLE TIMEOUT IS EXTENDED"), "{text}");
+        // It must NOT claim the printer is untouched.
+        assert!(!text.contains("untouched"), "{text}");
+        assert!(!text.contains("left as-is"), "{text}");
+        // And the machine really is in the state the message describes.
+        assert!(
+            sent.iter().any(|c| c.starts_with("SET_IDLE_TIMEOUT")),
+            "{sent:?}"
+        );
+        assert!(sent.iter().any(|c| c.starts_with("M104")), "{sent:?}");
+    }
 }
