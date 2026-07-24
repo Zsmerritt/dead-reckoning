@@ -61,9 +61,71 @@ SHARED_FIXTURES = [
 ]
 
 
+# The file-only noise-floor slice modeled in the Rust adversarial regression
+# (plrcfg.rs SHARED_ADXL_NOISE_FLOOR_HEX). Same hex asserted on both sides:
+# plrd hashes `configfile.config` (file-only), the plugin hashes its file
+# options, and they must agree even though `configfile.settings` carries
+# default-injected keys ([adxl345] axes_map / rate) neither side hashes.
+SHARED_ADXL_NOISE_FLOOR = {
+    "stepper_z": {"step_pin": "PB0", "position_min": "-2"},
+    "adxl345": {"cs_pin": "PB1"},
+    "plr": {"probe_method": "adxl_drag", "accel_chip": "adxl345"},
+}
+SHARED_ADXL_NOISE_FLOOR_HEX = "d5bd905a"
+
+
 def test_shared_fixture_hashes_match_rust():
     for sections, names, keys, expected in SHARED_FIXTURES:
         assert cm.fingerprint(sections, names, keys) == expected
+
+
+def test_shared_adxl_noise_floor_hash_matches_rust():
+    # Both the low-level explicit-selection and the high-level group entry
+    # points produce the shared file-only hex.
+    assert (
+        cm.fingerprint(
+            SHARED_ADXL_NOISE_FLOOR,
+            ["stepper_z", "adxl345"],
+            ["accel_chip", "probe_method"],
+        )
+        == SHARED_ADXL_NOISE_FLOOR_HEX
+    )
+    assert (
+        cm.compute_fingerprint(SHARED_ADXL_NOISE_FLOOR, NF)
+        == SHARED_ADXL_NOISE_FLOOR_HEX
+    )
+
+
+def test_default_injected_keys_would_diverge_confirming_file_only():
+    # The plugin hashes FILE options only (ConfigWrapper.get_prefix_options),
+    # so klippy's default-injected [adxl345] axes_map / rate never enter the
+    # hash. A view that DID include them (the Rust `settings` superset) hashes
+    # differently — which is exactly why plrd must hash `config`, not
+    # `settings`. This pins that the file-only hash is the correct one.
+    superset = {
+        "stepper_z": {"step_pin": "PB0", "position_min": "-2", "microsteps": "16"},
+        "adxl345": {"cs_pin": "PB1", "axes_map": "x,y,z", "rate": "3200"},
+        "plr": {"probe_method": "adxl_drag", "accel_chip": "adxl345"},
+    }
+    assert cm.compute_fingerprint(superset, NF) != SHARED_ADXL_NOISE_FLOOR_HEX
+
+
+def test_fingerprint_from_config_hashes_only_written_options(fake_printer, plr_config):
+    # fingerprint_from_config reads FILE options (get_prefix_options), so it
+    # equals the dict-based file-only fingerprint over the same written keys —
+    # a defaulted-but-unwritten option cannot influence it (the harness never
+    # injects defaults; this is file-only by construction, matching the Rust
+    # `configfile.config` source).
+    config = plr_config(
+        options={"probe_method": "adxl_drag", "accel_chip": "adxl345"},
+        sections={
+            "stepper_z": {"step_pin": "PB0", "position_min": "-2"},
+            "adxl345": {"cs_pin": "PB1"},
+        },
+    )
+    from_config = cm.fingerprint_from_config(config, NF)
+    from_dict = cm.compute_fingerprint(SHARED_ADXL_NOISE_FLOOR, NF)
+    assert from_config == from_dict == SHARED_ADXL_NOISE_FLOOR_HEX
 
 
 def test_crc32_matches_zlib_reference():

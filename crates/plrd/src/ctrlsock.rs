@@ -364,8 +364,12 @@ fn machine_summary(config: &Config) -> (String, String) {
     };
     match pipeline::resolve_machine_source(config) {
         MachineSource::Plr(source) => {
-            let (machine, _) =
-                crate::plrcfg::machine_from_settings(&source.snapshot.settings, &source.plr, true);
+            let (machine, _) = crate::plrcfg::machine_from_settings(
+                &source.snapshot.settings,
+                &source.snapshot.config,
+                &source.plr,
+                true,
+            );
             ("plr".to_owned(), validated(&machine))
         }
         MachineSource::Legacy { note } => {

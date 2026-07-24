@@ -17,8 +17,18 @@
 //!   (`ConfigAutoSave.load_main_config`), so autosaved options such as
 //!   `[plr] self_locking_z` appear here as ordinary settings after a
 //!   restart.
-//! * `config` — the raw (string-valued) file config; not used here:
-//!   `settings` already carries the typed, default-resolved view.
+//! * `config` — the raw, file-only, **string-valued** file config as
+//!   `{section: {option: value}}`: exactly the options the operator
+//!   wrote (autosave block merged in), with NO default-injected keys and
+//!   NO access filtering. Used for the **calibration fingerprint** and
+//!   nothing else (see the fingerprinting section below).
+//!
+//! Machine ASSEMBLY (Z steppers, probe `z_offset`, axis limits, …) reads
+//! `settings` — it needs the typed, default-resolved view. The
+//! calibration FINGERPRINT reads `config` — it must hash the same
+//! file-only key-set the plugin hashes on the Python side
+//! (`config.get_prefix_options`, file options only). These are the two
+//! distinct inputs; conflating them was a real bug (see below).
 //!
 //! The daemon queries `configfile` (plus the plugin's `plr` status
 //! object) over the Klipper API socket at recover time, so the machine
@@ -33,6 +43,25 @@
 //! (primary-MCU Z, empty `activate_gcode`, single probe); plrd
 //! re-derives every one of them independently from the settings here.
 //! A plugin bug cannot bless a machine the daemon would refuse.
+//!
+//! # Calibration fingerprint: why `config`, not `settings`
+//!
+//! The plugin stamps each calibration value-group with a CRC-32 over the
+//! calibration-relevant config slice, computed on the Python side from
+//! the raw FILE options (`ConfigWrapper.get_prefix_options("")`,
+//! klippy/configfile.py — file-written options only). plrd re-derives
+//! the identical hash here — but it MUST hash `config`, not `settings`:
+//! `settings` is the access-tracked, **default-resolved** view, so it
+//! carries keys the operator never wrote (e.g. `[adxl345] axes_map` /
+//! `rate` defaulted by klippy/extras/adxl345.py, and `[probe]` defaults),
+//! a superset of the file. Hashing `settings` would diverge from the
+//! plugin's file-only hash on essentially every real machine —
+//! `CalTier::Invalid`, the noise floor nulled, and recovery spuriously
+//! refused on a correctly-calibrated printer. Hashing `config` feeds both
+//! sides the identical file-only, string-valued key-set. Because the
+//! inputs are now identical, the value normalization
+//! (`normalize_value`) is only defensive robustness (both sides already
+//! see the same strings), documented at its definition.
 
 use std::collections::BTreeMap;
 
@@ -351,8 +380,11 @@ fn normalize_str(text: &str) -> String {
     }
 }
 
-/// Normalize a typed `configfile.settings` value to the same canonical text
-/// the Python side derives from the raw config string.
+/// Normalize a config value to the canonical text the Python side derives from
+/// the raw config string. The fingerprint input is `configfile.config` (raw,
+/// string-valued), so in practice every value is already a `String` and the
+/// numeric/bool arms are only defensive robustness (harmless: a `String`
+/// `"-2"` and a `Number` `-2.0` both canonicalize to `-2`).
 fn normalize_value(value: &Value) -> String {
     match value {
         Value::String(text) => normalize_str(text),
@@ -430,13 +462,13 @@ fn probe_section_for(method: &str) -> Option<&'static str> {
 }
 
 /// The section names that feed `group`'s fingerprint, derived from the
-/// `[plr]` hardware selection.
+/// `[plr]` hardware selection. `config` is the raw file-only config map.
 fn relevant_section_names(
-    sections: &Map<String, Value>,
+    config: &Map<String, Value>,
     plr: &PlrSettings,
     group: CalGroup,
 ) -> Vec<String> {
-    let mut names: Vec<String> = sections
+    let mut names: Vec<String> = config
         .keys()
         .filter(|name| is_z_stepper(name))
         .cloned()
@@ -464,25 +496,33 @@ fn plr_keys(group: CalGroup) -> &'static [&'static str] {
     }
 }
 
-/// Recompute `group`'s fingerprint from the live `configfile.settings`.
+/// Recompute `group`'s fingerprint from the raw file-only `configfile.config`
+/// map.
+///
+/// The `config` parameter MUST be `configfile.config` (raw, file-only), NEVER
+/// `configfile.settings` (which carries default-injected keys the plugin's
+/// file-only hash never sees). This is a load-bearing precondition — feeding
+/// `settings` would spuriously invalidate correctly-calibrated machines; the
+/// module docs and the `fingerprint_uses_config_not_settings` test pin it.
 pub(crate) fn compute_fingerprint(
-    sections: &Map<String, Value>,
+    config: &Map<String, Value>,
     plr: &PlrSettings,
     group: CalGroup,
 ) -> String {
     crc32_hex(
         canonical_string(
-            sections,
-            &relevant_section_names(sections, plr, group),
+            config,
+            &relevant_section_names(config, plr, group),
             plr_keys(group),
         )
         .as_bytes(),
     )
 }
 
-/// Classify `group`: `(tier, stored_stamp, recomputed_fingerprint)`.
+/// Classify `group`: `(tier, stored_stamp, recomputed_fingerprint)`. `config`
+/// is the raw file-only `configfile.config` map (see [`compute_fingerprint`]).
 pub(crate) fn validate_group(
-    sections: &Map<String, Value>,
+    config: &Map<String, Value>,
     plr: &PlrSettings,
     group: CalGroup,
 ) -> (CalTier, Option<String>, String) {
@@ -490,7 +530,7 @@ pub(crate) fn validate_group(
         CalGroup::NoiseFloor => plr.cal_fingerprint_noise_floor.clone(),
         CalGroup::ProbeResolution => plr.cal_fingerprint_probe_resolution.clone(),
     };
-    let current = compute_fingerprint(sections, plr, group);
+    let current = compute_fingerprint(config, plr, group);
     let tier = match &stored {
         None => CalTier::Legacy,
         Some(stamp) if *stamp == current => CalTier::Valid,
@@ -506,7 +546,7 @@ pub(crate) fn validate_group(
 /// accepted with a note. plrd checks the fingerprint only — plugin-version
 /// regression is the plugin's (authoritative) load-time check.
 fn gated_noise_floor(
-    settings: &Map<String, Value>,
+    config: &Map<String, Value>,
     plr: &PlrSettings,
     notes: &mut Vec<String>,
 ) -> Option<f64> {
@@ -514,7 +554,7 @@ fn gated_noise_floor(
     if representative.is_none() {
         return representative;
     }
-    let (tier, stored, current) = validate_group(settings, plr, CalGroup::NoiseFloor);
+    let (tier, stored, current) = validate_group(config, plr, CalGroup::NoiseFloor);
     match tier {
         CalTier::Invalid => {
             notes.push(format!(
@@ -541,14 +581,14 @@ fn gated_noise_floor(
 /// `probe_resolution` is not consumed by machine validation, but a stale one
 /// is worth flagging so the operator re-runs `PLR_PROBE_TEST`.
 fn note_stale_probe_resolution(
-    settings: &Map<String, Value>,
+    config: &Map<String, Value>,
     plr: &PlrSettings,
     notes: &mut Vec<String>,
 ) {
     if plr.probe_resolution.is_none() {
         return;
     }
-    let (tier, stored, current) = validate_group(settings, plr, CalGroup::ProbeResolution);
+    let (tier, stored, current) = validate_group(config, plr, CalGroup::ProbeResolution);
     if tier == CalTier::Invalid {
         notes.push(format!(
             "probe_resolution calibration fingerprint mismatch (staged {}, \
@@ -624,9 +664,18 @@ fn probe_from_section(section: &Map<String, Value>, kind: ProbeKind) -> ProbeCon
     }
 }
 
-/// Assembles the recovery `MachineConfig` from the full
-/// `configfile.settings` map (the `[plr]` section already parsed).
-/// Returns the config plus human-readable assembly notes.
+/// Assembles the recovery `MachineConfig` from the Klipper config snapshot
+/// (the `[plr]` section already parsed). Returns the config plus
+/// human-readable assembly notes.
+///
+/// Two distinct inputs:
+/// * `settings` — `configfile.settings` (typed, default-resolved): every
+///   machine-ASSEMBLY value (Z steppers, probe `z_offset`, axis limits, …).
+/// * `config` — `configfile.config` (raw, file-only): the calibration
+///   FINGERPRINT input ONLY. It must be the file-only map so the recomputed
+///   fingerprint matches the plugin's file-only Python hash; passing
+///   `settings` here would spuriously invalidate a correctly-calibrated
+///   machine (module docs).
 ///
 /// Total by design: missing cross-check data becomes the
 /// `MachineConfig` shape that *fails validation* (empty probe list,
@@ -634,6 +683,7 @@ fn probe_from_section(section: &Map<String, Value>, kind: ProbeKind) -> ProbeCon
 /// operator sees every problem in one `validate_machine` report.
 pub fn machine_from_settings(
     settings: &Map<String, Value>,
+    config: &Map<String, Value>,
     plr: &PlrSettings,
     type_annotations_present: bool,
 ) -> (MachineConfig, Vec<String>) {
@@ -716,8 +766,9 @@ pub fn machine_from_settings(
     };
 
     // Calibration fingerprint defense-in-depth (see `gated_noise_floor`).
-    let noise_floor = gated_noise_floor(settings, plr, &mut notes);
-    note_stale_probe_resolution(settings, plr, &mut notes);
+    // The fingerprint reads `config` (raw file-only), NOT `settings`.
+    let noise_floor = gated_noise_floor(config, plr, &mut notes);
+    note_stale_probe_resolution(config, plr, &mut notes);
 
     let virtual_sdcard_root = section("virtual_sdcard")
         .and_then(|s| s.get("path"))
@@ -761,8 +812,19 @@ pub fn machine_from_settings(
 /// What one live query of the Klipper API socket returned.
 #[derive(Debug, Clone)]
 pub struct KlippySnapshot {
-    /// `configfile.settings`: `{section: {option: typed value}}`.
+    /// `configfile.settings`: `{section: {option: typed value}}` — the
+    /// access-tracked, default-resolved view. Used for machine ASSEMBLY
+    /// (typed values), never for the calibration fingerprint.
     pub settings: Map<String, Value>,
+    /// `configfile.config`: `{section: {option: string value}}` — the
+    /// raw, file-only config (autosave merged, no defaults). This is the
+    /// calibration FINGERPRINT input, so it matches the plugin's
+    /// file-only Python hash byte-for-byte. Empty when the query result
+    /// omits it (older klippy / a stub) — a legacy calibration then still
+    /// legacy-accepts (empty config only matters when a stamp is present,
+    /// in which case a mismatch conservatively refuses, never a
+    /// false-accept).
+    pub config: Map<String, Value>,
     /// The plugin's `plr` status object, when the plugin is loaded
     /// (`{method, configured, attested, probe_resolution,
     /// daemon_alive}` plus `last_drag_result` after a drag probe).
@@ -778,8 +840,8 @@ impl KlippySnapshot {
             .get("status")
             .and_then(Value::as_object)
             .ok_or_else(|| "objects/query result has no status map".to_owned())?;
-        let settings = status
-            .get("configfile")
+        let configfile = status.get("configfile");
+        let settings = configfile
             .and_then(|c| c.get("settings"))
             .and_then(Value::as_object)
             .cloned()
@@ -787,6 +849,15 @@ impl KlippySnapshot {
                 "configfile.settings absent from the query result (klippy still starting?)"
                     .to_owned()
             })?;
+        // The raw file-only config (klippy `PrinterConfig.get_status` ->
+        // `config`): the calibration-fingerprint input. Tolerant of
+        // absence so machine ASSEMBLY (which uses `settings`) still works
+        // against an older klippy that omits it.
+        let config = configfile
+            .and_then(|c| c.get("config"))
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_default();
         let plr_object = status
             .get("plr")
             .and_then(Value::as_object)
@@ -794,6 +865,7 @@ impl KlippySnapshot {
             .cloned();
         Ok(Self {
             settings,
+            config,
             plr_object,
         })
     }
@@ -922,8 +994,34 @@ pub(crate) mod tests {
         for (key, value) in plr_overrides {
             plr[*key] = value.clone();
         }
+        // The raw, file-only `config` block (klippy `PrinterConfig.get_status`
+        // -> `config`): the calibration-fingerprint input. It carries the
+        // SAME file-written keys as `settings` for the fingerprint-relevant
+        // sections but as raw STRINGS (as klippy's raw config does) — and
+        // deliberately NONE of the default-injected keys `settings` gains
+        // (modeled per-test, e.g. `settings_default_keys_do_not_move_the_...`).
+        // `[plr]` in `config` carries only the fingerprint-relevant hardware
+        // keys (the plugin's file-options view), mirrored from the overrides.
+        let config_plr = json!({
+            "probe_method": plr["probe_method"].clone(),
+            "accel_chip": plr["accel_chip"].clone()
+        });
         json!({
-            "config": {"printer": {"kinematics": "corexy"}},
+            "config": {
+                "plr": config_plr,
+                "stepper_z": {
+                    "step_pin": "PB0",
+                    "position_min": "-2",
+                    "position_max": "250"
+                },
+                "stepper_z1": {"step_pin": "!PB3"},
+                "probe": {
+                    "z_offset": "-0.1",
+                    "activate_gcode": "",
+                    "deactivate_gcode": ""
+                },
+                "printer": {"kinematics": "corexy"}
+            },
             "warnings": [],
             "save_config_pending": false,
             "save_config_pending_items": {},
@@ -1057,7 +1155,8 @@ pub(crate) mod tests {
         assert!(plr.noise_floor.is_empty());
         assert_eq!(plr.control_socket, "/var/lib/plrd/plrd.sock");
 
-        let (machine, notes) = machine_from_settings(&snapshot.settings, &plr, true);
+        let (machine, notes) =
+            machine_from_settings(&snapshot.settings, &snapshot.config, &plr, true);
         assert!(notes.is_empty(), "{notes:?}");
         assert!(machine.force_move_enabled);
         assert!(machine.z_self_locking_attested);
@@ -1117,7 +1216,7 @@ pub(crate) mod tests {
         // never part of the calibrated-floor map.
         assert_eq!(plr.noise_floor_speed, Some(20.0));
         assert!(!plr.noise_floor.contains_key("noise_floor_speed"));
-        let (machine, _) = machine_from_settings(&snapshot.settings, &plr, true);
+        let (machine, _) = machine_from_settings(&snapshot.settings, &snapshot.config, &plr, true);
         assert_eq!(machine.noise_floor_speed, Some(20.0));
         // probe_method is authoritative: the coexisting [probe]
         // section does not create a second probe object.
@@ -1143,7 +1242,7 @@ pub(crate) mod tests {
         ]);
         assert!(plr.noise_floor.is_empty());
         assert_eq!(plr.noise_floor_speed, Some(20.0));
-        let (machine, _) = machine_from_settings(&snapshot.settings, &plr, true);
+        let (machine, _) = machine_from_settings(&snapshot.settings, &snapshot.config, &plr, true);
         let rejection = validate_machine(&machine).unwrap_err();
         assert!(rejection
             .failures
@@ -1157,7 +1256,10 @@ pub(crate) mod tests {
         let (snapshot, plr) = parse_fixture(&[]);
         let mut settings = Map::new();
         settings.insert("plr".to_owned(), snapshot.settings["plr"].clone());
-        let (machine, _) = machine_from_settings(&settings, &plr, false);
+        // No stamps and no noise floor here, so the fingerprint input is
+        // immaterial (probe_resolution is legacy, noise floor absent);
+        // reuse `settings` as the config map.
+        let (machine, _) = machine_from_settings(&settings, &settings, &plr, false);
         let rejection = validate_machine(&machine).unwrap_err();
         let f = &rejection.failures;
         assert!(f.contains(&PrereqFailure::ForceMoveDisabled));
@@ -1175,7 +1277,7 @@ pub(crate) mod tests {
         snapshot.settings["stepper_z1"]["step_pin"] = json!("^!z_board:PA1");
         snapshot.settings["probe"]["activate_gcode"] = json!("G1 Z5\n");
         let plr = PlrSettings::parse(snapshot.plr_section().unwrap()).unwrap();
-        let (machine, _) = machine_from_settings(&snapshot.settings, &plr, true);
+        let (machine, _) = machine_from_settings(&snapshot.settings, &snapshot.config, &plr, true);
         let rejection = validate_machine(&machine).unwrap_err();
         assert!(rejection.failures.iter().any(|f| matches!(
             f,
@@ -1196,7 +1298,7 @@ pub(crate) mod tests {
             json!({"z_offset": -0.15, "activate_gcode": ""}),
         );
         let plr = PlrSettings::parse(snapshot.plr_section().unwrap()).unwrap();
-        let (machine, _) = machine_from_settings(&snapshot.settings, &plr, true);
+        let (machine, _) = machine_from_settings(&snapshot.settings, &snapshot.config, &plr, true);
         // The method's section leads; the stray one still counts.
         assert_eq!(machine.probes[0].kind, ProbeKind::Tap);
         let rejection = validate_machine(&machine).unwrap_err();
@@ -1218,7 +1320,7 @@ pub(crate) mod tests {
         lc.insert("z_offset".to_owned(), json!(-0.15));
         settings.insert("load_cell_probe".to_owned(), Value::Object(lc));
         let plr = PlrSettings::parse(snapshot.plr_section().unwrap()).unwrap();
-        let (machine, _) = machine_from_settings(&snapshot.settings, &plr, true);
+        let (machine, _) = machine_from_settings(&snapshot.settings, &snapshot.config, &plr, true);
         assert_eq!(machine.probes.len(), 1);
         assert_eq!(machine.probes[0].kind, ProbeKind::LoadCell);
         assert!((machine.probes[0].z_offset - (-0.15)).abs() < 1e-12);
@@ -1230,7 +1332,7 @@ pub(crate) mod tests {
         let mut snapshot = KlippySnapshot::from_query_result(&result).unwrap();
         snapshot.settings["virtual_sdcard"]["path"] = json!("~/printer_data/gcodes");
         let plr = PlrSettings::parse(snapshot.plr_section().unwrap()).unwrap();
-        let (_, notes) = machine_from_settings(&snapshot.settings, &plr, true);
+        let (_, notes) = machine_from_settings(&snapshot.settings, &snapshot.config, &plr, true);
         assert!(notes.iter().any(|n| n.contains('~')), "{notes:?}");
     }
 
@@ -1318,7 +1420,7 @@ pub(crate) mod tests {
         // The fixture has stepper_z position_min/max but no stepper_x/y,
         // so z_max is known and x/y are unknown ("where known").
         let (snapshot, plr) = parse_fixture(&[]);
-        let (machine, _) = machine_from_settings(&snapshot.settings, &plr, true);
+        let (machine, _) = machine_from_settings(&snapshot.settings, &snapshot.config, &plr, true);
         assert_eq!(machine.axis_limits.z_max, Some(250.0));
         assert_eq!(machine.axis_limits.x, None);
         assert_eq!(machine.axis_limits.y, None);
@@ -1335,7 +1437,7 @@ pub(crate) mod tests {
             json!({"position_min": -1.0, "position_max": 235.0}),
         );
         let plr = PlrSettings::parse(snapshot.plr_section().unwrap()).unwrap();
-        let (machine, _) = machine_from_settings(&snapshot.settings, &plr, true);
+        let (machine, _) = machine_from_settings(&snapshot.settings, &snapshot.config, &plr, true);
         assert_eq!(machine.axis_limits.x, Some((0.0, 235.0)));
         assert_eq!(machine.axis_limits.y, Some((-1.0, 235.0)));
     }
@@ -1381,6 +1483,15 @@ pub(crate) mod tests {
 
     // --- calibration fingerprinting -------------------------------------
     use super::{compute_fingerprint, fingerprint, validate_group, CalGroup, CalTier};
+
+    /// The noise-floor fingerprint of the file-only slice
+    /// `{stepper_z: {step_pin: PB0, position_min: -2}, adxl345: {cs_pin: PB1},
+    /// plr: {probe_method: adxl_drag, accel_chip: adxl345}}`. Shared,
+    /// byte-identical cross-language constant — the python suite asserts the
+    /// SAME hex (`test_calibration_meta.py` `SHARED_ADXL_NOISE_FLOOR_HEX`),
+    /// proving
+    /// plrd's config-based recompute matches the plugin's file-options hash.
+    const SHARED_ADXL_NOISE_FLOOR_HEX: &str = "d5bd905a";
 
     /// A `{key: string}` JSON object for a fixture section.
     fn obj(pairs: &[(&str, &str)]) -> Value {
@@ -1514,7 +1625,8 @@ pub(crate) mod tests {
             ("noise_floor_rms", json!(118.0)),
             ("cal_fingerprint_noise_floor", json!("deadbeef")),
         ]);
-        let (machine, notes) = machine_from_settings(&snapshot.settings, &plr, true);
+        let (machine, notes) =
+            machine_from_settings(&snapshot.settings, &snapshot.config, &plr, true);
         assert_eq!(machine.noise_floor, None);
         let rejection = validate_machine(&machine).unwrap_err();
         assert!(rejection
@@ -1535,7 +1647,7 @@ pub(crate) mod tests {
             ("accel_chip", json!("adxl345")),
             ("noise_floor_rms", json!(118.0)),
         ]);
-        let fp = compute_fingerprint(&snapshot.settings, &base, CalGroup::NoiseFloor);
+        let fp = compute_fingerprint(&snapshot.config, &base, CalGroup::NoiseFloor);
         let (snapshot, plr) = parse_fixture(&[
             ("probe_method", json!("adxl_drag")),
             ("accel_chip", json!("adxl345")),
@@ -1543,10 +1655,11 @@ pub(crate) mod tests {
             ("cal_fingerprint_noise_floor", json!(fp)),
         ]);
         assert_eq!(
-            validate_group(&snapshot.settings, &plr, CalGroup::NoiseFloor).0,
+            validate_group(&snapshot.config, &plr, CalGroup::NoiseFloor).0,
             CalTier::Valid
         );
-        let (machine, notes) = machine_from_settings(&snapshot.settings, &plr, true);
+        let (machine, notes) =
+            machine_from_settings(&snapshot.settings, &snapshot.config, &plr, true);
         assert_eq!(machine.noise_floor, Some(118.0));
         assert!(validate_machine(&machine).is_ok());
         assert!(!notes.iter().any(|n| n.contains("mismatch")), "{notes:?}");
@@ -1562,10 +1675,11 @@ pub(crate) mod tests {
             ("noise_floor_rms", json!(118.0)),
         ]);
         assert_eq!(
-            validate_group(&snapshot.settings, &plr, CalGroup::NoiseFloor).0,
+            validate_group(&snapshot.config, &plr, CalGroup::NoiseFloor).0,
             CalTier::Legacy
         );
-        let (machine, notes) = machine_from_settings(&snapshot.settings, &plr, true);
+        let (machine, notes) =
+            machine_from_settings(&snapshot.settings, &snapshot.config, &plr, true);
         assert_eq!(machine.noise_floor, Some(118.0));
         assert!(validate_machine(&machine).is_ok());
         assert!(notes.iter().any(|n| n.contains("legacy")), "{notes:?}");
@@ -1580,7 +1694,7 @@ pub(crate) mod tests {
             ("accel_chip", json!("adxl345")),
             ("noise_floor_rms", json!(118.0)),
         ]);
-        let fp = compute_fingerprint(&snapshot.settings, &base, CalGroup::NoiseFloor);
+        let fp = compute_fingerprint(&snapshot.config, &base, CalGroup::NoiseFloor);
         let result = query_result(
             configfile_status(&[
                 ("probe_method", json!("adxl_drag")),
@@ -1594,16 +1708,17 @@ pub(crate) mod tests {
         // Unchanged config still validates VALID...
         let plr = PlrSettings::parse(snapshot.plr_section().unwrap()).unwrap();
         assert_eq!(
-            validate_group(&snapshot.settings, &plr, CalGroup::NoiseFloor).0,
+            validate_group(&snapshot.config, &plr, CalGroup::NoiseFloor).0,
             CalTier::Valid
         );
-        // ...but changing the Z stepper step_pin invalidates it.
-        snapshot.settings["stepper_z"]["step_pin"] = json!("PF99");
+        // ...but changing the Z stepper step_pin (in the file config, the
+        // fingerprint input) invalidates it.
+        snapshot.config["stepper_z"]["step_pin"] = json!("PF99");
         assert_eq!(
-            validate_group(&snapshot.settings, &plr, CalGroup::NoiseFloor).0,
+            validate_group(&snapshot.config, &plr, CalGroup::NoiseFloor).0,
             CalTier::Invalid
         );
-        let (machine, _) = machine_from_settings(&snapshot.settings, &plr, true);
+        let (machine, _) = machine_from_settings(&snapshot.settings, &snapshot.config, &plr, true);
         assert_eq!(machine.noise_floor, None);
     }
 
@@ -1614,11 +1729,84 @@ pub(crate) mod tests {
             ("accel_chip", json!("adxl345")),
             ("noise_floor_rms", json!(118.0)),
         ]);
-        let before = compute_fingerprint(&snapshot.settings, &plr, CalGroup::NoiseFloor);
-        let mut settings = snapshot.settings.clone();
-        settings.insert("fan".to_owned(), json!({ "pin": "PA8" }));
-        settings.insert("display".to_owned(), json!({ "lcd_type": "st7920" }));
-        let after = compute_fingerprint(&settings, &plr, CalGroup::NoiseFloor);
+        let before = compute_fingerprint(&snapshot.config, &plr, CalGroup::NoiseFloor);
+        let mut config = snapshot.config.clone();
+        config.insert("fan".to_owned(), json!({ "pin": "PA8" }));
+        config.insert("display".to_owned(), json!({ "lcd_type": "st7920" }));
+        let after = compute_fingerprint(&config, &plr, CalGroup::NoiseFloor);
         assert_eq!(before, after);
+    }
+
+    /// The decisive regression test: `settings` carries default-injected keys
+    /// (`[adxl345] axes_map` / `rate` — klippy/extras/adxl345.py defaults)
+    /// that the operator never wrote, so they are ABSENT from `config`. The
+    /// fingerprint MUST hash `config` (file-only) and MUST match the plugin's
+    /// file-only Python hash; hashing `settings` would diverge and spuriously
+    /// invalidate a correctly-calibrated machine.
+    #[test]
+    fn settings_default_keys_do_not_move_the_config_fingerprint() {
+        let file_only = json!({
+            "stepper_z": {"step_pin": "PB0", "position_min": "-2"},
+            "adxl345": {"cs_pin": "PB1"},
+            "plr": {"probe_method": "adxl_drag", "accel_chip": "adxl345"}
+        });
+        let file_only = file_only.as_object().unwrap().clone();
+        // `settings` view: the same, PLUS klippy's default-injected keys.
+        let mut with_defaults = file_only.clone();
+        with_defaults.insert(
+            "adxl345".to_owned(),
+            json!({"cs_pin": "PB1", "axes_map": "x,y,z", "rate": 3200}),
+        );
+        with_defaults["stepper_z"]["microsteps"] = json!(16);
+
+        let plr = PlrSettings::parse(file_only.get("plr").unwrap().as_object().unwrap()).unwrap();
+        // The config (file-only) hash is what the plugin's file-options hash
+        // equals — pinned as a shared cross-language constant (asserted in
+        // klippy_plugin/tests/test_calibration_meta.py::SHARED_FIXTURES).
+        let config_fp = compute_fingerprint(&file_only, &plr, CalGroup::NoiseFloor);
+        assert_eq!(config_fp, SHARED_ADXL_NOISE_FLOOR_HEX);
+        // Hashing the default-injected `settings` view would DIVERGE — proving
+        // why the fingerprint input must be `config`, not `settings`.
+        let settings_fp = compute_fingerprint(&with_defaults, &plr, CalGroup::NoiseFloor);
+        assert_ne!(settings_fp, config_fp);
+    }
+
+    /// Structural guard that the extraction site feeds the fingerprint the
+    /// file-only `config`, never `settings`: build a snapshot whose two views
+    /// diverge on a fingerprint-relevant key and assert the gating used the
+    /// `config` hash (floor kept), not the `settings` hash (which would null
+    /// it). This fails if `machine_from_settings` ever passes `settings` to
+    /// the fingerprint.
+    #[test]
+    fn fingerprint_uses_config_not_settings() {
+        // Stamp the CONFIG (file-only) fingerprint.
+        let (base_snapshot, base_plr) = parse_fixture(&[
+            ("probe_method", json!("adxl_drag")),
+            ("accel_chip", json!("adxl345")),
+            ("noise_floor_rms", json!(118.0)),
+        ]);
+        let config_fp = compute_fingerprint(&base_snapshot.config, &base_plr, CalGroup::NoiseFloor);
+        let result = query_result(
+            configfile_status(&[
+                ("probe_method", json!("adxl_drag")),
+                ("accel_chip", json!("adxl345")),
+                ("noise_floor_rms", json!(118.0)),
+                ("cal_fingerprint_noise_floor", json!(config_fp)),
+            ]),
+            plr_object(),
+        );
+        let mut snapshot = KlippySnapshot::from_query_result(&result).unwrap();
+        // Inject a default-only key into `settings` (absent from `config`): if
+        // the fingerprint ever read `settings`, this would flip it to Invalid.
+        snapshot.settings["stepper_z"]["microsteps"] = json!(16);
+        snapshot
+            .settings
+            .insert("adxl345".to_owned(), json!({"axes_map": "x,y,z"}));
+        let plr = PlrSettings::parse(snapshot.plr_section().unwrap()).unwrap();
+        let (machine, notes) =
+            machine_from_settings(&snapshot.settings, &snapshot.config, &plr, true);
+        // config hash matches -> floor kept, no mismatch note.
+        assert_eq!(machine.noise_floor, Some(118.0));
+        assert!(!notes.iter().any(|n| n.contains("mismatch")), "{notes:?}");
     }
 }
