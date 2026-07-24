@@ -45,6 +45,7 @@ probe_method: tap
 | --- | --- | --- | --- |
 | `probe_method` | `tap` | `tap` \| `load_cell` \| `adxl_drag` | Which contact oracle recovery uses: `tap` needs a `[probe]` section, `load_cell` a `[load_cell_probe]` section, `adxl_drag` an accel chip (`accel_chip`). |
 | `accel_chip` | none | section name | Accel chip section, e.g. `adxl345` or `adxl345 bed`. Required if (and only if) `probe_method: adxl_drag`. |
+| `noise_floor_temp_sensor` | none | sensor name | Optional klippy sensor object (e.g. `temperature_sensor chamber`) to read the current temperature from for the drag oracle's temperature covariate. When unset the covariate is skipped (no guessing). |
 | `wal_dir` | `/var/lib/plrd/wal` | path | plrd's WAL directory; the plugin reads `<wal_dir>/heartbeat.bin` as a recorder liveness hint. |
 | `control_socket` | `/var/lib/plrd/plrd.sock` | path | plrd's UNIX control socket for `PLR_STATUS`/`PLR_RECOVER`. |
 | `probe_speed` | `1.5` | `[1.0, 2.0]` mm/s | Recovery probe descent speed. |
@@ -62,9 +63,10 @@ cross-repo breaking change.
 Values the plugin persists itself (never hand-edit; they live in the
 `SAVE_CONFIG` autosave block under `[plr]`): `self_locking_z` (operator
 attestation staged by `PLR_SETUP ACCEPT_SELF_LOCKING_Z=1`),
-`probe_resolution` (measured by `PLR_PROBE_TEST`), and
+`probe_resolution` (measured by `PLR_PROBE_TEST`),
 `noise_floor_rms` / `noise_floor_still_rms` / `noise_floor_peak` /
-`noise_floor_speed` (measured by `PLR_NOISE_TEST`).
+`noise_floor_speed` / `noise_floor_temp` (measured by `PLR_NOISE_TEST`),
+and `drag_sensitivity` (staged by `PLR_DRAG_CALIBRATE`).
 
 ## Command reference
 
@@ -217,6 +219,11 @@ geometry `PLR_DRAG_PROBE` uses). Stages four keys for `SAVE_CONFIG`:
   at. The noise floor is speed-specific, so recovery plans **warn**
   (never refuse) when their `drag_speed` strays more than 20% from this
   calibration speed — the nudge to re-run `PLR_NOISE_TEST`.
+- `noise_floor_temp` — the temperature (°C) the baseline was captured
+  at, staged **only** when `noise_floor_temp_sensor` is configured and
+  readable. `PLR_DRAG_PROBE` uses it to widen (never narrow) its
+  threshold if the machine has since drifted (see below). No sensor, no
+  reading → nothing staged and the covariate is silently skipped.
 
 **This command moves the toolhead** — without `START=1` it only prints
 the plan. It refuses while printing or unhomed.
@@ -226,14 +233,16 @@ the plan. It refuses while printing or unhomed.
 > one corrupts the noise floor (it would read as "normal", making real
 > contact invisible).
 
-### `PLR_DRAG_PROBE [CHIP=] [SPEED=] [Z_STEP=] [SENSITIVITY=] [PASS_LENGTH=8]`
+### `PLR_DRAG_PROBE [CHIP=] [SPEED=] [Z_STEP=] [SENSITIVITY=] [PASS_LENGTH=8] [MAX_SECONDS=120] [STALL_PASSES=8]`
 
 Locates the top of a solidified part with the accelerometer: the drag
 oracle for `probe_method: adxl_drag`. Arguments default to the `[plr]`
 tunables; `CHIP` accepts quoted spaced names (`CHIP="adxl345 bed"`).
 Like Klipper's own `PROBE`, this command is a primitive and runs when
 typed — no `START=` consent parameter (the scripted multi-move
-diagnostics keep theirs).
+diagnostics keep theirs). `MAX_SECONDS` (range `[30, 600]`) and
+`STALL_PASSES` (`>= 2`) are optional hardening bounds (see below);
+omitting them leaves the frozen `plrd` invocation contract unchanged.
 
 How it works — **staircase with between-pass classification**, because
 accelerometer data arrives in batches and there is no real-time halt:
@@ -252,8 +261,40 @@ accelerometer data arrives in batches and there is no real-time halt:
    descent is ever commanded below the floor; hitting the bound with no
    contact aborts, restores the starting Z, and reports an error.
 5. A pass that cannot be classified (too few samples, non-finite
-   values, frozen signal, collapsed sample rate) **aborts** the probe —
-   it is never assumed clean.
+   values, frozen signal, collapsed sample rate, or a **coverage gap** —
+   see below) **aborts** the probe — it is never assumed clean.
+
+**Staircase hardening** (typed aborts; each restores the starting Z and
+sets `last_drag_error` with a `[code]` token):
+
+- **Coverage bracketing** (`coverage_gap`): each pass's sample window
+  must span the pass motion — the first sample no later than the motion
+  start (plus a grace) and the last no earlier than the motion end
+  (minus a grace). A batch that starts late or ends short could miss the
+  contact burst, so the pass is refused rather than trusted.
+- **Impossible signal** (`drag_implausible_signal`): if the
+  ratio-to-threshold falls monotonically over **3 consecutive**
+  descending clean passes while the first is already ≥ 50% of threshold,
+  the probe refuses. Vibration should *rise* as the nozzle nears the
+  part; a substantial signal that recedes as we descend means the noise
+  floor drifted or the site is wrong — re-run `PLR_NOISE_TEST` or move.
+- **Three independent bounds:** the up-front iteration bound
+  (`drag_envelope_exhausted`), a **wall-clock budget** `MAX_SECONDS`
+  (`drag_time_budget`), and a **no-progress stall** detector
+  (`drag_stalled`). The stall detector watches for `STALL_PASSES`
+  consecutive flat clean passes (ratio moving < 5% of threshold, no
+  upward trend) that have descended ≥ `8 × drag_z_step` with the signal
+  never approaching contact: it **warns once** at half the budget and
+  aborts at the full budget, with the wall-clock budget as the outer
+  hard cap.
+- **Temperature covariate:** when `noise_floor_temp_sensor` is
+  configured and `noise_floor_temp` was staged, and the current
+  temperature deviates more than **15 °C** from it, the effective
+  threshold is **widened** by +2% per °C beyond the band (capped at
+  +50%) and a one-time warning is printed. It only ever *widens* (a
+  hotter/colder machine is noisier), never narrows, so it can never
+  manufacture a false contact. No sensor, no staged temperature, or a
+  within-band reading → exactly the prior behavior.
 
 `trigger_z` semantics: the reported height is the Z of the **last
 clean pass**. The surface lies within `(trigger_z - drag_z_step,
@@ -277,7 +318,8 @@ The intended flow:
 G28                                  ; home
 ; position the head well AWAY from any part, at a safe Z
 PLR_NOISE_TEST START=1               ; measure the baseline
-SAVE_CONFIG                          ; persist noise_floor_* (restarts)
+PLR_DRAG_CALIBRATE START=1           ; (optional) pick drag_sensitivity
+SAVE_CONFIG                          ; persist noise_floor_* + sensitivity (restarts)
 ; ... after a power loss, plrd's plan issues:
 PLR_DRAG_PROBE                       ; or with CHIP=/SPEED=/Z_STEP=/SENSITIVITY=
 ```
@@ -295,6 +337,35 @@ PLR_DRAG_PROBE                       ; or with CHIP=/SPEED=/Z_STEP=/SENSITIVITY=
   changing `drag_speed` or mechanics.
 - Bench validation on real hardware is still pending (E5); until then
   treat detection quality (not the safety bounds) as unproven.
+
+### `PLR_DRAG_CALIBRATE [CHIP=] [SPEED=] [CLEAR_Z=] [SCREEN_PASSES=3] [VERIFY_PASSES=6] [MARGIN=5] START=1`
+
+Finds the **most sensitive** `drag_sensitivity` knob that never
+false-triggers, running **entirely at a Z where contact is impossible**
+— so an over-sensitive candidate fails *safely*, as a false contact in
+clear air, never as a crash into a part. Requires `PLR_NOISE_TEST` first
+(it classifies against the real noise floor) and `START=1` consent;
+without `START=1` it prints the plan and moves nothing.
+
+- `CLEAR_Z` (default: the current Z) must be **≥ 5 mm above** the
+  kinematic Z floor, and the command **refuses to descend** to reach it:
+  every pass runs at `CLEAR_Z` exactly. The only Z move it ever makes is
+  an upward lift to `CLEAR_Z`.
+- **Sensitive-first sweep** (ported from Cartographer's touch
+  calibration): start at the most sensitive knob (100) and step *down*
+  only as far as needed. At each candidate it runs `SCREEN_PASSES`
+  screening passes — any contact in clear air is a false trigger — and
+  steps the knob down by an adaptive amount (20% of the knob when
+  failing badly, 10% when close, clamped to `[2, 15]` knob units). A
+  screening survivor then runs `VERIFY_PASSES` passes that must **all**
+  be contact-free (early-exiting on the first false contact). The
+  **first (highest) surviving knob** is accepted.
+- It stages `drag_sensitivity = accepted − MARGIN` (floored at 0) for
+  `SAVE_CONFIG` and reports the headroom (threshold vs the worst
+  clear-air peak).
+- If even the least sensitive knob false-triggers, that is **not an
+  error**: it prints a copy-pasteable retry and a hint to re-run
+  `PLR_NOISE_TEST` or check the accel mounting.
 
 ## Commissioning in 5 console commands
 

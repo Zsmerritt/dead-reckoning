@@ -135,12 +135,20 @@ def cmd_PLR_NOISE_TEST(plugin, gcmd):
     # validation warns when a recovery probe would run at a different
     # drag speed than the floor was measured at.
     configfile = plugin.printer.lookup_object("configfile")
-    staged = (
+    staged = [
         ("noise_floor_rms", moving.rms),
         ("noise_floor_still_rms", still.rms),
         ("noise_floor_peak", moving.peak_rms),
         ("noise_floor_speed", speed),
-    )
+    ]
+    # Temperature covariate: when a sensor is configured AND currently
+    # readable, stage the temperature the baseline was captured at, so
+    # PLR_DRAG_PROBE can widen the threshold if the machine has since
+    # drifted.  No sensor configured, or no reading, stages nothing
+    # (the covariate is skipped silently at probe time — no guessing).
+    baseline_temp = drag_probe.read_temp(plugin, plugin.noise_floor_temp_sensor)
+    if baseline_temp is not None:
+        staged.append(("noise_floor_temp", baseline_temp))
     for option, value in staged:
         configfile.set("plr", option, "%.6f" % (value,))
         plugin.note_pending_save(option)
@@ -148,6 +156,8 @@ def cmd_PLR_NOISE_TEST(plugin, gcmd):
     plugin.noise_floor_still_rms = still.rms
     plugin.noise_floor_peak = moving.peak_rms
     plugin.noise_floor_speed = speed
+    if baseline_temp is not None:
+        plugin.noise_floor_temp = baseline_temp
 
     sensitivity = plugin.tunables["drag_sensitivity"]
     mult = classifier.multiplier(sensitivity)

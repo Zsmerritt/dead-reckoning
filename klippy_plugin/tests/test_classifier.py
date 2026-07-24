@@ -169,6 +169,7 @@ def test_invalid_reasons_vocabulary_closed():
         "non_finite",
         "constant_signal",
         "sample_rate_collapse",
+        "coverage_gap",
     }
 
 

@@ -13,6 +13,7 @@ cites the klippy shape it mirrors.
 """
 
 import collections
+import math
 
 _SENTINEL = object()
 
@@ -187,13 +188,25 @@ class FakeConfig:
 
 
 class FakeReactor:
-    """Stands in for klippy's reactor: deterministic monotonic clock."""
+    """Stands in for klippy's reactor: deterministic monotonic clock.
 
-    def __init__(self, start=100.0):
+    ``auto_advance`` (seconds) is added to ``now`` after each
+    ``monotonic()`` read, so a test can drive wall-clock elapsed time
+    forward without any real sleeping — the drag-oracle time-budget
+    bound reads the reactor once per pass, and a nonzero auto_advance
+    makes those reads march forward deterministically.  Default 0.0
+    keeps monotonic() a stable clock (every existing caller reads a
+    constant value).
+    """
+
+    def __init__(self, start=100.0, auto_advance=0.0):
         self.now = start
+        self.auto_advance = auto_advance
 
     def monotonic(self):
-        return self.now
+        value = self.now
+        self.now += self.auto_advance
+        return value
 
     def advance(self, seconds):
         self.now += seconds
@@ -421,6 +434,17 @@ class FakeToolhead:
             and coord[2] < self.position_min
         ):
             raise FakeCommandError("Move out of range")
+        # Advance the move-time clock by the geometric travel time of this
+        # move (distance / speed) so get_last_move_time() marches forward
+        # per move, mirroring klippy's print-time clock (toolhead.py:410-427).
+        # Bookkeeping, not physics: it lets the drag-oracle coverage check
+        # compare accel-sample timestamps against a real motion window.
+        dist_sq = 0.0
+        for i, value in enumerate(coord):
+            if value is not None and i < 3:
+                dist_sq += (value - self.position[i]) ** 2
+        if speed > 0.0:
+            self._last_move_time += math.sqrt(dist_sq) / speed
         for i, value in enumerate(coord):
             if value is not None:
                 self.position[i] = value
@@ -452,6 +476,15 @@ class FakeAccelClient:
         self._samples = samples
         self._toolhead = toolhead
         self.finished = False
+        # The accel streams during the same motion the toolhead is
+        # running, so its sample timestamps live on the toolhead's
+        # move-time clock.  Capture that clock at client-start and rebase
+        # the canned stream onto it (preserving every inter-sample gap):
+        # each capture's samples then bracket that capture's own motion
+        # window, so multi-pass coverage checks see a consistent clock
+        # instead of every canned stream restarting at the same absolute
+        # time.  Shift-invariant statistics (RMS, dt) are unaffected.
+        self._t0 = toolhead.get_last_move_time()
 
     def finish_measurements(self):
         self._toolhead.wait_moves()
@@ -461,7 +494,11 @@ class FakeAccelClient:
         return bool(self._samples)
 
     def get_samples(self):
-        return list(self._samples or [])
+        raw = list(self._samples or [])
+        if not raw:
+            return []
+        offset = self._t0 - raw[0][0]
+        return [(t + offset, ax, ay, az) for (t, ax, ay, az) in raw]
 
 
 class FakeAccelChip:
@@ -517,6 +554,23 @@ class FakePrintStats:
 
     def get_status(self, eventtime):
         return {"state": self.state}
+
+
+class FakeTempSensor:
+    """Stands in for a klippy temperature sensor object.
+
+    Every klippy sensor printer object (heater_bed, extruder,
+    ``temperature_sensor <name>``) exposes a get_status reporting the
+    latest reading under the ``temperature`` key
+    (klippy/extras/temperature_sensor.py:34-40).  ``temperature=None``
+    scripts a sensor that has not produced a reading yet.
+    """
+
+    def __init__(self, temperature=25.0):
+        self.temperature = temperature
+
+    def get_status(self, eventtime):
+        return {"temperature": self.temperature}
 
 
 # Mirrors the fields plugin code reads off klippy probe results
