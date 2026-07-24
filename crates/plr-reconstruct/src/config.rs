@@ -84,12 +84,29 @@ pub struct ReconstructConfig {
     /// Prompting there is a false positive we accept, because the
     /// alternative is trusting a stale set.
     pub exclusion_freshness_horizon: f64,
-    /// The daemon's heartbeat period in nanoseconds — the cadence at
-    /// which it proves itself alive independently of any record it
-    /// journals. Set this from the recorder's configured rate
-    /// (`plrd`'s `heartbeat_hz`, default 10 Hz ⇒ 100 ms); the default
-    /// here mirrors that default, it is not an assumption about the
-    /// running daemon.
+    /// Expected spacing, in nanoseconds, of the heartbeat samples that
+    /// reach [`crate::WalTimeline::heartbeats`].
+    ///
+    /// # This is the WAL heartbeat period, not the file heartbeat period
+    ///
+    /// `plrd` rewrites the heartbeat *file* at `heartbeat_hz` (default
+    /// 10 Hz), but appends a `Heartbeat` **record** only every
+    /// `WAL_HEARTBEAT_EVERY`-th file heartbeat (`plrd::walsvc`,
+    /// currently 10). The historical stream a recovery can read back is
+    /// therefore
+    ///
+    /// ```text
+    /// wal_heartbeat_hz = heartbeat_hz / WAL_HEARTBEAT_EVERY
+    /// ```
+    ///
+    /// — about **1 Hz** at the defaults, not 10 Hz. (The heartbeat file
+    /// itself contributes exactly one further sample, the newest.)
+    /// Setting this to the file period makes an on-time stream look like
+    /// a chain of holes and defeats the `Continuous` classification
+    /// entirely; `plrd::convert::reconstruct_config` derives it from
+    /// both real constants. The default here mirrors the daemon
+    /// defaults (10 Hz / 10 = 1 Hz ⇒ 1 s); it is not an assumption about
+    /// the running daemon, which should pass its own.
     ///
     /// [`crate::exclude`] uses heartbeat *continuity* to decide whether
     /// a long silence between the last exclusion observation and the
@@ -101,9 +118,10 @@ pub struct ReconstructConfig {
     ///
     /// The writer re-arms its timer from the previous deadline and
     /// resynchronizes when it falls behind, so ordinary scheduling
-    /// jitter costs well under one period; 3 tolerates a missed beat
-    /// plus jitter without tolerating a real stall. A break is reported
-    /// as [`crate::UncertaintyCause::HeartbeatGap`] with its span.
+    /// jitter costs well under one period; 3 tolerates a couple of
+    /// missed WAL heartbeats plus jitter without tolerating a real
+    /// stall. A break is reported as
+    /// [`crate::UncertaintyCause::HeartbeatGap`] with its span.
     pub heartbeat_gap_tolerance: f64,
     /// Two Z candidates closer than this (mm) with identical
     /// kind/provenance/knowledge merge into one. Covers float noise
@@ -122,7 +140,9 @@ impl Default for ReconstructConfig {
             max_processing_lead: 3.0,
             extension_horizon: 2.0,
             exclusion_freshness_horizon: 5.0,
-            heartbeat_period_ns: 100_000_000,
+            // 1 s: plrd's default 10 Hz file heartbeat divided by
+            // WAL_HEARTBEAT_EVERY = 10. See the field docs.
+            heartbeat_period_ns: 1_000_000_000,
             heartbeat_gap_tolerance: 3.0,
             sim: SimConfig::default(),
             z_merge_tolerance: 1e-6,

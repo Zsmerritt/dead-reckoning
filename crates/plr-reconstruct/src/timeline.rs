@@ -32,9 +32,8 @@
 //!   happened relative to other records.
 //! * Every finite heartbeat is kept, sorted, in
 //!   [`WalTimeline::heartbeats`] — not just the newest — because the
-//!   *continuity* of the ~10 Hz heartbeat stream is the only proof the
-//!   recorder was alive across a span in which it journaled nothing
-//!   else.
+//!   *continuity* of that stream is the only proof the WAL writer was
+//!   running across a span in which it journaled nothing else.
 
 use plr_wal::{
     Context, Heartbeat, HeartbeatRecovery, Marker, MarkerKind, RecoveryScan, ScanEnd, StepperRange,
@@ -133,12 +132,12 @@ pub struct WalTimeline {
     /// Every finite heartbeat sample (heartbeat file plus WAL records),
     /// sorted ascending by `mono_ns` and deduplicated on that key.
     ///
-    /// Heartbeats are written on their own cadence (~10 Hz), completely
+    /// Heartbeats are written on the WAL writer's own timer,
     /// independently of context records, which makes them the only
-    /// evidence that the recorder was *alive* across a span in which it
-    /// wrote nothing else. [`crate::exclude`] uses that to tell a long
-    /// dwell (alive, nothing happened) from a stalled recorder (we
-    /// simply do not know).
+    /// evidence that the **WAL writer thread** was running and able to
+    /// append across a span in which it journaled nothing else. See
+    /// [`crate::exclude`] for exactly what that does and does not
+    /// prove, and for the markers that cover the rest.
     pub heartbeats: Vec<Heartbeat>,
     /// `true` when a [`MarkerKind::CleanShutdown`] marker ends the log
     /// (no motion records after it): the print ended on purpose and no

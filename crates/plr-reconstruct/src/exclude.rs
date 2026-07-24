@@ -45,14 +45,19 @@
 //! would prompt on every long dwell; judging on "the newest context of
 //! any kind" would let a genuinely stalled recorder pass.
 //!
-//! The discriminator is the **heartbeat**, written at a fixed cadence
-//! (~10 Hz) independently of every other record and already the liveness
-//! proof behind `t_a`. Because a cancellation *always* forces an
-//! immediate context:
+//! The discriminator is the **heartbeat**, written on the WAL writer's
+//! own timer independently of every other record and already the
+//! liveness proof behind `t_a`. Note the cadence that matters here is
+//! the *WAL* heartbeat rate — `heartbeat_hz / WAL_HEARTBEAT_EVERY`,
+//! about 1 Hz at plrd's defaults — not the 10 Hz heartbeat-file
+//! rewrite; see [`ReconstructConfig::heartbeat_period_ns`]. Because a
+//! cancellation *always* forces an immediate context:
 //!
-//! * continuous heartbeats across the silent span ⇒ the recorder was
-//!   demonstrably alive and journaled no cancellation, so the silence is
-//!   **evidence of absence**. Fresh, however long the dwell.
+//! * continuous heartbeats across the silent span ⇒ the writer kept
+//!   running and journaled no cancellation, so the silence is
+//!   **evidence of absence**. Fresh, however long the dwell. (See
+//!   [`HeartbeatCoverage`] for what a heartbeat proves on its own and
+//!   which markers cover the observation path.)
 //! * a hole in the heartbeat stream ⇒ the recorder was stalled or dead
 //!   there and a cancellation could have been missed:
 //!   [`UncertaintyCause::HeartbeatGap`] with the hole's span.
@@ -64,7 +69,7 @@
 //! A gap inside the horizon skips the check entirely — the recorder's
 //! own cadence explains it. Holes are measured against
 //! `heartbeat_period_ns * heartbeat_gap_tolerance`, both configured, so
-//! nothing here assumes 10 Hz. The same "later knowledge supersedes an
+//! nothing here assumes a rate. The same "later knowledge supersedes an
 //! earlier event" rule applies as for markers: a heartbeat hole that
 //! predates the exclusion observation is irrelevant.
 //!
@@ -156,20 +161,43 @@ pub enum ExclusionProvenance {
     Unknown,
 }
 
-/// Whether the recorder proved itself alive across the span between the
+/// Whether the WAL writer kept journaling across the span between the
 /// newest exclusion observation and the end of the stop window.
 ///
 /// This is the discriminator that separates the two silences: a
-/// cancellation always forces an immediate context, so if the daemon was
-/// demonstrably alive across a silent span, the absence of an exclusion
-/// context is *evidence of absence* — nothing was cancelled — no matter
-/// how long the span. If the heartbeats stop too, the recorder was
-/// stalled or dead and we genuinely do not know.
+/// cancellation always forces an immediate context, so if the writer was
+/// demonstrably running and appending across a silent span, the absence
+/// of an exclusion context is *evidence of absence* — nothing was
+/// cancelled — no matter how long the span. If the heartbeats stop too,
+/// the writer was stalled or dead and we genuinely do not know.
+///
+/// # Exactly what a heartbeat proves — and what covers the rest
+///
+/// The tick runs on the WAL writer thread's own timer from cached data
+/// (`plrd::walsvc`, `heartbeat_tick`), so a heartbeat proves that
+/// **thread** was scheduled and able to write and fsync at that instant.
+/// It does **not** by itself prove the Klipper observation path was
+/// still delivering status. Two interlocks close that gap, which is why
+/// continuity is usable here at all:
+///
+/// * losing the API socket pauses heartbeats outright — the client sends
+///   `heartbeat_data(None)` alongside the never-dropped `SocketLost`
+///   marker, and the writer emits nothing without a correlation sample —
+///   so an observation-path failure shows up as a heartbeat hole *and* a
+///   marker, never as silent continuity;
+/// * a full WAL channel that swallows contexts journals a
+///   [`plr_wal::MarkerKind::SubscriptionGap`], plus a
+///   [`plr_wal::MarkerKind::ExclusionUpdateLost`] when the dropped
+///   context carried an exclusion change.
+///
+/// Each of those independently defeats conclusiveness through its own
+/// [`UncertaintyCause`], so `Continuous` is only ever consulted for
+/// spans in which none of them fired.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HeartbeatCoverage {
     /// Heartbeats span the whole gap with no hole longer than
-    /// `heartbeat_period_ns * heartbeat_gap_tolerance`: the recorder was
-    /// continuously alive and journaled no cancellation.
+    /// `heartbeat_period_ns * heartbeat_gap_tolerance`: the writer kept
+    /// running and journaled no cancellation.
     Continuous,
     /// Coverage breaks here — the largest hole found in the span. The
     /// recorder may have missed a cancellation inside it.
@@ -974,13 +1002,16 @@ fn seconds_to_ns(seconds: f64) -> Option<u64> {
     Some(ns as u64)
 }
 
-/// Classifies the recorder's liveness across `[from_mono_ns, to_mono_ns]`
+/// Classifies WAL-writer liveness across `[from_mono_ns, to_mono_ns]`
 /// from the heartbeat stream.
 ///
 /// Heartbeats are emitted on a fixed cadence independently of any other
-/// record, so a hole longer than `max_gap_ns` means the recorder was not
+/// record, so a hole longer than `max_gap_ns` means the writer was not
 /// running — the only state in which a cancellation could have happened
-/// without leaving a context behind.
+/// without leaving a context behind. `max_gap_ns` must be derived from
+/// the **WAL** heartbeat period (see
+/// [`ReconstructConfig::heartbeat_period_ns`]), not the heartbeat-file
+/// period, or an on-time stream reads as a chain of holes.
 fn heartbeat_coverage(
     heartbeats: &[Heartbeat],
     from_mono_ns: u64,
@@ -1503,8 +1534,13 @@ mod tests {
 
     /// Heartbeat instants every 100 ms across `[from_ns, to_ns]`.
     fn beats(from_ns: u64, to_ns: u64) -> Vec<u64> {
-        const PERIOD_NS: usize = 100_000_000;
-        (from_ns..=to_ns).step_by(PERIOD_NS).collect()
+        beats_every(from_ns, to_ns, 100_000_000)
+    }
+
+    /// Heartbeat instants spaced `period_ns` apart across
+    /// `[from_ns, to_ns]`.
+    fn beats_every(from_ns: u64, to_ns: u64, period_ns: usize) -> Vec<u64> {
+        (from_ns..=to_ns).step_by(period_ns).collect()
     }
 
     fn tail(bytes: &[u8]) -> FileTail<'_> {
@@ -1941,6 +1977,73 @@ G1 X10 Y10 F3000
             report.is_conclusive(),
             "a 60 s dwell with unbroken liveness must not prompt: {:?}",
             report.uncertainty_causes()
+        );
+    }
+
+    #[test]
+    fn the_real_one_hertz_wal_heartbeat_cadence_reads_as_continuous() {
+        // Regression pin for the cadence that actually reaches the WAL.
+        // plrd rewrites the heartbeat *file* at `heartbeat_hz` (10 Hz)
+        // but appends a `Heartbeat` *record* only every
+        // WAL_HEARTBEAT_EVERY = 10 ticks, so the stream a recovery reads
+        // back is ~1 Hz. Sizing the tolerance from the file period made
+        // a flawless on-time stream classify as Interrupted between
+        // every pair of consecutive beats: the Continuous arm became
+        // unreachable in production and every long dwell prompted.
+        assert_eq!(
+            cfg().heartbeat_period_ns,
+            1_000_000_000,
+            "the default must be the WAL heartbeat period, not the file period"
+        );
+        let observed = 1_000_000_000;
+        let end = 61_000_000_000;
+        let timeline = timeline_with_beats(
+            observed,
+            exclude_state(Some(vec![square("A", 100.0, 100.0)]), &[]),
+            &[],
+            ScanEnd::CleanEof,
+            &beats_every(observed, end, 1_000_000_000),
+        );
+        let window = window_for(observed, 1.0);
+        let report = resolve(&timeline, &window, 61.0, None);
+        assert_eq!(
+            report.freshness(),
+            ExclusionFreshness::Known {
+                gap_s: 60.0,
+                coverage: HeartbeatCoverage::Continuous,
+            }
+        );
+        assert!(
+            report.is_conclusive(),
+            "an on-time 1 Hz stream must not prompt: {:?}",
+            report.uncertainty_causes()
+        );
+
+        // The bug, pinned from the other side: sized against the *file*
+        // period, the very same healthy stream reports a hole.
+        let file_period = ReconstructConfig {
+            heartbeat_period_ns: 100_000_000,
+            ..cfg()
+        };
+        let report = resolve_exclusions(
+            &timeline,
+            &ExclusionInputs {
+                window: Some(&window),
+                stop_end_print_time: Some(61.0),
+                file: None,
+            },
+            &file_period,
+        );
+        assert!(
+            matches!(
+                report.freshness(),
+                ExclusionFreshness::Known {
+                    coverage: HeartbeatCoverage::Interrupted { .. },
+                    ..
+                }
+            ),
+            "guards the regression: {:?}",
+            report.freshness()
         );
     }
 

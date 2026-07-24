@@ -75,9 +75,7 @@ use crate::scan::{segment_file_name, segment_index};
 use crate::sender::{HeartbeatData, SyncPolicy, WalCmd};
 use crate::seqfile::encode_seq;
 
-/// Append a WAL `Heartbeat` record every Nth file heartbeat (10 Hz file
-/// rate → 1 Hz WAL rate).
-const WAL_HEARTBEAT_EVERY: u64 = 10;
+use crate::convert::WAL_HEARTBEAT_EVERY;
 
 /// Service configuration (derived from `config::Config` by the daemon).
 #[derive(Debug, Clone)]

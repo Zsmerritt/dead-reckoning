@@ -68,8 +68,8 @@ use plr_analyzer::{
     ContactOutcome, Interval, MatchConfig, ModelConfig, StopEvidence,
 };
 use plr_reconstruct::{
-    anchor_state_from_context, reconstruct, FileTail, PossibleStopSet, ReconstructConfig,
-    ReconstructInputs, Reconstruction, RecoveryReconstruction,
+    anchor_state_from_context, reconstruct, FileTail, PossibleStopSet, ReconstructInputs,
+    Reconstruction, RecoveryReconstruction,
 };
 use plr_recovery::{
     plan_recovery, select_resume_target, validate_machine, MachineConfig, MachineRejection,
@@ -180,7 +180,7 @@ pub fn run_pipeline(config: &Config, out: &mut dyn Write) -> Result<PipelineOutc
         }),
         receive_seq,
     };
-    let recovery = match reconstruct(&inputs, &ReconstructConfig::default()) {
+    let recovery = match reconstruct(&inputs, &crate::convert::reconstruct_config(Some(config))) {
         Ok(Reconstruction::CleanShutdown(_)) => return Ok(PipelineOutcome::CleanShutdown),
         Ok(Reconstruction::Recovery(recovery)) => recovery,
         Err(e) => {

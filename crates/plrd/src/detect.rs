@@ -141,8 +141,7 @@ pub fn detect(wal_dir: &Path, heartbeat_path: &Path, detected_wall_ns: u64) -> D
         receive_seq,
     };
     let recovery =
-        match plr_reconstruct::reconstruct(&inputs, &plr_reconstruct::ReconstructConfig::default())
-        {
+        match plr_reconstruct::reconstruct(&inputs, &crate::convert::reconstruct_config(None)) {
             Ok(plr_reconstruct::Reconstruction::CleanShutdown(_)) => return Detection::Clean,
             Ok(plr_reconstruct::Reconstruction::Recovery(recovery)) => recovery,
             Err(e) => return Detection::Nothing(format!("unclean WAL but unanalyzable: {e}")),

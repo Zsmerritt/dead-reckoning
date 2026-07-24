@@ -104,12 +104,14 @@ use plr_klipper::{
     ReceiveSeqWidener, ResponseTemplate, SampleOutcome, SeqKind, StatusUpdate, StepperBatch,
     TrapqBatch, VirtualSdcardStatus,
 };
+use plr_reconstruct::ReconstructConfig;
 use plr_wal::{
     Context, ExcludeObjectDef, ExcludeState, FanTarget, GcodeState, HeaterTarget, StepChunk,
     StepperRange, TransformObservations, TrapqSegment, VirtualSdState, WalRecord,
 };
 use serde_json::{Map, Value};
 
+use crate::config::Config;
 use crate::sender::{HeartbeatData, SyncPolicy};
 
 /// The response-template key used to demultiplex subscriptions. Klipper
@@ -120,6 +122,64 @@ pub const TEMPLATE_KEY: &str = "k";
 
 /// Minimum spacing of contexts triggered *only* by file-position advance.
 pub const POSITION_CONTEXT_MIN_NS: u64 = 1_000_000_000;
+
+/// Append a WAL `Heartbeat` record every Nth heartbeat-file rewrite
+/// (10 Hz file rate → 1 Hz WAL rate). Consumed by `walsvc`, which
+/// applies it, and by [`reconstruct_config`], which tells recovery how
+/// far apart the heartbeat *records* it reads back should be.
+///
+/// It lives here rather than in `walsvc` because it is a contract
+/// between the writer and the reader, and `walsvc` is Linux-only while
+/// this module is not.
+pub const WAL_HEARTBEAT_EVERY: u64 = 10;
+
+/// Derives the reconstruction tunables from the daemon's own
+/// configuration, so recovery is not left guessing at rates this process
+/// already knows.
+///
+/// Only the heartbeat cadence is derived today; everything else keeps
+/// [`ReconstructConfig::default`]. The cadence matters because
+/// `plr-reconstruct` uses heartbeat *continuity* to tell a long dwell
+/// (the writer was alive and journaled no object cancellation — nothing
+/// to confirm) from a stalled recorder (a cancellation may be missing).
+/// Get the period wrong and an on-time stream reads as a chain of holes,
+/// which makes every recovery of a plate with objects prompt the
+/// operator.
+///
+/// The period is the **WAL** heartbeat period, not the heartbeat-file
+/// period: `walsvc` rewrites the file at `heartbeat_hz` but appends a
+/// `Heartbeat` record only every [`WAL_HEARTBEAT_EVERY`]-th tick, so
+///
+/// ```text
+/// period = WAL_HEARTBEAT_EVERY / heartbeat_hz
+/// ```
+///
+/// `None` is for entry points that run without a loaded config (the
+/// forensic `scan` subcommand, and `detect`, which classifies the
+/// previous session and does not read the exclusion report); they get
+/// the documented defaults.
+#[must_use]
+pub fn reconstruct_config(config: Option<&Config>) -> ReconstructConfig {
+    let defaults = ReconstructConfig::default();
+    let Some(config) = config else {
+        return defaults;
+    };
+    // `Config::validate` guarantees heartbeat_hz is finite and > 0, but
+    // this must stay total for a hand-built Config: fall back rather
+    // than produce a nonsense period.
+    #[allow(clippy::cast_precision_loss)]
+    let period_ns = WAL_HEARTBEAT_EVERY as f64 / config.heartbeat_hz * 1e9;
+    #[allow(clippy::cast_precision_loss)]
+    let max = u64::MAX as f64;
+    if !period_ns.is_finite() || period_ns < 1.0 || period_ns >= max {
+        return defaults;
+    }
+    ReconstructConfig {
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        heartbeat_period_ns: period_ns as u64,
+        ..defaults
+    }
+}
 
 /// Which subscription a notification belongs to, decoded from the echoed
 /// response template.
@@ -811,6 +871,80 @@ mod tests {
         let out = r.on_initial_status(&initial_status(100.0), 1_000).unwrap();
         assert_eq!(out.records.len(), 1, "initial context expected");
         r
+    }
+
+    #[test]
+    fn reconstruct_config_derives_the_wal_heartbeat_period() {
+        use crate::config::Config;
+
+        // The default 10 Hz *file* rate becomes a 1 Hz *record* rate,
+        // because walsvc appends one record per WAL_HEARTBEAT_EVERY
+        // ticks. Getting this wrong by that factor makes an on-time
+        // heartbeat stream look like a chain of holes to recovery.
+        let config = Config::default();
+        assert_eq!(config.heartbeat_hz, 10.0);
+        assert_eq!(
+            super::reconstruct_config(Some(&config)).heartbeat_period_ns,
+            1_000_000_000
+        );
+
+        // A non-default rate is followed, not assumed away (the daemon's
+        // own test fixtures configure 20 Hz).
+        let faster = Config {
+            heartbeat_hz: 20.0,
+            ..Config::default()
+        };
+        assert_eq!(
+            super::reconstruct_config(Some(&faster)).heartbeat_period_ns,
+            500_000_000
+        );
+        let slower = Config {
+            heartbeat_hz: 2.0,
+            ..Config::default()
+        };
+        assert_eq!(
+            super::reconstruct_config(Some(&slower)).heartbeat_period_ns,
+            5_000_000_000
+        );
+
+        // Entry points without a loaded config get the documented
+        // defaults rather than a fabricated rate.
+        assert_eq!(
+            super::reconstruct_config(None),
+            plr_reconstruct::ReconstructConfig::default()
+        );
+
+        // Everything else is left at the defaults.
+        let derived = super::reconstruct_config(Some(&faster));
+        let defaults = plr_reconstruct::ReconstructConfig::default();
+        assert_eq!(derived.extension_horizon, defaults.extension_horizon);
+        assert_eq!(
+            derived.exclusion_freshness_horizon,
+            defaults.exclusion_freshness_horizon
+        );
+        assert_eq!(
+            derived.heartbeat_gap_tolerance,
+            defaults.heartbeat_gap_tolerance
+        );
+    }
+
+    #[test]
+    fn reconstruct_config_is_total_on_a_degenerate_rate() {
+        use crate::config::Config;
+
+        // `Config::validate` rejects these, but a hand-built Config must
+        // not be able to produce a nonsense period.
+        for hz in [0.0, -1.0, f64::NAN, f64::INFINITY, 1e-30, 1e30] {
+            let config = Config {
+                heartbeat_hz: hz,
+                ..Config::default()
+            };
+            let derived = super::reconstruct_config(Some(&config));
+            assert!(
+                derived.validate().is_ok(),
+                "heartbeat_hz {hz} produced an invalid config"
+            );
+        }
     }
 
     #[test]
