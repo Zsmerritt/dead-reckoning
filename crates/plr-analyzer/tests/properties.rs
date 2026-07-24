@@ -8,9 +8,11 @@ use proptest::prelude::*;
 use proptest::test_runner::FileFailurePersistence;
 
 use plr_analyzer::{
-    build_layer_model, match_stop_point, select_contact_zone, ByteWindow, ContactConfig,
-    ContactOutcome, FeatureClass, Interval, Layer, LayerModel, MatchConfidence, MatchConfig,
-    MatchError, ModelConfig, ModelStop, StopEvidence, TypedPath, XySegment,
+    build_layer_model, match_stop_point, select_contact_zone, select_contact_zone_detailed,
+    ByteWindow, ContactConfig, ContactMode, ContactOutcome, FeatureClass, Interval, Layer,
+    LayerModel, MatchConfidence, MatchConfig, MatchError, ModelConfig, ModelStop, StopEvidence,
+    StructuralAnalysis, StructuralAssessment as ContactAssessment, StructuralCriterion,
+    StructuralOutcome, TypedPath, XySegment,
 };
 use plr_gcode::{ByteSpan, GcodeState};
 
@@ -253,8 +255,14 @@ proptest! {
             segment.span = ByteSpan { start, end: start + 1 };
         }
         let model = synth_model(prev.clone(), cover.clone(), FeatureClass::InternalInfill);
+        // This property is about the *geometric* selector invariants
+        // (on-segment, exclusion radius, coverage). The structural stage
+        // would filter most of this random geometry out before those
+        // invariants could be observed, and has its own properties
+        // below, so it is switched off here.
         let config = ContactConfig {
             exclusion_radius: radius,
+            structural_checks_enabled: false,
             ..ContactConfig::default()
         };
         let out = select_contact_zone(&model, 1, [crash_x, crash_y], &config);
@@ -330,5 +338,208 @@ proptest! {
                 prop_assert!(c.point[0].is_finite() && c.point[1].is_finite());
             }
         }
+    }
+}
+
+/// Scan lines filling a square centred on `centre`, at the 0.4 mm
+/// production line spacing so the patch rasterizes as solid material.
+fn square_segments(centre: [f64; 2], side: f64, z: f64, span_base: u64) -> Vec<XySegment> {
+    let (lo, hi) = (centre[0] - side / 2.0, centre[0] + side / 2.0);
+    let mut out = Vec::new();
+    for row in 0_u32.. {
+        let y = f64::from(row).mul_add(0.4, centre[1] - side / 2.0);
+        if y > centre[1] + side / 2.0 + 1e-9 {
+            break;
+        }
+        let offset = span_base + u64::from(row);
+        out.push(XySegment {
+            start: [lo, y],
+            end: [hi, y],
+            z,
+            e_start: 0.0,
+            e_end: 1.0,
+            span: ByteSpan {
+                start: offset,
+                end: offset + 1,
+            },
+            arc: None,
+        });
+    }
+    out
+}
+
+/// A coordinate strategy that can actually land on the material.
+///
+/// A pure `f64::from_bits(any::<u64>())` never does: the odds of a
+/// random bit pattern falling inside an 8 mm square at (50,50) are about
+/// 4e-9 per axis, so a property written that way exercises only the
+/// `OffMaterial` and `InvalidPoint` arms and its headline assertions
+/// (score finite and in range, every measured/threshold finite,
+/// `Safe` iff no failures) never run at all. Mixing in an in-range band
+/// keeps the adversarial coverage and makes the interesting arm
+/// reachable: roughly a quarter of cases land on the patch.
+fn probe_coordinate() -> impl Strategy<Value = f64> {
+    prop_oneof![
+        3 => 44.0f64..56.0,
+        1 => any::<u64>().prop_map(f64_from_bits),
+    ]
+}
+
+/// Drag components: mostly usable, sometimes an arbitrary bit pattern.
+fn drag_component() -> impl Strategy<Value = f64> {
+    prop_oneof![
+        2 => -5.0f64..5.0,
+        1 => any::<u64>().prop_map(f64_from_bits),
+    ]
+}
+
+/// Drag run lengths: mostly plausible, sometimes an arbitrary pattern.
+fn drag_run_length() -> impl Strategy<Value = f64> {
+    prop_oneof![
+        2 => 0.25f64..24.0,
+        1 => any::<u64>().prop_map(f64_from_bits),
+    ]
+}
+
+/// Whether the bed-adhesion criterion passed at `point`, for a model
+/// whose layer 0 is a square of `base_side` carrying a fixed 2 mm plate.
+fn adhesion_passes(base_side: f64) -> (bool, f64) {
+    let model = synth_model(
+        square_segments([50.0, 50.0], base_side, 0.2, 1_000),
+        square_segments([50.0, 50.0], 2.0, 0.4, 20_000),
+        FeatureClass::InternalInfill,
+    );
+    let analysis = StructuralAnalysis::build(&model, 1, &ContactConfig::default())
+        .expect("valid config and layer");
+    match analysis.assess([50.0, 50.0], &ContactMode::Tap) {
+        ContactAssessment::Evaluated(verdict) => {
+            let check = verdict
+                .check(StructuralCriterion::BedAdhesion)
+                .expect("adhesion check");
+            (check.passed, check.measured)
+        }
+        other => panic!("expected a verdict, got {other:?}"),
+    }
+}
+
+proptest! {
+    // Each case builds a full structural analysis (islands, rasters,
+    // distance transform, footprint trace), so the case count is
+    // lowered from the default 256 to keep the suite's runtime honest;
+    // the shrunk counterexamples that matter here are coordinate bit
+    // patterns, which the reduced count still finds.
+    #![proptest_config(ProptestConfig {
+        cases: 64,
+        failure_persistence: Some(Box::new(FileFailurePersistence::WithSource(
+            "proptest-regressions",
+        ))),
+        ..ProptestConfig::default()
+    })]
+
+    /// Structural verdicts are total: arbitrary (including non-finite)
+    /// geometry, points and drag parameters never panic, and every
+    /// number a verdict reports is finite — the decline payload is
+    /// serialized as JSON downstream, which cannot encode an infinity.
+    #[test]
+    fn structural_verdicts_total_on_arbitrary_geometry(
+        bits in proptest::collection::vec(any::<u64>(), 8),
+        px in probe_coordinate(),
+        py in probe_coordinate(),
+        dx in drag_component(),
+        dy in drag_component(),
+        run in drag_run_length(),
+        drag in any::<bool>(),
+    ) {
+        let mut prev = square_segments([50.0, 50.0], 8.0, 0.2, 1_000);
+        let mut cover = square_segments([50.0, 50.0], 8.0, 0.4, 20_000);
+        // Splice adversarial coordinates into both layers.
+        prev[0].start = [f64_from_bits(bits[0]), f64_from_bits(bits[1])];
+        prev[0].end = [f64_from_bits(bits[2]), f64_from_bits(bits[3])];
+        cover[0].start = [f64_from_bits(bits[4]), f64_from_bits(bits[5])];
+        cover[0].end = [f64_from_bits(bits[6]), f64_from_bits(bits[7])];
+        let model = synth_model(prev, cover, FeatureClass::InternalInfill);
+        let analysis = StructuralAnalysis::build(&model, 1, &ContactConfig::default())
+            .expect("the default config is valid");
+        let mode = if drag {
+            ContactMode::Drag {
+                direction: [dx, dy],
+                run_length: run,
+            }
+        } else {
+            ContactMode::Tap
+        };
+        let point = [px, py];
+        match analysis.assess(point, &mode) {
+            ContactAssessment::Evaluated(verdict) => {
+                prop_assert!(verdict.score.is_finite());
+                prop_assert!((0.0..=1.0).contains(&verdict.score));
+                prop_assert!(!verdict.summary.is_empty());
+                prop_assert!(verdict.footprint.effective_area.is_finite());
+                prop_assert!(verdict.footprint.bed_area.is_finite());
+                prop_assert!(verdict.footprint.weakest_link_area.is_finite());
+                prop_assert!(verdict.island.area.is_finite());
+                for check in &verdict.checks {
+                    prop_assert!(check.measured.is_finite(), "{:?}", check);
+                    prop_assert!(check.threshold.is_finite(), "{:?}", check);
+                    prop_assert!(!check.reason.is_empty());
+                }
+                if let Some(alignment) = verdict.centroid_alignment {
+                    prop_assert!(alignment.is_finite());
+                }
+                // A safe verdict has no failing check, and vice versa.
+                match verdict.outcome() {
+                    StructuralOutcome::Safe => prop_assert!(verdict.failures().is_empty()),
+                    StructuralOutcome::Unsafe { primary } => {
+                        prop_assert!(!verdict.failures().is_empty());
+                        prop_assert_eq!(verdict.failures()[0].criterion, primary);
+                    }
+                }
+            }
+            ContactAssessment::OffMaterial { distance, .. } => {
+                prop_assert!(distance.is_finite());
+            }
+            ContactAssessment::InvalidPoint { .. } => {
+                let bad_point = !point[0].is_finite() || !point[1].is_finite();
+                let dragging = matches!(&mode, ContactMode::Drag { .. });
+                prop_assert!(bad_point || dragging);
+            }
+        }
+        // The selector never panics on the same model either.
+        let _ = select_contact_zone_detailed(&model, 1, [0.0, 0.0], &ContactConfig::default());
+    }
+}
+
+proptest! {
+    // Each case builds two full analyses with their rasters, so the
+    // case count is lowered deliberately; the property is structural,
+    // not statistical.
+    #![proptest_config(ProptestConfig {
+        cases: 24,
+        failure_persistence: Some(Box::new(FileFailurePersistence::WithSource(
+            "proptest-regressions",
+        ))),
+        ..ProptestConfig::default()
+    })]
+
+    /// Monotonicity: shrinking the footprint that holds a feature can
+    /// never turn a structural failure into a pass. Concretely, if the
+    /// smaller base clears the bed-adhesion bar then the larger one
+    /// must too, and it must measure at least as much area.
+    #[test]
+    fn shrinking_a_footprint_never_turns_a_fail_into_a_pass(
+        base in 8.0f64..14.0,
+        factor in 0.2f64..0.5,
+    ) {
+        let small = base * factor;
+        let (small_passed, small_area) = adhesion_passes(small);
+        let (big_passed, big_area) = adhesion_passes(base);
+        prop_assert!(
+            big_area >= small_area,
+            "shrinking {base} -> {small} grew the measured area: {big_area} < {small_area}"
+        );
+        prop_assert!(
+            !small_passed || big_passed,
+            "the smaller {small} mm base passed where the {base} mm one failed"
+        );
     }
 }
