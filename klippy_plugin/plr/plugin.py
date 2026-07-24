@@ -23,7 +23,8 @@ config options — klippy/configfile.py:311-324):
 * ``self_locking_z`` — operator attestation staged by PLR_SETUP;
 * ``probe_resolution`` — measured by PLR_PROBE_TEST;
 * ``noise_floor_rms`` / ``noise_floor_still_rms`` / ``noise_floor_peak``
-  — measured by PLR_NOISE_TEST.  Parsed here at config time (not read
+  / ``noise_floor_speed`` — measured by PLR_NOISE_TEST.  Parsed here at
+  config time (not read
   lazily by the drag modules) for the same reason probe_resolution is:
   the live value doubles as this-session state that PLR_NOISE_TEST
   updates in place, and config-time getfloat bounds reject a
@@ -31,6 +32,7 @@ config options — klippy/configfile.py:311-324):
   a mid-probe surprise.
 """
 
+import math
 import os
 import time
 
@@ -86,6 +88,19 @@ class PLRPlugin:
             "noise_floor_still_rms", None, minval=0.0
         )
         self.noise_floor_peak = config.getfloat("noise_floor_peak", None, minval=0.0)
+        # Baseline capture speed (mm/s), read by plrd's plan validation
+        # to warn on drag-speed mismatch.  getfloat's above=0.0 rejects
+        # non-positive values but happily parses "inf"/"nan" (nan even
+        # passes the bound comparisons), so finiteness is checked
+        # explicitly — a mangled autosave value must fail at config
+        # time, not at plan time.
+        self.noise_floor_speed = config.getfloat("noise_floor_speed", None, above=0.0)
+        if self.noise_floor_speed is not None and not math.isfinite(
+            self.noise_floor_speed
+        ):
+            raise config.error(
+                "Option 'noise_floor_speed' in section 'plr' must be finite"
+            )
         # --- drag-oracle session state (PLR_DRAG_PROBE outcome; plrd
         # reads these through get_status like probe status) ------------
         self.last_drag_result = None

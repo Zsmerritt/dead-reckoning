@@ -7,6 +7,7 @@ including under hostile scripts that never report contact.
 """
 
 import math
+import shlex
 
 import fake_klippy
 import pytest
@@ -401,6 +402,60 @@ def test_spaced_chip_name_resolves(fake_printer, plr_config, run_cmd):
     run_cmd("PLR_DRAG_PROBE", CHIP="adxl345 bed")
     assert plugin.last_drag_result is not None
     assert len(chip.clients) == 3
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        'CHIP="adxl345 bed" SPEED=25',  # double-quoted (plrd emits this)
+        "CHIP='adxl345 bed' SPEED=25",  # single-quoted
+    ],
+)
+def test_quoted_chip_through_extended_params_parse(
+    fake_printer, plr_config, run_cmd, raw
+):
+    """Fidelity test of the quoted-CHIP contract, end to end.
+
+    Replicates klippy's extended-parameter parse EXACTLY as
+    gcode.py:266-281 performs it (shlex posix + whitespace_split,
+    split each token at the first '=', uppercase keys, values keep
+    case and embedded spaces) over the raw quoted command line the
+    Rust plan emits, then dispatches the resulting params.  If klippy
+    changes this contract, this test's premise assertions break first.
+    """
+    s = shlex.shlex(raw, posix=True)
+    s.whitespace_split = True
+    s.commenters = "#;"
+    eparams = [earg.split("=", 1) for earg in s]
+    params = {k.upper(): v for k, v in eparams}
+    # The premise proved against klippy's parser: quotes stripped, the
+    # embedded space and value case preserved.
+    assert params == {"CHIP": "adxl345 bed", "SPEED": "25"}
+
+    toolhead = fake_klippy.FakeToolhead(position=(150.0, 150.0, START_Z, 0.0))
+    fake_printer.add_object("toolhead", toolhead)
+    fake_printer.add_object("idle_timeout", fake_klippy.FakeIdleTimeout())
+    chip = fake_klippy.FakeAccelChip(fake_printer, default=contact_below(0.61))
+    fake_printer.add_object("adxl345 bed", chip)
+    plugin = plr.load_config(
+        plr_config(
+            options={
+                "probe_method": "adxl_drag",
+                "accel_chip": "adxl345 bed",
+                "noise_floor_rms": NOISE_FLOOR,
+                "drag_z_step": str(Z_STEP),
+            },
+            sections={
+                "stepper_z": {"step_pin": "PF11", "position_min": "0"},
+                "adxl345 bed": {"cs_pin": "PB1"},
+            },
+        )
+    )
+    run_cmd("PLR_DRAG_PROBE", **params)
+    assert plugin.last_drag_result is not None
+    assert len(chip.clients) == 3
+    # SPEED came through the same parse.
+    assert all(m[1] == pytest.approx(25.0) for m in lateral_moves(toolhead.moves))
 
 
 def test_chip_arg_overrides_configured_chip(drag_setup, run_cmd, fake_printer):

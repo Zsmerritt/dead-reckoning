@@ -29,6 +29,10 @@ autosave mechanism, klippy/configfile.py:311-324):
   statistic classify_pass compares against its threshold, so
   peak/threshold headroom at the chosen sensitivity is readable
   directly from the report.
+* ``noise_floor_speed`` — the SPEED (mm/s) the moving baseline was
+  captured at.  Consumed by plrd's plan validation to warn when a
+  recovery probe would drag at a different speed than the floor was
+  measured at (the baseline is speed-dependent).
 
 Degenerate captures (too few samples, non-finite, constant, collapsed
 sample rate — classifier.validate_pass_samples' taxonomy) refuse the
@@ -84,7 +88,7 @@ def cmd_PLR_NOISE_TEST(plugin, gcmd):
             "  b) %d no-contact passes of %.1f mm at %.1f mm/s at the "
             "current Z (same geometry as PLR_DRAG_PROBE)\n"
             "  then stage noise_floor_rms / noise_floor_still_rms / "
-            "noise_floor_peak for SAVE_CONFIG.\n"
+            "noise_floor_peak / noise_floor_speed for SAVE_CONFIG.\n"
             "%s\n"
             "Re-run with START=1 to consent to this motion."
             % (
@@ -123,15 +127,19 @@ def cmd_PLR_NOISE_TEST(plugin, gcmd):
         aclient.finish_measurements()
     moving = _capture_stats(gcmd, aclient, "moving")
 
-    # Stage all three keys, then mirror them live on the plugin so
+    # Stage the keys, then mirror them live on the plugin so
     # PLR_DRAG_PROBE works this session without waiting for the
     # SAVE_CONFIG restart (same live-then-persist convention as
-    # PLR_PROBE_TEST's probe_resolution).
+    # PLR_PROBE_TEST's probe_resolution).  noise_floor_speed records
+    # the SPEED the moving baseline was captured at: plrd's plan
+    # validation warns when a recovery probe would run at a different
+    # drag speed than the floor was measured at.
     configfile = plugin.printer.lookup_object("configfile")
     staged = (
         ("noise_floor_rms", moving.rms),
         ("noise_floor_still_rms", still.rms),
         ("noise_floor_peak", moving.peak_rms),
+        ("noise_floor_speed", speed),
     )
     for option, value in staged:
         configfile.set("plr", option, "%.6f" % (value,))
@@ -139,16 +147,19 @@ def cmd_PLR_NOISE_TEST(plugin, gcmd):
     plugin.noise_floor_rms = moving.rms
     plugin.noise_floor_still_rms = still.rms
     plugin.noise_floor_peak = moving.peak_rms
+    plugin.noise_floor_speed = speed
 
     sensitivity = plugin.tunables["drag_sensitivity"]
     mult = classifier.multiplier(sensitivity)
     gcmd.respond_info(
-        "plr noise test (chip %s, %.1f mm/s):\n"
+        "plr noise test (chip %s):\n"
         "  noise_floor_rms       = %.3f mm/s^2 (moving baseline — the "
         "drag threshold reference)\n"
         "  noise_floor_still_rms = %.3f mm/s^2\n"
         "  noise_floor_peak      = %.3f mm/s^2 (max windowed RMS while "
         "moving)\n"
+        "  noise_floor_speed     = %.1f mm/s (baseline capture speed; "
+        "plans warn on drag-speed mismatch)\n"
         "  drag threshold at sensitivity %.0f: %.3f mm/s^2 (rms x %.2f); "
         "moving peak leaves %.1fx headroom\n"
         "%s\n"
@@ -156,10 +167,10 @@ def cmd_PLR_NOISE_TEST(plugin, gcmd):
         "with the above and restart the printer."
         % (
             chip_name,
-            speed,
             moving.rms,
             still.rms,
             moving.peak_rms,
+            speed,
             sensitivity,
             moving.rms * mult,
             mult,
