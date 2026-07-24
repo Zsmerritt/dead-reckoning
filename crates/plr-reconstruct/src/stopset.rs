@@ -43,15 +43,19 @@
 //! `gcode_move`'s `base_position`, and M221 is baked in before the
 //! trapq. Matching WAL E to file E therefore requires the
 //! `(base_e, extrude_factor)` pair that was active when the motion was
-//! *processed*. For the extension that pair is tracked line by line
-//! (exact). For the WAL span the set of pairs is taken from every
-//! context snapshot recent enough to have applied
-//! (`>= t_a - max_processing_lead - 1 s`) and the converted intervals
-//! are unioned; a frame created *and* replaced between two context
-//! flushes cannot be recovered, which is flagged via
-//! [`Degradation::e_frame_shift_in_extension`] when frame shifts are
-//! seen near the cut. Real slicers emit `G92 E0` at most once per layer,
-//! so consecutive frames are normally many flush periods apart.
+//! *processed*. The primary path recovers those pairs **exactly** by
+//! replaying the file from the offset-window floor context through the
+//! extension end and recording the g-code-frame E after every line
+//! ([`file_frame_e`]'s replay). Because the interpreter is
+//! deterministic, this reconstructs the frame of every candidate line —
+//! including frames created *and* replaced between two context flushes
+//! (e.g. `G92 E0` + retract processed in one burst right after a
+//! dwell), which no context snapshot ever captured; relying on
+//! snapshotted frames alone was a proven containment hole (see the
+//! checked-in proptest regression seed). Only when the replay cannot
+//! run or cannot reach the window end does the computation fall back to
+//! unioning the WAL-internal interval converted under recent context
+//! frames, flagged [`Degradation::e_file_frames_incomplete`].
 //!
 //! # File-offset window
 //!
@@ -266,9 +270,16 @@ pub struct Degradation {
     /// A G28 inside the extension window invalidated XY knowledge; the
     /// XY region includes untrusted values.
     pub unknown_xy_in_extension: bool,
-    /// The E frame (`G92 E`/M221) shifted inside the extension window;
-    /// file-frame E conversion of WAL evidence may straddle frames.
+    /// The E frame (`G92 E`/M221) shifted inside the extension window
+    /// (informational; the replay-based file-frame E handles shifts
+    /// exactly).
     pub e_frame_shift_in_extension: bool,
+    /// The file-frame E replay could not run or could not reach the
+    /// window end; `e_file` fell back to (or was widened by) the
+    /// snapshot-frame union, which cannot see a frame created and
+    /// replaced between two context flushes. Treat `e_file` as
+    /// best-effort in this state.
+    pub e_file_frames_incomplete: bool,
     /// No context old enough to predate `t_a - max_processing_lead`
     /// exists; the offset-window floor fell back to the oldest known
     /// frontier and may be optimistic.
@@ -367,10 +378,20 @@ pub fn compute_stop_set(
     };
 
     let extension = run_extension(anchor, window, file_tail, config, &mut degradation)?;
+    let floor = floor_context(timeline, window, anchor, config, &mut degradation);
 
     let mut e_internal = wal_e;
-    let mut e_file =
-        wal_e.and_then(|iv| convert_e_to_file_frame(iv, timeline, window, anchor, config));
+    let mut e_file = file_frame_e(
+        timeline,
+        window,
+        anchor,
+        floor.as_ref(),
+        extension.as_ref(),
+        file_tail,
+        wal_e,
+        config,
+        &mut degradation,
+    );
     if let Some(ext) = &extension {
         z_candidates.extend(ext.z.iter().cloned());
         if let Some(ext_xy) = ext.xy {
@@ -383,14 +404,7 @@ pub fn compute_stop_set(
         e_file = union_opt(e_file, ext.e_file);
     }
 
-    let file_window = offset_window(
-        timeline,
-        window,
-        anchor,
-        extension.as_ref(),
-        config,
-        &mut degradation,
-    );
+    let file_window = offset_window(anchor, floor.as_ref(), extension.as_ref());
 
     degradation.confidence = if degradation.observation_gap
         || degradation.extension_unavailable
@@ -816,9 +830,164 @@ fn extension_file_e(
     e_file
 }
 
+/// The offset-window floor: the newest context (for the anchor's file)
+/// whose capture time predates `t_a - max_processing_lead` — execution
+/// at any in-window time had certainly passed its recorded frontier.
+/// Falls back to the oldest same-file context (flagged
+/// `offset_floor_uncertain`) when nothing is old enough.
+struct FloorContext<'a> {
+    ctx: &'a Context,
+    file_position: u64,
+    /// `true` when the fallback was taken: the floor may sit *after*
+    /// motion that was still executing in the window.
+    uncertain: bool,
+}
+
+fn floor_context<'a>(
+    timeline: &'a WalTimeline,
+    window: &StopWindow,
+    anchor: &Context,
+    config: &ReconstructConfig,
+    degradation: &mut Degradation,
+) -> Option<FloorContext<'a>> {
+    let anchor_vsd = anchor.virtual_sdcard.as_ref()?;
+    let threshold = window.t_a - config.max_processing_lead;
+    let same_file = |ctx: &&'a Context| {
+        ctx.virtual_sdcard
+            .as_ref()
+            .is_some_and(|v| v.file_path == anchor_vsd.file_path)
+    };
+    let fp_of = |ctx: &&'a Context| ctx.virtual_sdcard.as_ref().map_or(0, |v| v.file_position);
+    let old_enough = timeline
+        .contexts
+        .iter()
+        .filter(same_file)
+        .filter(|ctx| {
+            window
+                .mono_ns_to_print_time(ctx.mono_ns)
+                .is_some_and(|pt| pt <= threshold)
+        })
+        .max_by_key(fp_of);
+    let (ctx, uncertain) = if let Some(ctx) = old_enough {
+        (ctx, false)
+    } else {
+        degradation.offset_floor_uncertain = true;
+        let oldest = timeline
+            .contexts
+            .iter()
+            .filter(same_file)
+            .min_by_key(fp_of)?;
+        (oldest, true)
+    };
+    Some(FloorContext {
+        file_position: fp_of(&ctx),
+        ctx,
+        uncertain,
+    })
+}
+
+/// File-frame E over the whole candidate window.
+///
+/// Primary (exact) path: replay the file from the **floor context**
+/// through the extension end, recording the g-code-frame E after every
+/// line. The interpreter is deterministic, so this reconstructs the
+/// exact `(base_e, extrude_factor)` frame of *every* line in the offset
+/// window — including frames created and replaced between two context
+/// flushes (e.g. `G92 E0` + retract processed in a burst after a
+/// dwell), which no snapshot ever captured. Consecutive per-line values
+/// bracket every mid-line E because E moves monotonically within a line
+/// under a fixed frame.
+///
+/// Fallback (when the replay cannot run or cannot reach the window
+/// end — no file tail, tail not covering the floor, malformed floor
+/// snapshot, line budget, unparseable line): union the WAL-internal
+/// interval converted under every recent context frame, flagged
+/// [`Degradation::e_file_frames_incomplete`] because a frame that
+/// lived entirely between two flushes is unrecoverable without the
+/// file. The fallback is also unioned in when the floor itself is
+/// uncertain, since the replay may then start past in-window motion.
+#[allow(clippy::too_many_arguments)] // one cohesive assembly step; a param struct would just rename the call site
+fn file_frame_e(
+    timeline: &WalTimeline,
+    window: &StopWindow,
+    anchor: &Context,
+    floor: Option<&FloorContext<'_>>,
+    extension: Option<&ExtensionResult>,
+    file_tail: Option<&FileTail<'_>>,
+    wal_e: Option<Interval>,
+    config: &ReconstructConfig,
+    degradation: &mut Degradation,
+) -> Option<Interval> {
+    let end_offset = extension
+        .and_then(|e| e.summary.resume_offset)
+        .or_else(|| anchor.virtual_sdcard.as_ref().map(|v| v.file_position));
+    let replay = match (floor, file_tail, end_offset) {
+        (Some(floor), Some(tail), Some(end)) => replay_file_e(floor, end, tail, config),
+        _ => None,
+    };
+    let context_fallback =
+        || wal_e.and_then(|iv| convert_e_to_file_frame(iv, timeline, window, anchor, config));
+    if let Some((interval, reached_end)) = replay {
+        let complete = reached_end && floor.is_some_and(|f| !f.uncertain);
+        if complete {
+            Some(interval)
+        } else {
+            if !reached_end {
+                degradation.e_file_frames_incomplete = true;
+            }
+            union_opt(Some(interval), context_fallback())
+        }
+    } else {
+        degradation.e_file_frames_incomplete = true;
+        context_fallback()
+    }
+}
+
+/// Replays file bytes from the floor context's offset up to
+/// `end_offset`, returning the interval of per-line g-code-frame E
+/// values and whether the replay actually reached `end_offset`.
+/// `None` when the replay cannot start (tail does not cover the floor,
+/// or the floor snapshot cannot seed a state).
+fn replay_file_e(
+    floor: &FloorContext<'_>,
+    end_offset: u64,
+    tail: &FileTail<'_>,
+    config: &ReconstructConfig,
+) -> Option<(Interval, bool)> {
+    let tail_end = tail.base_offset.saturating_add(tail.bytes.len() as u64);
+    if floor.file_position < tail.base_offset || floor.file_position > tail_end {
+        return None;
+    }
+    let mut state = anchor_state_from_context(&floor.ctx.gcode).ok()?;
+    // Fits: file_position - base_offset <= bytes.len().
+    #[allow(clippy::cast_possible_truncation)]
+    let skip = (floor.file_position - tail.base_offset) as usize;
+    let bytes = tail.bytes.get(skip..).unwrap_or(&[]);
+    let mut interval = Interval::point(state.gcode_position()[3]);
+    let mut position = floor.file_position;
+    let mut budget = config.sim.max_lines.unwrap_or(usize::MAX);
+    for line in LineIter::new(bytes, floor.file_position) {
+        if line.span.start >= end_offset {
+            break;
+        }
+        if budget == 0 {
+            return Some((interval, false));
+        }
+        budget -= 1;
+        if state.apply(&line).is_err() {
+            return Some((interval, false));
+        }
+        interval.expand(state.gcode_position()[3]);
+        position = line.span.end;
+    }
+    Some((interval, position >= end_offset || position >= tail_end))
+}
+
 /// Converts a Klipper-internal E interval to the file frame by unioning
 /// the conversion under every recent context's `(base_e, extrude_factor)`
-/// pair. See the module docs for the honesty limits.
+/// pair — the fallback path of [`file_frame_e`]; a frame that was
+/// created *and* replaced between two context flushes is invisible
+/// here, which is why the replay path is primary.
 fn convert_e_to_file_frame(
     internal: Interval,
     timeline: &WalTimeline,
@@ -863,52 +1032,21 @@ fn e_frame_of(gcode: &plr_wal::GcodeState) -> Option<(f64, f64)> {
     Some((pos_e - gpos_e * factor, factor))
 }
 
-/// Builds the file byte-offset candidate window; see module docs for
-/// the floor rationale.
+/// Builds the file byte-offset candidate window from the floor context
+/// and the extension end; see module docs for the floor rationale.
 fn offset_window(
-    timeline: &WalTimeline,
-    window: &StopWindow,
     anchor: &Context,
+    floor: Option<&FloorContext<'_>>,
     extension: Option<&ExtensionResult>,
-    config: &ReconstructConfig,
-    degradation: &mut Degradation,
 ) -> Option<OffsetWindow> {
     let anchor_vsd = anchor.virtual_sdcard.as_ref()?;
-    let threshold = window.t_a - config.max_processing_lead;
-    let same_file = |ctx: &&Context| {
-        ctx.virtual_sdcard
-            .as_ref()
-            .is_some_and(|v| v.file_path == anchor_vsd.file_path)
-    };
-    let floor_from_old = timeline
-        .contexts
-        .iter()
-        .filter(same_file)
-        .filter(|ctx| {
-            window
-                .mono_ns_to_print_time(ctx.mono_ns)
-                .is_some_and(|pt| pt <= threshold)
-        })
-        .filter_map(|ctx| ctx.virtual_sdcard.as_ref().map(|v| v.file_position))
-        .max();
-    let floor = if let Some(f) = floor_from_old {
-        f
-    } else {
-        degradation.offset_floor_uncertain = true;
-        timeline
-            .contexts
-            .iter()
-            .filter(same_file)
-            .filter_map(|ctx| ctx.virtual_sdcard.as_ref().map(|v| v.file_position))
-            .min()
-            .unwrap_or(anchor_vsd.file_position)
-    };
+    let start = floor.map_or(anchor_vsd.file_position, |f| f.file_position);
     let end = extension
         .and_then(|e| e.summary.resume_offset)
         .unwrap_or(anchor_vsd.file_position)
         .max(anchor_vsd.file_position);
     Some(OffsetWindow {
-        start: floor.min(end),
+        start: start.min(end),
         end,
     })
 }
@@ -1304,6 +1442,73 @@ mod tests {
         // internal [101 (t_a=10.5), 102] -> file [(101-90)/0.5, (102-90)/0.5] = [22, 24].
         assert!((ef.lo - 22.0).abs() < 1e-9, "ef.lo = {}", ef.lo);
         assert!((ef.hi - 24.0).abs() < 1e-9);
+        // No file tail: the exact replay could not run, and the
+        // snapshot-frame fallback is honestly flagged.
+        assert!(set.degradation.e_file_frames_incomplete);
+    }
+
+    #[test]
+    fn file_e_recovers_frames_never_snapshotted() {
+        // Regression for the fault-injection counterexample (seed
+        // ae60143c...): a `G92 E0` + retract processed in a burst
+        // between two context flushes. The retract executes in an
+        // E-frame that exists in NO context snapshot — the old context
+        // predates the first G92, the anchor's frontier is already past
+        // a second G92. Only the file replay from the floor context can
+        // reconstruct the intermediate frame's (negative) file E.
+        let text =
+            "G1 X60 Y50 E101 F3000\nG92 E0\nG1 E-0.8\nG1 X70 Y50 E-0.2\nG92 E0\nG1 X80 Y50 E0.5\n";
+        let end = text.len() as u64;
+        let old_gcode = WalGcodeState {
+            speed_factor: 1.0,
+            speed: 3000.0,
+            extrude_factor: 1.0,
+            absolute_coordinates: true,
+            absolute_extrude: true,
+            homing_origin: vec![0.0; 4],
+            position: vec![50.0, 50.0, 0.2, 100.0],
+            gcode_position: vec![50.0, 50.0, 0.2, 100.0],
+        };
+        // Anchor = state after replaying all six lines from old_gcode:
+        // internal E 101.3, base_e 100.8 (second G92), gcode E 0.5.
+        let anchor_gcode = WalGcodeState {
+            speed_factor: 1.0,
+            speed: 3000.0,
+            extrude_factor: 1.0,
+            absolute_coordinates: true,
+            absolute_extrude: true,
+            homing_origin: vec![0.0; 4],
+            position: vec![80.0, 50.0, 0.2, 101.3],
+            gcode_position: vec![80.0, 50.0, 0.2, 0.5],
+        };
+        // Heartbeat pt 10 => t_a = 10; old context at pt 5 predates
+        // t_a - max_processing_lead (7): a certain floor.
+        let records = base_records(
+            10.0,
+            10.1,
+            vec![
+                WalRecord::Context(context_with_gcode(5_000_000_000, 0, old_gcode)),
+                WalRecord::Context(context_with_gcode(10_000_000_000, end, anchor_gcode)),
+            ],
+        );
+        let timeline = ingest_records(records);
+        let window = compute_stop_window(&timeline, None, &cfg()).unwrap();
+        let tail = FileTail {
+            base_offset: 0,
+            bytes: text.as_bytes(),
+        };
+        let set = compute_stop_set(&timeline, &window, Some(&tail), &cfg()).unwrap();
+        let ef = set.e_file.unwrap();
+        // The full retract depth in the never-snapshotted frame.
+        assert!(ef.contains(-0.8, 1e-9), "e_file = {ef:?}");
+        // And the pre-G92 frame values.
+        assert!(ef.contains(101.0, 1e-9), "e_file = {ef:?}");
+        // The replay reached the window end from a certain floor: the
+        // result is exact, not best-effort.
+        assert!(!set.degradation.e_file_frames_incomplete);
+        assert!(!set.degradation.offset_floor_uncertain);
+        let fw = set.file_window.unwrap();
+        assert_eq!((fw.start, fw.end), (0, end));
     }
 
     #[test]
