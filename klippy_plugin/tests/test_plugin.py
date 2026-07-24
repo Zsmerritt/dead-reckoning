@@ -19,6 +19,13 @@ ALL_COMMANDS = [
     "PLR_NOISE_TEST",
     "PLR_DRAG_PROBE",
     "PLR_DRAG_CALIBRATE",
+    "PLR_WIZARD_START",
+    "PLR_WIZARD_DRYRUN",
+    "PLR_WIZARD_CONFIRM_CLEAN",
+    "PLR_WIZARD_EXECUTE",
+    "PLR_WIZARD_CANCEL",
+    "PLR_WIZARD_CLOSE",
+    "PLR_SETUP_WIZARD",
 ]
 
 
@@ -102,6 +109,63 @@ def test_persisted_autosave_options_read_back(plr_config):
     assert plugin.noise_floor_still_rms == 10.25
     assert plugin.noise_floor_peak == 88.0
     assert plugin.noise_floor_speed == 12.5
+
+
+def test_max_probe_nozzle_temp_default(plugin):
+    assert plugin.max_probe_nozzle_temp == 150.0
+
+
+def test_max_probe_nozzle_temp_override_parses(plr_config):
+    plugin = plr.load_config(plr_config(options={"max_probe_nozzle_temp": "120"}))
+    assert plugin.max_probe_nozzle_temp == 120.0
+
+
+@pytest.mark.parametrize("bad", ["79", "161", "0", "300"])
+def test_max_probe_nozzle_temp_out_of_range_rejected(plr_config, bad):
+    with pytest.raises(fake_klippy.FakeConfigError, match="max_probe_nozzle_temp"):
+        plr.load_config(plr_config(options={"max_probe_nozzle_temp": bad}))
+
+
+@pytest.mark.parametrize("edge", ["80", "160"])
+def test_max_probe_nozzle_temp_bounds_inclusive(plr_config, edge):
+    plugin = plr.load_config(plr_config(options={"max_probe_nozzle_temp": edge}))
+    assert plugin.max_probe_nozzle_temp == float(edge)
+
+
+def test_clean_nozzle_macro_default(plugin):
+    assert plugin.clean_nozzle_macro == "CLEAN_NOZZLE"
+    # good_sections() has no [gcode_macro CLEAN_NOZZLE].
+    assert plugin.clean_nozzle_macro_available is False
+
+
+def test_clean_nozzle_macro_detected_case_insensitively(plr_config):
+    plugin = plr.load_config(
+        plr_config(sections={"gcode_macro clean_nozzle": {"gcode": "M117 clean"}})
+    )
+    assert plugin.clean_nozzle_macro_available is True
+    assert plugin.get_status(100.0)["clean_nozzle_macro_available"] is True
+
+
+def test_clean_nozzle_macro_custom_name(plr_config):
+    plugin = plr.load_config(
+        plr_config(
+            options={"clean_nozzle_macro": "WIPE_TIP"},
+            sections={"gcode_macro WIPE_TIP": {"gcode": "M117 wipe"}},
+        )
+    )
+    assert plugin.clean_nozzle_macro == "WIPE_TIP"
+    assert plugin.clean_nozzle_macro_available is True
+
+
+def test_clean_nozzle_macro_missing_named_section_not_available(plr_config):
+    plugin = plr.load_config(
+        plr_config(
+            options={"clean_nozzle_macro": "WIPE_TIP"},
+            sections={"gcode_macro CLEAN_NOZZLE": {"gcode": "M117 x"}},
+        )
+    )
+    # A different macro is present, but not the configured one.
+    assert plugin.clean_nozzle_macro_available is False
 
 
 def test_noise_floor_defaults_none(plugin):
@@ -189,6 +253,8 @@ def test_get_status_shape_on_good_config(plugin):
         "attested": False,
         "probe_resolution": None,
         "daemon_alive": False,
+        "wizard_active": False,
+        "clean_nozzle_macro_available": False,
         "noise_floor_rms": None,
         "noise_floor_temp": None,
         "last_drag_result": None,

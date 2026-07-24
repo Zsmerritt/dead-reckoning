@@ -32,6 +32,8 @@ probe_method: tap
 #noise_floor_temp_sensor:
 #wal_dir: /var/lib/plrd/wal
 #control_socket: /var/lib/plrd/plrd.sock
+#max_probe_nozzle_temp: 150.0
+#clean_nozzle_macro: CLEAN_NOZZLE
 #probe_speed: 1.5
 #envelope_margin: 0.5
 #sag_allowance: 0.2
@@ -49,6 +51,8 @@ probe_method: tap
 | `noise_floor_temp_sensor` | none | sensor name | Optional klippy sensor object (e.g. `temperature_sensor chamber`) to read the current temperature from for the drag oracle's temperature covariate. When unset the covariate is skipped (no guessing). |
 | `wal_dir` | `/var/lib/plrd/wal` | path | plrd's WAL directory; the plugin reads `<wal_dir>/heartbeat.bin` as a recorder liveness hint. |
 | `control_socket` | `/var/lib/plrd/plrd.sock` | path | plrd's UNIX control socket for `PLR_STATUS`/`PLR_RECOVER`. |
+| `max_probe_nozzle_temp` | `150.0` | `[80, 160]` °C | Contact operations refuse while the extruder is hotter than this: the **target** strictly, the **measured** temperature with a 2 °C tolerance (so 151 °C probes fine at the default, 153 °C does not). A molten nozzle oozes onto the part and skews contact readings — see [Nozzle cleanliness](#nozzle-cleanliness). |
+| `clean_nozzle_macro` | `CLEAN_NOZZLE` | macro name | Name of the `[gcode_macro …]` recovery cleans the nozzle with before contact probing. Whether that macro exists selects auto-clean vs the wizard's manual clean-confirmation prompt — see [Nozzle cleanliness](#nozzle-cleanliness). |
 | `probe_speed` | `1.5` | `[1.0, 2.0]` mm/s | Recovery probe descent speed. |
 | `envelope_margin` | `0.5` | `>= 0` mm | Extra clearance around the reconstructed part envelope. |
 | `sag_allowance` | `0.2` | `>= 0` mm | Expected unpowered Z sag budget when matching the stop point. |
@@ -131,7 +135,14 @@ Commissioning report: every automated check with `[PASS]`/`[WARN]`/
   `[printer] minimum_z_position`);
 - accel chip sections detected (informational);
 - recorder heartbeat file fresh (**liveness hint only** — durability is
-  proven by plrd from the WAL at recovery time).
+  proven by plrd from the WAL at recovery time);
+- nozzle-cleanliness mode: whether a `[gcode_macro CLEAN_NOZZLE]` exists
+  (auto-clean) or the recovery wizard will ask for manual confirmation —
+  see [Nozzle cleanliness](#nozzle-cleanliness).
+
+`PLR_SETUP_WIZARD` walks the same report as an interactive prompt on
+supported clients (Mainsail/Fluidd/KlipperScreen/OctoApp), one button per
+remaining step — see [Recovery and setup wizards](#recovery-and-setup-wizards).
 
 The one thing software cannot check is whether your Z axis holds
 position unpowered (leadscrew printers generally do; belted-Z printers
@@ -188,7 +199,12 @@ standoff.
 - `SPEED` is the descent speed (defaults to the `[plr]` `probe_speed`).
 
 **This command moves the toolhead.** It refuses while a print is active,
-when unhomed, and for `probe_method: adxl_drag` (use `PLR_DRAG_PROBE`).
+when unhomed, for `probe_method: adxl_drag` (use `PLR_DRAG_PROBE`), and
+**while the nozzle is hot** (current *or* target above
+`max_probe_nozzle_temp`; cool it — `M104 S0` — and retry). The
+temperature gate is shared by all four contact commands (`PLR_TOUCH`,
+`PLR_PROBE_TEST`, `PLR_DRAG_PROBE`, `PLR_DRAG_CALIBRATE`); see
+[Nozzle cleanliness](#nozzle-cleanliness).
 On success the result surfaces in `get_status` as
 `last_touch_result: {median_z, range, samples_used, touches}` for plrd.
 If the touch budget is exhausted without a consensus, the error names
@@ -244,6 +260,90 @@ Power-loss recovery, driven by plrd:
   protocol has no multi-round confirmation dialogue. For a step-by-step
   recovery use the CLI: `plrd recover --execute --confirm --step`.
 
+### Recovery and setup wizards
+
+Two prompt-driven flows that render as interactive dialogs on clients
+that support Klipper's **action prompts** (see
+[Client support](#client-support-and-graceful-degradation) below) and
+degrade to plain console text everywhere else. **Prompts are sugar;
+console commands are the contract** — every prompt is paired with a
+plain-text line naming the exact console command that advances it, so
+you are never stuck on a client without prompt support.
+
+**`PLR_WIZARD_START`** opens the guided power-loss recovery flow. It asks
+plrd whether a recovery is pending (the `status` response's `pending`
+field: `null` for none, otherwise the pending-recovery record) and, if so,
+offers a dialog summarizing the interrupted print — file name, approximate
+progress, resume byte and crash classification, each shown only when the
+daemon actually reports it — with two choices:
+
+- **Attempt recovery** → `PLR_WIZARD_DRYRUN`: fetches and prints the full
+  recovery plan (no motion), then prompts the next step. It **asks
+  *"Is the nozzle clean?"*** — **Nozzle is clean**
+  (`PLR_WIZARD_CONFIRM_CLEAN`) or **abort** (`PLR_WIZARD_CANCEL`) —
+  unless *both* independent sources agree the nozzle is cleaned
+  automatically: plrd reports the plan does not need confirmation **and**
+  the plugin can see the configured `[gcode_macro CLEAN_NOZZLE]` section.
+  Only then does it skip to the execute prompt, which names that macro
+  section as the reason. In particular it **asks anyway** when:
+  - plrd is older (or the field is unreadable) and reports nothing about
+    cleaning — the unknown case takes the conservative branch;
+  - plrd says cleaning is automatic but no such macro is configured here
+    — the two sources disagree, and the prompt says so.
+
+  This asymmetry is deliberate: asking redundantly costs one click, while
+  skipping the check when nothing actually cleans the nozzle silently
+  corrupts the contact reading recovery depends on.
+- **`PLR_WIZARD_EXECUTE`** runs the plan — **the printer WILL MOVE** (all
+  motion is plrd's, over the control socket; the wizard itself never
+  issues g-code). On success it reports *resuming print*; a typed failure
+  prints the remediation from the daemon's report.
+- **`PLR_WIZARD_CANCEL`** dismisses the flow and resets at any point.
+
+A second `PLR_WIZARD_START` while a flow is active simply re-shows the
+current prompt; any daemon error resets the flow with a clear message.
+`get_status` exposes `wizard_active` so UIs can tell a flow is mid-run.
+plrd's boot announcement is expected to tell users to run
+`PLR_WIZARD_START` after a power loss (the announcement text is owned by
+the daemon).
+
+**`PLR_SETUP_WIZARD`** walks the commissioning report (the exact
+`PLR_SETUP` checks) as one dialog with a button per remaining step —
+attest self-locking Z, run the probe test (or, for drag machines, the
+noise test and drag calibrate), and finally `SAVE_CONFIG`. Each button
+fires the underlying command directly; those commands remain the single
+source of truth (and keep their own motion consent). Its **Close** button
+(`PLR_WIZARD_CLOSE`) dismisses the dialog, and re-running the command
+closes the previous dialog before opening a new one, so prompts never
+stack or linger.
+
+**`PLR_WIZARD_CLOSE`** closes whatever prompt is on screen. It is
+display-only: it will not abandon an in-flight recovery (use
+`PLR_WIZARD_CANCEL` for that; `PLR_WIZARD_START` re-shows the prompt).
+
+#### Client support and graceful degradation
+
+The action-prompt wire format is Mainsail's *Macro Prompts* spec
+(`// action:prompt_begin`, `prompt_text`, `prompt_button
+<label>|<gcode>|<color>`, `prompt_footer_button`, `prompt_show`,
+`prompt_end`).
+
+You do **not** need Klipper's `[respond]` module for these wizards. The
+Mainsail docs list it because their examples emit prompts from a
+`[gcode_macro]` using the `RESPOND` command; this plugin emits the same
+bytes directly from plugin code, so no config change is required.
+
+| client | support | what you get |
+| --- | --- | --- |
+| Mainsail ≥ 2.9.0 | full (verified) | interactive dialog, working buttons |
+| KlipperScreen | full (verified) | interactive dialog, working buttons |
+| Fluidd | **unverified** | assume console fallback unless your version shows the dialog |
+| OctoPrint / OctoApp | plain prompts only | the older Action Command Prompt protocol has no pipe-delimited fields, gcode, or colors, so our buttons render as inert literal text — **use the console commands** |
+
+On any client that does not render the dialog, the plain-text
+instructions printed beside every prompt carry the entire flow — they name
+the exact command for each choice, so nothing is unreachable.
+
 ### `PLR_NOISE_TEST [CHIP=] [SPEED=] [DURATION=2.0] START=1`
 
 Measures the accelerometer noise floor the drag oracle thresholds
@@ -286,7 +386,10 @@ oracle for `probe_method: adxl_drag`. Arguments default to the `[plr]`
 tunables; `CHIP` accepts quoted spaced names (`CHIP="adxl345 bed"`).
 Like Klipper's own `PROBE`, this command is a primitive and runs when
 typed — no `START=` consent parameter (the scripted multi-move
-diagnostics keep theirs). `MAX_SECONDS` (range `[30, 600]`) and
+diagnostics keep theirs). It still refuses while printing, unhomed, or
+**while the nozzle is hot** (the shared temperature gate — see
+[Nozzle cleanliness](#nozzle-cleanliness)); a gate refusal also sets
+`last_drag_error`. `MAX_SECONDS` (range `[30, 600]`) and
 `STALL_PASSES` (`>= 2`) are optional hardening bounds (see below);
 omitting them leaves the frozen `plrd` invocation contract unchanged.
 
@@ -391,7 +494,10 @@ false-triggers, running **entirely at a Z where contact is impossible**
 — so an over-sensitive candidate fails *safely*, as a false contact in
 clear air, never as a crash into a part. Requires `PLR_NOISE_TEST` first
 (it classifies against the real noise floor) and `START=1` consent;
-without `START=1` it prints the plan and moves nothing.
+without `START=1` it prints the plan and moves nothing. It shares the
+contact-operation **temperature gate** (refuses while the nozzle is hot —
+its clear-Z passes still drip; see
+[Nozzle cleanliness](#nozzle-cleanliness)).
 
 - `CLEAR_Z` (default: the current Z) must be **≥ 5 mm above** the
   kinematic Z floor, and the command **refuses to descend** to reach it:
@@ -412,6 +518,67 @@ without `START=1` it prints the plan and moves nothing.
 - If even the least sensitive knob false-triggers, that is **not an
   error**: it prints a copy-pasteable retry and a hint to re-run
   `PLR_NOISE_TEST` or check the accel mounting.
+
+## Nozzle cleanliness
+
+Every contact reading — a descending `tap`/`load_cell` touch **and** a
+lateral `adxl_drag` pass — is only as trustworthy as the nozzle tip. A
+bead of ooze or a drag of stringing changes where "contact" registers by
+tens of microns, and recovery trusts that height to re-establish Z
+against the part. Two mechanisms protect it:
+
+**1. The temperature gate (automatic, non-negotiable).** All four contact
+commands — `PLR_TOUCH`, `PLR_PROBE_TEST`, `PLR_DRAG_PROBE`,
+`PLR_DRAG_CALIBRATE` — refuse before any motion when the extruder is
+hotter than `max_probe_nozzle_temp` (default 150 °C, range `[80, 160]`).
+The *target* is checked too: a nozzle at 45 °C but commanded to 250 °C is
+already on its way up and is refused now, not after it melts onto the
+part. The drag passes run at a guaranteed-clear Z, but a molten nozzle
+still drips, so they are gated identically. Remediation is always in the
+refusal: **cool the nozzle below the limit (`M104 S0`) and wait**, then
+retry.
+
+The two comparisons are deliberately **asymmetric**, which is why a
+nozzle reading 151 °C still probes at the 150 °C default:
+
+- the **measured** temperature is allowed a **2 °C tolerance** — it
+  refuses only above `max_probe_nozzle_temp + 2`. Sensor noise and
+  ordinary PID overshoot put the reading a few tenths above whatever was
+  commanded, and recovery deliberately probes *at* this ceiling, so a
+  strict comparison would refuse the recovery plan's own probe command
+  mid-recovery;
+- the **target** is compared strictly, with no tolerance. A target above
+  the ceiling is an *intent* to get too hot, not measurement scatter, so
+  the tolerance never licenses commanding a hotter nozzle.
+
+**2. A clean tip (auto-macro or manual confirmation).** A cold nozzle can
+still carry dried filament. The recovery wizard makes cleanliness an
+explicit step:
+
+- If you configure a nozzle-cleaning macro and name it in
+  `clean_nozzle_macro` (default `CLEAN_NOZZLE`) **and** plrd's plan
+  reports that cleaning is handled automatically, the wizard skips the
+  question and the execute prompt names that macro section as the reason.
+  The convention is a `[gcode_macro CLEAN_NOZZLE]` that wipes/purges the
+  tip; the name is configurable so an existing wipe macro can be reused.
+- **In every other case the wizard asks** you to confirm the nozzle is
+  clean before executing (**Nozzle is clean** vs **It's dirty — abort**),
+  and says why it is asking: no macro is configured, plrd reported
+  nothing about cleaning (an older daemon), or plrd and the plugin
+  disagree about whether a macro exists.
+
+The skip therefore requires **both** independent sources to agree; an
+unknown or contradictory answer takes the conservative branch. That is
+deliberate — a redundant question costs one click, whereas skipping the
+check when nothing cleans the nozzle silently corrupts the reference
+measurement that recovery re-establishes Z from.
+
+`PLR_SETUP` reports which mode applies, and `get_status` exposes
+`clean_nozzle_macro_available` so UIs can surface it. Whether a plan
+actually requires the manual confirmation is decided by plrd (it knows
+the server-side park/purge configuration) and carried to the wizard as a
+plan flag; the plugin-side macro detection is the second, independent
+source and drives the report and status row.
 
 ## Commissioning in 5 console commands
 

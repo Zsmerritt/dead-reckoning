@@ -58,6 +58,263 @@ ACCEL_CHIP_PREFIXES = ("adxl345", "lis2dw", "lis3dh", "mpu9250", "icm20948")
 _PROBE_SECTION_BY_METHOD = {"tap": "probe", "load_cell": "load_cell_probe"}
 
 
+# ---------------------------------------------------------------------
+# Contact-operation nozzle-temperature gate (the shared safety helper)
+#
+# Every PLR command that can bring the nozzle to the part — PLR_TOUCH,
+# PLR_PROBE_TEST, PLR_DRAG_PROBE and PLR_DRAG_CALIBRATE — must refuse
+# while the nozzle is hot.  A molten nozzle oozes filament onto the part
+# and bed (a descending touch smears it; a drag pass runs at a clear Z
+# but a dripping nozzle still contaminates the surface it reads), and the
+# contact reading is only trustworthy from a clean, cold tip.  The gate
+# lives HERE, in exactly one function, and all four commands reach it
+# through their existing ready/motion-gate helpers
+# (touch_sequence.require_touch_ready and drag_probe.check_motion_gates),
+# so the threshold comparison is single-sourced — there is no duplicated
+# temperature logic to drift.
+#
+# Schema for the FROZEN [plr] ``max_probe_nozzle_temp`` key (parsed and
+# bounds-checked in plugin.py against these constants).
+MAX_PROBE_NOZZLE_TEMP_DEFAULT = 150.0
+MAX_PROBE_NOZZLE_TEMP_MIN = 80.0
+MAX_PROBE_NOZZLE_TEMP_MAX = 160.0
+
+# Tolerance applied to the MEASURED temperature only (never to the
+# target).  Ported from Cartographer3D's touch mode, which guards its own
+# max-temperature refusal exactly this way: MAX_TOUCH_TEMPERATURE_EPSILON
+# = 2.0 (src/cartographer/probe/touch_mode.py:34, pattern as of the 2025
+# rewrite layout), used at touch_mode.py:299-303 as
+# ``if nozzle_temperature > max_temp + EPSILON``.
+#
+# WHY THIS IS LOAD-BEARING, not cosmetic: plrd's recovery plan commands
+# ``probe_nozzle_temp`` (default 150.0) and verifies the extruder sits in
+# the clamped probe band before it sends PLR_TOUCH / PLR_DRAG_PROBE
+# (crates/plr-recovery/src/build.rs — PlanConfig::clamped_probe_max is
+# ``probe_temp_max.min(max_probe_nozzle_temp)``, i.e. exactly OUR
+# ceiling).  At that moment the target IS the ceiling and ordinary PID
+# overshoot puts the reading a few tenths above it.  Without this epsilon
+# the gate refuses the plan's own probe command after the shifted-frame
+# declaration — the frame is invalidated, execution is refused, and a
+# fresh dry run regenerates the same plan that fails the same way, wedging
+# recovery with the nozzle over the part.  See
+# tests/test_temp_gate.py::test_plan_commanded_probe_temperature_is_accepted.
+MAX_TOUCH_TEMPERATURE_EPSILON = 2.0
+
+
+def active_extruder(printer):
+    """The active extruder printer object, or ``None`` when there is none.
+
+    Prefers the toolhead's currently-selected extruder
+    (klippy/toolhead.py ``get_extruder`` returns the active
+    PrinterExtruder) — on a toolchanger that is the nozzle that will
+    actually reach the probe point — and falls back to the primary
+    ``extruder`` printer object.  Returns ``None`` on a machine with no
+    extruder/heater at all: there is nothing to ooze, so nothing to gate.
+    """
+    toolhead = printer.lookup_object("toolhead", None)
+    if toolhead is not None and hasattr(toolhead, "get_extruder"):
+        extruder = toolhead.get_extruder()
+        if extruder is not None and hasattr(extruder, "get_status"):
+            return extruder
+    extruder = printer.lookup_object("extruder", None)
+    if extruder is not None and hasattr(extruder, "get_status"):
+        return extruder
+    return None
+
+
+def nozzle_temperatures(printer):
+    """``(current, target)`` °C of the active extruder, or ``None``.
+
+    Reads the extruder's ``get_status``, which delegates to its heater
+    (klippy/heaters.py ``Heater.get_status`` reports ``temperature`` and
+    ``target``; klippy/kinematics/extruder.py ``get_status`` returns that
+    dict).  A missing field is read as ``0.0`` so a partially-populated
+    status can never hide heat.  ``None`` when no extruder is present or
+    neither field is reported.
+    """
+    extruder = active_extruder(printer)
+    if extruder is None:
+        return None
+    status = extruder.get_status(printer.get_reactor().monotonic())
+    current = status.get("temperature")
+    target = status.get("target")
+    if current is None and target is None:
+        return None
+    return (current or 0.0, target or 0.0)
+
+
+def nozzle_too_hot_message(printer, max_temp, command):
+    """Console refusal text when the nozzle is too hot for ``command`` to
+    bring it to the part, else ``None``.
+
+    Two ASYMMETRIC comparisons against the ``max_probe_nozzle_temp``
+    ceiling:
+
+    * the **measured** temperature refuses only above
+      ``max_temp + MAX_TOUCH_TEMPERATURE_EPSILON``.  The epsilon absorbs
+      sensor noise and PID overshoot around a temperature that was
+      legitimately commanded — including the one plrd's own recovery plan
+      commands right before it issues PLR_TOUCH / PLR_DRAG_PROBE (see the
+      constant's note).  It does NOT license running hotter on purpose.
+    * the **target** refuses strictly above ``max_temp``: a target over
+      the ceiling is an *intent* to get too hot, so a nozzle at 45 °C
+      already commanded to 250 °C is refused now, not after it melts onto
+      the part.  No legitimate plan ever sets such a target — plrd clamps
+      its own to ``min(probe_temp_max, max_probe_nozzle_temp)`` — so
+      there is nothing to tolerate here.
+
+    THE THRESHOLD COMPARISON LIVES ONLY HERE — the four contact commands
+    all reach it through their shared gate helpers, so there is nothing
+    to keep in sync.
+    """
+    temps = nozzle_temperatures(printer)
+    if temps is None:
+        return None
+    current, target = temps
+    measured_too_hot = current > max_temp + MAX_TOUCH_TEMPERATURE_EPSILON
+    target_too_hot = target > max_temp
+    if not measured_too_hot and not target_too_hot:
+        return None
+    if target_too_hot and not measured_too_hot:
+        detail = "extruder target %.0f°C is above the %d°C probing ceiling" % (
+            target,
+            max_temp,
+        )
+    else:
+        detail = "nozzle is %.0f°C (target %.0f°C), over the %d°C probing ceiling" % (
+            current,
+            target,
+            max_temp,
+        )
+    return (
+        "%s refused: %s — a hot nozzle oozes onto the part and skews "
+        "contact readings. Cool the nozzle below %d°C / M104 S0 and wait "
+        "for it to drop, then retry." % (command, detail, max_temp)
+    )
+
+
+def require_nozzle_cool(plugin, gcmd, command):
+    """Raise ``gcmd.error`` if the nozzle is too hot for ``command``.
+
+    The single call the contact-gate helpers make; keeps the refusal
+    one line at every call site while the comparison stays in
+    :func:`nozzle_too_hot_message`.
+    """
+    message = nozzle_too_hot_message(
+        plugin.printer, plugin.max_probe_nozzle_temp, command
+    )
+    if message:
+        raise gcmd.error(message)
+
+
+# ---------------------------------------------------------------------
+# Clean-nozzle detection (config lookup) + the PLR_SETUP mode row.
+
+_GCODE_MACRO_PREFIX = "gcode_macro "
+
+
+def gcode_macro_available(config, macro_name):
+    """True when a ``[gcode_macro <macro_name>]`` section is configured.
+
+    Klipper registers a gcode_macro's command as its section-name suffix
+    uppercased (klippy/extras/gcode_macro.py: the alias is
+    ``config.get_name().split()[1].upper()``), so macro names are
+    effectively case-insensitive — match the suffix that way.  Enumerated
+    via the same prefix scan klippy tooling uses
+    (klippy/configfile.py:124-126 ``get_prefix_sections``).
+    """
+    wanted = macro_name.strip().upper()
+    for section in config.get_prefix_sections(_GCODE_MACRO_PREFIX):
+        suffix = section.get_name()[len(_GCODE_MACRO_PREFIX) :].strip().upper()
+        if suffix == wanted:
+            return True
+    return False
+
+
+# plrd's DEFAULT lower bound of the probing band, °C.  Referenced only to
+# warn about a self-defeating ceiling (see below).  This plugin cannot
+# read plrd's config — the daemon owns that value and an operator may
+# have changed it — so every message built from this constant must
+# present it as plrd's default, never as a fact about this machine.
+PLRD_DEFAULT_PROBE_TEMP_MIN = 140.0
+
+
+def probe_temp_ceiling_check_result(plugin):
+    """PLR_SETUP row warning when ``max_probe_nozzle_temp`` is set so low
+    that recovery could never plan.
+
+    plrd probes in a band whose lower bound (``probe_temp_min``, default
+    140 °C) it clamps against our ceiling; a ceiling at or below that
+    bound leaves an empty band and the daemon refuses to build a plan at
+    all.  The plugin accepts the whole [80, 160] range at config time, so
+    without this row an operator who sets 100 would only discover it at
+    recovery time — the worst possible moment.
+
+    Deliberately a ``warn``, not a ``fail``: this plugin cannot read
+    plrd's config, so it does not KNOW the daemon's band; an operator who
+    lowered ``probe_temp_min`` to match has a perfectly valid setup.  The
+    wording says so.
+    """
+    ceiling = plugin.max_probe_nozzle_temp
+    if ceiling >= PLRD_DEFAULT_PROBE_TEMP_MIN:
+        return CheckResult(
+            "probe temp ceiling",
+            "pass",
+            "max_probe_nozzle_temp = %g °C" % (ceiling,),
+            "",
+        )
+    return CheckResult(
+        "probe temp ceiling",
+        "warn",
+        "max_probe_nozzle_temp = %g °C is below %g °C, plrd's DEFAULT "
+        "probe_temp_min (this plugin cannot read plrd's config, so the "
+        "daemon's actual lower bound may differ)"
+        % (ceiling, PLRD_DEFAULT_PROBE_TEMP_MIN),
+        "if plrd still uses its default band, recovery will refuse to plan "
+        "because the probing band is empty — either raise "
+        "max_probe_nozzle_temp to %g or above, or lower plrd's "
+        "probe_temp_min to match your ceiling" % (PLRD_DEFAULT_PROBE_TEMP_MIN,),
+    )
+
+
+def clean_nozzle_check_result(plugin):
+    """PLR_SETUP row naming which nozzle-cleanliness mode applies: an
+    auto-run clean macro, or the operator confirmation the wizard asks for.
+
+    Wording verified against the producer
+    (crates/plr-recovery/src/build.rs ``step_clean_nozzle``): the recovery
+    plan always contains a ``CleanNozzle`` phase; that step carries the
+    configured macro as its command when the ``[gcode_macro <name>]``
+    section exists, and carries NO command (raising the plan's
+    ``requires_clean_nozzle_confirmation``) when it does not.  Because it
+    is a plan STEP, it runs for every execution path — the wizard and a
+    plain ``PLR_RECOVER EXECUTE=1`` alike — so neither row promises
+    anything path-specific.
+
+    Informational only (a ``warn`` at most — the CLEAN_NOZZLE macro is a
+    convention, not a requirement, so its absence never blocks
+    COMMISSIONED)."""
+    macro = plugin.clean_nozzle_macro
+    if plugin.clean_nozzle_macro_available:
+        return CheckResult(
+            "clean nozzle",
+            "pass",
+            "auto: [gcode_macro %s] present — recovery's clean-nozzle step "
+            "calls it before contact probing (any recovery: wizard or "
+            "PLR_RECOVER EXECUTE=1)" % (macro,),
+            "",
+        )
+    return CheckResult(
+        "clean nozzle",
+        "warn",
+        "manual: no [gcode_macro %s] — recovery's clean-nozzle step runs no "
+        "command, so you are asked to confirm the nozzle is clean before "
+        "contact probing" % (macro,),
+        "add a [gcode_macro %s] that wipes/cleans the nozzle to automate this "
+        "(or just confirm cleanliness at the wizard prompt)" % (macro,),
+    )
+
+
 def check_force_move(config):
     """[force_move] must exist with enable_force_move on.
 
@@ -424,6 +681,24 @@ def calibration_check_results(plugin):
     return results
 
 
+def full_report_results(plugin):
+    """Every commissioning row, in report order.
+
+    The single assembly point for the report: static config checks, the
+    live recorder-heartbeat check, the persisted-calibration validity
+    rows, the probe-temperature ceiling sanity row, and the
+    nozzle-cleanliness mode row.  Shared by ``PLR_SETUP`` and
+    ``PLR_SETUP_WIZARD`` so a future check cannot appear in one and
+    silently go missing from the other.
+    """
+    results = list(plugin.static_check_results)
+    results.append(check_recorder_heartbeat(plugin.wal_dir))
+    results.extend(calibration_check_results(plugin))
+    results.append(probe_temp_ceiling_check_result(plugin))
+    results.append(clean_nozzle_check_result(plugin))
+    return results
+
+
 def cmd_PLR_SETUP(plugin, gcmd):
     """PLR_SETUP [ACCEPT_SELF_LOCKING_Z=1] — commissioning report."""
     if gcmd.get_int("ACCEPT_SELF_LOCKING_Z", 0):
@@ -439,13 +714,10 @@ def cmd_PLR_SETUP(plugin, gcmd):
             "and restart the printer."
         )
         return
-    results = list(plugin.static_check_results)
-    results.append(check_recorder_heartbeat(plugin.wal_dir))
-    # Persisted-calibration validity rows (fingerprint/version stamps): a
-    # stale calibration reports [FAIL] with the old-vs-new fingerprint.
-    results.extend(calibration_check_results(plugin))
     gcmd.respond_info(
-        format_report(results, plugin.self_locking_z, plugin.probe_method)
+        format_report(
+            full_report_results(plugin), plugin.self_locking_z, plugin.probe_method
+        )
     )
 
 

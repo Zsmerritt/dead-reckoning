@@ -390,3 +390,110 @@ def test_require_numpy_raises_caller_error_type(monkeypatch):
     monkeypatch.setattr(importlib.util, "find_spec", lambda name: None)
     with pytest.raises(FakeGCodeError, match="numpy is required"):
         setup_checks.require_numpy(error_type=FakeGCodeError)
+
+
+# --- clean-nozzle detection + PLR_SETUP mode row ----------------------
+
+
+def test_gcode_macro_available_case_insensitive(fake_printer):
+    config = make_config(
+        fake_printer, {"gcode_macro clean_nozzle": {"gcode": "M117 clean"}}
+    )
+    assert setup_checks.gcode_macro_available(config, "CLEAN_NOZZLE") is True
+    assert setup_checks.gcode_macro_available(config, "clean_nozzle") is True
+    assert setup_checks.gcode_macro_available(config, "OTHER") is False
+
+
+def test_gcode_macro_available_ignores_prefix_false_positive(fake_printer):
+    # A macro whose name merely starts with the wanted name must not match.
+    config = make_config(
+        fake_printer, {"gcode_macro clean_nozzle_v2": {"gcode": "M117 x"}}
+    )
+    assert setup_checks.gcode_macro_available(config, "clean_nozzle") is False
+
+
+def test_plr_setup_manual_clean_row_when_no_macro(plugin, run_cmd):
+    # good_sections() has no [gcode_macro CLEAN_NOZZLE]: manual mode.
+    report = run_cmd("PLR_SETUP").responses[-1]
+    assert "clean nozzle" in report
+    assert "manual" in report
+    assert "wizard" in report
+
+
+def test_plr_setup_auto_clean_row_when_macro_present(fake_printer, plr_config, run_cmd):
+    fake_printer.add_object("toolhead", fake_klippy.FakeToolhead())
+    fake_printer.add_object("idle_timeout", fake_klippy.FakeIdleTimeout())
+    plr.load_config(
+        plr_config(sections={"gcode_macro CLEAN_NOZZLE": {"gcode": "M117 clean"}})
+    )
+    report = run_cmd("PLR_SETUP").responses[-1]
+    assert "clean nozzle" in report
+    assert "auto:" in report
+    # An auto-clean row is a [PASS], never a blocker.
+    assert "[PASS] clean nozzle" in report
+
+
+# --- probe-temperature ceiling sanity row -----------------------------
+
+
+@pytest.mark.parametrize("ceiling", ["140", "150", "160"])
+def test_probe_temp_ceiling_at_or_above_plrd_default_passes(
+    fake_printer, plr_config, ceiling
+):
+    plugin = plr.load_config(plr_config(options={"max_probe_nozzle_temp": ceiling}))
+    res = setup_checks.probe_temp_ceiling_check_result(plugin)
+    assert res.verdict == "pass"
+    assert "max_probe_nozzle_temp" in res.detail
+
+
+@pytest.mark.parametrize("ceiling", ["80", "100", "139"])
+def test_probe_temp_ceiling_below_plrd_default_warns(fake_printer, plr_config, ceiling):
+    # plrd refuses to plan when its probing band is empty; the plugin
+    # accepts the whole [80,160] range, so warn at commissioning time
+    # rather than letting the operator find out during a recovery.
+    plugin = plr.load_config(plr_config(options={"max_probe_nozzle_temp": ceiling}))
+    res = setup_checks.probe_temp_ceiling_check_result(plugin)
+    assert res.verdict == "warn"
+    assert "refuse to plan" in res.hint
+    # Both remedies are offered: raise ours, or lower plrd's bound.
+    assert "raise" in res.hint and "probe_temp_min" in res.hint
+
+
+def test_probe_temp_ceiling_warning_does_not_claim_to_know_plrd_config(
+    fake_printer, plr_config
+):
+    # The plugin cannot read plrd's config: 140 must be presented as the
+    # daemon's DEFAULT, never as a fact about this machine.
+    plugin = plr.load_config(plr_config(options={"max_probe_nozzle_temp": "100"}))
+    res = setup_checks.probe_temp_ceiling_check_result(plugin)
+    assert "DEFAULT" in res.detail
+    assert "cannot read plrd's config" in res.detail
+    assert "may differ" in res.detail
+
+
+def test_probe_temp_ceiling_boundary_is_plrd_default(fake_printer, plr_config):
+    # Exactly at the default bound is fine (band is non-empty above it).
+    assert setup_checks.PLRD_DEFAULT_PROBE_TEMP_MIN == 140.0
+    plugin = plr.load_config(plr_config(options={"max_probe_nozzle_temp": "140"}))
+    assert setup_checks.probe_temp_ceiling_check_result(plugin).verdict == "pass"
+
+
+def test_plr_setup_shows_ceiling_warning_row(fake_printer, plr_config, run_cmd):
+    fake_printer.add_object("toolhead", fake_klippy.FakeToolhead())
+    fake_printer.add_object("idle_timeout", fake_klippy.FakeIdleTimeout())
+    plr.load_config(plr_config(options={"max_probe_nozzle_temp": "100"}))
+    report = run_cmd("PLR_SETUP").responses[-1]
+    assert "[WARN] probe temp ceiling" in report
+    # A caution, never a blocker: the row itself must not be a [FAIL]
+    # (the report's overall verdict here is driven by the absent
+    # heartbeat file, which is a separate, pre-existing check).
+    assert "[FAIL] probe temp ceiling" not in report
+
+
+def test_setup_wizard_shares_the_ceiling_row(fake_printer, plr_config, run_cmd):
+    # The shared assembly means the wizard cannot silently drop a row.
+    fake_printer.add_object("toolhead", fake_klippy.FakeToolhead())
+    fake_printer.add_object("idle_timeout", fake_klippy.FakeIdleTimeout())
+    plr.load_config(plr_config(options={"max_probe_nozzle_temp": "100"}))
+    joined = "\n".join(run_cmd("PLR_SETUP_WIZARD").responses)
+    assert "[WARN] probe temp ceiling" in joined

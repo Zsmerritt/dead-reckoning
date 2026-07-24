@@ -407,6 +407,7 @@ class FakeToolhead:
         position=(150.0, 150.0, 5.0, 0.0),
         position_min=None,
         max_accel=3000.0,
+        extruder=None,
     ):
         self.homed_axes = homed_axes
         self.position = list(position)
@@ -414,6 +415,10 @@ class FakeToolhead:
         self.moves = []
         self.wait_moves_calls = 0
         self.dwells = []
+        # Active extruder the toolhead reports (klippy/toolhead.py
+        # get_extruder returns the selected PrinterExtruder); None on a
+        # machine with no extruder wired for a test.
+        self._extruder = extruder
         self._last_move_time = 0.0
         # Velocity-limit surface (klippy/toolhead.py:503-550): max_accel
         # is reported in get_status and mutated by set_max_velocities,
@@ -443,6 +448,10 @@ class FakeToolhead:
 
     def get_position(self):
         return list(self.position)
+
+    def get_extruder(self):
+        # klippy/toolhead.py get_extruder returns the active extruder.
+        return self._extruder
 
     def manual_move(self, coord, speed):
         self.moves.append((list(coord), speed))
@@ -573,6 +582,32 @@ class FakePrintStats:
 
     def get_status(self, eventtime):
         return {"state": self.state}
+
+
+class FakeExtruder:
+    """Stands in for a PrinterExtruder's get_status surface.
+
+    klippy/kinematics/extruder.py ``get_status`` delegates to the
+    heater, and klippy/heaters.py ``Heater.get_status`` reports
+    ``temperature``/``target``/``power``; the nozzle-temperature gate
+    reads exactly those two fields.  ``target`` defaults to 0 (heater
+    off).  Set ``report`` to override the whole dict (e.g. to script a
+    status missing a field, for the defensive-read tests).
+    """
+
+    def __init__(self, temperature=25.0, target=0.0, report=None):
+        self.temperature = temperature
+        self.target = target
+        self._report = report
+
+    def get_status(self, eventtime):
+        if self._report is not None:
+            return dict(self._report)
+        return {
+            "temperature": self.temperature,
+            "target": self.target,
+            "power": 0.0,
+        }
 
 
 class FakeTempSensor:

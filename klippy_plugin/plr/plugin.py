@@ -46,6 +46,7 @@ from . import (
     setup_checks,
     touch_sequence,
     tunables,
+    wizard,
 )
 
 PROBE_METHODS = ["tap", "load_cell", "adxl_drag"]
@@ -82,6 +83,27 @@ class PLRPlugin:
         self.daemon = daemon_link.DaemonLink(self.control_socket)
         # --- tunables (schema + ranges live in tunables.TUNABLES) ---
         self.tunables = tunables.load_from_config(config)
+        # --- contact-operation nozzle-temperature gate --------------
+        # FROZEN [plr] key shared with plrd: every command that can bring
+        # the nozzle to the part refuses while the nozzle (current OR
+        # target) is hotter than this (setup_checks.nozzle_too_hot_message).
+        # getfloat's bounds reject an out-of-range printer.cfg value with
+        # klippy's standard error at config time.
+        self.max_probe_nozzle_temp = config.getfloat(
+            "max_probe_nozzle_temp",
+            setup_checks.MAX_PROBE_NOZZLE_TEMP_DEFAULT,
+            minval=setup_checks.MAX_PROBE_NOZZLE_TEMP_MIN,
+            maxval=setup_checks.MAX_PROBE_NOZZLE_TEMP_MAX,
+        )
+        # Name of the [gcode_macro ...] recovery runs to clean the nozzle
+        # before contact probing.  Whether that section EXISTS is cached
+        # here (config is immutable per klippy session) and drives both
+        # get_status and the PLR_SETUP mode row; the recovery wizard's
+        # clean-nozzle branch is driven instead by the daemon's plan flag.
+        self.clean_nozzle_macro = config.get("clean_nozzle_macro", "CLEAN_NOZZLE")
+        self.clean_nozzle_macro_available = setup_checks.gcode_macro_available(
+            config, self.clean_nozzle_macro
+        )
         # --- SAVE_CONFIG-persisted state (autosave block; defaults
         # keep a fresh install working before first SAVE_CONFIG) ------
         self.self_locking_z = config.getboolean("self_locking_z", False)
@@ -166,6 +188,10 @@ class PLRPlugin:
         # --- daemon_alive cache for get_status ----------------------
         self._daemon_alive = False
         self._daemon_alive_checked = None
+        # --- recovery/setup wizard state (single in-flight wizard) --
+        # Holds the prompt-driven recovery state machine; get_status
+        # surfaces wizard_active from it.
+        self.wizard = wizard.RecoveryWizard(self)
         # --- console commands ---------------------------------------
         self._register_commands()
 
@@ -206,6 +232,28 @@ class PLRPlugin:
         "entirely at a guaranteed-clear Z (requires START=1; moves the "
         "toolhead laterally only) and stage drag_sensitivity for SAVE_CONFIG"
     )
+    cmd_PLR_WIZARD_START_help = (
+        "Open the guided power-loss recovery wizard (prompts on supported "
+        "clients; console commands drive it everywhere)"
+    )
+    cmd_PLR_WIZARD_DRYRUN_help = (
+        "Wizard step: fetch and show the recovery plan (no motion)"
+    )
+    cmd_PLR_WIZARD_CONFIRM_CLEAN_help = (
+        "Wizard step: confirm the nozzle is clean and advance to the execute prompt"
+    )
+    cmd_PLR_WIZARD_EXECUTE_help = (
+        "Wizard step: execute the recovery plan (the printer WILL MOVE)"
+    )
+    cmd_PLR_WIZARD_CANCEL_help = "Wizard step: dismiss the recovery wizard and reset"
+    cmd_PLR_WIZARD_CLOSE_help = (
+        "Close the on-screen wizard prompt (display only; does not cancel an "
+        "in-flight recovery)"
+    )
+    cmd_PLR_SETUP_WIZARD_help = (
+        "Prompt-driven walk of the PLR commissioning report with a button "
+        "per remaining step"
+    )
 
     def _register_commands(self):
         gcode = self.printer.lookup_object("gcode")
@@ -222,6 +270,13 @@ class PLRPlugin:
             ("PLR_NOISE_TEST", noise_test.cmd_PLR_NOISE_TEST),
             ("PLR_DRAG_PROBE", drag_probe.cmd_PLR_DRAG_PROBE),
             ("PLR_DRAG_CALIBRATE", drag_calibrate.cmd_PLR_DRAG_CALIBRATE),
+            ("PLR_WIZARD_START", wizard.cmd_PLR_WIZARD_START),
+            ("PLR_WIZARD_DRYRUN", wizard.cmd_PLR_WIZARD_DRYRUN),
+            ("PLR_WIZARD_CONFIRM_CLEAN", wizard.cmd_PLR_WIZARD_CONFIRM_CLEAN),
+            ("PLR_WIZARD_EXECUTE", wizard.cmd_PLR_WIZARD_EXECUTE),
+            ("PLR_WIZARD_CANCEL", wizard.cmd_PLR_WIZARD_CANCEL),
+            ("PLR_WIZARD_CLOSE", wizard.cmd_PLR_WIZARD_CLOSE),
+            ("PLR_SETUP_WIZARD", wizard.cmd_PLR_SETUP_WIZARD),
         ]
         for name, func in commands:
             gcode.register_command(
@@ -410,6 +465,11 @@ class PLRPlugin:
             "attested": self.self_locking_z,
             "probe_resolution": self.probe_resolution,
             "daemon_alive": self._daemon_alive_now(eventtime),
+            # Recovery-wizard liveness so UIs can tell a prompt flow is
+            # mid-run, and whether the clean-nozzle step will auto-run a
+            # macro (server config permitting) or ask for confirmation.
+            "wizard_active": self.wizard.is_active(),
+            "clean_nozzle_macro_available": self.clean_nozzle_macro_available,
             "noise_floor_rms": self.noise_floor_rms,
             "noise_floor_temp": self.noise_floor_temp,
             "last_drag_result": self.last_drag_result,
