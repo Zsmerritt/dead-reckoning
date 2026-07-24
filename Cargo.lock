@@ -332,6 +332,13 @@ dependencies = [
 [[package]]
 name = "plr-reconstruct"
 version = "0.1.0"
+dependencies = [
+ "plr-gcode",
+ "plr-klipper",
+ "plr-wal",
+ "proptest",
+ "thiserror",
+]
 
 [[package]]
 name = "plr-recovery"
