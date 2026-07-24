@@ -8,5 +8,14 @@ license.workspace = true
 repository.workspace = true
 publish = false
 
+[dependencies]
+plr-gcode = { path = "../plr-gcode" }
+plr-klipper = { path = "../plr-klipper" }
+plr-wal = { path = "../plr-wal" }
+thiserror.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+
 [lints]
 workspace = true
