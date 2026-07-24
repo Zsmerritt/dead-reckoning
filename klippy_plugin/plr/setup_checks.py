@@ -58,6 +58,159 @@ ACCEL_CHIP_PREFIXES = ("adxl345", "lis2dw", "lis3dh", "mpu9250", "icm20948")
 _PROBE_SECTION_BY_METHOD = {"tap": "probe", "load_cell": "load_cell_probe"}
 
 
+# ---------------------------------------------------------------------
+# Contact-operation nozzle-temperature gate (the shared safety helper)
+#
+# Every PLR command that can bring the nozzle to the part — PLR_TOUCH,
+# PLR_PROBE_TEST, PLR_DRAG_PROBE and PLR_DRAG_CALIBRATE — must refuse
+# while the nozzle is hot.  A molten nozzle oozes filament onto the part
+# and bed (a descending touch smears it; a drag pass runs at a clear Z
+# but a dripping nozzle still contaminates the surface it reads), and the
+# contact reading is only trustworthy from a clean, cold tip.  The gate
+# lives HERE, in exactly one function, and all four commands reach it
+# through their existing ready/motion-gate helpers
+# (touch_sequence.require_touch_ready and drag_probe.check_motion_gates),
+# so the threshold comparison is single-sourced — there is no duplicated
+# temperature logic to drift.
+#
+# Schema for the FROZEN [plr] ``max_probe_nozzle_temp`` key (parsed and
+# bounds-checked in plugin.py against these constants).
+MAX_PROBE_NOZZLE_TEMP_DEFAULT = 150.0
+MAX_PROBE_NOZZLE_TEMP_MIN = 80.0
+MAX_PROBE_NOZZLE_TEMP_MAX = 160.0
+
+
+def active_extruder(printer):
+    """The active extruder printer object, or ``None`` when there is none.
+
+    Prefers the toolhead's currently-selected extruder
+    (klippy/toolhead.py ``get_extruder`` returns the active
+    PrinterExtruder) — on a toolchanger that is the nozzle that will
+    actually reach the probe point — and falls back to the primary
+    ``extruder`` printer object.  Returns ``None`` on a machine with no
+    extruder/heater at all: there is nothing to ooze, so nothing to gate.
+    """
+    toolhead = printer.lookup_object("toolhead", None)
+    if toolhead is not None and hasattr(toolhead, "get_extruder"):
+        extruder = toolhead.get_extruder()
+        if extruder is not None and hasattr(extruder, "get_status"):
+            return extruder
+    extruder = printer.lookup_object("extruder", None)
+    if extruder is not None and hasattr(extruder, "get_status"):
+        return extruder
+    return None
+
+
+def nozzle_temperatures(printer):
+    """``(current, target)`` °C of the active extruder, or ``None``.
+
+    Reads the extruder's ``get_status``, which delegates to its heater
+    (klippy/heaters.py ``Heater.get_status`` reports ``temperature`` and
+    ``target``; klippy/kinematics/extruder.py ``get_status`` returns that
+    dict).  A missing field is read as ``0.0`` so a partially-populated
+    status can never hide heat.  ``None`` when no extruder is present or
+    neither field is reported.
+    """
+    extruder = active_extruder(printer)
+    if extruder is None:
+        return None
+    status = extruder.get_status(printer.get_reactor().monotonic())
+    current = status.get("temperature")
+    target = status.get("target")
+    if current is None and target is None:
+        return None
+    return (current or 0.0, target or 0.0)
+
+
+def nozzle_too_hot_message(printer, max_temp, command):
+    """Console refusal text when the nozzle is too hot for ``command`` to
+    bring it to the part, else ``None``.
+
+    Gates on ``max(current, target)``: a nozzle at 45 °C already
+    *commanded* to 250 °C is on its way up and must be refused now, not
+    after it melts onto the part.  Strictly greater than ``max_temp``
+    refuses; at-or-below passes.  THE THRESHOLD COMPARISON LIVES ONLY
+    HERE — the four contact commands all reach it through their shared
+    gate helpers, so there is nothing to keep in sync.
+    """
+    temps = nozzle_temperatures(printer)
+    if temps is None:
+        return None
+    current, target = temps
+    if max(current, target) <= max_temp:
+        return None
+    return (
+        "%s refused: nozzle is %.0f°C (target %.0f°C) — a hot "
+        "nozzle oozes onto the part and skews contact readings. Cool the "
+        "nozzle below %d°C / M104 S0 and wait for it to drop, then retry."
+        % (command, current, target, max_temp)
+    )
+
+
+def require_nozzle_cool(plugin, gcmd, command):
+    """Raise ``gcmd.error`` if the nozzle is too hot for ``command``.
+
+    The single call the contact-gate helpers make; keeps the refusal
+    one line at every call site while the comparison stays in
+    :func:`nozzle_too_hot_message`.
+    """
+    message = nozzle_too_hot_message(
+        plugin.printer, plugin.max_probe_nozzle_temp, command
+    )
+    if message:
+        raise gcmd.error(message)
+
+
+# ---------------------------------------------------------------------
+# Clean-nozzle detection (config lookup) + the PLR_SETUP mode row.
+
+_GCODE_MACRO_PREFIX = "gcode_macro "
+
+
+def gcode_macro_available(config, macro_name):
+    """True when a ``[gcode_macro <macro_name>]`` section is configured.
+
+    Klipper registers a gcode_macro's command as its section-name suffix
+    uppercased (klippy/extras/gcode_macro.py: the alias is
+    ``config.get_name().split()[1].upper()``), so macro names are
+    effectively case-insensitive — match the suffix that way.  Enumerated
+    via the same prefix scan klippy tooling uses
+    (klippy/configfile.py:124-126 ``get_prefix_sections``).
+    """
+    wanted = macro_name.strip().upper()
+    for section in config.get_prefix_sections(_GCODE_MACRO_PREFIX):
+        suffix = section.get_name()[len(_GCODE_MACRO_PREFIX) :].strip().upper()
+        if suffix == wanted:
+            return True
+    return False
+
+
+def clean_nozzle_check_result(plugin):
+    """PLR_SETUP row naming which nozzle-cleanliness mode applies: an
+    auto-run clean macro, or the recovery wizard's manual confirmation.
+
+    Informational only (a ``warn`` at most — the CLEAN_NOZZLE macro is a
+    convention, not a requirement, so its absence never blocks
+    COMMISSIONED)."""
+    macro = plugin.clean_nozzle_macro
+    if plugin.clean_nozzle_macro_available:
+        return CheckResult(
+            "clean nozzle",
+            "pass",
+            "auto: [gcode_macro %s] present — recovery cleans the nozzle "
+            "before contact probing" % (macro,),
+            "",
+        )
+    return CheckResult(
+        "clean nozzle",
+        "warn",
+        "manual: no [gcode_macro %s] — the recovery wizard asks you to "
+        "confirm the nozzle is clean before contact probing" % (macro,),
+        "add a [gcode_macro %s] that wipes/cleans the nozzle to automate this "
+        "(or just confirm cleanliness at the wizard prompt)" % (macro,),
+    )
+
+
 def check_force_move(config):
     """[force_move] must exist with enable_force_move on.
 
@@ -444,6 +597,8 @@ def cmd_PLR_SETUP(plugin, gcmd):
     # Persisted-calibration validity rows (fingerprint/version stamps): a
     # stale calibration reports [FAIL] with the old-vs-new fingerprint.
     results.extend(calibration_check_results(plugin))
+    # Nozzle-cleanliness mode row (auto-macro vs manual wizard confirm).
+    results.append(clean_nozzle_check_result(plugin))
     gcmd.respond_info(
         format_report(results, plugin.self_locking_z, plugin.probe_method)
     )

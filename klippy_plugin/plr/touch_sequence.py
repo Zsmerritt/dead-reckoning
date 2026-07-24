@@ -36,6 +36,7 @@ from dataclasses import dataclass
 from itertools import combinations
 from math import ceil, isfinite
 
+from . import setup_checks
 from .probe_test import _print_active
 
 logger = logging.getLogger(__name__)
@@ -396,8 +397,10 @@ def require_touch_ready(plugin, gcmd, command):
     """Shared PLR_TOUCH / PLR_PROBE_TEST gates: refuse loudly, no motion.
 
     Same signals PLR_PROBE_TEST already uses: not a descending probe
-    method, no active print, xyz homed, and a probe object present.
-    Returns ``(toolhead, probe)`` when every gate passes.
+    method, no active print, a cool nozzle (the shared contact-operation
+    temperature gate, setup_checks.require_nozzle_cool), xyz homed, and a
+    probe object present.  Returns ``(toolhead, probe)`` when every gate
+    passes.
     """
     printer = plugin.printer
     if plugin.probe_method == "adxl_drag":
@@ -410,6 +413,7 @@ def require_touch_ready(plugin, gcmd, command):
             "%s refused: a print is active (it moves the toolhead); wait for "
             "the print to finish or cancel it" % (command,)
         )
+    setup_checks.require_nozzle_cool(plugin, gcmd, command)
     toolhead = printer.lookup_object("toolhead")
     eventtime = printer.get_reactor().monotonic()
     homed = toolhead.get_status(eventtime)["homed_axes"]

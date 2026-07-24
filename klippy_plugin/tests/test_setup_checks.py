@@ -390,3 +390,44 @@ def test_require_numpy_raises_caller_error_type(monkeypatch):
     monkeypatch.setattr(importlib.util, "find_spec", lambda name: None)
     with pytest.raises(FakeGCodeError, match="numpy is required"):
         setup_checks.require_numpy(error_type=FakeGCodeError)
+
+
+# --- clean-nozzle detection + PLR_SETUP mode row ----------------------
+
+
+def test_gcode_macro_available_case_insensitive(fake_printer):
+    config = make_config(
+        fake_printer, {"gcode_macro clean_nozzle": {"gcode": "M117 clean"}}
+    )
+    assert setup_checks.gcode_macro_available(config, "CLEAN_NOZZLE") is True
+    assert setup_checks.gcode_macro_available(config, "clean_nozzle") is True
+    assert setup_checks.gcode_macro_available(config, "OTHER") is False
+
+
+def test_gcode_macro_available_ignores_prefix_false_positive(fake_printer):
+    # A macro whose name merely starts with the wanted name must not match.
+    config = make_config(
+        fake_printer, {"gcode_macro clean_nozzle_v2": {"gcode": "M117 x"}}
+    )
+    assert setup_checks.gcode_macro_available(config, "clean_nozzle") is False
+
+
+def test_plr_setup_manual_clean_row_when_no_macro(plugin, run_cmd):
+    # good_sections() has no [gcode_macro CLEAN_NOZZLE]: manual mode.
+    report = run_cmd("PLR_SETUP").responses[-1]
+    assert "clean nozzle" in report
+    assert "manual" in report
+    assert "wizard" in report
+
+
+def test_plr_setup_auto_clean_row_when_macro_present(fake_printer, plr_config, run_cmd):
+    fake_printer.add_object("toolhead", fake_klippy.FakeToolhead())
+    fake_printer.add_object("idle_timeout", fake_klippy.FakeIdleTimeout())
+    plr.load_config(
+        plr_config(sections={"gcode_macro CLEAN_NOZZLE": {"gcode": "M117 clean"}})
+    )
+    report = run_cmd("PLR_SETUP").responses[-1]
+    assert "clean nozzle" in report
+    assert "auto:" in report
+    # An auto-clean row is a [PASS], never a blocker.
+    assert "[PASS] clean nozzle" in report

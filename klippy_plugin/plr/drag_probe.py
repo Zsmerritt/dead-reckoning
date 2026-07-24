@@ -68,7 +68,7 @@ convention.
 import collections
 import math
 
-from . import calibration_meta, classifier
+from . import calibration_meta, classifier, setup_checks
 from .probe_test import _print_active
 
 # Pass geometry: total back-and-forth path length in mm, centered on
@@ -219,12 +219,20 @@ def resolve_accel_chip(plugin, gcmd, chip_name):
 
 
 def check_motion_gates(plugin, gcmd, command):
-    """Shared invocation gates: refuse while printing / not homed.
+    """Shared invocation gates: refuse while printing / hot / not homed.
 
     Same signals as PLR_PROBE_TEST: print_stats state with idle_timeout
-    fallback (probe_test._print_active), and toolhead homed_axes
-    (klippy/toolhead.py:503-513 get_status merged with the kinematics
-    status, the signal probe.py:352-355 checks for z).
+    fallback (probe_test._print_active), the shared contact-operation
+    nozzle-temperature gate (setup_checks.require_nozzle_cool), and
+    toolhead homed_axes (klippy/toolhead.py:503-513 get_status merged
+    with the kinematics status, the signal probe.py:352-355 checks for
+    z).
+
+    Shared by PLR_DRAG_PROBE and PLR_DRAG_CALIBRATE, so both inherit the
+    temperature gate from this one place.  The drag passes run at a
+    guaranteed-clear Z (they never descend to the part), but a molten
+    nozzle still drips onto the surface it reads, so a hot nozzle is
+    refused here too — the same rule the descending touch commands apply.
     """
     printer = plugin.printer
     if _print_active(printer):
@@ -232,6 +240,7 @@ def check_motion_gates(plugin, gcmd, command):
             "%s refused: a print is active (it moves the toolhead); "
             "wait for the print to finish or cancel it" % (command,)
         )
+    setup_checks.require_nozzle_cool(plugin, gcmd, command)
     toolhead = printer.lookup_object("toolhead")
     eventtime = printer.get_reactor().monotonic()
     homed = toolhead.get_status(eventtime)["homed_axes"]
