@@ -79,7 +79,9 @@ def test_target_only_hot_refused():
     ext = fake_klippy.FakeExtruder(temperature=45.0, target=250.0)
     printer = _printer_with_extruder(ext)
     msg = setup_checks.nozzle_too_hot_message(printer, 150.0, "PLR_DRAG_PROBE")
-    assert msg is not None and "45°C" in msg and "250°C" in msg
+    assert msg is not None
+    # Target-only refusals name the offending target and the ceiling.
+    assert "250°C" in msg and "150°C" in msg
 
 
 def test_both_cool_allowed():
@@ -95,10 +97,57 @@ def test_exactly_at_threshold_allowed():
     assert setup_checks.nozzle_too_hot_message(printer, 150.0, "PLR_TOUCH") is None
 
 
-def test_one_over_threshold_refused():
-    ext = fake_klippy.FakeExtruder(temperature=150.5, target=0.0)
+# --- the measured/target asymmetry (carto MAX_TOUCH_TEMPERATURE_EPSILON)
+
+
+def test_plan_commanded_probe_temperature_is_accepted():
+    """The interlock this epsilon exists to protect.
+
+    plrd's recovery plan commands probe_nozzle_temp (default 150.0) and
+    verifies the extruder is in the clamped probe band, THEN sends
+    PLR_TOUCH / PLR_DRAG_PROBE.  At that instant target == our ceiling
+    exactly and the measured value sits a few tenths above it from
+    ordinary PID overshoot.  Refusing here would land AFTER the
+    shifted-frame declaration: the frame is invalidated, execution is
+    refused, and a fresh dry run rebuilds the same plan that fails
+    identically — recovery permanently wedged with the nozzle over the
+    part.  This pair MUST be accepted.
+    """
+    ext = fake_klippy.FakeExtruder(temperature=150.4, target=150.0)
     printer = _printer_with_extruder(ext)
-    assert setup_checks.nozzle_too_hot_message(printer, 150.0, "PLR_TOUCH") is not None
+    assert setup_checks.nozzle_too_hot_message(printer, 150.0, "PLR_TOUCH") is None
+    assert setup_checks.nozzle_too_hot_message(printer, 150.0, "PLR_DRAG_PROBE") is None
+
+
+@pytest.mark.parametrize(
+    "current,target,refused",
+    [
+        # Measured value: tolerated up to ceiling + epsilon (2.0)...
+        pytest.param(152.0, 150.0, False, id="152-at-epsilon-edge-allowed"),
+        pytest.param(153.0, 150.0, True, id="153-beyond-epsilon-refused"),
+        # ...target: strict, no tolerance at all.
+        pytest.param(150.0, 151.0, True, id="target-151-refused"),
+        pytest.param(150.0, 150.0, False, id="target-at-ceiling-allowed"),
+    ],
+)
+def test_epsilon_applies_to_measured_not_target(current, target, refused):
+    ext = fake_klippy.FakeExtruder(temperature=current, target=target)
+    printer = _printer_with_extruder(ext)
+    message = setup_checks.nozzle_too_hot_message(printer, 150.0, "PLR_TOUCH")
+    assert (message is not None) is refused, message
+
+
+def test_epsilon_matches_the_cartographer_constant():
+    # carto src/cartographer/probe/touch_mode.py:34.
+    assert setup_checks.MAX_TOUCH_TEMPERATURE_EPSILON == 2.0
+
+
+def test_target_only_refusal_names_the_target():
+    ext = fake_klippy.FakeExtruder(temperature=40.0, target=151.0)
+    printer = _printer_with_extruder(ext)
+    message = setup_checks.nozzle_too_hot_message(printer, 150.0, "PLR_TOUCH")
+    assert "target 151°C is above" in message
+    assert REFUSAL_PHRASE in message
 
 
 def test_threshold_honors_configured_max():

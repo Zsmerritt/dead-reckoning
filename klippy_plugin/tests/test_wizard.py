@@ -794,3 +794,90 @@ def test_setup_wizard_hides_attestation_when_already_attested(
     run_cmd("PLR_SETUP_WIZARD")
     lines = since()
     assert not any("Attest self-locking Z" in ln for ln in lines)
+
+
+# --- dialog termination: no wizard may leave a prompt open ------------
+
+
+def test_setup_wizard_offers_a_closing_footer_button(plugin, run_cmd, fake_printer):
+    gcode = fake_printer.lookup_object("gcode")
+    since = _new_responses(gcode)
+    run_cmd("PLR_SETUP_WIZARD")
+    lines = since()
+    # A dialog with no prompt_end path sits over the UI forever.
+    assert "action:prompt_footer_button Close|PLR_WIZARD_CLOSE" in lines
+    # ...and the plain-text fallback names it for prompt-less clients.
+    assert any(
+        "PLR_WIZARD_CLOSE" in ln and not ln.startswith("action:") for ln in lines
+    )
+
+
+def test_setup_wizard_closes_previous_dialog_before_reopening(
+    plugin, run_cmd, fake_printer
+):
+    run_cmd("PLR_SETUP_WIZARD")
+    gcode = fake_printer.lookup_object("gcode")
+    since = _new_responses(gcode)
+    run_cmd("PLR_SETUP_WIZARD")
+    lines = since()
+    # prompt_end precedes the new prompt_begin: prompts never stack.
+    assert lines[0] == "action:prompt_end"
+    assert lines.index("action:prompt_end") < lines.index(
+        "action:prompt_begin PLR commissioning"
+    )
+
+
+def test_wizard_close_emits_prompt_end(plugin, run_cmd, fake_printer):
+    run_cmd("PLR_SETUP_WIZARD")
+    gcode = fake_printer.lookup_object("gcode")
+    since = _new_responses(gcode)
+    run_cmd("PLR_WIZARD_CLOSE")
+    assert since() == ["action:prompt_end", "PLR: dialog closed."]
+
+
+def test_wizard_close_does_not_abandon_an_active_recovery(
+    plugin, run_cmd, fake_printer
+):
+    # Closing the dialog is display-only: an in-flight recovery survives,
+    # so a stray Close cannot silently drop the operator out of the flow.
+    plugin.daemon = FakeDaemon(responses={"status": _status_pending()})
+    run_cmd("PLR_WIZARD_START")
+    gcode = fake_printer.lookup_object("gcode")
+    since = _new_responses(gcode)
+    run_cmd("PLR_WIZARD_CLOSE")
+    lines = since()
+    assert lines[0] == "action:prompt_end"
+    assert any("still in progress" in ln for ln in lines)
+    assert plugin.wizard.is_active() is True
+    # ...and START re-shows it rather than starting a second flow.
+    run_cmd("PLR_WIZARD_START")
+    assert plugin.daemon.calls == [("status", None, daemon_link.STATUS_TIMEOUT)]
+
+
+@pytest.mark.parametrize(
+    "terminal",
+    [
+        pytest.param(["PLR_WIZARD_CANCEL"], id="cancel"),
+        pytest.param(["PLR_WIZARD_CLOSE"], id="close"),
+        pytest.param(
+            ["PLR_WIZARD_DRYRUN", "PLR_WIZARD_CONFIRM_CLEAN", "PLR_WIZARD_EXECUTE"],
+            id="execute",
+        ),
+    ],
+)
+def test_every_recovery_terminal_path_emits_prompt_end(
+    plugin, run_cmd, fake_printer, terminal
+):
+    plugin.daemon = FakeDaemon(
+        responses={
+            "status": _status_pending(),
+            "recover_dryrun": _dryrun(requires_clean_nozzle_confirmation=True),
+            "recover_execute": {"ok": True, "text": "done", "data": {}},
+        }
+    )
+    run_cmd("PLR_WIZARD_START")
+    gcode = fake_printer.lookup_object("gcode")
+    since = _new_responses(gcode)
+    for command in terminal:
+        run_cmd(command)
+    assert "action:prompt_end" in since()

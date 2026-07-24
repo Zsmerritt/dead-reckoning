@@ -79,6 +79,26 @@ MAX_PROBE_NOZZLE_TEMP_DEFAULT = 150.0
 MAX_PROBE_NOZZLE_TEMP_MIN = 80.0
 MAX_PROBE_NOZZLE_TEMP_MAX = 160.0
 
+# Tolerance applied to the MEASURED temperature only (never to the
+# target).  Ported from Cartographer3D's touch mode, which guards its own
+# max-temperature refusal exactly this way: MAX_TOUCH_TEMPERATURE_EPSILON
+# = 2.0 (src/cartographer/probe/touch_mode.py:34), used at
+# touch_mode.py:299-303 as ``if nozzle_temperature > max_temp + EPSILON``.
+#
+# WHY THIS IS LOAD-BEARING, not cosmetic: plrd's recovery plan commands
+# ``probe_nozzle_temp`` (default 150.0) and verifies the extruder sits in
+# the clamped probe band before it sends PLR_TOUCH / PLR_DRAG_PROBE
+# (crates/plr-recovery/src/build.rs — PlanConfig::clamped_probe_max is
+# ``probe_temp_max.min(max_probe_nozzle_temp)``, i.e. exactly OUR
+# ceiling).  At that moment the target IS the ceiling and ordinary PID
+# overshoot puts the reading a few tenths above it.  Without this epsilon
+# the gate refuses the plan's own probe command after the shifted-frame
+# declaration — the frame is invalidated, execution is refused, and a
+# fresh dry run regenerates the same plan that fails the same way, wedging
+# recovery with the nozzle over the part.  See
+# tests/test_temp_gate.py::test_plan_commanded_probe_temperature_is_accepted.
+MAX_TOUCH_TEMPERATURE_EPSILON = 2.0
+
 
 def active_extruder(printer):
     """The active extruder printer object, or ``None`` when there is none.
@@ -126,24 +146,49 @@ def nozzle_too_hot_message(printer, max_temp, command):
     """Console refusal text when the nozzle is too hot for ``command`` to
     bring it to the part, else ``None``.
 
-    Gates on ``max(current, target)``: a nozzle at 45 °C already
-    *commanded* to 250 °C is on its way up and must be refused now, not
-    after it melts onto the part.  Strictly greater than ``max_temp``
-    refuses; at-or-below passes.  THE THRESHOLD COMPARISON LIVES ONLY
-    HERE — the four contact commands all reach it through their shared
-    gate helpers, so there is nothing to keep in sync.
+    Two ASYMMETRIC comparisons against the ``max_probe_nozzle_temp``
+    ceiling:
+
+    * the **measured** temperature refuses only above
+      ``max_temp + MAX_TOUCH_TEMPERATURE_EPSILON``.  The epsilon absorbs
+      sensor noise and PID overshoot around a temperature that was
+      legitimately commanded — including the one plrd's own recovery plan
+      commands right before it issues PLR_TOUCH / PLR_DRAG_PROBE (see the
+      constant's note).  It does NOT license running hotter on purpose.
+    * the **target** refuses strictly above ``max_temp``: a target over
+      the ceiling is an *intent* to get too hot, so a nozzle at 45 °C
+      already commanded to 250 °C is refused now, not after it melts onto
+      the part.  No legitimate plan ever sets such a target — plrd clamps
+      its own to ``min(probe_temp_max, max_probe_nozzle_temp)`` — so
+      there is nothing to tolerate here.
+
+    THE THRESHOLD COMPARISON LIVES ONLY HERE — the four contact commands
+    all reach it through their shared gate helpers, so there is nothing
+    to keep in sync.
     """
     temps = nozzle_temperatures(printer)
     if temps is None:
         return None
     current, target = temps
-    if max(current, target) <= max_temp:
+    measured_too_hot = current > max_temp + MAX_TOUCH_TEMPERATURE_EPSILON
+    target_too_hot = target > max_temp
+    if not measured_too_hot and not target_too_hot:
         return None
+    if target_too_hot and not measured_too_hot:
+        detail = "extruder target %.0f°C is above the %d°C probing ceiling" % (
+            target,
+            max_temp,
+        )
+    else:
+        detail = "nozzle is %.0f°C (target %.0f°C), over the %d°C probing ceiling" % (
+            current,
+            target,
+            max_temp,
+        )
     return (
-        "%s refused: nozzle is %.0f°C (target %.0f°C) — a hot "
-        "nozzle oozes onto the part and skews contact readings. Cool the "
-        "nozzle below %d°C / M104 S0 and wait for it to drop, then retry."
-        % (command, current, target, max_temp)
+        "%s refused: %s — a hot nozzle oozes onto the part and skews "
+        "contact readings. Cool the nozzle below %d°C / M104 S0 and wait "
+        "for it to drop, then retry." % (command, detail, max_temp)
     )
 
 
@@ -187,7 +232,17 @@ def gcode_macro_available(config, macro_name):
 
 def clean_nozzle_check_result(plugin):
     """PLR_SETUP row naming which nozzle-cleanliness mode applies: an
-    auto-run clean macro, or the recovery wizard's manual confirmation.
+    auto-run clean macro, or the operator confirmation the wizard asks for.
+
+    Wording verified against the producer
+    (crates/plr-recovery/src/build.rs ``step_clean_nozzle``): the recovery
+    plan always contains a ``CleanNozzle`` phase; that step carries the
+    configured macro as its command when the ``[gcode_macro <name>]``
+    section exists, and carries NO command (raising the plan's
+    ``requires_clean_nozzle_confirmation``) when it does not.  Because it
+    is a plan STEP, it runs for every execution path — the wizard and a
+    plain ``PLR_RECOVER EXECUTE=1`` alike — so neither row promises
+    anything path-specific.
 
     Informational only (a ``warn`` at most — the CLEAN_NOZZLE macro is a
     convention, not a requirement, so its absence never blocks
@@ -197,15 +252,17 @@ def clean_nozzle_check_result(plugin):
         return CheckResult(
             "clean nozzle",
             "pass",
-            "auto: [gcode_macro %s] present — recovery cleans the nozzle "
-            "before contact probing" % (macro,),
+            "auto: [gcode_macro %s] present — recovery's clean-nozzle step "
+            "calls it before contact probing (any recovery: wizard or "
+            "PLR_RECOVER EXECUTE=1)" % (macro,),
             "",
         )
     return CheckResult(
         "clean nozzle",
         "warn",
-        "manual: no [gcode_macro %s] — the recovery wizard asks you to "
-        "confirm the nozzle is clean before contact probing" % (macro,),
+        "manual: no [gcode_macro %s] — recovery's clean-nozzle step runs no "
+        "command, so you are asked to confirm the nozzle is clean before "
+        "contact probing" % (macro,),
         "add a [gcode_macro %s] that wipes/cleans the nozzle to automate this "
         "(or just confirm cleanliness at the wizard prompt)" % (macro,),
     )
@@ -577,6 +634,22 @@ def calibration_check_results(plugin):
     return results
 
 
+def full_report_results(plugin):
+    """Every commissioning row, in report order.
+
+    The single assembly point for the report: static config checks, the
+    live recorder-heartbeat check, the persisted-calibration validity
+    rows, and the nozzle-cleanliness mode row.  Shared by ``PLR_SETUP``
+    and ``PLR_SETUP_WIZARD`` so a future check cannot appear in one and
+    silently go missing from the other.
+    """
+    results = list(plugin.static_check_results)
+    results.append(check_recorder_heartbeat(plugin.wal_dir))
+    results.extend(calibration_check_results(plugin))
+    results.append(clean_nozzle_check_result(plugin))
+    return results
+
+
 def cmd_PLR_SETUP(plugin, gcmd):
     """PLR_SETUP [ACCEPT_SELF_LOCKING_Z=1] — commissioning report."""
     if gcmd.get_int("ACCEPT_SELF_LOCKING_Z", 0):
@@ -592,15 +665,10 @@ def cmd_PLR_SETUP(plugin, gcmd):
             "and restart the printer."
         )
         return
-    results = list(plugin.static_check_results)
-    results.append(check_recorder_heartbeat(plugin.wal_dir))
-    # Persisted-calibration validity rows (fingerprint/version stamps): a
-    # stale calibration reports [FAIL] with the old-vs-new fingerprint.
-    results.extend(calibration_check_results(plugin))
-    # Nozzle-cleanliness mode row (auto-macro vs manual wizard confirm).
-    results.append(clean_nozzle_check_result(plugin))
     gcmd.respond_info(
-        format_report(results, plugin.self_locking_z, plugin.probe_method)
+        format_report(
+            full_report_results(plugin), plugin.self_locking_z, plugin.probe_method
+        )
     )
 
 

@@ -312,18 +312,37 @@ the daemon).
 attest self-locking Z, run the probe test (or, for drag machines, the
 noise test and drag calibrate), and finally `SAVE_CONFIG`. Each button
 fires the underlying command directly; those commands remain the single
-source of truth (and keep their own motion consent).
+source of truth (and keep their own motion consent). Its **Close** button
+(`PLR_WIZARD_CLOSE`) dismisses the dialog, and re-running the command
+closes the previous dialog before opening a new one, so prompts never
+stack or linger.
+
+**`PLR_WIZARD_CLOSE`** closes whatever prompt is on screen. It is
+display-only: it will not abandon an in-flight recovery (use
+`PLR_WIZARD_CANCEL` for that; `PLR_WIZARD_START` re-shows the prompt).
 
 #### Client support and graceful degradation
 
 The action-prompt wire format is Mainsail's *Macro Prompts* spec
 (`// action:prompt_begin`, `prompt_text`, `prompt_button
 <label>|<gcode>|<color>`, `prompt_footer_button`, `prompt_show`,
-`prompt_end`), which needs Klipper's `[respond]` module. Support:
-**Mainsail** ≥ 2.9.0 (native), **Fluidd** (macro prompts supported),
-**KlipperScreen** (dialog prompts, needs `[respond]`), **OctoApp**
-(action-command prompts). On any client that ignores the `action:` lines,
-the paired plain-text console instructions carry the entire flow.
+`prompt_end`).
+
+You do **not** need Klipper's `[respond]` module for these wizards. The
+Mainsail docs list it because their examples emit prompts from a
+`[gcode_macro]` using the `RESPOND` command; this plugin emits the same
+bytes directly from plugin code, so no config change is required.
+
+| client | support | what you get |
+| --- | --- | --- |
+| Mainsail ≥ 2.9.0 | full (verified) | interactive dialog, working buttons |
+| KlipperScreen | full (verified) | interactive dialog, working buttons |
+| Fluidd | **unverified** | assume console fallback unless your version shows the dialog |
+| OctoPrint / OctoApp | plain prompts only | the older Action Command Prompt protocol has no pipe-delimited fields, gcode, or colors, so our buttons render as inert literal text — **use the console commands** |
+
+On any client that does not render the dialog, the plain-text
+instructions printed beside every prompt carry the entire flow — they name
+the exact command for each choice, so nothing is unreachable.
 
 ### `PLR_NOISE_TEST [CHIP=] [SPEED=] [DURATION=2.0] START=1`
 

@@ -17,8 +17,8 @@ module emits is paired with plain-text fallback lines that name the exact
 console command which advances the flow, so a client without prompt
 support is never stuck.
 
-Action-prompt wire format (Mainsail "Macro Prompts" spec, requires
-Klipper's ``[respond]`` module; supported since Mainsail 2.9.0):
+Action-prompt wire format (Mainsail "Macro Prompts" spec, supported since
+Mainsail 2.9.0):
 
     // action:prompt_begin <headline>
     // action:prompt_text <text>
@@ -29,12 +29,28 @@ Klipper's ``[respond]`` module; supported since Mainsail 2.9.0):
 
 Colors: primary | secondary | info | warning | error (else a default).
 The plugin emits each action line through ``gcmd.respond_info``, which
-klippy prepends with the ``// `` transport prefix on every line
+klippy itself prepends with the ``// `` transport prefix on every line
 (klippy/gcode.py ``respond_info``) — byte-identical to what
 ``RESPOND TYPE=command MSG="action:..."`` puts on the wire
 (klippy/extras/respond.py maps TYPE=command to the ``//`` prefix).  The
 literal strings the tests assert are therefore the ``action:...`` payload
 without that prefix.
+
+NOTE — the ``[respond]`` module is NOT required for these wizards.  The
+Mainsail docs list it because their examples emit prompts from a
+``[gcode_macro]`` via the ``RESPOND`` command, which ``[respond]``
+provides; this module bypasses that by calling ``respond_info`` directly
+from plugin code.  Users need no config change.  (A prompt BUTTON that
+fires ``RESPOND ...`` would need it — which is why the buttons here fire
+``PLR_*`` commands instead.)
+
+Client support (verified July 2026): Mainsail >= 2.9.0 and KlipperScreen
+implement this full spec, including the pipe-delimited button fields.
+OctoPrint/OctoApp implement the older Action Command Prompt protocol
+(``prompt_begin`` / ``prompt_choice`` / ``prompt_button <text>`` /
+``prompt_show`` / ``prompt_end``) with NO pipe fields, gcode, or colors —
+a pipe-delimited button renders there as inert literal text, so the
+plain-console fallback is the working path on those clients.
 
 SAFETY INVARIANT: no wizard command ever sends motion g-code to the
 printer.  The ONLY machine motion a wizard triggers is the daemon's own
@@ -140,12 +156,21 @@ def _clean_flag(data):
     is absent, non-boolean, or otherwise unreadable.
 
     CONTRACT SOURCE — crates/plrd/src/ctrlsock.rs ``cmd_recover_dryrun``
-    returns ``data: {"outcome": <tag>}`` today; the frozen
-    ``requires_clean_nozzle_confirmation`` flag is being added by the Rust
-    side and may land either at the top level of ``data`` or nested under
-    a ``plan`` object.  Both are read, a valid boolean at the TOP LEVEL
-    winning over a nested one; anything else yields ``None`` for the
-    caller to resolve conservatively (see :func:`_clean_decision`).
+    emits ``data: {"outcome": <tag>, "requires_clean_nozzle_confirmation":
+    <bool>}``: the flag is TOP LEVEL, an explicit boolean, and present on
+    every outcome (``false`` when there is no plan).  It is set from
+    ``RecoveryPlan::requires_clean_nozzle_confirmation``, which
+    crates/plr-recovery/src/build.rs raises in the ``CleanNozzle`` phase
+    when no ``[gcode_macro <clean_nozzle_macro>]`` exists — that step
+    carries the macro call when it does exist, and no command when it
+    does not.
+
+    The nested ``data.plan.*`` spelling is still accepted as a fallback so
+    a future reshaping of the response cannot silently turn the
+    confirmation off; a valid boolean at the TOP LEVEL wins.  Anything
+    unreadable yields ``None`` for the caller to resolve conservatively
+    (see :func:`_clean_decision`) — which also covers any daemon older
+    than the field.
     """
     value = data.get(CLEAN_FLAG_KEY)
     if isinstance(value, bool):
@@ -394,11 +419,10 @@ class RecoveryWizard:
                 "PLR_WIZARD_START again."
             )
         data = resp.get("data", {})
-        # ctrlsock.rs cmd_recover_dryrun: data carries {"outcome": <tag>}
-        # today; the frozen clean-nozzle flag may arrive top level or
-        # nested under "plan" (see _clean_flag).  The branch is decided by
-        # BOTH the daemon flag and the plugin's own macro detection, and
-        # the unknown case asks (see _clean_decision).
+        # ctrlsock.rs cmd_recover_dryrun emits the clean-nozzle flag top
+        # level on every outcome (see _clean_flag).  The branch is decided
+        # by BOTH the daemon flag and the plugin's own macro detection,
+        # and the unknown case asks (see _clean_decision).
         macro = self.plugin.clean_nozzle_macro
         ask, reason = _clean_decision(
             _clean_flag(data), self.plugin.clean_nozzle_macro_available, macro
@@ -513,13 +537,14 @@ class RecoveryWizard:
         only, and it never touches the recovery state machine.
         """
         plugin = self.plugin
-        results = list(plugin.static_check_results)
-        results.append(setup_checks.check_recorder_heartbeat(plugin.wal_dir))
-        results.extend(setup_checks.calibration_check_results(plugin))
-        results.append(setup_checks.clean_nozzle_check_result(plugin))
+        # Close any dialog still on screen from a previous run before
+        # opening a new one, so re-running never stacks prompts.
+        gcmd.respond_info(action_prompt_end())
         gcmd.respond_info(
             setup_checks.format_report(
-                results, plugin.self_locking_z, plugin.probe_method
+                setup_checks.full_report_results(plugin),
+                plugin.self_locking_z,
+                plugin.probe_method,
             )
         )
 
@@ -565,16 +590,41 @@ class RecoveryWizard:
         for label, gcode, _color in buttons:
             fallbacks.append("  %s  ->  %s" % (label, gcode))
         fallbacks.append("  Persist everything  ->  SAVE_CONFIG")
+        fallbacks.append("  Close this dialog  ->  PLR_WIZARD_CLOSE")
 
         prompt = _Prompt(
             title="PLR commissioning",
             texts=texts,
             buttons=buttons,
-            footers=[("SAVE_CONFIG", "SAVE_CONFIG", "primary")],
+            # Every dialog needs a path that emits prompt_end, or it sits
+            # over the UI forever: SAVE_CONFIG restarts klippy (which
+            # tears the dialog down) and Close dismisses it explicitly.
+            footers=[
+                ("SAVE_CONFIG", "SAVE_CONFIG", "primary"),
+                ("Close", "PLR_WIZARD_CLOSE", None),
+            ],
             fallbacks=fallbacks,
         )
         # A standalone dialog: emit without touching recovery state.
         self._emit_prompt(gcmd, prompt)
+
+    def close(self, gcmd):
+        """PLR_WIZARD_CLOSE — dismiss whatever dialog is on screen.
+
+        Display-only: it emits ``prompt_end`` and deliberately does NOT
+        touch the recovery state machine, so closing the commissioning
+        dialog cannot silently abandon an in-flight recovery (dismiss that
+        with ``PLR_WIZARD_CANCEL``; ``PLR_WIZARD_START`` re-shows it).
+        """
+        gcmd.respond_info(action_prompt_end())
+        if self.is_active():
+            gcmd.respond_info(
+                "PLR: dialog closed. The recovery wizard is still in "
+                "progress — PLR_WIZARD_START re-shows it, PLR_WIZARD_CANCEL "
+                "dismisses it."
+            )
+        else:
+            gcmd.respond_info("PLR: dialog closed.")
 
 
 # --- console command entry points (wired in plr.plugin) --------------
@@ -608,3 +658,8 @@ def cmd_PLR_WIZARD_CANCEL(plugin, gcmd):
 def cmd_PLR_SETUP_WIZARD(plugin, gcmd):
     """PLR_SETUP_WIZARD — prompt-driven commissioning walk."""
     plugin.wizard.setup_wizard(gcmd)
+
+
+def cmd_PLR_WIZARD_CLOSE(plugin, gcmd):
+    """PLR_WIZARD_CLOSE — close the on-screen prompt (display only)."""
+    plugin.wizard.close(gcmd)

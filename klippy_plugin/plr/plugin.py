@@ -246,6 +246,10 @@ class PLRPlugin:
         "Wizard step: execute the recovery plan (the printer WILL MOVE)"
     )
     cmd_PLR_WIZARD_CANCEL_help = "Wizard step: dismiss the recovery wizard and reset"
+    cmd_PLR_WIZARD_CLOSE_help = (
+        "Close the on-screen wizard prompt (display only; does not cancel an "
+        "in-flight recovery)"
+    )
     cmd_PLR_SETUP_WIZARD_help = (
         "Prompt-driven walk of the PLR commissioning report with a button "
         "per remaining step"
@@ -271,6 +275,7 @@ class PLRPlugin:
             ("PLR_WIZARD_CONFIRM_CLEAN", wizard.cmd_PLR_WIZARD_CONFIRM_CLEAN),
             ("PLR_WIZARD_EXECUTE", wizard.cmd_PLR_WIZARD_EXECUTE),
             ("PLR_WIZARD_CANCEL", wizard.cmd_PLR_WIZARD_CANCEL),
+            ("PLR_WIZARD_CLOSE", wizard.cmd_PLR_WIZARD_CLOSE),
             ("PLR_SETUP_WIZARD", wizard.cmd_PLR_SETUP_WIZARD),
         ]
         for name, func in commands:
