@@ -22,9 +22,13 @@
 //!   word at all (`if e_per_move:`, line 173);
 //! * F, when present, is attached to every segment (lines 177-178).
 //!
-//! Divergence: Klipper happily produces unbounded segment counts; this
+//! Divergences: Klipper happily produces unbounded segment counts; this
 //! port refuses more than [`MAX_ARC_SEGMENTS`] to bound recovery-time
-//! memory (a sane sliced file stays far below it).
+//! memory (a sane sliced file stays far below it). Non-finite inputs
+//! are rejected with [`ArcError::NonFiniteInput`] instead of producing
+//! a garbage decomposition (see the variant docs). A successful return
+//! always contains at least one chord, matching Klipper's
+//! `max(1., ...)` segment rule.
 
 use serde::{Deserialize, Serialize};
 
@@ -50,6 +54,20 @@ pub enum ArcError {
     InvalidResolution {
         /// The rejected resolution value.
         value: f64,
+    },
+    /// An input coordinate, offset, or word is `nan`/`inf`.
+    ///
+    /// Divergence by necessity from Klipper: `CPython`'s `float('nan')`
+    /// would propagate into garbage chords that this port would then
+    /// return as a *successful* decomposition — silently wrong, which
+    /// this crate forbids. Unreachable via [`crate::state::GcodeState`]
+    /// (its parameter parsing already rejects non-finite values), but
+    /// `plan_arc` is public API and must be total on its own.
+    #[error("non-finite arc input: {field}")]
+    NonFiniteInput {
+        /// Which input field was non-finite (`current`, `target`,
+        /// `offset`, `e_param`, or `f_param`).
+        field: String,
     },
     /// The arc would decompose into more than [`MAX_ARC_SEGMENTS`]
     /// chords (divergence from Klipper, which has no cap).
@@ -157,13 +175,39 @@ pub struct ArcSegment {
     pub f: Option<f64>,
 }
 
+/// Reject non-finite inputs up front (see [`ArcError::NonFiniteInput`]):
+/// NaN poisons the segment-count arithmetic and would otherwise yield a
+/// successful garbage decomposition. After this check, `Ok` from
+/// [`plan_arc`] guarantees at least one chord (Klipper's `max(1, ...)`
+/// rule).
+fn reject_non_finite(req: &ArcRequest) -> Result<(), ArcError> {
+    let field: &'static str = if !req.current.iter().all(|v| v.is_finite()) {
+        "current"
+    } else if !req.target.iter().all(|v| v.is_finite()) {
+        "target"
+    } else if !(req.offset.0.is_finite() && req.offset.1.is_finite()) {
+        "offset"
+    } else if req.e_param.is_some_and(|v| !v.is_finite()) {
+        "e_param"
+    } else if req.f_param.is_some_and(|v| !v.is_finite()) {
+        "f_param"
+    } else {
+        return Ok(());
+    };
+    Err(ArcError::NonFiniteInput {
+        field: field.to_string(),
+    })
+}
+
 /// Decompose an arc into chords, replicating `planArc`
 /// (gcode_arcs.py:104-180) operation for operation.
 ///
 /// Mode validation (absolute-coordinates requirement, R rejection,
 /// offset-presence check) is the caller's job, mirroring Klipper's
 /// `_cmd_inner`; [`crate::state::GcodeState`] performs it before calling
-/// here. This function validates only what `planArc` itself relies on.
+/// here. This function validates what `planArc` itself relies on:
+/// resolution and input finiteness. A successful return always contains
+/// at least one chord.
 #[allow(clippy::similar_names)] // r_p/r_q etc. mirror the Klipper source names.
 pub fn plan_arc(req: &ArcRequest) -> Result<Vec<ArcSegment>, ArcError> {
     if req.resolution <= 0.0 || !req.resolution.is_finite() {
@@ -171,6 +215,7 @@ pub fn plan_arc(req: &ArcRequest) -> Result<Vec<ArcSegment>, ArcError> {
             value: req.resolution,
         });
     }
+    reject_non_finite(req)?;
     let (alpha, beta, helical) = req.plane.axes();
 
     // Radius vector from center to current location (lines 109-111).
@@ -455,6 +500,72 @@ mod tests {
                 Err(ArcError::InvalidResolution { .. })
             ));
         }
+    }
+
+    #[test]
+    fn non_finite_inputs_rejected_per_field() {
+        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let cases: Vec<(&str, ArcRequest)> = vec![
+                ("current", {
+                    let mut r = xy_request();
+                    r.current[0] = bad;
+                    r
+                }),
+                ("current", {
+                    let mut r = xy_request();
+                    r.current[3] = bad; // E component counts too
+                    r
+                }),
+                ("target", {
+                    let mut r = xy_request();
+                    r.target[2] = bad;
+                    r
+                }),
+                ("offset", {
+                    let mut r = xy_request();
+                    r.offset.0 = bad;
+                    r
+                }),
+                ("offset", {
+                    let mut r = xy_request();
+                    r.offset.1 = bad;
+                    r
+                }),
+                ("e_param", {
+                    let mut r = xy_request();
+                    r.e_param = Some(bad);
+                    r
+                }),
+                ("f_param", {
+                    let mut r = xy_request();
+                    r.f_param = Some(bad);
+                    r
+                }),
+            ];
+            for (field, req) in cases {
+                match plan_arc(&req) {
+                    Err(ArcError::NonFiniteInput { field: f }) => {
+                        assert_eq!(f, field, "wrong field for {bad}");
+                    }
+                    other => panic!("{field}={bad}: expected NonFiniteInput, got {other:?}"),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn huge_finite_inputs_stay_klipper_faithful() {
+        // Finite-but-overflowing geometry (radius -> inf, angular 0)
+        // lands in CPython's max(1., floor(nan)) == 1.0 path: a single
+        // chord snapped to the target. Klipper does the same; this is
+        // not rejected.
+        let mut req = xy_request();
+        req.offset = (1e308, 1e308);
+        req.target = [10.0, 0.0, 0.4];
+        req.current = [10.0, 0.0, 0.4, 0.0];
+        let segs = plan_arc(&req).unwrap();
+        assert_eq!(segs.len(), 1);
+        assert_eq!(segs.first().unwrap().target, [10.0, 0.0, 0.4]);
     }
 
     #[test]

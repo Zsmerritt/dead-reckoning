@@ -155,6 +155,50 @@ proptest! {
         }
     }
 
+    /// plan_arc is total over arbitrary f64 bit patterns (NaN and
+    /// infinities included): it never panics, and `Ok` always means at
+    /// least one chord (Klipper's `max(1, ...)` rule) computed from
+    /// all-finite inputs — never a silent garbage decomposition.
+    #[test]
+    fn plan_arc_total_over_arbitrary_bits(
+        bits in proptest::collection::vec(any::<u64>(), 12),
+        plane_sel in 0..3_usize,
+        clockwise in any::<bool>(),
+        absolute_extrude in any::<bool>(),
+        has_e in any::<bool>(),
+        has_f in any::<bool>(),
+    ) {
+        let v: Vec<f64> = bits.iter().copied().map(f64::from_bits).collect();
+        let plane = [ArcPlane::Xy, ArcPlane::Xz, ArcPlane::Yz][plane_sel];
+        let req = ArcRequest {
+            current: [v[0], v[1], v[2], v[3]],
+            target: [v[4], v[5], v[6]],
+            offset: (v[7], v[8]),
+            plane,
+            clockwise,
+            absolute_extrude,
+            e_param: has_e.then_some(v[9]),
+            f_param: has_f.then_some(v[10]),
+            resolution: v[11],
+        };
+        let inputs_finite = req.current.iter().all(|x| x.is_finite())
+            && req.target.iter().all(|x| x.is_finite())
+            && req.offset.0.is_finite()
+            && req.offset.1.is_finite()
+            && req.e_param.is_none_or(f64::is_finite)
+            && req.f_param.is_none_or(f64::is_finite);
+        if let Ok(segs) = plan_arc(&req) {
+            prop_assert!(!segs.is_empty(), "Ok with zero chords");
+            prop_assert!(inputs_finite, "Ok despite non-finite input");
+            prop_assert!(
+                req.resolution.is_finite() && req.resolution > 0.0,
+                "Ok despite invalid resolution"
+            );
+            // The final chord always lands exactly on the target.
+            prop_assert_eq!(segs.last().expect("nonempty").target, req.target);
+        }
+    }
+
     /// M220 never changes positions; G92 changes base_position only;
     /// M221 preserves the g-code E reading; G90/G91 round-trips.
     #[test]
