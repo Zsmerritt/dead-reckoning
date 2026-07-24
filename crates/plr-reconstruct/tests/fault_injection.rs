@@ -856,8 +856,9 @@ fn run_case(scenario: &Scenario) -> Result<(), TestCaseError> {
 }
 
 proptest! {
+    // Case count comes from ProptestConfig::default(), so
+    // PROPTEST_CASES can crank it up for soak runs (256 by default).
     #![proptest_config(ProptestConfig {
-        cases: 64,
         max_shrink_iters: 400,
         ..ProptestConfig::default()
     })]

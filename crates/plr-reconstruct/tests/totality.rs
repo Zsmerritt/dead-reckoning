@@ -230,11 +230,6 @@ fn any_config() -> impl Strategy<Value = ReconstructConfig> {
 }
 
 proptest! {
-    #![proptest_config(ProptestConfig {
-        cases: 128,
-        ..ProptestConfig::default()
-    })]
-
     /// `reconstruct` is total: for any records (hostile floats
     /// included), any scan end, any heartbeat-file bytes, any file
     /// tail, and any configuration, it returns a `Result` — it never
