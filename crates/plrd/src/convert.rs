@@ -967,8 +967,8 @@ mod tests {
         // interval and reverse-direction (negative) counts
         // (stepcompress.c:372), plus a set_position marker row.
         let batch: StepperBatch = serde_json::from_value(json!({
-            "data": [[-2136919700, 1, 0], [10000, 976, 0], [9855, -40, 187],
-                     [12000, -1, 0], [0, 0, 0]],
+            "data": [[-2_136_919_700, 1, 0], [10_000, 976, 0], [9855, -40, 187],
+                     [12_000, -1, 0], [0, 0, 0]],
             "start_position": 12.7,
             "start_mcu_position": -3175,
             "step_distance": 0.0025,
