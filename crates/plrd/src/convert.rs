@@ -583,14 +583,17 @@ fn full_gcode_state(gm: &GcodeMoveStatus) -> Option<GcodeState> {
     })
 }
 
-/// Klipper's `queue_step` wire format bounds these fields (`interval=%u
-/// count=%hu add=%hi`), so saturation is defensive only — it cannot fire
-/// on data a real MCU accepted.
+/// Passes a dump row through verbatim. The row fields are the signed C
+/// ints of Klipper's `struct pull_history_steps`
+/// (`klippy/chelper/stepcompress.h`): a negative `count` is a
+/// reverse-direction chunk (`stepcompress.c:372`) and a negative
+/// `interval` is a wrapped u32 tick count — both are real data the WAL
+/// must preserve, so no clamping is performed.
 fn step_chunk(step: &plr_klipper::StepperStep) -> StepChunk {
     StepChunk {
-        interval: u32::try_from(step.interval).unwrap_or(u32::MAX),
-        count: u16::try_from(step.count).unwrap_or(u16::MAX),
-        add: i16::try_from(step.add).unwrap_or(if step.add < 0 { i16::MIN } else { i16::MAX }),
+        interval: step.interval,
+        count: step.count,
+        add: step.add,
     }
 }
 
@@ -960,8 +963,12 @@ mod tests {
     #[test]
     fn stepper_batches_map_to_ranges_with_chunk_conversion() {
         let mut r = Recorder::new();
+        // Rows include real captured triple-Z values: a wrapped-u32
+        // interval and reverse-direction (negative) counts
+        // (stepcompress.c:372), plus a set_position marker row.
         let batch: StepperBatch = serde_json::from_value(json!({
-            "data": [[7457, 1, 0], [10000, 976, 0], [0, 0, 0]],
+            "data": [[-2_136_919_700, 1, 0], [10_000, 976, 0], [9855, -40, 187],
+                     [12_000, -1, 0], [0, 0, 0]],
             "start_position": 12.7,
             "start_mcu_position": -3175,
             "step_distance": 0.0025,
@@ -980,7 +987,7 @@ mod tests {
         assert_eq!(range.first_clock, 5_000_000_000);
         assert_eq!(range.last_clock, 5_009_862_855);
         assert_eq!(range.start_mcu_position, -3175);
-        assert_eq!(range.steps.len(), 3);
+        assert_eq!(range.steps.len(), 5);
         assert_eq!(
             (
                 range.steps[1].interval,
@@ -989,20 +996,30 @@ mod tests {
             ),
             (10_000, 976, 0)
         );
+        // Signed values pass through the conversion verbatim.
+        assert_eq!(range.steps[0].interval, -2_136_919_700);
+        assert_eq!(range.steps[2].count, -40);
+        assert_eq!(range.steps[2].add, 187);
+        assert_eq!(range.steps[3].count, -1);
+        assert_eq!((range.steps[4].interval, range.steps[4].count), (0, 0));
         // No est sample yet: no heartbeat claim.
         assert!(out.heartbeat.is_none());
     }
 
     #[test]
-    fn step_chunk_conversion_saturates_out_of_wire_range_values() {
+    fn step_chunk_conversion_preserves_signed_history_values() {
+        // Full i32 range must survive: these are the C `int` fields of
+        // struct pull_history_steps, not the MCU wire widths.
         let step: plr_klipper::StepperStep =
-            serde_json::from_value(json!([u64::from(u32::MAX) + 5, 70_000, -40_000])).unwrap();
+            serde_json::from_value(json!([i32::MIN, i32::MAX, -40_000])).unwrap();
         let chunk = super::step_chunk(&step);
-        assert_eq!(chunk.interval, u32::MAX);
-        assert_eq!(chunk.count, u16::MAX);
-        assert_eq!(chunk.add, i16::MIN);
-        let step: plr_klipper::StepperStep = serde_json::from_value(json!([1, 2, 40_000])).unwrap();
-        assert_eq!(super::step_chunk(&step).add, i16::MAX);
+        assert_eq!(chunk.interval, i32::MIN);
+        assert_eq!(chunk.count, i32::MAX);
+        assert_eq!(chunk.add, -40_000);
+        // A realistic reverse Z chunk keeps its sign exactly.
+        let step: plr_klipper::StepperStep = serde_json::from_value(json!([4964, -40, 0])).unwrap();
+        let chunk = super::step_chunk(&step);
+        assert_eq!((chunk.interval, chunk.count, chunk.add), (4964, -40, 0));
     }
 
     #[test]
