@@ -390,7 +390,13 @@ fn adhesion_passes(base_side: f64) -> (bool, f64) {
 }
 
 proptest! {
+    // Each case builds a full structural analysis (islands, rasters,
+    // distance transform, footprint trace), so the case count is
+    // lowered from the default 256 to keep the suite's runtime honest;
+    // the shrunk counterexamples that matter here are coordinate bit
+    // patterns, which the reduced count still finds.
     #![proptest_config(ProptestConfig {
+        cases: 64,
         failure_persistence: Some(Box::new(FileFailurePersistence::WithSource(
             "proptest-regressions",
         ))),
