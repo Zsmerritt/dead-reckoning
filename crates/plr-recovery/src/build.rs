@@ -743,7 +743,14 @@ fn step_probe(ctx: &Ctx<'_>) -> RecoveryStep {
         ProbeKind::AdxlDrag { chip } => (
             "ADXL drag probe (bounded fixed-Z staircase; the accelerometer hears the contact)",
             format!(
-                "PLR_DRAG_PROBE CHIP={chip} SPEED={} Z_STEP={} SENSITIVITY={}",
+                // CHIP is ALWAYS double-quoted: klippy's extended-command
+                // parser shlex-parses quoted values on every ingress path
+                // plrd uses (gcode.py `_get_extended_params` 145-151 +
+                // posix shlex 266-281), so spaced section names like
+                // `adxl345 bed` arrive intact — and quoting a space-free
+                // name is equally valid. Names quoting cannot carry are
+                // refused by validation (`machine::chip_embeddable`).
+                "PLR_DRAG_PROBE CHIP=\"{chip}\" SPEED={} Z_STEP={} SENSITIVITY={}",
                 fmt_num(ctx.cfg.drag_speed),
                 fmt_num(ctx.cfg.drag_z_step),
                 fmt_num(ctx.cfg.drag_sensitivity),
@@ -1100,6 +1107,32 @@ fn true_z_formula(
 }
 
 /// Appends the non-fatal planning observations.
+/// The noise floor is speed-specific: when the calibration speed is
+/// known (optional `[plr]` `noise_floor_speed`) and the plan's
+/// `drag_speed` strays more than 20% from it, warn — never refuse —
+/// so the operator re-runs `PLR_NOISE_TEST` at the current speed.
+/// Non-finite or non-positive recorded speeds are ignored (tolerant:
+/// the key is forward-looking metadata, not a gate). Contact-probe
+/// machines never check it.
+fn noise_floor_speed_warning(
+    machine: &ValidatedMachine,
+    noise_floor_speed: Option<f64>,
+    drag_speed: f64,
+) -> Option<PlanWarning> {
+    let ProbeKind::AdxlDrag { .. } = &machine.probe.kind else {
+        return None;
+    };
+    let calibrated_at = noise_floor_speed?;
+    let usable = calibrated_at.is_finite() && calibrated_at > 0.0;
+    if usable && (drag_speed - calibrated_at).abs() > 0.2 * calibrated_at {
+        return Some(PlanWarning::NoiseFloorSpeedMismatch {
+            calibrated_at,
+            drag_speed,
+        });
+    }
+    None
+}
+
 fn collect_warnings(
     context: &Context,
     bed_unknown: bool,
@@ -1255,6 +1288,11 @@ pub fn plan_recovery(
         resume.on_infill,
         &mut warnings,
     );
+    warnings.extend(noise_floor_speed_warning(
+        &machine,
+        inputs.machine.noise_floor_speed,
+        config.drag_speed,
+    ));
 
     let ctx = Ctx {
         cfg: config,

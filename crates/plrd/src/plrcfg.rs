@@ -88,10 +88,17 @@ pub struct PlrSettings {
     pub self_locking_z: bool,
     /// Autosaved probe resolution, mm; `None` before first calibration.
     pub probe_resolution: Option<f64>,
-    /// Every autosaved `noise_floor_*` option (the plugin's future
-    /// `PLR_NOISE_TEST` writes these). Non-empty means the noise floor
-    /// is calibrated.
+    /// Every autosaved `noise_floor_*` **measurement** (the plugin's
+    /// `PLR_NOISE_TEST` writes `noise_floor_rms` /
+    /// `noise_floor_still_rms` / `noise_floor_peak`). Non-empty means
+    /// the noise floor is calibrated. `noise_floor_speed` is metadata,
+    /// not a measurement, and is carried separately — it must never
+    /// make an uncalibrated machine look calibrated.
     pub noise_floor: BTreeMap<String, f64>,
+    /// OPTIONAL: drag speed the noise floor was measured at, mm/s
+    /// (`noise_floor_speed` — not yet staged by the plugin; tolerated
+    /// here for forward compatibility, absent → no speed check).
+    pub noise_floor_speed: Option<f64>,
 }
 
 /// Reads a required-or-defaulted f64 option.
@@ -131,12 +138,21 @@ impl PlrSettings {
             ));
         }
         let mut noise_floor = BTreeMap::new();
+        let mut noise_floor_speed = None;
         for (key, value) in plr {
             if let Some(_suffix) = key.strip_prefix("noise_floor_") {
                 let number = value
                     .as_f64()
                     .ok_or_else(|| format!("[plr] {key} is not a number: {value}"))?;
-                noise_floor.insert(key.clone(), number);
+                // The calibration speed is metadata about the
+                // measurements, not a measurement: keep it out of the
+                // calibrated-floor map (an uncalibrated machine with
+                // only a speed recorded must still refuse drag).
+                if key == "noise_floor_speed" {
+                    noise_floor_speed = Some(number);
+                } else {
+                    noise_floor.insert(key.clone(), number);
+                }
             }
         }
         let probe_resolution = match plr.get("probe_resolution") {
@@ -172,6 +188,7 @@ impl PlrSettings {
             self_locking_z,
             probe_resolution,
             noise_floor,
+            noise_floor_speed,
         })
     }
 
@@ -372,6 +389,7 @@ pub fn machine_from_settings(
         validated_config_hash: Some(LIVE_CONFIG_HASH.to_owned()),
         virtual_sdcard_root,
         noise_floor: plr.representative_noise_floor(),
+        noise_floor_speed: plr.noise_floor_speed,
     };
     (machine, notes)
 }
@@ -727,10 +745,16 @@ pub(crate) mod tests {
             ("accel_chip", json!("adxl345")),
             ("noise_floor_rms", json!(118.0)),
             ("noise_floor_peak", json!(410.0)),
+            ("noise_floor_speed", json!(20.0)),
         ]);
         assert_eq!(plr.noise_floor.get("noise_floor_rms").copied(), Some(118.0));
         assert_eq!(plr.representative_noise_floor(), Some(118.0));
+        // The calibration speed is metadata, carried separately —
+        // never part of the calibrated-floor map.
+        assert_eq!(plr.noise_floor_speed, Some(20.0));
+        assert!(!plr.noise_floor.contains_key("noise_floor_speed"));
         let (machine, _) = machine_from_settings(&snapshot.settings, &plr, true);
+        assert_eq!(machine.noise_floor_speed, Some(20.0));
         // probe_method is authoritative: the coexisting [probe]
         // section does not create a second probe object.
         assert_eq!(machine.probes.len(), 1);
@@ -746,11 +770,15 @@ pub(crate) mod tests {
 
     #[test]
     fn uncalibrated_drag_machine_fails_validation_with_the_hint() {
+        // A recorded calibration SPEED alone is not a calibration:
+        // the machine must still refuse drag.
         let (snapshot, plr) = parse_fixture(&[
             ("probe_method", json!("adxl_drag")),
             ("accel_chip", json!("adxl345")),
+            ("noise_floor_speed", json!(20.0)),
         ]);
         assert!(plr.noise_floor.is_empty());
+        assert_eq!(plr.noise_floor_speed, Some(20.0));
         let (machine, _) = machine_from_settings(&snapshot.settings, &plr, true);
         let rejection = validate_machine(&machine).unwrap_err();
         assert!(rejection
@@ -851,6 +879,7 @@ pub(crate) mod tests {
             ("self_locking_z", json!("yes"), "not a boolean"),
             ("accel_chip", json!(3), "not a string"),
             ("noise_floor_rms", json!("loud"), "not a number"),
+            ("noise_floor_speed", json!("fast"), "not a number"),
             ("probe_resolution", json!(false), "not a number"),
         ] {
             let result = query_result(configfile_status(&[(key, value)]), plr_object());

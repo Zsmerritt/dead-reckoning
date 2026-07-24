@@ -46,7 +46,9 @@ pub enum ProbeKind {
     /// ([`MachineConfig::noise_floor`], autosaved by `PLR_NOISE_TEST`).
     AdxlDrag {
         /// The accelerometer chip name (the `[plr]` `accel_chip`
-        /// setting), embedded verbatim in the `PLR_DRAG_PROBE` command.
+        /// setting), embedded double-quoted in the `PLR_DRAG_PROBE`
+        /// command (`CHIP="<chip>"` — spaced section names such as
+        /// `adxl345 bed` are supported; see `chip_embeddable`).
         chip: String,
     },
 }
@@ -118,6 +120,17 @@ pub struct MachineConfig {
     /// probe kind is [`ProbeKind::AdxlDrag`]; ignored otherwise.
     #[serde(default)]
     pub noise_floor: Option<f64>,
+    /// Drag speed the noise floor was measured at, mm/s (the OPTIONAL
+    /// `[plr]` `noise_floor_speed` autosave — not yet staged by the
+    /// plugin's `PLR_NOISE_TEST`; parsed tolerantly for forward
+    /// compatibility). The noise floor is speed-specific, so when this
+    /// is present and differs from the plan's `drag_speed` by more
+    /// than 20% the plan carries
+    /// [`crate::plan::PlanWarning::NoiseFloorSpeedMismatch`] — a
+    /// warning, never a refusal. `None` (the current plugin) checks
+    /// nothing.
+    #[serde(default)]
+    pub noise_floor_speed: Option<f64>,
 }
 
 /// One failed prerequisite check.
@@ -186,10 +199,14 @@ pub enum PrereqFailure {
     #[error("[virtual_sdcard] root directory is unknown")]
     SdcardRootUnknown,
     /// The ADXL drag probe has no usable accelerometer chip name:
-    /// empty, or containing characters that cannot be embedded in the
-    /// `PLR_DRAG_PROBE` command line (whitespace, quotes, `=`,
-    /// control characters).
-    #[error("accel_chip {chip:?} is empty or cannot be embedded in a command")]
+    /// empty, or containing characters that cannot survive the quoted
+    /// `PLR_DRAG_PROBE CHIP="<chip>"` embedding (double quotes,
+    /// backslashes, control characters — see `chip_embeddable`).
+    #[error(
+        "accel_chip {chip:?} is empty or cannot be embedded in a quoted \
+         command argument (double quotes, backslashes, and control \
+         characters are not representable)"
+    )]
     AccelChipInvalid {
         /// The offending chip name.
         chip: String,
@@ -229,20 +246,32 @@ pub struct MachineRejection {
     pub failures: Vec<PrereqFailure>,
 }
 
-/// `true` when a chip name can be embedded verbatim as a command
-/// argument (`PLR_DRAG_PROBE CHIP=<chip>`). Klipper's extended-command
-/// parameter parsing splits on whitespace and performs no unquoting, so
-/// whitespace, quotes, `=`, and control characters are all refused.
-/// Note this refuses multi-word chip names like `adxl345 bed`
-/// (Klipper's `[adxl345 bed]` sections), which the plugin's own
-/// `accel_chip` option otherwise permits — a documented v1 limitation
-/// of the command transport, reported as a prerequisite failure rather
-/// than mangled at execution time.
+/// `true` when a chip name can be embedded as a **quoted** command
+/// argument (`PLR_DRAG_PROBE CHIP="<chip>"`).
+///
+/// The plan always emits the CHIP value double-quoted: klippy's
+/// extended-command parser handles quoted values on every ingress path
+/// plrd uses (`klippy/gcode.py`, `_get_extended_params` at 145-151
+/// dispatches lines containing a quote to shlex, and 266-281 parses
+/// them posix-style — console, macros, and the `run_script` API path
+/// all arrive intact). Spaced section names like `adxl345 bed`
+/// (Klipper's `[adxl345 bed]` chips) are therefore fully supported,
+/// and quoting a space-free name is equally valid.
+///
+/// What quoting canNOT carry, and is refused here:
+///
+/// * a **double quote** in the name — it terminates the shlex quoted
+///   region, so the value cannot round-trip;
+/// * a **backslash** — inside posix double quotes shlex treats it as
+///   an escape character, so the name would arrive altered;
+/// * **control characters** — a newline would break the daemon's
+///   line-framed transcript/command stream before klippy ever saw it;
+/// * the empty string.
 fn chip_embeddable(chip: &str) -> bool {
     !chip.is_empty()
         && !chip
             .chars()
-            .any(|c| c.is_whitespace() || c.is_control() || matches!(c, '=' | '"' | '\''))
+            .any(|c| c.is_control() || matches!(c, '"' | '\\'))
 }
 
 /// Validates every machine prerequisite (design doc §1), collecting
@@ -371,6 +400,7 @@ mod tests {
             validated_config_hash: Some("abc".to_owned()),
             virtual_sdcard_root: Some("/home/pi/gcodes".to_owned()),
             noise_floor: None,
+            noise_floor_speed: None,
         }
     }
 
@@ -397,6 +427,7 @@ mod tests {
             validated_config_hash: None,
             virtual_sdcard_root: None,
             noise_floor: None,
+            noise_floor_speed: None,
         };
         let rejection = validate_machine(&config).unwrap_err();
         let f = &rejection.failures;
@@ -543,8 +574,10 @@ mod tests {
     }
 
     #[test]
-    fn drag_chip_must_be_embeddable() {
-        for bad in ["", "adxl345 hotend", "a=b", "a\"b", "a'b", "a\nb"] {
+    fn drag_chip_must_be_quote_embeddable() {
+        // Only names the quoted CHIP="..." transport cannot carry are
+        // refused: double quotes, backslashes, control chars, empty.
+        for bad in ["", "a\"b", "a\\b", "a\nb", "a\tb\x07"] {
             let mut config = drag_config();
             config.probes[0].kind = ProbeKind::AdxlDrag {
                 chip: bad.to_owned(),
@@ -558,8 +591,16 @@ mod tests {
                 "chip {bad:?}: {rejection:?}"
             );
         }
-        // Typical chip section names pass.
-        for ok in ["adxl345", "lis2dw", "adxl345_bed"] {
+        // Bare names AND spaced Klipper section names pass (klippy's
+        // shlex path parses the quoted value; see chip_embeddable).
+        for ok in [
+            "adxl345",
+            "lis2dw",
+            "adxl345_bed",
+            "adxl345 bed",
+            "a'b",
+            "a=b",
+        ] {
             let mut config = drag_config();
             config.probes[0].kind = ProbeKind::AdxlDrag {
                 chip: ok.to_owned(),

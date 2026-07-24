@@ -424,6 +424,54 @@ pub enum PlanWarning {
         /// The fan's WAL name.
         name: String,
     },
+    /// The ADXL noise floor was calibrated at a drag speed that
+    /// differs from the plan's `drag_speed` by more than 20% (the
+    /// noise floor is speed-specific: faster passes excite more
+    /// baseline vibration). A warning, not a refusal — the sensitivity
+    /// knob usually absorbs the difference — but the calibration
+    /// should be repeated at the current speed.
+    NoiseFloorSpeedMismatch {
+        /// Drag speed the noise floor was measured at, mm/s
+        /// (the `[plr]` `noise_floor_speed` autosave).
+        calibrated_at: f64,
+        /// The plan's `drag_speed`, mm/s.
+        drag_speed: f64,
+    },
+}
+
+impl PlanWarning {
+    /// Operator-facing one-line description (rendered into the plan).
+    #[must_use]
+    pub fn describe(&self) -> String {
+        match self {
+            PlanWarning::AdaptiveMeshNotRestorable => {
+                "active bed mesh has no saved profile (adaptive?); it will not be restored"
+                    .to_owned()
+            }
+            PlanWarning::SkewProfileUnknown => {
+                "skew correction was active but no profile name is known; skew is not restored"
+                    .to_owned()
+            }
+            PlanWarning::NoBedTarget => {
+                "no bed target found in the WAL or the file; the bed is left unheated".to_owned()
+            }
+            PlanWarning::ResumeNotOnInfill => {
+                "the resume point is not on infill; the seam may be visible".to_owned()
+            }
+            PlanWarning::UnrestorableFan { name } => {
+                format!("fan {name:?} has an unrecognized shape and is not restored")
+            }
+            PlanWarning::NoiseFloorSpeedMismatch {
+                calibrated_at,
+                drag_speed,
+            } => format!(
+                "noise floor was calibrated at {} mm/s but drag_speed is {} mm/s \
+                 (>20% apart); re-run PLR_NOISE_TEST at the current speed",
+                fmt_num(*calibrated_at),
+                fmt_num(*drag_speed)
+            ),
+        }
+    }
 }
 
 /// The complete, strictly ordered recovery plan.
@@ -622,7 +670,7 @@ impl RecoveryPlan {
             fmt_num(self.envelope.position_min),
         );
         for warning in &self.warnings {
-            let _ = writeln!(out, "# warning: {warning:?}");
+            let _ = writeln!(out, "# warning: {}", warning.describe());
         }
         for step in &self.steps {
             let _ = writeln!(

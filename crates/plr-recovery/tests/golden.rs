@@ -194,7 +194,7 @@ fn adxl_drag_recovery_matches_the_golden_plan() {
     let probe = plan.steps_in_phase(Phase::Probe).next().expect("probe");
     assert_eq!(
         probe.commands,
-        vec!["PLR_DRAG_PROBE CHIP=adxl345 SPEED=20 Z_STEP=0.05 SENSITIVITY=30"]
+        vec!["PLR_DRAG_PROBE CHIP=\"adxl345\" SPEED=20 Z_STEP=0.05 SENSITIVITY=30"]
     );
     assert!(probe
         .verify
@@ -228,6 +228,78 @@ fn adxl_drag_recovery_matches_the_golden_plan() {
     }
     let golden = std::fs::read_to_string(golden_path).expect("golden file (run with PLR_BLESS=1)");
     assert_eq!(rendered, golden.replace("\r\n", "\n"));
+}
+
+#[test]
+fn quoted_chip_carries_spaced_section_names() {
+    // A spaced Klipper accel section name rides intact inside the
+    // quoted CHIP value (klippy shlex-parses quoted extended-command
+    // values; see machine::chip_embeddable).
+    let mut machine = machine_adxl_drag();
+    machine.probes[0].kind = plr_recovery::ProbeKind::AdxlDrag {
+        chip: "adxl345 bed".to_owned(),
+    };
+    let plan = build_plan(&machine, plain_transforms());
+    let probe = plan.steps_in_phase(Phase::Probe).next().expect("probe");
+    assert_eq!(
+        probe.commands,
+        vec!["PLR_DRAG_PROBE CHIP=\"adxl345 bed\" SPEED=20 Z_STEP=0.05 SENSITIVITY=30"]
+    );
+}
+
+#[test]
+fn noise_floor_speed_mismatch_warns_but_never_refuses() {
+    // Calibrated at 10 mm/s, planned at 20 mm/s (default): 100% apart,
+    // far beyond the 20% band -> warning, plan still produced.
+    let mut machine = machine_adxl_drag();
+    machine.noise_floor_speed = Some(10.0);
+    let plan = build_plan(&machine, plain_transforms());
+    assert!(
+        plan.warnings.iter().any(|w| matches!(
+            w,
+            plr_recovery::PlanWarning::NoiseFloorSpeedMismatch {
+                calibrated_at,
+                drag_speed,
+            } if (*calibrated_at - 10.0).abs() < 1e-12 && (*drag_speed - 20.0).abs() < 1e-12
+        )),
+        "{:?}",
+        plan.warnings
+    );
+    // The rendered plan tells the operator what to do.
+    assert!(
+        plan.render().contains("re-run PLR_NOISE_TEST"),
+        "{}",
+        plan.render()
+    );
+
+    // Within 20% of the calibration speed: no warning.
+    let mut machine = machine_adxl_drag();
+    machine.noise_floor_speed = Some(18.0); // |20-18| = 2 <= 3.6
+    let plan = build_plan(&machine, plain_transforms());
+    assert!(
+        !plan
+            .warnings
+            .iter()
+            .any(|w| matches!(w, plr_recovery::PlanWarning::NoiseFloorSpeedMismatch { .. })),
+        "{:?}",
+        plan.warnings
+    );
+
+    // No recorded speed (today's plugin): nothing to check.
+    let plan = build_plan(&machine_adxl_drag(), plain_transforms());
+    assert!(!plan
+        .warnings
+        .iter()
+        .any(|w| matches!(w, plr_recovery::PlanWarning::NoiseFloorSpeedMismatch { .. })));
+
+    // A tap machine never checks it, even with a stray recorded speed.
+    let mut machine = machine_tap();
+    machine.noise_floor_speed = Some(1.0);
+    let plan = build_plan(&machine, plain_transforms());
+    assert!(!plan
+        .warnings
+        .iter()
+        .any(|w| matches!(w, plr_recovery::PlanWarning::NoiseFloorSpeedMismatch { .. })));
 }
 
 #[test]
