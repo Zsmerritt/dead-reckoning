@@ -1223,7 +1223,7 @@ fn probe_target_leaves_headroom_below_the_contact_ceiling() {
 /// PLUGIN's real value rather than a local copy of it.
 ///
 /// `Err(reason)` distinguishes the two ways this can be unavailable —
-/// file absent vs. constant not yet present in it — so the skip message
+/// file unreadable vs. constant missing from it — so the failure message
 /// states which, instead of guessing.
 fn plugin_touch_temperature_epsilon() -> Result<f64, String> {
     const CONST_NAME: &str = "MAX_TOUCH_TEMPERATURE_EPSILON";
@@ -1237,8 +1237,8 @@ fn plugin_touch_temperature_epsilon() -> Result<f64, String> {
         .find(|l| l.trim_start().starts_with(CONST_NAME))
         .ok_or_else(|| {
             format!(
-                "{} exists but defines no {CONST_NAME} (the plugin's temperature gate \
-                 lands with the recovery-wizard branch)",
+                "{} exists but defines no {CONST_NAME} — the plugin's contact temperature \
+                 gate must keep this constant for plrd to pin against",
                 path.display()
             )
         })?;
@@ -1257,23 +1257,22 @@ fn plugin_touch_temperature_epsilon() -> Result<f64, String> {
         .map_err(|e| format!("{CONST_NAME} value {value:?} is not a number: {e}"))
 }
 
-/// The cross-language tolerance pin, as a test that can be SEEN not to
-/// have run.
+/// The cross-language tolerance pin must be VERIFIABLE, not merely
+/// satisfied.
 ///
 /// `probe_temperature_bounds_stay_in_lockstep_with_the_plugin` asserts the
-/// pin whenever the plugin constant is readable, but when it is not that
-/// assertion silently has nothing to do — and a gate that cannot be seen
-/// to have not-run is the same class of problem as a guard that cannot
-/// fire. This test therefore FAILS whenever the pin is unverifiable, and
-/// carries `#[ignore]` while `klippy_plugin` has no
-/// `MAX_TOUCH_TEMPERATURE_EPSILON` (it lands with `feat/recovery-wizard`),
-/// so every `cargo test` run reports it as `ignored` rather than `ok`.
+/// pin whenever the plugin constant is readable — but if the constant ever
+/// becomes unreadable (the file moves, is renamed, or the definition is
+/// deleted) that assertion silently has nothing to do, and a gate that
+/// cannot be seen to have not-run is the same class of problem as a guard
+/// that cannot fire. This test closes that hole by FAILING whenever the
+/// pin cannot be evaluated at all.
 ///
-/// **When the wizard branch merges, delete the `#[ignore]`.** The test
-/// then passes on its own, and the pin is enforced from both directions.
+/// Together the two tests enforce the contract from both directions: this
+/// one proves the plugin's `MAX_TOUCH_TEMPERATURE_EPSILON` is still
+/// reachable, and the other proves it still agrees with
+/// [`plr_recovery::PROBE_TEMP_MEASURED_TOLERANCE`].
 #[test]
-#[ignore = "klippy_plugin has no MAX_TOUCH_TEMPERATURE_EPSILON yet (lands with \
-            feat/recovery-wizard); remove this #[ignore] once it does"]
 fn plugin_tolerance_pin_is_live() {
     match plugin_touch_temperature_epsilon() {
         Ok(plugin_epsilon) => assert!(
@@ -1283,8 +1282,11 @@ fn plugin_tolerance_pin_is_live() {
         ),
         Err(reason) => panic!(
             "the cross-language tolerance pin is NOT verifiable: {reason}. \
-             plr-recovery's PROBE_TEMP_MEASURED_TOLERANCE is {}, and nothing currently \
-             checks it against the plugin's MAX_TOUCH_TEMPERATURE_EPSILON.",
+             plr-recovery's PROBE_TEMP_MEASURED_TOLERANCE is {}, and with the plugin's \
+             constant unreadable NOTHING checks the two against each other — \
+             `probe_temperature_bounds_stay_in_lockstep_with_the_plugin` silently has \
+             nothing to compare and would pass. Restore the constant (or fix this \
+             test's path to it) rather than deleting this test.",
             plr_recovery::PROBE_TEMP_MEASURED_TOLERANCE
         ),
     }
@@ -1305,10 +1307,11 @@ fn plugin_tolerance_pin_is_live() {
 /// a hotter commanded target is not.
 #[test]
 fn probe_temperature_bounds_stay_in_lockstep_with_the_plugin() {
-    // When the plugin defines the constant, the pin is LIVE and bites
-    // here automatically — no flag to flip, no test to un-ignore. When it
-    // does not, `plugin_tolerance_pin_is_live` (below, `#[ignore]`d)
-    // reports the pending state visibly in every `cargo test` summary.
+    // The plugin defines the constant on main, so this pin is LIVE: it
+    // compares against the plugin's real value and fails on divergence.
+    // `plugin_tolerance_pin_is_live` (above) separately guarantees the
+    // constant stays READABLE, so this `if let` can never silently become
+    // a no-op.
     if let Ok(plugin_epsilon) = plugin_touch_temperature_epsilon() {
         assert!(
             (plr_recovery::PROBE_TEMP_MEASURED_TOLERANCE - plugin_epsilon).abs() < 1e-12,
