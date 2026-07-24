@@ -8,6 +8,13 @@
 //!
 //! # Ordering deviations, documented
 //!
+//! * The restore step (§8.9) begins with a bounded **relative Z lift**
+//!   off the part: after `PROBE SAMPLES=1` the nozzle rests pressed
+//!   against layer N−1 plastic, and the restore step's print
+//!   temperature verification polls for minutes — a nozzle dwelling at
+//!   print temperature against the part would melt a divot. The lift
+//!   moves in the safe direction (away from the part) inside the
+//!   already-declared true frame.
 //! * The final feedrate (`G1 F<raw>`) is emitted in the restore step
 //!   (§8.9) **and re-asserted at the end of the entry step**, because
 //!   the entry moves carry their own `F` words which would otherwise
@@ -786,7 +793,17 @@ fn step_final_declare(ctx: &Ctx<'_>) -> RecoveryStep {
 
 fn step_restore_frame(ctx: &Ctx<'_>) -> RecoveryStep {
     let g = &ctx.gcode;
+    // After the probe the nozzle rests pressed against layer N−1. It
+    // must lift off *before* the print temperature is restored — the
+    // temperature verification below polls for minutes, and a nozzle
+    // dwelling at print temperature against plastic melts a divot. The
+    // lift is a bounded relative move in the safe direction (away from
+    // the part), never less than 0.5 mm.
+    let lift = ctx.cfg.entry_hop.max(0.5);
     let mut commands = vec![
+        "G91".to_owned(),
+        format!("G1 Z{} F{}", fmt_num(lift), fmt_num(ctx.cfg.entry_feed)),
+        "G90".to_owned(),
         format!(
             "SET_GCODE_OFFSET X={} Y={} Z={}",
             fmt_num(g.origin[0]),
@@ -846,7 +863,7 @@ fn step_restore_frame(ctx: &Ctx<'_>) -> RecoveryStep {
     }
     step(
         Phase::RestoreFrame,
-        "replay offsets, factors, skew, print temperatures, fans, feedrate",
+        "lift off the part, then replay offsets, factors, skew, print temperatures, fans, feedrate",
         commands,
         vec![],
         verify,

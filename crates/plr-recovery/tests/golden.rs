@@ -112,6 +112,26 @@ fn normal_tap_recovery_matches_the_golden_plan() {
     assert_eq!(plan.resume_offset, resume_offset());
     assert_eq!(plan.resume_file, "part.gcode");
 
+    // The restore step lifts off the part (bounded relative Z, safe
+    // direction) BEFORE any print-temperature command: the nozzle must
+    // not dwell at print temperature pressed against the plastic.
+    let restore = plan
+        .steps_in_phase(Phase::RestoreFrame)
+        .next()
+        .expect("restore step");
+    assert_eq!(restore.commands[0], "G91");
+    assert!(restore.commands[1].starts_with("G1 Z"));
+    assert_eq!(restore.commands[2], "G90");
+    let first_heat = restore
+        .commands
+        .iter()
+        .position(|c| c.starts_with("M104") || c.starts_with("M140"))
+        .expect("restore sets print temps");
+    assert!(
+        first_heat > 2,
+        "lift must precede print-temperature restore"
+    );
+
     // The Tap probe uses the raw trigger Z.
     let probe_declare = plan
         .steps_in_phase(Phase::TrueZDeclare)

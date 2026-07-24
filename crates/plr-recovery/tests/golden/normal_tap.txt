@@ -51,7 +51,10 @@
       ok?:  toolhead.homed_axes contains "z"
       ok?:  toolhead.position.2 within 0.05 of the computed true Z
       fail: abort (final-declare-failed)
-10. [restore-frame] replay offsets, factors, skew, print temperatures, fans, feedrate
+10. [restore-frame] lift off the part, then replay offsets, factors, skew, print temperatures, fans, feedrate
+      send: G91
+      send: G1 Z1 F1200
+      send: G90
       send: SET_GCODE_OFFSET X=0 Y=0 Z=0.05
       send: M220 S100
       send: M221 S100
