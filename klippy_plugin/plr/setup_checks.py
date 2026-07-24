@@ -28,7 +28,7 @@ import math
 import os
 import time
 
-from . import classifier
+from . import calibration_meta, classifier
 
 # A single commissioning check outcome.  verdict is one of
 # classifier.VERDICTS; hint is the remediation shown on warn/fail (may
@@ -376,6 +376,54 @@ def format_report(results, attested, probe_method):
     return "\n".join(lines)
 
 
+_CAL_REMEDIATION = {
+    calibration_meta.GROUP_NOISE_FLOOR: "re-run PLR_NOISE_TEST",
+    calibration_meta.GROUP_PROBE_RESOLUTION: "re-run PLR_PROBE_TEST",
+}
+
+
+def calibration_check_results(plugin):
+    """Commissioning rows for the persisted-calibration validity (one per
+    value-group that carries a value): VALID -> pass, LEGACY -> warn,
+    INVALID -> fail with the old-vs-new fingerprint in the detail."""
+    results = []
+    for group in calibration_meta.GROUPS:
+        result = plugin.calibrations[group]
+        if result.tier == calibration_meta.TIER_UNSET:
+            continue
+        name = "calibration:%s" % (group,)
+        if result.tier == calibration_meta.TIER_VALID:
+            results.append(
+                CheckResult(
+                    name,
+                    "pass",
+                    "stamped, fingerprint %s current" % (result.stored_fingerprint,),
+                    "",
+                )
+            )
+        elif result.tier == calibration_meta.TIER_LEGACY:
+            results.append(
+                CheckResult(
+                    name,
+                    "warn",
+                    "no fingerprint stamp (calibrated before stamping)",
+                    "%s to stamp it; a future version may refuse unstamped values"
+                    % (_CAL_REMEDIATION[group],),
+                )
+            )
+        else:
+            results.append(
+                CheckResult(
+                    name,
+                    "fail",
+                    "stale — staged fingerprint %s, current %s (ignored)"
+                    % (result.stored_fingerprint, result.current_fingerprint),
+                    _CAL_REMEDIATION[group],
+                )
+            )
+    return results
+
+
 def cmd_PLR_SETUP(plugin, gcmd):
     """PLR_SETUP [ACCEPT_SELF_LOCKING_Z=1] — commissioning report."""
     if gcmd.get_int("ACCEPT_SELF_LOCKING_Z", 0):
@@ -393,6 +441,9 @@ def cmd_PLR_SETUP(plugin, gcmd):
         return
     results = list(plugin.static_check_results)
     results.append(check_recorder_heartbeat(plugin.wal_dir))
+    # Persisted-calibration validity rows (fingerprint/version stamps): a
+    # stale calibration reports [FAIL] with the old-vs-new fingerprint.
+    results.extend(calibration_check_results(plugin))
     gcmd.respond_info(
         format_report(results, plugin.self_locking_z, plugin.probe_method)
     )

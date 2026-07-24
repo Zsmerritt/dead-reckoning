@@ -41,7 +41,7 @@ nothing.
 import collections
 import math
 
-from . import classifier, drag_probe, tunables
+from . import calibration_meta, classifier, drag_probe, tunables
 from .touch_sequence import format_command, format_distance
 
 # Sweep endpoints and the two-tier pass counts.
@@ -227,14 +227,23 @@ def cmd_PLR_DRAG_CALIBRATE(plugin, gcmd):
         chip = drag_probe.resolve_accel_chip(plugin, gcmd, chip_name)
         noise_floor = plugin.noise_floor_rms
         if noise_floor is None:
+            stale = plugin.stale_calibration_message(
+                calibration_meta.GROUP_NOISE_FLOOR, "PLR_NOISE_TEST"
+            )
             raise gcmd.error(
-                "no accelerometer noise floor on record — run PLR_NOISE_TEST first"
+                stale
+                or "no accelerometer noise floor on record — run PLR_NOISE_TEST first"
             )
         if plugin.z_position_min is None or not math.isfinite(plugin.z_position_min):
             raise gcmd.error(
                 "no finite Z floor configured: set position_min in "
                 "[stepper_z] (or minimum_z_position in [printer])"
             )
+        # Refuse up front when the recommendation could not be stamped, and
+        # surface a one-time notice if the floor being built on is unstamped
+        # legacy (calibration_meta).
+        calibration_meta.require_klipper_version(plugin.printer, gcmd.error)
+        plugin.warn_legacy_calibration_once(gcmd)
     except gcmd.error:
         plugin.last_drag_calibrate = None
         raise
@@ -347,9 +356,17 @@ def cmd_PLR_DRAG_CALIBRATE(plugin, gcmd):
     threshold = noise_floor * classifier.multiplier(accepted)
     headroom = threshold / peak if peak > 0.0 else float("inf")
 
-    configfile = plugin.printer.lookup_object("configfile")
-    configfile.set("plr", "drag_sensitivity", tunables.format_value(recommended))
-    plugin.note_pending_save("drag_sensitivity")
+    # drag_sensitivity is derived from the noise floor, so it shares the
+    # noise-floor group's fingerprint: stage it together with the same
+    # version/fingerprint stamps, atomically (guarded above).
+    try:
+        calibration_meta.stage_calibration(
+            plugin,
+            calibration_meta.GROUP_NOISE_FLOOR,
+            [("drag_sensitivity", tunables.format_value(recommended))],
+        )
+    except calibration_meta.UnstampableError as e:
+        raise gcmd.error("PLR_DRAG_CALIBRATE: %s" % (e,)) from None
     plugin.tunables["drag_sensitivity"] = recommended
     plugin.last_drag_calibrate = {
         "accepted_knob": accepted,

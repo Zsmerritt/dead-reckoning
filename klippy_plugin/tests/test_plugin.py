@@ -195,6 +195,8 @@ def test_get_status_shape_on_good_config(plugin):
         "last_drag_error": None,
         "last_drag_calibrate": None,
         "last_touch_result": None,
+        "calibrations_valid": True,
+        "calibration_status": {"noise_floor": "unset", "probe_resolution": "unset"},
     }
 
 

@@ -109,6 +109,21 @@ pub struct PlrSettings {
     /// absent — a calibration from before the key existed — means no
     /// speed check, tolerant back-compat).
     pub noise_floor_speed: Option<f64>,
+    /// Per-group calibration fingerprint stamp for the noise-floor group
+    /// (`cal_fingerprint_noise_floor`, staged by `PLR_NOISE_TEST` /
+    /// `PLR_DRAG_CALIBRATE` — `klippy_plugin/plr/calibration_meta.py`).
+    /// `None` for a pre-stamping (legacy) calibration.
+    pub cal_fingerprint_noise_floor: Option<String>,
+    /// Per-group calibration fingerprint stamp for the `probe_resolution`
+    /// group (`cal_fingerprint_probe_resolution`, staged by
+    /// `PLR_PROBE_TEST`). `None` for a legacy calibration.
+    pub cal_fingerprint_probe_resolution: Option<String>,
+    /// The plugin version the calibration was staged under
+    /// (`cal_plugin_version`); recorded for forensics, not gated here.
+    pub cal_plugin_version: Option<String>,
+    /// The Klipper version the calibration was staged under
+    /// (`cal_klipper_version`); recorded for forensics, not gated here.
+    pub cal_klipper_version: Option<String>,
 }
 
 /// Reads a required-or-defaulted f64 option.
@@ -119,6 +134,14 @@ fn opt_f64(section: &Map<String, Value>, key: &str, default: f64) -> Result<f64,
             .as_f64()
             .ok_or_else(|| format!("[plr] {key} is not a number: {v}")),
     }
+}
+
+/// Reads an OPTIONAL string stamp tolerantly: absent OR wrong-typed both
+/// yield `None` (never an error). A calibration stamp is metadata — a
+/// malformed one degrades the calibration to legacy/unstamped, it must not
+/// make an otherwise-valid `[plr]` section refuse.
+fn opt_stamp(section: &Map<String, Value>, key: &str) -> Option<String> {
+    section.get(key).and_then(Value::as_str).map(str::to_owned)
 }
 
 /// Reads a defaulted string option.
@@ -203,6 +226,14 @@ impl PlrSettings {
             probe_resolution,
             noise_floor,
             noise_floor_speed,
+            // Calibration stamps: parsed tolerantly — a wrong-typed or
+            // absent stamp is `None`, never a hard error. A malformed
+            // stamp degrades to "unstamped/legacy"; it must not make an
+            // otherwise-parseable [plr] section refuse.
+            cal_fingerprint_noise_floor: opt_stamp(plr, "cal_fingerprint_noise_floor"),
+            cal_fingerprint_probe_resolution: opt_stamp(plr, "cal_fingerprint_probe_resolution"),
+            cal_plugin_version: opt_stamp(plr, "cal_plugin_version"),
+            cal_klipper_version: opt_stamp(plr, "cal_klipper_version"),
         })
     }
 
@@ -241,6 +272,290 @@ impl PlrSettings {
             legacy_single_probe: false,
             ..PlanConfig::default()
         }
+    }
+}
+
+// --- calibration fingerprinting --------------------------------------------
+//
+// A byte-for-byte port of `klippy_plugin/plr/calibration_meta.py`: the plugin
+// stamps each persisted calibration value-group with a CRC-32 fingerprint of
+// the calibration-relevant config slice, and plrd re-derives the same
+// fingerprint here (defense in depth). The Python side reads raw config
+// strings; this side reads Klipper's typed `configfile.settings` — the
+// numeric normalization below is what makes the two agree. Pinned by the
+// shared literal-hash fixtures in the test module (identical hex to the
+// python suite).
+
+/// The two independently-fingerprinted calibration value-groups.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CalGroup {
+    /// The `noise_floor_*` measurements (and the derived `drag_sensitivity`):
+    /// depends on the `stepper_z*` kinematics and the accel-chip section.
+    NoiseFloor,
+    /// The `probe_resolution` measurement: depends on the `stepper_z*`
+    /// kinematics and the active touch-probe section (NOT the accel chip).
+    ProbeResolution,
+}
+
+/// The three-tier classification of a value-group's stamp (plrd checks the
+/// fingerprint only; the plugin additionally checks plugin-version
+/// regression at load time).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CalTier {
+    /// Stamp present and matches the recomputed fingerprint.
+    Valid,
+    /// No stamp (a pre-stamping calibration): accepted, cross-check skipped.
+    Legacy,
+    /// Stamp present but the recomputed fingerprint differs: the value is
+    /// treated as absent.
+    Invalid,
+}
+
+/// CRC-32 (IEEE 802.3, reflected, poly `0xEDB88320`, init/xorout all-ones) —
+/// reproduces Python's `zlib.crc32` byte-for-byte. Eight lowercase hex digits.
+fn crc32_hex(data: &[u8]) -> String {
+    let mut crc: u32 = 0xFFFF_FFFF;
+    for &byte in data {
+        crc ^= u32::from(byte);
+        for _ in 0..8 {
+            let mask = (crc & 1).wrapping_neg();
+            crc = (crc >> 1) ^ (0xEDB8_8320 & mask);
+        }
+    }
+    format!("{:08x}", !crc)
+}
+
+/// The canonical decimal string for a finite `f64`: integer-valued numbers
+/// without a decimal point (`-2.0` -> `"-2"`), others via the shortest
+/// round-tripping `Display`. `None` for a non-finite value (caller keeps the
+/// original text) — mirrors `calibration_meta._canonical_number`.
+fn canonical_number(value: f64) -> Option<String> {
+    if !value.is_finite() {
+        return None;
+    }
+    #[allow(clippy::cast_possible_truncation)]
+    if value.abs() < 1e15 && value.fract() == 0.0 {
+        Some(format!("{}", value as i64))
+    } else {
+        Some(format!("{value}"))
+    }
+}
+
+/// Whitespace-collapse then numeric-canonicalize a string value (mirrors the
+/// Python side operating on raw config strings).
+fn normalize_str(text: &str) -> String {
+    let collapsed = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    match collapsed.parse::<f64>() {
+        Ok(number) => canonical_number(number).unwrap_or(collapsed),
+        Err(_) => collapsed,
+    }
+}
+
+/// Normalize a typed `configfile.settings` value to the same canonical text
+/// the Python side derives from the raw config string.
+fn normalize_value(value: &Value) -> String {
+    match value {
+        Value::String(text) => normalize_str(text),
+        Value::Number(number) => number
+            .as_f64()
+            .and_then(canonical_number)
+            .unwrap_or_else(|| number.to_string()),
+        Value::Bool(flag) => (if *flag { "true" } else { "false" }).to_owned(),
+        Value::Null => String::new(),
+        other => other.to_string(),
+    }
+}
+
+/// The canonical serialization of the relevant config slice: sorted section
+/// names, sorted option keys, normalized values, then a synthetic `[plr]`
+/// block with only the selected hardware-selection keys. See
+/// `calibration_meta._canonical_string` for the exact grammar.
+fn canonical_string(
+    sections: &Map<String, Value>,
+    section_names: &[String],
+    plr_keys: &[&str],
+) -> String {
+    let mut names: Vec<&String> = section_names.iter().collect();
+    names.sort();
+    let mut parts: Vec<String> = Vec::new();
+    for name in names {
+        let Some(body) = sections.get(name.as_str()).and_then(Value::as_object) else {
+            continue;
+        };
+        parts.push(format!("[{name}]"));
+        let mut keys: Vec<&String> = body.keys().collect();
+        keys.sort();
+        for key in keys {
+            parts.push(format!("{key}={}", normalize_value(&body[key])));
+        }
+    }
+    parts.push("[plr]".to_owned());
+    if let Some(plr) = sections.get("plr").and_then(Value::as_object) {
+        let mut selected: Vec<&str> = plr_keys.to_vec();
+        selected.sort_unstable();
+        for key in selected {
+            if let Some(value) = plr.get(key) {
+                parts.push(format!("{key}={}", normalize_value(value)));
+            }
+        }
+    }
+    parts.join("\n")
+}
+
+/// The low-level fingerprint over an explicit section/key selection — the
+/// surface the cross-language literal-hash fixtures pin. Test-only: the
+/// production path always goes through [`compute_fingerprint`] (group-derived
+/// section selection).
+#[cfg(test)]
+pub(crate) fn fingerprint(
+    sections: &Map<String, Value>,
+    section_names: &[&str],
+    plr_keys: &[&str],
+) -> String {
+    let names: Vec<String> = section_names
+        .iter()
+        .map(|name| (*name).to_owned())
+        .collect();
+    crc32_hex(canonical_string(sections, &names, plr_keys).as_bytes())
+}
+
+/// The touch-probe section backing each descending probe method (`None` for
+/// `adxl_drag`, which has no touch-probe section).
+fn probe_section_for(method: &str) -> Option<&'static str> {
+    match method {
+        "tap" => Some("probe"),
+        "load_cell" => Some("load_cell_probe"),
+        _ => None,
+    }
+}
+
+/// The section names that feed `group`'s fingerprint, derived from the
+/// `[plr]` hardware selection.
+fn relevant_section_names(
+    sections: &Map<String, Value>,
+    plr: &PlrSettings,
+    group: CalGroup,
+) -> Vec<String> {
+    let mut names: Vec<String> = sections
+        .keys()
+        .filter(|name| is_z_stepper(name))
+        .cloned()
+        .collect();
+    match group {
+        CalGroup::ProbeResolution => {
+            if let Some(section) = probe_section_for(&plr.probe_method) {
+                names.push(section.to_owned());
+            }
+        }
+        CalGroup::NoiseFloor => {
+            if !plr.accel_chip.is_empty() {
+                names.push(plr.accel_chip.clone());
+            }
+        }
+    }
+    names
+}
+
+/// The `[plr]` hardware-selection keys folded into `group`'s fingerprint.
+fn plr_keys(group: CalGroup) -> &'static [&'static str] {
+    match group {
+        CalGroup::ProbeResolution => &["probe_method"],
+        CalGroup::NoiseFloor => &["accel_chip", "probe_method"],
+    }
+}
+
+/// Recompute `group`'s fingerprint from the live `configfile.settings`.
+pub(crate) fn compute_fingerprint(
+    sections: &Map<String, Value>,
+    plr: &PlrSettings,
+    group: CalGroup,
+) -> String {
+    crc32_hex(
+        canonical_string(
+            sections,
+            &relevant_section_names(sections, plr, group),
+            plr_keys(group),
+        )
+        .as_bytes(),
+    )
+}
+
+/// Classify `group`: `(tier, stored_stamp, recomputed_fingerprint)`.
+pub(crate) fn validate_group(
+    sections: &Map<String, Value>,
+    plr: &PlrSettings,
+    group: CalGroup,
+) -> (CalTier, Option<String>, String) {
+    let stored = match group {
+        CalGroup::NoiseFloor => plr.cal_fingerprint_noise_floor.clone(),
+        CalGroup::ProbeResolution => plr.cal_fingerprint_probe_resolution.clone(),
+    };
+    let current = compute_fingerprint(sections, plr, group);
+    let tier = match &stored {
+        None => CalTier::Legacy,
+        Some(stamp) if *stamp == current => CalTier::Valid,
+        Some(_) => CalTier::Invalid,
+    };
+    (tier, stored, current)
+}
+
+/// The effective noise floor after the fingerprint cross-check (ports
+/// `calibration_meta.validate_group` + treat-as-absent gating): a stamp
+/// mismatch treats the calibrated floor as absent so the existing
+/// `NoiseFloorMissing` refusal fires; an absent stamp is a legacy calibration,
+/// accepted with a note. plrd checks the fingerprint only — plugin-version
+/// regression is the plugin's (authoritative) load-time check.
+fn gated_noise_floor(
+    settings: &Map<String, Value>,
+    plr: &PlrSettings,
+    notes: &mut Vec<String>,
+) -> Option<f64> {
+    let representative = plr.representative_noise_floor();
+    if representative.is_none() {
+        return representative;
+    }
+    let (tier, stored, current) = validate_group(settings, plr, CalGroup::NoiseFloor);
+    match tier {
+        CalTier::Invalid => {
+            notes.push(format!(
+                "noise-floor calibration fingerprint mismatch (staged {}, \
+                 recomputed {current}) — treating the noise floor as \
+                 uncalibrated; re-run PLR_NOISE_TEST",
+                stored.as_deref().unwrap_or("<none>")
+            ));
+            None
+        }
+        CalTier::Legacy => {
+            notes.push(
+                "noise-floor calibration predates fingerprint stamping (legacy) \
+                 — accepted without a fingerprint cross-check; re-run \
+                 PLR_NOISE_TEST to stamp it"
+                    .to_owned(),
+            );
+            representative
+        }
+        CalTier::Valid => representative,
+    }
+}
+
+/// `probe_resolution` is not consumed by machine validation, but a stale one
+/// is worth flagging so the operator re-runs `PLR_PROBE_TEST`.
+fn note_stale_probe_resolution(
+    settings: &Map<String, Value>,
+    plr: &PlrSettings,
+    notes: &mut Vec<String>,
+) {
+    if plr.probe_resolution.is_none() {
+        return;
+    }
+    let (tier, stored, current) = validate_group(settings, plr, CalGroup::ProbeResolution);
+    if tier == CalTier::Invalid {
+        notes.push(format!(
+            "probe_resolution calibration fingerprint mismatch (staged {}, \
+             recomputed {current}) — ignore the stored probe_resolution; re-run \
+             PLR_PROBE_TEST",
+            stored.as_deref().unwrap_or("<none>")
+        ));
     }
 }
 
@@ -400,6 +715,10 @@ pub fn machine_from_settings(
         }
     };
 
+    // Calibration fingerprint defense-in-depth (see `gated_noise_floor`).
+    let noise_floor = gated_noise_floor(settings, plr, &mut notes);
+    note_stale_probe_resolution(settings, plr, &mut notes);
+
     let virtual_sdcard_root = section("virtual_sdcard")
         .and_then(|s| s.get("path"))
         .and_then(Value::as_str)
@@ -432,7 +751,7 @@ pub fn machine_from_settings(
         config_hash: LIVE_CONFIG_HASH.to_owned(),
         validated_config_hash: Some(LIVE_CONFIG_HASH.to_owned()),
         virtual_sdcard_root,
-        noise_floor: plr.representative_noise_floor(),
+        noise_floor,
         noise_floor_speed: plr.noise_floor_speed,
         axis_limits,
     };
@@ -1058,5 +1377,248 @@ pub(crate) mod tests {
         assert_eq!(pin_mcu("^!PB0"), "mcu");
         assert_eq!(pin_mcu("z_board:PA1"), "z_board");
         assert_eq!(pin_mcu("~*aux: PA1"), "aux");
+    }
+
+    // --- calibration fingerprinting -------------------------------------
+    use super::{compute_fingerprint, fingerprint, validate_group, CalGroup, CalTier};
+
+    /// A `{key: string}` JSON object for a fixture section.
+    fn obj(pairs: &[(&str, &str)]) -> Value {
+        let mut map = Map::new();
+        for (key, value) in pairs {
+            map.insert((*key).to_owned(), json!(value));
+        }
+        Value::Object(map)
+    }
+
+    #[test]
+    fn crc32_reproduces_zlib_reference_vectors() {
+        assert_eq!(super::crc32_hex(b"123456789"), "cbf43926");
+        assert_eq!(super::crc32_hex(b""), "00000000");
+    }
+
+    /// The three shared literal fixtures: the SAME expected hex the python
+    /// suite asserts (`klippy_plugin/tests/test_calibration_meta.py`
+    /// `SHARED_FIXTURES`). A byte-identical fingerprint across languages is
+    /// the cross-language contract.
+    #[test]
+    fn fingerprint_matches_python_shared_fixtures() {
+        // F1: stepper_z + probe, plr_keys=[probe_method] -> ca910c12.
+        let mut f1 = Map::new();
+        f1.insert(
+            "stepper_z".to_owned(),
+            obj(&[
+                ("step_pin", "PF11"),
+                ("dir_pin", "!PH1"),
+                ("position_min", "-2"),
+                ("position_max", "250"),
+            ]),
+        );
+        f1.insert(
+            "probe".to_owned(),
+            obj(&[("z_offset", "0.5"), ("pin", "^PA1")]),
+        );
+        f1.insert(
+            "plr".to_owned(),
+            obj(&[("probe_method", "tap"), ("accel_chip", "adxl345")]),
+        );
+        assert_eq!(
+            fingerprint(&f1, &["stepper_z", "probe"], &["probe_method"]),
+            "ca910c12"
+        );
+
+        // F3: two Z steppers + accel chip, plr_keys=[accel_chip,probe_method].
+        let mut f3 = Map::new();
+        f3.insert(
+            "stepper_z".to_owned(),
+            obj(&[("step_pin", "PF11"), ("position_min", "-2")]),
+        );
+        f3.insert("stepper_z1".to_owned(), obj(&[("step_pin", "PG0")]));
+        f3.insert(
+            "adxl345".to_owned(),
+            obj(&[("cs_pin", "PB1"), ("axes_map", "x,y,z")]),
+        );
+        f3.insert(
+            "plr".to_owned(),
+            obj(&[("probe_method", "adxl_drag"), ("accel_chip", "adxl345")]),
+        );
+        assert_eq!(
+            fingerprint(
+                &f3,
+                &["stepper_z", "stepper_z1", "adxl345"],
+                &["accel_chip", "probe_method"]
+            ),
+            "cecd3842"
+        );
+
+        // F4: numeric canonicalization (-2.0 -> -2), plr_keys=[probe_method].
+        let mut f4 = Map::new();
+        f4.insert(
+            "stepper_z".to_owned(),
+            obj(&[("position_min", "-2.0"), ("microsteps", "16")]),
+        );
+        f4.insert("plr".to_owned(), obj(&[("probe_method", "tap")]));
+        assert_eq!(
+            fingerprint(&f4, &["stepper_z"], &["probe_method"]),
+            "404202d1"
+        );
+    }
+
+    #[test]
+    fn fingerprint_normalizes_typed_numbers_like_python_strings() {
+        // A typed JSON number (as Klipper's getfloat yields) and the raw
+        // string "-2" canonicalize identically, so plrd's recompute matches
+        // the plugin's stamp on the same machine.
+        let mut typed = Map::new();
+        typed.insert("stepper_z".to_owned(), json!({ "position_min": -2.0 }));
+        typed.insert("plr".to_owned(), json!({ "probe_method": "tap" }));
+        let mut text = Map::new();
+        text.insert("stepper_z".to_owned(), obj(&[("position_min", "-2")]));
+        text.insert("plr".to_owned(), obj(&[("probe_method", "tap")]));
+        assert_eq!(
+            fingerprint(&typed, &["stepper_z"], &["probe_method"]),
+            fingerprint(&text, &["stepper_z"], &["probe_method"])
+        );
+    }
+
+    #[test]
+    fn parse_tolerates_absent_and_wrongtyped_stamps() {
+        // Absent -> None.
+        let (_, plr) = parse_fixture(&[]);
+        assert!(plr.cal_fingerprint_noise_floor.is_none());
+        assert!(plr.cal_fingerprint_probe_resolution.is_none());
+        assert!(plr.cal_plugin_version.is_none());
+        assert!(plr.cal_klipper_version.is_none());
+        // Wrong-typed -> None (tolerant), NOT a parse error.
+        let (_, plr) = parse_fixture(&[
+            ("cal_fingerprint_noise_floor", json!(12345)),
+            ("cal_plugin_version", json!(3.0)),
+            ("cal_klipper_version", json!(false)),
+        ]);
+        assert!(plr.cal_fingerprint_noise_floor.is_none());
+        assert!(plr.cal_plugin_version.is_none());
+        assert!(plr.cal_klipper_version.is_none());
+        // A well-formed string stamp parses through.
+        let (_, plr) = parse_fixture(&[("cal_plugin_version", json!("0.3.0"))]);
+        assert_eq!(plr.cal_plugin_version.as_deref(), Some("0.3.0"));
+    }
+
+    #[test]
+    fn noise_floor_fingerprint_mismatch_is_treated_as_missing() {
+        // A drag machine with a calibrated floor but a STALE stamp: the floor
+        // is treated as absent, the existing NoiseFloorMissing refusal fires,
+        // and a note names the mismatch.
+        let (snapshot, plr) = parse_fixture(&[
+            ("probe_method", json!("adxl_drag")),
+            ("accel_chip", json!("adxl345")),
+            ("noise_floor_rms", json!(118.0)),
+            ("cal_fingerprint_noise_floor", json!("deadbeef")),
+        ]);
+        let (machine, notes) = machine_from_settings(&snapshot.settings, &plr, true);
+        assert_eq!(machine.noise_floor, None);
+        let rejection = validate_machine(&machine).unwrap_err();
+        assert!(rejection
+            .failures
+            .contains(&PrereqFailure::NoiseFloorMissing));
+        assert!(
+            notes.iter().any(|n| n.contains("fingerprint mismatch")),
+            "{notes:?}"
+        );
+    }
+
+    #[test]
+    fn noise_floor_fingerprint_match_is_accepted() {
+        // Recompute the true fingerprint, stamp it, and confirm the floor is
+        // kept and validation passes (no mismatch note).
+        let (snapshot, base) = parse_fixture(&[
+            ("probe_method", json!("adxl_drag")),
+            ("accel_chip", json!("adxl345")),
+            ("noise_floor_rms", json!(118.0)),
+        ]);
+        let fp = compute_fingerprint(&snapshot.settings, &base, CalGroup::NoiseFloor);
+        let (snapshot, plr) = parse_fixture(&[
+            ("probe_method", json!("adxl_drag")),
+            ("accel_chip", json!("adxl345")),
+            ("noise_floor_rms", json!(118.0)),
+            ("cal_fingerprint_noise_floor", json!(fp)),
+        ]);
+        assert_eq!(
+            validate_group(&snapshot.settings, &plr, CalGroup::NoiseFloor).0,
+            CalTier::Valid
+        );
+        let (machine, notes) = machine_from_settings(&snapshot.settings, &plr, true);
+        assert_eq!(machine.noise_floor, Some(118.0));
+        assert!(validate_machine(&machine).is_ok());
+        assert!(!notes.iter().any(|n| n.contains("mismatch")), "{notes:?}");
+    }
+
+    #[test]
+    fn legacy_noise_floor_without_stamp_is_accepted_with_note() {
+        // No stamp at all: the floor is kept (legacy back-compat) and a note
+        // records that it was accepted without a fingerprint cross-check.
+        let (snapshot, plr) = parse_fixture(&[
+            ("probe_method", json!("adxl_drag")),
+            ("accel_chip", json!("adxl345")),
+            ("noise_floor_rms", json!(118.0)),
+        ]);
+        assert_eq!(
+            validate_group(&snapshot.settings, &plr, CalGroup::NoiseFloor).0,
+            CalTier::Legacy
+        );
+        let (machine, notes) = machine_from_settings(&snapshot.settings, &plr, true);
+        assert_eq!(machine.noise_floor, Some(118.0));
+        assert!(validate_machine(&machine).is_ok());
+        assert!(notes.iter().any(|n| n.contains("legacy")), "{notes:?}");
+    }
+
+    #[test]
+    fn a_changed_z_stepper_pin_invalidates_a_stamped_floor() {
+        // Stamp the true fingerprint, then mutate a Z stepper pin: the
+        // recomputed fingerprint diverges and the floor is treated as missing.
+        let (snapshot, base) = parse_fixture(&[
+            ("probe_method", json!("adxl_drag")),
+            ("accel_chip", json!("adxl345")),
+            ("noise_floor_rms", json!(118.0)),
+        ]);
+        let fp = compute_fingerprint(&snapshot.settings, &base, CalGroup::NoiseFloor);
+        let result = query_result(
+            configfile_status(&[
+                ("probe_method", json!("adxl_drag")),
+                ("accel_chip", json!("adxl345")),
+                ("noise_floor_rms", json!(118.0)),
+                ("cal_fingerprint_noise_floor", json!(fp)),
+            ]),
+            plr_object(),
+        );
+        let mut snapshot = KlippySnapshot::from_query_result(&result).unwrap();
+        // Unchanged config still validates VALID...
+        let plr = PlrSettings::parse(snapshot.plr_section().unwrap()).unwrap();
+        assert_eq!(
+            validate_group(&snapshot.settings, &plr, CalGroup::NoiseFloor).0,
+            CalTier::Valid
+        );
+        // ...but changing the Z stepper step_pin invalidates it.
+        snapshot.settings["stepper_z"]["step_pin"] = json!("PF99");
+        assert_eq!(
+            validate_group(&snapshot.settings, &plr, CalGroup::NoiseFloor).0,
+            CalTier::Invalid
+        );
+        let (machine, _) = machine_from_settings(&snapshot.settings, &plr, true);
+        assert_eq!(machine.noise_floor, None);
+    }
+
+    #[test]
+    fn irrelevant_section_change_does_not_move_the_fingerprint() {
+        let (snapshot, plr) = parse_fixture(&[
+            ("probe_method", json!("adxl_drag")),
+            ("accel_chip", json!("adxl345")),
+            ("noise_floor_rms", json!(118.0)),
+        ]);
+        let before = compute_fingerprint(&snapshot.settings, &plr, CalGroup::NoiseFloor);
+        let mut settings = snapshot.settings.clone();
+        settings.insert("fan".to_owned(), json!({ "pin": "PA8" }));
+        settings.insert("display".to_owned(), json!({ "lcd_type": "st7920" }));
+        let after = compute_fingerprint(&settings, &plr, CalGroup::NoiseFloor);
+        assert_eq!(before, after);
     }
 }

@@ -48,7 +48,7 @@ where parts are — a pass that clips one poisons the baseline high and
 the drag oracle would then under-trigger.
 """
 
-from . import classifier, drag_probe
+from . import calibration_meta, classifier, drag_probe
 
 # Still-capture duration bounds (seconds).
 DEFAULT_DURATION = 2.0
@@ -105,6 +105,10 @@ def cmd_PLR_NOISE_TEST(plugin, gcmd):
         return
     gcmd.respond_info(CLEARANCE_WARNING)
 
+    # Refuse up front (before any motion) when the calibration cannot be
+    # stamped — a stamped-or-nothing policy (calibration_meta).
+    calibration_meta.require_klipper_version(plugin.printer, gcmd.error)
+
     # a) Still capture: park, then let the chip stream for DURATION.
     toolhead.wait_moves()
     aclient = chip.start_internal_client()
@@ -134,12 +138,11 @@ def cmd_PLR_NOISE_TEST(plugin, gcmd):
     # the SPEED the moving baseline was captured at: plrd's plan
     # validation warns when a recovery probe would run at a different
     # drag speed than the floor was measured at.
-    configfile = plugin.printer.lookup_object("configfile")
     staged = [
-        ("noise_floor_rms", moving.rms),
-        ("noise_floor_still_rms", still.rms),
-        ("noise_floor_peak", moving.peak_rms),
-        ("noise_floor_speed", speed),
+        ("noise_floor_rms", "%.6f" % (moving.rms,)),
+        ("noise_floor_still_rms", "%.6f" % (still.rms,)),
+        ("noise_floor_peak", "%.6f" % (moving.peak_rms,)),
+        ("noise_floor_speed", "%.6f" % (speed,)),
     ]
     # Temperature covariate: when a sensor is configured AND currently
     # readable, stage the temperature the baseline was captured at, so
@@ -148,10 +151,16 @@ def cmd_PLR_NOISE_TEST(plugin, gcmd):
     # (the covariate is skipped silently at probe time — no guessing).
     baseline_temp = drag_probe.read_temp(plugin, plugin.noise_floor_temp_sensor)
     if baseline_temp is not None:
-        staged.append(("noise_floor_temp", baseline_temp))
-    for option, value in staged:
-        configfile.set("plr", option, "%.6f" % (value,))
-        plugin.note_pending_save(option)
+        staged.append(("noise_floor_temp", "%.6f" % (baseline_temp,)))
+    # Stage the noise-floor group together with its version/fingerprint
+    # stamps, atomically (nothing written if the Klipper version is
+    # unavailable — already guarded above, re-checked here).
+    try:
+        calibration_meta.stage_calibration(
+            plugin, calibration_meta.GROUP_NOISE_FLOOR, staged
+        )
+    except calibration_meta.UnstampableError as e:
+        raise gcmd.error("PLR_NOISE_TEST: %s" % (e,)) from None
     plugin.noise_floor_rms = moving.rms
     plugin.noise_floor_still_rms = still.rms
     plugin.noise_floor_peak = moving.peak_rms

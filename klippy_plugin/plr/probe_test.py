@@ -31,6 +31,8 @@ explicit ``START=1`` (motion consent).  The per-touch retract/accel
 invariants live in :func:`plr.touch_sequence.perform_consensus_touch`.
 """
 
+from . import calibration_meta
+
 # Verification tier: how many full consensus sequences to run.
 MIN_SEQUENCES = 3
 DEFAULT_SEQUENCES = 5
@@ -206,6 +208,11 @@ def cmd_PLR_PROBE_TEST(plugin, gcmd):
         )
         return
 
+    # Refuse up front (before any motion) when the calibration cannot be
+    # stamped — a stamped-or-nothing policy (calibration_meta), so a probe
+    # test never runs its sequences only to fail to persist the result.
+    calibration_meta.require_klipper_version(printer, gcmd.error)
+
     start_pos = toolhead.get_position()
     gcmd.respond_info(
         "PLR_PROBE_TEST at X:%.3f Y:%.3f: %d consensus sequences, accept "
@@ -251,10 +258,18 @@ def cmd_PLR_PROBE_TEST(plugin, gcmd):
         )
 
     resolution = resolution_from_medians(stats["range"], stats["stddev"])
+    # Stage probe_resolution together with its version/fingerprint stamps,
+    # atomically (nothing is written if the Klipper version is unavailable —
+    # already guarded above, re-checked here).
+    try:
+        calibration_meta.stage_calibration(
+            plugin,
+            calibration_meta.GROUP_PROBE_RESOLUTION,
+            [("probe_resolution", "%.6f" % (resolution,))],
+        )
+    except calibration_meta.UnstampableError as e:
+        raise gcmd.error("PLR_PROBE_TEST: %s" % (e,)) from None
     plugin.probe_resolution = resolution
-    configfile = printer.lookup_object("configfile")
-    configfile.set("plr", "probe_resolution", "%.6f" % (resolution,))
-    plugin.note_pending_save("probe_resolution")
     gcmd.respond_info(
         "plr probe test: %d sequences, median range %s (limit %s), "
         "stddev %s, median %.6f\n"

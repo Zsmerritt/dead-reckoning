@@ -13,7 +13,15 @@ Source-compatibility note: everything under ``plr/`` must stay Python
 Python 3.9 — see ``klippy_plugin/pyproject.toml``.
 """
 
-from . import plugin
+# Single source of truth for the plugin version.  Staged into the [plr]
+# autosave block as ``cal_plugin_version`` alongside every calibration value
+# (plr/calibration_meta.py); a major.minor regression below the staging
+# version invalidates the affected calibration at load time.  Defined BEFORE
+# the ``plugin`` import so calibration_meta.plugin_version() can read it during
+# package initialization without an import cycle.
+__version__ = "0.3.0"
+
+from . import plugin  # noqa: E402  (must follow __version__)
 
 
 def load_config(config):
