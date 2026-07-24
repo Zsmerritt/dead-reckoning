@@ -65,6 +65,7 @@ caller script can catch them, mirroring klippy's "No trigger on probe"
 convention.
 """
 
+import collections
 import math
 
 from . import classifier
@@ -90,6 +91,72 @@ SETTLE_SECONDS = 0.25
 # Lift/restore speed (mm/s) for upward-only moves back into already
 # proven-clear heights; deliberately fixed, not a tunable.
 LIFT_SPEED = 5.0
+
+# --- staircase-hardening constants -----------------------------------
+#
+# Typed abort codes.  last_drag_error stays a console string for the
+# Rust consumer (its contract is unchanged), but each hardening abort
+# embeds its code as a "[<code>]" token so both a human and a machine
+# can tell the failure kinds apart.
+ABORT_ENVELOPE = "drag_envelope_exhausted"
+ABORT_IMPLAUSIBLE = "drag_implausible_signal"
+ABORT_TIME_BUDGET = "drag_time_budget"
+ABORT_STALL = "drag_stalled"
+
+# Data-coverage bracketing (carto scan_mesh.py:308-323, which waits for
+# the capture to cover the motion window before trusting it): the accel
+# sample window must bracket the pass motion to within this slack, or a
+# contact burst could have landed in an uncaptured span.  Larger than
+# the worst-case scheduling offset between the move clock and the first
+# batch, small enough that a capture ending a fifth of a pass early is
+# refused.
+COVERAGE_GRACE_SECONDS = 0.15
+
+# Impossible-result branch (carto backlash.py:93-114 refuses a
+# physically implausible result rather than acting on it).  Rule: over
+# IMPLAUSIBLE_RUN consecutive descending clean passes the ratio-to-
+# threshold falls monotonically (r0 > r1 > r2) while the first is
+# already at least IMPLAUSIBLE_MIN_RATIO of the threshold.  Vibration
+# should RISE as the nozzle nears the part; a substantial signal that
+# instead recedes as we descend means the baseline drifted or the site
+# is wrong, so we refuse instead of chasing it to the floor.
+IMPLAUSIBLE_RUN = 3
+IMPLAUSIBLE_MIN_RATIO = 0.5
+
+# Wall-clock budget (seconds): the third independent bound, alongside
+# the up-front iteration bound and the stall detector.  MAX_SECONDS arg
+# range.
+DEFAULT_MAX_SECONDS = 120.0
+MIN_MAX_SECONDS = 30.0
+MAX_MAX_SECONDS = 600.0
+
+# No-progress stall detection (carto temperature_calibrate.py:192-299's
+# 3-tier warn -> abort -> hard-cap progress-stall pattern).  A run of
+# STALL_PASSES consecutive clean passes whose ratio-to-threshold each
+# changes by less than STALL_RATIO_EPS (5% of threshold) with no upward
+# trend, AND which has descended at least STALL_MIN_DESCENT_STEPS x
+# z_step, is a stall: warn once at half the budget, abort at the full
+# budget; the wall-clock budget above is the outer hard cap.
+DEFAULT_STALL_PASSES = 8
+MIN_STALL_PASSES = 2
+MAX_STALL_PASSES = 200
+STALL_RATIO_EPS = 0.05
+STALL_MIN_DESCENT_STEPS = 8.0
+
+# Temperature covariate: WIDEN (never narrow) the threshold when the
+# current temperature deviates from the temperature the noise floor was
+# staged at.  No widening within +-TEMP_BAND_C; beyond it, +2% of the
+# threshold per degC past the band, capped at +50%.
+TEMP_BAND_C = 15.0
+TEMP_WIDEN_PER_C = 0.02
+TEMP_WIDEN_CAP = 0.50
+
+# One capture: the pass samples plus the toolhead-clock window the pass
+# motion ran in (klippy/toolhead.py:410-427 get_last_move_time), used by
+# the data-coverage bracketing check.
+PassCapture = collections.namedtuple(
+    "PassCapture", ["samples", "motion_start", "motion_end"]
+)
 
 
 def travel_seconds(distance_mm, speed_mm_s):
@@ -182,15 +249,23 @@ def run_capture_pass(toolhead, chip, center_x, center_y, pass_length, speed):
     Canonical internal-client shape (resonance_tester.py:328-352):
     settle, start client, run the moves, finish_measurements (which
     itself waits for motion, adxl345.py:42-46), then read the batch.
-    Returns the sample list, or None when the chip produced no usable
-    batches (adxl345.py:55-71 has_valid_samples).  The segment is
+    Returns a :class:`PassCapture` (samples plus the motion-time window
+    for the data-coverage check), or None when the chip produced no
+    usable batches (adxl345.py:55-71 has_valid_samples).  The segment is
     center -> +L/4 -> -L/4 -> center: symmetric about the invocation
     XY and exactly ``pass_length`` mm of total travel.
+
+    The single shared pass-motion helper: PLR_DRAG_PROBE and
+    PLR_DRAG_CALIBRATE both drive their passes through it so their
+    geometry, settle, and capture lifecycle are identical by
+    construction.  PLR_DRAG_CALIBRATE ignores the motion window (it runs
+    in guaranteed-clear air); the staircase uses it for coverage.
     """
     seg = pass_length / 4.0
     toolhead.wait_moves()
     toolhead.dwell(SETTLE_SECONDS)
     aclient = chip.start_internal_client()
+    motion_start = toolhead.get_last_move_time()
     try:
         toolhead.manual_move([center_x + seg, center_y, None], speed)
         toolhead.manual_move([center_x - seg, center_y, None], speed)
@@ -199,7 +274,84 @@ def run_capture_pass(toolhead, chip, center_x, center_y, pass_length, speed):
         aclient.finish_measurements()
     if not aclient.has_valid_samples():
         return None
-    return aclient.get_samples()
+    motion_end = toolhead.get_last_move_time()
+    return PassCapture(aclient.get_samples(), motion_start, motion_end)
+
+
+def check_coverage(samples, motion_start, motion_end, grace):
+    """PassInvalid(coverage_gap) if the samples don't bracket the motion.
+
+    carto scan_mesh.py:308-323 blocks until the capture session covers
+    the motion window before it trusts the data; the staircase runs the
+    same guarantee as an after-the-fact assertion, because a batch that
+    began after the pass started, or ended before it finished, could
+    have missed the very contact burst the pass exists to detect.  Both
+    ends are checked to ``grace`` slack; returns None when the window is
+    covered.  Pure and side-effect free (samples are already known
+    non-empty and count-valid at the call site).
+    """
+    first_t = samples[0][0]
+    last_t = samples[-1][0]
+    if first_t > motion_start + grace:
+        return classifier.PassInvalid(
+            classifier.INVALID_COVERAGE,
+            "capture starts %.4fs after motion start (grace %.3fs) — the "
+            "batch began late" % (first_t - motion_start, grace),
+        )
+    if last_t < motion_end - grace:
+        return classifier.PassInvalid(
+            classifier.INVALID_COVERAGE,
+            "capture ends %.4fs before motion end (grace %.3fs) — the "
+            "batch ran short" % (motion_end - last_t, grace),
+        )
+    return None
+
+
+def read_temp(plugin, sensor_name):
+    """Current temperature (degC) from a named klippy sensor, or None.
+
+    Every klippy sensor object reports its latest reading under the
+    ``temperature`` status key.  Returns None on any of: no sensor
+    configured, the object absent, no reading yet, or a non-finite
+    value — the temperature covariate is advisory, so an unreadable
+    sensor simply skips widening rather than aborting the probe.
+    """
+    if not sensor_name:
+        return None
+    obj = plugin.printer.lookup_object(sensor_name, None)
+    if obj is None or not hasattr(obj, "get_status"):
+        return None
+    try:
+        eventtime = plugin.printer.get_reactor().monotonic()
+        status = obj.get_status(eventtime)
+    except Exception:  # noqa: BLE001 - advisory read, never fatal
+        return None
+    temp = status.get("temperature")
+    if temp is None:
+        return None
+    try:
+        temp = float(temp)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(temp):
+        return None
+    return temp
+
+
+def temp_widen_factor(staged_temp, current_temp):
+    """Threshold-widening fraction from a temperature deviation.
+
+    0.0 within the +-TEMP_BAND_C band (exact prior behavior); beyond it,
+    TEMP_WIDEN_PER_C per degC past the band, capped at TEMP_WIDEN_CAP.
+    Never negative: a temperature swing only ever WIDENS the threshold
+    (a hotter/colder machine is noisier, not quieter), so the covariate
+    can never manufacture a false contact by narrowing — the unsafe
+    direction is refused by construction.
+    """
+    deviation = abs(current_temp - staged_temp)
+    if deviation <= TEMP_BAND_C:
+        return 0.0
+    return min(TEMP_WIDEN_CAP, TEMP_WIDEN_PER_C * (deviation - TEMP_BAND_C))
 
 
 def _fail(plugin, gcmd, message):
@@ -216,12 +368,16 @@ def _fail(plugin, gcmd, message):
 
 def cmd_PLR_DRAG_PROBE(plugin, gcmd):
     """PLR_DRAG_PROBE [CHIP=] [SPEED=] [Z_STEP=] [SENSITIVITY=]
-    [PASS_LENGTH=] — locate the part surface with the drag oracle."""
+    [PASS_LENGTH=] [MAX_SECONDS=] [STALL_PASSES=] — locate the part
+    surface with the drag oracle."""
     toolhead = None
     try:
         # Argument ranges mirror the [plr] tunable schema exactly
         # (tunables.TUNABLES); absent args fall back to the live
         # tunable values, per the frozen plrd invocation contract.
+        # MAX_SECONDS / STALL_PASSES are new optional bounds; both
+        # default so the frozen contract (CHIP/SPEED/Z_STEP/SENSITIVITY)
+        # is unchanged for callers that omit them.
         chip_name = gcmd.get("CHIP", plugin.accel_chip_name)
         speed = gcmd.get_float(
             "SPEED", plugin.tunables["drag_speed"], above=0.0, maxval=100.0
@@ -240,6 +396,18 @@ def cmd_PLR_DRAG_PROBE(plugin, gcmd):
             DEFAULT_PASS_LENGTH,
             minval=MIN_PASS_LENGTH,
             maxval=MAX_PASS_LENGTH,
+        )
+        max_seconds = gcmd.get_float(
+            "MAX_SECONDS",
+            DEFAULT_MAX_SECONDS,
+            minval=MIN_MAX_SECONDS,
+            maxval=MAX_MAX_SECONDS,
+        )
+        stall_passes = gcmd.get_int(
+            "STALL_PASSES",
+            DEFAULT_STALL_PASSES,
+            minval=MIN_STALL_PASSES,
+            maxval=MAX_STALL_PASSES,
         )
         toolhead = check_motion_gates(plugin, gcmd, "PLR_DRAG_PROBE")
         chip = resolve_accel_chip(plugin, gcmd, chip_name)
@@ -273,22 +441,54 @@ def cmd_PLR_DRAG_PROBE(plugin, gcmd):
         )
     bound = iteration_bound(start_z, floor_z, z_step)
     descend_speed = plugin.tunables["probe_speed"]
-    threshold = noise_floor * classifier.multiplier(sensitivity)
+
+    # Temperature covariate: widen (never narrow) the classification
+    # threshold when the current temperature has drifted from the
+    # temperature the noise floor was staged at.  Absent a configured
+    # sensor or a staged noise_floor_temp, effective_floor == noise_floor
+    # and every downstream number is bit-for-bit the prior behavior.
+    widen = 0.0
+    staged_temp = plugin.noise_floor_temp
+    sensor_name = plugin.noise_floor_temp_sensor
+    if staged_temp is not None and sensor_name:
+        current_temp = read_temp(plugin, sensor_name)
+        if current_temp is not None:
+            widen = temp_widen_factor(staged_temp, current_temp)
+            if widen > 0.0:
+                gcmd.respond_info(
+                    "PLR_DRAG_PROBE: temperature %.1f degC deviates %.1f degC "
+                    "from the noise-floor staging temperature %.1f degC — "
+                    "widening the threshold +%.0f%% (never narrowing)"
+                    % (
+                        current_temp,
+                        abs(current_temp - staged_temp),
+                        staged_temp,
+                        widen * 100.0,
+                    )
+                )
+    effective_floor = noise_floor * (1.0 + widen)
+    mult = classifier.multiplier(sensitivity)
+    threshold = effective_floor * mult
+    reactor = plugin.printer.get_reactor()
     gcmd.respond_info(
         "PLR_DRAG_PROBE: staircase from Z %.3f, floor %.3f, step %.3f "
-        "(max %d passes), pass %.1f mm at %.1f mm/s, threshold %.2f mm/s^2 "
-        "(noise floor %.2f x %.2f at sensitivity %.0f)"
+        "(max %d passes / %.0f s / %d-pass stall), pass %.1f mm at %.1f "
+        "mm/s, threshold %.2f mm/s^2 (noise floor %.2f x %.2f at "
+        "sensitivity %.0f, temp widen +%.0f%%)"
         % (
             start_z,
             floor_z,
             z_step,
             bound,
+            max_seconds,
+            stall_passes,
             pass_length,
             speed,
             threshold,
             noise_floor,
-            classifier.multiplier(sensitivity),
+            mult,
             sensitivity,
+            widen * 100.0,
         )
     )
 
@@ -296,12 +496,30 @@ def cmd_PLR_DRAG_PROBE(plugin, gcmd):
     last_clean_z = None
     contact = None
     passes_run = 0
+    # Clean-pass ratio-to-threshold history (Z-descending), for the
+    # impossible-signal branch and the stall detector.
+    clean_ratios = []
+    stall_run = 0  # length of the current flat run of clean passes
+    stall_run_start_z = start_z
+    stall_warned = False
+    budget_start = reactor.monotonic()
     for pass_index in range(bound):
-        samples = run_capture_pass(
+        # Bound 3 (wall-clock hard cap): the outer budget, independent of
+        # the up-front iteration bound and the stall detector.
+        if reactor.monotonic() - budget_start > max_seconds:
+            _restore_z(toolhead, start_z)
+            _fail(
+                plugin,
+                gcmd,
+                "PLR_DRAG_PROBE aborted [%s]: wall-clock budget %.0f s "
+                "exceeded after %d passes at Z %.3f — Z restored to %.3f"
+                % (ABORT_TIME_BUDGET, max_seconds, passes_run, z, start_z),
+            )
+        capture = run_capture_pass(
             toolhead, chip, start_pos[0], start_pos[1], pass_length, speed
         )
         passes_run += 1
-        if samples is None:
+        if capture is None:
             _restore_z(toolhead, start_z)
             _fail(
                 plugin,
@@ -309,7 +527,8 @@ def cmd_PLR_DRAG_PROBE(plugin, gcmd):
                 "PLR_DRAG_PROBE aborted at Z %.3f: accelerometer measured "
                 "no data (pass %d) — Z restored to %.3f" % (z, passes_run, start_z),
             )
-        result = classifier.classify_pass(samples, noise_floor, sensitivity)
+        samples = capture.samples
+        result = classifier.classify_pass(samples, effective_floor, sensitivity)
         if isinstance(result, classifier.PassInvalid):
             # Never "assume clean and descend": a pass that cannot be
             # classified ends the probe with the toolhead back at the
@@ -320,6 +539,21 @@ def cmd_PLR_DRAG_PROBE(plugin, gcmd):
                 gcmd,
                 "PLR_DRAG_PROBE aborted at Z %.3f: invalid pass (%s: %s) "
                 "— Z restored to %.3f" % (z, result.reason, result.detail, start_z),
+            )
+        # Data-coverage bracketing (carto scan_mesh.py:308-323): the
+        # sample window must span the pass motion, or a burst could have
+        # landed in an uncaptured gap.  Checked after the count/finiteness
+        # validation above so the too_few/constant taxonomy still wins.
+        cover = check_coverage(
+            samples, capture.motion_start, capture.motion_end, COVERAGE_GRACE_SECONDS
+        )
+        if cover is not None:
+            _restore_z(toolhead, start_z)
+            _fail(
+                plugin,
+                gcmd,
+                "PLR_DRAG_PROBE aborted at Z %.3f: invalid pass (%s: %s) "
+                "— Z restored to %.3f" % (z, cover.reason, cover.detail, start_z),
             )
         if result.contact:
             if last_clean_z is None:
@@ -336,6 +570,83 @@ def cmd_PLR_DRAG_PROBE(plugin, gcmd):
             contact = result
             break
         last_clean_z = z
+
+        # Impossible-result branch (carto backlash.py:93-114): refuse a
+        # signal that RECEDES as we descend toward the part.
+        clean_ratios.append(result.ratio)
+        if len(clean_ratios) >= IMPLAUSIBLE_RUN:
+            r0, r1, r2 = clean_ratios[-IMPLAUSIBLE_RUN:]
+            if r0 >= IMPLAUSIBLE_MIN_RATIO and r0 > r1 > r2:
+                _restore_z(toolhead, start_z)
+                _fail(
+                    plugin,
+                    gcmd,
+                    "PLR_DRAG_PROBE aborted [%s] at Z %.3f: signal is "
+                    "receding as the nozzle descends (ratio-to-threshold "
+                    "%.2f > %.2f > %.2f over %d passes, all >= %.0f%% of "
+                    "threshold) — physically implausible; re-run "
+                    "PLR_NOISE_TEST or check the probe site/mounting. Z "
+                    "restored to %.3f"
+                    % (
+                        ABORT_IMPLAUSIBLE,
+                        z,
+                        r0,
+                        r1,
+                        r2,
+                        IMPLAUSIBLE_RUN,
+                        IMPLAUSIBLE_MIN_RATIO * 100.0,
+                        start_z,
+                    ),
+                )
+
+        # Stall detector (carto temperature_calibrate.py:192-299 3-tier
+        # warn -> abort, with the wall-clock budget above as the hard
+        # cap).  A flat run = consecutive clean passes whose ratio moves
+        # < STALL_RATIO_EPS with no upward trend.
+        if len(clean_ratios) >= 2 and (
+            abs(clean_ratios[-1] - clean_ratios[-2]) < STALL_RATIO_EPS
+        ):
+            stall_run += 1
+        else:
+            stall_run = 1
+            stall_run_start_z = z
+            stall_warned = False
+        stall_half = max(1, stall_passes // 2)
+        if stall_run >= stall_half and not stall_warned:
+            stall_warned = True
+            gcmd.respond_info(
+                "PLR_DRAG_PROBE: no-progress warning [%s] — %d consecutive "
+                "clean passes with a flat signal (ratio ~%.2f) while "
+                "descending; will abort at %d such passes. Check "
+                "SENSITIVITY / part location / noise floor."
+                % (ABORT_STALL, stall_run, clean_ratios[-1], stall_passes)
+            )
+        descended = stall_run_start_z - z
+        no_upward = clean_ratios[-1] <= clean_ratios[-stall_run] + STALL_RATIO_EPS
+        if (
+            stall_run >= stall_passes
+            and descended >= STALL_MIN_DESCENT_STEPS * z_step - 1e-9
+            and no_upward
+        ):
+            _restore_z(toolhead, start_z)
+            _fail(
+                plugin,
+                gcmd,
+                "PLR_DRAG_PROBE aborted [%s] at Z %.3f: %d consecutive clean "
+                "passes with a flat signal (ratio ~%.2f) over %.3f mm of "
+                "descent showed no approach to the part — re-run "
+                "PLR_NOISE_TEST or check SENSITIVITY / part location. Z "
+                "restored to %.3f"
+                % (
+                    ABORT_STALL,
+                    z,
+                    stall_run,
+                    clean_ratios[-1],
+                    descended,
+                    start_z,
+                ),
+            )
+
         if pass_index == bound - 1:
             break  # iteration bound reached; never descend without a
             # following pass to classify at the new height
@@ -352,9 +663,10 @@ def cmd_PLR_DRAG_PROBE(plugin, gcmd):
         _fail(
             plugin,
             gcmd,
-            "PLR_DRAG_PROBE: no contact within envelope after %d passes "
-            "(Z %.3f down to %.3f) — check SENSITIVITY / part location; "
-            "Z restored to %.3f" % (passes_run, start_z, z, start_z),
+            "PLR_DRAG_PROBE aborted [%s]: no contact within envelope after "
+            "%d passes (Z %.3f down to %.3f) — check SENSITIVITY / part "
+            "location; Z restored to %.3f"
+            % (ABORT_ENVELOPE, passes_run, start_z, z, start_z),
         )
 
     clearance_z = min(start_z, z + CLEARANCE_STEPS * z_step)

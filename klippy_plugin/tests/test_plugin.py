@@ -18,6 +18,7 @@ ALL_COMMANDS = [
     "PLR_RECOVER",
     "PLR_NOISE_TEST",
     "PLR_DRAG_PROBE",
+    "PLR_DRAG_CALIBRATE",
 ]
 
 
@@ -132,6 +133,33 @@ def test_non_finite_noise_floor_speed_rejected(plr_config, bad):
         plr.load_config(plr_config(options={"noise_floor_speed": bad}))
 
 
+@pytest.mark.parametrize("bad", ["inf", "nan"])
+def test_non_finite_noise_floor_temp_rejected(plr_config, bad):
+    # noise_floor_temp has no bound (temperatures can be negative), so
+    # the explicit finiteness check is the only guard against a mangled
+    # autosave value.
+    with pytest.raises(fake_klippy.FakeConfigError, match="must be finite"):
+        plr.load_config(plr_config(options={"noise_floor_temp": bad}))
+
+
+def test_noise_floor_temp_and_sensor_parsed(plr_config):
+    plugin = plr.load_config(
+        plr_config(
+            options={
+                "noise_floor_temp": "31.5",
+                "noise_floor_temp_sensor": "temperature_sensor cham",
+            }
+        )
+    )
+    assert plugin.noise_floor_temp == 31.5
+    assert plugin.noise_floor_temp_sensor == "temperature_sensor cham"
+
+
+def test_noise_floor_temp_defaults_none(plugin):
+    assert plugin.noise_floor_temp is None
+    assert plugin.noise_floor_temp_sensor is None
+
+
 def test_z_position_min_cached_from_good_sections(plugin):
     # good_sections() carries [stepper_z] position_min = -2.
     assert plugin.z_position_min == -2.0
@@ -162,8 +190,10 @@ def test_get_status_shape_on_good_config(plugin):
         "probe_resolution": None,
         "daemon_alive": False,
         "noise_floor_rms": None,
+        "noise_floor_temp": None,
         "last_drag_result": None,
         "last_drag_error": None,
+        "last_drag_calibrate": None,
         "last_touch_result": None,
     }
 

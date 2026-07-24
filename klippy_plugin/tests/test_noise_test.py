@@ -78,6 +78,41 @@ def test_successful_run_stages_all_four_keys(noise_setup, run_cmd, fake_printer)
         assert plugin.is_pending_save(key), key
 
 
+def test_stages_noise_floor_temp_when_sensor_configured(
+    noise_setup, run_cmd, fake_printer
+):
+    plugin, toolhead, chip = noise_setup(
+        chip_script=[STILL, MOVING],
+        options={"noise_floor_temp_sensor": "temperature_sensor cham"},
+    )
+    fake_printer.add_object("temperature_sensor cham", fake_klippy.FakeTempSensor(48.5))
+    run_cmd("PLR_NOISE_TEST", START=1)
+    pending = staged(fake_printer)
+    assert pending["noise_floor_temp"] == "%.6f" % (48.5,)
+    assert plugin.is_pending_save("noise_floor_temp")
+    assert plugin.noise_floor_temp == pytest.approx(48.5)
+
+
+def test_no_temp_sensor_stages_no_temp(noise_setup, run_cmd, fake_printer):
+    plugin, toolhead, chip = noise_setup(chip_script=[STILL, MOVING])
+    run_cmd("PLR_NOISE_TEST", START=1)
+    assert "noise_floor_temp" not in staged(fake_printer)
+    assert plugin.noise_floor_temp is None
+
+
+def test_sensor_configured_but_no_reading_stages_no_temp(
+    noise_setup, run_cmd, fake_printer
+):
+    plugin, toolhead, chip = noise_setup(
+        chip_script=[STILL, MOVING],
+        options={"noise_floor_temp_sensor": "temperature_sensor cham"},
+    )
+    fake_printer.add_object("temperature_sensor cham", fake_klippy.FakeTempSensor(None))
+    run_cmd("PLR_NOISE_TEST", START=1)
+    assert "noise_floor_temp" not in staged(fake_printer)
+    assert plugin.noise_floor_temp is None
+
+
 def test_noise_floor_speed_is_the_capture_speed(noise_setup, run_cmd, fake_printer):
     """noise_floor_speed records the SPEED the moving baseline was
     captured at — plrd warns when a plan's drag speed differs."""

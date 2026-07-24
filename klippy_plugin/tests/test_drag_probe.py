@@ -613,3 +613,291 @@ def test_math_isfinite_guard_against_inf_floor(fake_printer, plr_config, run_cmd
     with pytest.raises(fake_klippy.FakeCommandError, match="finite Z floor"):
         run_cmd("PLR_DRAG_PROBE")
     assert toolhead.moves == []
+
+
+# =====================================================================
+# Staircase hardening
+# =====================================================================
+
+# ---------------------------------------------------------------------
+# Pure helpers: coverage bracketing + temperature widening
+
+
+def test_check_coverage_ok_window():
+    samples = [(100.0 + i / 3200.0, 1.0, 2.0, 3.0) for i in range(1024)]
+    # motion [100.0, 100.30]; samples span [100.0, 100.319] -> covered.
+    assert drag_probe.check_coverage(samples, 100.0, 100.30, 0.15) is None
+
+
+def test_check_coverage_late_start():
+    # First sample lands well after motion start + grace.
+    samples = [(100.5 + i / 3200.0, 1.0, 2.0, 3.0) for i in range(1024)]
+    invalid = drag_probe.check_coverage(samples, 100.0, 100.30, 0.15)
+    assert isinstance(invalid, classifier.PassInvalid)
+    assert invalid.reason == classifier.INVALID_COVERAGE
+    assert "began late" in invalid.detail
+
+
+def test_check_coverage_short_end():
+    # Last sample lands well before motion end - grace.
+    samples = [(100.0 + i / 3200.0, 1.0, 2.0, 3.0) for i in range(256)]
+    invalid = drag_probe.check_coverage(samples, 100.0, 100.60, 0.15)
+    assert isinstance(invalid, classifier.PassInvalid)
+    assert invalid.reason == classifier.INVALID_COVERAGE
+    assert "ran short" in invalid.detail
+
+
+@pytest.mark.parametrize(
+    ("staged", "current", "expected"),
+    [
+        (25.0, 25.0, 0.0),  # exact
+        (25.0, 40.0, 0.0),  # deviation 15 == band edge -> no widening
+        (25.0, 45.0, 0.10),  # deviation 20 -> 5 past band -> +10%
+        (25.0, 65.0, 0.50),  # deviation 40 -> capped at +50%
+        (25.0, 200.0, 0.50),  # far beyond -> still capped
+        (60.0, 20.0, 0.50),  # colder machine widens too (never narrows)
+    ],
+)
+def test_temp_widen_factor_formula(staged, current, expected):
+    assert drag_probe.temp_widen_factor(staged, current) == pytest.approx(expected)
+
+
+def test_temp_widen_factor_never_negative():
+    # Across a sweep of deviations the factor is always >= 0 (never narrows).
+    for current in range(-40, 200, 7):
+        assert drag_probe.temp_widen_factor(25.0, float(current)) >= 0.0
+
+
+def test_read_temp_absent_sensor_is_none(drag_setup):
+    plugin, toolhead, chip = drag_setup()
+    assert drag_probe.read_temp(plugin, None) is None
+    assert drag_probe.read_temp(plugin, "temperature_sensor ghost") is None
+
+
+def test_read_temp_reads_sensor(drag_setup, fake_printer):
+    plugin, toolhead, chip = drag_setup()
+    fake_printer.add_object("temperature_sensor cham", fake_klippy.FakeTempSensor(42.5))
+    assert drag_probe.read_temp(plugin, "temperature_sensor cham") == pytest.approx(
+        42.5
+    )
+
+
+def test_read_temp_no_reading_is_none(drag_setup, fake_printer):
+    plugin, toolhead, chip = drag_setup()
+    fake_printer.add_object("temperature_sensor cham", fake_klippy.FakeTempSensor(None))
+    assert drag_probe.read_temp(plugin, "temperature_sensor cham") is None
+
+
+def test_read_temp_non_numeric_is_none(drag_setup, fake_printer):
+    plugin, toolhead, chip = drag_setup()
+    fake_printer.add_object(
+        "temperature_sensor cham", fake_klippy.FakeTempSensor("warm")
+    )
+    assert drag_probe.read_temp(plugin, "temperature_sensor cham") is None
+
+
+def test_read_temp_non_finite_is_none(drag_setup, fake_printer):
+    plugin, toolhead, chip = drag_setup()
+    fake_printer.add_object(
+        "temperature_sensor cham", fake_klippy.FakeTempSensor(float("inf"))
+    )
+    assert drag_probe.read_temp(plugin, "temperature_sensor cham") is None
+
+
+def test_read_temp_raising_sensor_is_none(drag_setup, fake_printer):
+    class Raising:
+        def get_status(self, eventtime):
+            raise RuntimeError("sensor not ready")
+
+    plugin, toolhead, chip = drag_setup()
+    fake_printer.add_object("temperature_sensor cham", Raising())
+    assert drag_probe.read_temp(plugin, "temperature_sensor cham") is None
+
+
+# ---------------------------------------------------------------------
+# Impossible-result branch
+
+
+def decreasing_signal_script():
+    """Clean passes whose ratio-to-threshold falls monotonically while
+    staying >= 50% of threshold (peaks 35.5 -> 31.3 -> 27.0 at knob 30,
+    ratios ~0.78 > 0.68 > 0.59): physically implausible."""
+    return [sf.with_contact(sf.quiet(seed=60), a) for a in (30.0, 26.0, 22.0)]
+
+
+def test_receding_signal_aborts_typed_and_restores(drag_setup, run_cmd):
+    plugin, toolhead, chip = drag_setup(
+        chip_script=decreasing_signal_script(), chip_default=quiet_stream
+    )
+    with pytest.raises(
+        fake_klippy.FakeCommandError, match=drag_probe.ABORT_IMPLAUSIBLE
+    ):
+        run_cmd("PLR_DRAG_PROBE")
+    # Aborts as soon as the 3-pass receding run is complete; never runs
+    # the whole envelope.
+    assert len(chip.clients) == drag_probe.IMPLAUSIBLE_RUN
+    assert toolhead.position[2] == pytest.approx(START_Z)
+    assert plugin.last_drag_result is None
+    assert "receding" in plugin.last_drag_error
+
+
+def test_increasing_signal_not_flagged_implausible(drag_setup, run_cmd):
+    """Regression: a normal rising staircase (signal grows as we approach)
+    is never mistaken for the implausible receding case."""
+    rising = [sf.with_contact(sf.quiet(seed=60), a) for a in (18.0, 22.0, 26.0)]
+    plugin, toolhead, chip = drag_setup(chip_script=rising, chip_default=contact_stream)
+    run_cmd("PLR_DRAG_PROBE")
+    # Three rising clean passes, then contact on the fourth: a normal
+    # result, not an implausible abort.
+    assert plugin.last_drag_result is not None
+    assert plugin.last_drag_error is None
+    assert plugin.last_drag_result["passes"] == 4
+
+
+# ---------------------------------------------------------------------
+# Data-coverage bracketing (bound via PassInvalid)
+
+
+def test_short_capture_fails_coverage(drag_setup, run_cmd):
+    # A valid-but-short capture (400 samples ~= 0.125 s) does not span the
+    # ~0.4 s pass motion -> coverage_gap PassInvalid abort.
+    plugin, toolhead, chip = drag_setup(chip_script=[sf.quiet(n=400, seed=13)])
+    with pytest.raises(fake_klippy.FakeCommandError, match="coverage_gap"):
+        run_cmd("PLR_DRAG_PROBE")
+    assert plugin.last_drag_result is None
+    assert toolhead.position[2] == pytest.approx(START_Z)
+    assert "ran short" in plugin.last_drag_error
+
+
+# ---------------------------------------------------------------------
+# Three independent bounds
+
+
+def test_iteration_bound_is_typed(drag_setup, run_cmd):
+    plugin, toolhead, chip = drag_setup(chip_default=quiet_stream)
+    with pytest.raises(fake_klippy.FakeCommandError, match=drag_probe.ABORT_ENVELOPE):
+        run_cmd("PLR_DRAG_PROBE")
+    assert "no contact within envelope" in plugin.last_drag_error
+
+
+def test_wall_clock_budget_aborts(drag_setup, run_cmd, fake_printer):
+    # Drive the reactor clock forward 20 s per read: with MAX_SECONDS=30
+    # the budget trips on the second pass, before the (large) iteration
+    # bound or the stall detector.
+    plugin, toolhead, chip = drag_setup(chip_default=quiet_stream, start_z=5.0)
+    fake_printer.get_reactor().auto_advance = 20.0
+    with pytest.raises(
+        fake_klippy.FakeCommandError, match=drag_probe.ABORT_TIME_BUDGET
+    ):
+        run_cmd("PLR_DRAG_PROBE", MAX_SECONDS=30, STALL_PASSES=100)
+    assert plugin.last_drag_result is None
+    assert toolhead.position[2] == pytest.approx(5.0)
+    assert "wall-clock budget" in plugin.last_drag_error
+    # Tripped early, long before the ceil(4.8/0.2)=24 iteration bound.
+    assert len(chip.clients) < 5
+
+
+def test_stall_warns_at_half_then_aborts(drag_setup, run_cmd, fake_printer):
+    # Identical flat clean passes with plenty of travel: stall detector
+    # warns at half the budget and aborts at the full budget, before the
+    # iteration bound (24) and the wall-clock budget (default 120 s).
+    plugin, toolhead, chip = drag_setup(chip_default=quiet_stream, start_z=5.0)
+    with pytest.raises(fake_klippy.FakeCommandError, match=drag_probe.ABORT_STALL):
+        run_cmd("PLR_DRAG_PROBE", STALL_PASSES=8)
+    # Warn-at-half asserted: exactly one no-progress warning before abort.
+    responses = fake_printer.lookup_object("gcode").responses
+    warnings = [r for r in responses if "no-progress warning" in r]
+    assert len(warnings) == 1
+    assert drag_probe.ABORT_STALL in warnings[0]
+    assert plugin.last_drag_result is None
+    assert toolhead.position[2] == pytest.approx(5.0)
+    # Flat run of 8 needs 8 x z_step of descent to abort -> the 9th pass.
+    assert len(chip.clients) == 9
+
+
+# ---------------------------------------------------------------------
+# Temperature covariate
+
+
+def _temp_setup(drag_setup, fake_printer, sensor_temp, staged_temp="25.0"):
+    options = {"noise_floor_temp_sensor": "temperature_sensor cham"}
+    if staged_temp is not None:
+        options["noise_floor_temp"] = staged_temp
+    plugin, toolhead, chip = drag_setup(
+        chip_script=[quiet_stream, sf.with_contact(sf.quiet(seed=70), 44.0)],
+        chip_default=quiet_stream,
+        options=options,
+    )
+    if sensor_temp is not None:
+        fake_printer.add_object(
+            "temperature_sensor cham", fake_klippy.FakeTempSensor(sensor_temp)
+        )
+    return plugin, toolhead, chip
+
+
+def test_temp_deviation_widens_threshold_numeric(drag_setup, run_cmd, fake_printer):
+    plugin, toolhead, chip = _temp_setup(drag_setup, fake_printer, sensor_temp=65.0)
+    # Widening makes the faint pass-2 contact read clean, so the probe
+    # finds no contact -- but the widened-threshold report is emitted
+    # before that, and is what we assert on here.
+    with pytest.raises(fake_klippy.FakeCommandError):
+        run_cmd("PLR_DRAG_PROBE")  # staged 25, current 65 -> +50%
+    gresponses = fake_printer.lookup_object("gcode").responses
+    responses = "\n".join(gresponses)
+    # The widened threshold is exactly 1.5x the base: base 45.708 -> 68.56.
+    base = float(NOISE_FLOOR) * classifier.multiplier(30.0)
+    assert "%.2f" % (base * 1.5,) in responses
+    # Warned once, and the warning names the +50% cap.
+    warns = [r for r in gresponses if "widening the threshold" in r]
+    assert len(warns) == 1
+    assert "+50%" in warns[0]
+
+
+def test_temp_widening_flips_contact_to_clean(drag_setup, run_cmd, fake_printer):
+    """The faint pass-2 contact (peak ~50) is above the base threshold
+    (45.7) but below the widened one (68.6): widening turns it clean."""
+    faint = sf.with_contact(sf.quiet(seed=70), 44.0)
+    base = float(NOISE_FLOOR)
+    assert classifier.classify_pass(faint, base, 30.0).contact is True
+    assert classifier.classify_pass(faint, base * 1.5, 30.0).contact is False
+
+    # With widening: pass 2 reads clean, so the probe finds no contact.
+    plugin, toolhead, chip = _temp_setup(drag_setup, fake_printer, sensor_temp=65.0)
+    with pytest.raises(fake_klippy.FakeCommandError, match="no contact within"):
+        run_cmd("PLR_DRAG_PROBE")
+    assert plugin.last_drag_result is None
+
+
+def test_no_widening_within_band_is_prior_behavior(drag_setup, run_cmd, fake_printer):
+    """Regression: within the +-15 degC band the faint contact is still
+    detected exactly as before, with no widening warning."""
+    plugin, toolhead, chip = _temp_setup(drag_setup, fake_printer, sensor_temp=30.0)
+    run_cmd("PLR_DRAG_PROBE")  # deviation 5 -> no widening
+    assert plugin.last_drag_result is not None
+    assert plugin.last_drag_result["passes"] == 2
+    responses = fake_printer.lookup_object("gcode").responses
+    warns = [r for r in responses if "widening" in r]
+    assert warns == []
+
+
+def test_no_sensor_is_prior_behavior(drag_setup, run_cmd):
+    """Regression: no configured sensor -> no widening, faint contact
+    detected exactly as before (identical to the pre-covariate probe)."""
+    plugin, toolhead, chip = drag_setup(
+        chip_script=[quiet_stream, sf.with_contact(sf.quiet(seed=70), 44.0)],
+        chip_default=quiet_stream,
+    )
+    run_cmd("PLR_DRAG_PROBE")
+    assert plugin.last_drag_result is not None
+    assert plugin.last_drag_result["passes"] == 2
+
+
+def test_staged_temp_absent_skips_widening(drag_setup, run_cmd, fake_printer):
+    """Regression: sensor present but no staged noise_floor_temp -> no
+    widening (nothing to compare against)."""
+    plugin, toolhead, chip = _temp_setup(
+        drag_setup, fake_printer, sensor_temp=90.0, staged_temp=None
+    )
+    run_cmd("PLR_DRAG_PROBE")
+    assert plugin.last_drag_result is not None
+    assert plugin.last_drag_result["passes"] == 2

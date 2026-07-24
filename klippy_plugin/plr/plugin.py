@@ -38,6 +38,7 @@ import time
 
 from . import (
     daemon_link,
+    drag_calibrate,
     drag_probe,
     noise_test,
     probe_test,
@@ -102,10 +103,30 @@ class PLRPlugin:
             raise config.error(
                 "Option 'noise_floor_speed' in section 'plr' must be finite"
             )
+        # Temperature covariate for the drag oracle.  noise_floor_temp is
+        # a sibling autosave key staged by PLR_NOISE_TEST (the temperature
+        # the moving baseline was captured at); noise_floor_temp_sensor
+        # names the klippy sensor object to read the current temperature
+        # from at probe time.  Both optional: parsed here at config time —
+        # not lazily in the drag modules — so a hand-mangled autosave
+        # value fails config parsing with klippy's standard error, and so
+        # klippy's unused-option check accepts the keys.  When no sensor
+        # is configured the covariate is skipped silently (no guessing).
+        self.noise_floor_temp = config.getfloat("noise_floor_temp", None)
+        if self.noise_floor_temp is not None and not math.isfinite(
+            self.noise_floor_temp
+        ):
+            raise config.error(
+                "Option 'noise_floor_temp' in section 'plr' must be finite"
+            )
+        self.noise_floor_temp_sensor = config.get("noise_floor_temp_sensor", None)
         # --- drag-oracle session state (PLR_DRAG_PROBE outcome; plrd
         # reads these through get_status like probe status) ------------
         self.last_drag_result = None
         self.last_drag_error = None
+        # PLR_DRAG_CALIBRATE outcome: the accepted/recommended sensitivity
+        # knobs from the last sweep (None until it runs), for observability.
+        self.last_drag_calibrate = None
         # --- consensus-touch session state (PLR_TOUCH outcome; the Rust
         # side consumes last_touch_result through get_status) ----------
         self.last_touch_result = None
@@ -158,6 +179,11 @@ class PLRPlugin:
         "Locate the part surface by dragging lateral passes down a Z "
         "staircase with the accel chip (CHIP= SPEED= Z_STEP= SENSITIVITY=)"
     )
+    cmd_PLR_DRAG_CALIBRATE_help = (
+        "Find the most-sensitive drag knob that never false-triggers, "
+        "entirely at a guaranteed-clear Z (requires START=1; moves the "
+        "toolhead laterally only) and stage drag_sensitivity for SAVE_CONFIG"
+    )
 
     def _register_commands(self):
         gcode = self.printer.lookup_object("gcode")
@@ -173,6 +199,7 @@ class PLRPlugin:
             ("PLR_RECOVER", daemon_link.cmd_PLR_RECOVER),
             ("PLR_NOISE_TEST", noise_test.cmd_PLR_NOISE_TEST),
             ("PLR_DRAG_PROBE", drag_probe.cmd_PLR_DRAG_PROBE),
+            ("PLR_DRAG_CALIBRATE", drag_calibrate.cmd_PLR_DRAG_CALIBRATE),
         ]
         for name, func in commands:
             gcode.register_command(
@@ -259,7 +286,9 @@ class PLRPlugin:
             "probe_resolution": self.probe_resolution,
             "daemon_alive": self._daemon_alive_now(eventtime),
             "noise_floor_rms": self.noise_floor_rms,
+            "noise_floor_temp": self.noise_floor_temp,
             "last_drag_result": self.last_drag_result,
             "last_drag_error": self.last_drag_error,
+            "last_drag_calibrate": self.last_drag_calibrate,
             "last_touch_result": self.last_touch_result,
         }

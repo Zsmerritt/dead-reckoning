@@ -95,11 +95,18 @@ INVALID_TOO_FEW = "too_few_samples"
 INVALID_NON_FINITE = "non_finite"
 INVALID_CONSTANT = "constant_signal"
 INVALID_RATE_COLLAPSE = "sample_rate_collapse"
+# Coverage gap: the capture's sample window does not span the pass
+# motion (a batch that started late or ended early).  Detected by the
+# drag staircase, not validate_pass_samples, because only the caller
+# knows the motion window — but it lives in this taxonomy so every
+# unclassifiable-pass abort shares one machine-readable vocabulary.
+INVALID_COVERAGE = "coverage_gap"
 INVALID_REASONS = (
     INVALID_TOO_FEW,
     INVALID_NON_FINITE,
     INVALID_CONSTANT,
     INVALID_RATE_COLLAPSE,
+    INVALID_COVERAGE,
 )
 
 # One classified pass: ``contact`` is the decision, ``peak_rms`` the
