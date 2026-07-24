@@ -47,10 +47,12 @@ pub mod machine;
 pub mod plan;
 pub mod preflight;
 pub mod preheat;
+pub mod resume_file;
 
 pub use build::{
-    plan_recovery, select_resume_target, ExcludeObjectDef, FallbackReason, PlanConfig, PlanInputs,
-    PlanOutcome, ResumeTarget,
+    plan_recovery, preflight_generated_file, select_resume_target, ExcludeObjectDef,
+    FallbackReason, PlanConfig, PlanInputs, PlanOutcome, ResumeTarget, DRAG_TEMP_FLOOR,
+    PROBE_HOLD_BAND, PROBE_TEMP_HEADROOM, PROBE_TEMP_MEASURED_TOLERANCE,
 };
 pub use envelope::{
     compute_envelope, Envelope, EnvelopeParams, OvershootTerm, POST_TRIGGER_TRAVEL_S,
@@ -65,11 +67,17 @@ pub use machine::{
     ProbeKind, ValidatedMachine, ZStepper,
 };
 pub use plan::{
-    fmt_num, true_z_at_halt, AbortReason, FailureAction, Phase, PlanWarning, Predicate,
+    fmt_num, park_z_at, true_z_at_halt, AbortReason, FailureAction, Phase, PlanWarning, Predicate,
     RecoveryPlan, RecoveryStep, RuntimeComputation, TriggerSource, TrueZFormula, Verification,
-    RESTORE_ACCEL_PLACEHOLDER, TRUE_Z_PLACEHOLDER,
+    PARK_Z_PLACEHOLDER, RESTORE_ACCEL_PLACEHOLDER, TRUE_Z_PLACEHOLDER,
 };
 pub use preflight::{
-    preflight_itinerary, BoundsViolation, ItineraryBounds, PlanRejection, ViolationKind,
+    preflight_itinerary, preflight_recovery_file, BoundsViolation, ItineraryBounds, PlanRejection,
+    ViolationKind, RECOVERY_FILE_STEP_ID,
 };
 pub use preheat::{derive_preheat, scan_file_temps, FileTemps, PreheatTargets};
+pub use resume_file::{
+    build_recovery_file, is_motion_command, recovery_file_name, sanitize_name, verify_heating_gate,
+    GeneratedRecoveryFile, HeatingGateViolation, PurgePlan, RecoveryFileSpec, ZIntent,
+    MOTION_COMMANDS,
+};

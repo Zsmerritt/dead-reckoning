@@ -1,7 +1,8 @@
 # dead-reckoning recovery plan
-# resume: part.gcode @ byte 128
+# recovery file: part_RECOVERY.gcode (verbatim tail from original byte 128)
 # envelope: gap 0.2 + drag_z_step 0.05 + margin 0.5 = 0.75 mm
 # shifted frame: Z declared 0.75 above position_min -2
+# warning: no reheat_park_x/y configured; parking at computed (40, 15), verified clear of the part bounding box — set an explicit park position
  1. [idle-timeout] disarm the idle timeout FIRST (its default M84 would clear all homed state)
       send: SET_IDLE_TIMEOUT TIMEOUT=86400
       ok?:  idle_timeout.idle_timeout within 0.5 of 86400
@@ -12,84 +13,80 @@
       ok?:  stepper_enable.steppers.stepper_z is true
       ok?:  stepper_enable.steppers.stepper_z1 is true
       fail: abort (stepper-enable-failed)
- 3. [preheat] bed to target; nozzle to the warm-but-below-ooze probing band
+ 3. [immediate-bed-heat] FIRST heating action (non-blocking): bed toward target (the long pole) + nozzle toward the clamped probe temp
       send: M140 S60
-      send: M104 S150
-      ok?:  heater_bed.temperature >= 57
-      ok?:  extruder.temperature in [140, 160] C
-      fail: abort (preheat-failed)
- 4. [home-xy] home XY only (never bare G28, never Z: the bed rises into a fixed gantry)
+      send: M104 S145
+      ok?:  heater_bed.target within 1 of 60
+      ok?:  extruder.target within 1 of 145
+      fail: abort (immediate-bed-heat-failed)
+ 4. [believed-z-declare] declare the conservative believed Z (possible-stop upper bound) then lift before XY homing
+      send: SET_KINEMATIC_POSITION Z=0.4
+      send: G91
+      send: G1 Z5 F6000
+      send: G90
+      ok?:  toolhead.homed_axes contains "z"
+      ok?:  toolhead.position.2 within 0.05 of 5.4
+      fail: abort (believed-z-declare-failed)
+ 5. [home-xy] home XY only (never bare G28, never Z: the bed rises into a fixed gantry)
       send: G28 X Y
       ok?:  toolhead.homed_axes contains "x"
       ok?:  toolhead.homed_axes contains "y"
       fail: abort (homing-failed)
- 5. [shifted-frame] declare the shifted frame: Klipper's rail limit now structurally bounds the descent
+ 6. [probe-temp-hold] heat to the drag temperature and HOLD (M109 blocks; a PID hotend also waits to COOL)
+      send: M109 S145
+      ok?:  extruder.temperature in [140, 150] C
+      fail: abort (probe-temp-hold-failed)
+ 7. [clean-nozzle] call the clean-nozzle macro (semantics unknowable; not verified)
+      send: CLEAN_NOZZLE
+      fail: abort (clean-nozzle-failed)
+ 8. [shifted-frame] declare the shifted frame: Klipper's rail limit now structurally bounds the descent
       send: SET_KINEMATIC_POSITION Z=-1.25
       ok?:  toolhead.homed_axes contains "z"
       ok?:  toolhead.position.2 within 0.05 of -1.25
       fail: abort (shifted-frame-not-declared)
- 6. [probe-approach] XY travel to the selected contact point (no Z motion)
+ 9. [probe-approach] XY travel to the selected contact point (no Z motion)
       send: G90
       send: G0 X20 Y10 F6000
       ok?:  toolhead.position.0 within 0.25 of 20
       ok?:  toolhead.position.1 within 0.25 of 10
       fail: abort (approach-failed)
- 7. [probe] ADXL drag probe (bounded fixed-Z staircase; the accelerometer hears the contact)
-      pre:  extruder.temperature in [140, 160] C
-      pre:  extruder.target <= 160
+10. [probe] ADXL drag probe (bounded fixed-Z staircase; the accelerometer hears the contact)
+      pre:  extruder.temperature <= 152
+      pre:  extruder.target <= 150
       pre:  toolhead.homed_axes contains "x"
       pre:  toolhead.homed_axes contains "y"
       pre:  toolhead.homed_axes contains "z"
       send: PLR_DRAG_PROBE CHIP="adxl345" SPEED=20 Z_STEP=0.05 SENSITIVITY=30
       ok?:  plr.last_drag_result.trigger_z present and finite
       fail: abort (probe-no-trigger)
- 8. [true-z-declare] true-Z arithmetic and kinematic re-declaration (never a gcode offset)
+11. [true-z-declare] true-Z arithmetic and kinematic re-declaration (never a gcode offset)
       send: SET_KINEMATIC_POSITION Z={true_z}
       ok?:  toolhead.position.2 within 0.05 of the step's computed value
       fail: abort (true-z-declare-failed)
- 9. [final-declare] final true-frame declaration after all transforms are in place
+12. [final-declare] final true-frame declaration after all transforms are in place
       send: SET_KINEMATIC_POSITION Z={true_z}
       ok?:  toolhead.homed_axes contains "z"
       ok?:  toolhead.position.2 within 0.05 of the step's computed value
       fail: abort (final-declare-failed)
-10. [restore-frame] lift off the part, then replay offsets, factors, skew, print temperatures, fans, feedrate
-      send: G91
-      send: G1 Z1 F1200
+13. [park-for-reheat] lift off the part (rail-clamped) and park at the reheat XY (the file reheats to print temp here)
       send: G90
+      send: G1 Z{park_z} F1200
+      send: G0 X40 Y15 F6000
+      ok?:  toolhead.position.0 within 0.25 of 40
+      ok?:  toolhead.position.1 within 0.25 of 15
+      ok?:  toolhead.position.2 within 0.05 of the step's computed value
+      fail: abort (park-for-reheat-failed)
+14. [restore-frame] replay offsets, speed/extrude factors, skew, fans (print temps reheat in the file)
       send: SET_GCODE_OFFSET X=0 Y=0 Z=0.05
       send: M220 S100
       send: M221 S100
-      send: M104 S210
-      send: M140 S60
       send: M106 S128
-      send: G1 F1800
       ok?:  gcode_move.speed_factor within 0.01 of 1
       ok?:  gcode_move.extrude_factor within 0.01 of 1
-      ok?:  extruder.temperature in [207, 213] C
-      ok?:  heater_bed.temperature >= 57
       fail: abort (restore-failed)
-11. [entry] enter from above the part interior, speed-limited; prime; final E frame and modes
-      send: G90
-      send: M83
-      send: G0 Z1.35 F1200
-      send: G0 X30 Y30 F1200
-      send: G1 Z0.35 F1200
-      send: G1 E0.4 F1800
-      send: G92 E3
-      send: M83
-      send: G90
-      send: G1 F1800
-      ok?:  toolhead.position.0 within 0.25 of 30
-      ok?:  toolhead.position.1 within 0.25 of 30
-      fail: abort (entry-failed)
-12. [file-select] select the file (top level only), restore exclude-object state, seek to the line boundary
-      send: M23 part.gcode
-      send: M26 S128
-      ok?:  virtual_sdcard.file_path equals "/tmp/part.gcode"
-      ok?:  virtual_sdcard.file_position within 0.5 of 128
-      fail: abort (file-select-failed)
-13. [resume-start] start playback
+15. [recovery-file-select] select the generated recovery file (M23), restore exclude-object state, start it (M24)
+      send: M23 part_RECOVERY.gcode
       send: M24
       ok?:  virtual_sdcard.is_active is true
       ok?:  idle_timeout.state equals "Printing"
-      fail: abort (resume-start-failed)
+      fail: abort (recovery-file-select-failed)

@@ -87,6 +87,189 @@ control_socket = /var/lib/plrd/plrd.sock
 # exist on the printer: it falls back to the stock single `PROBE
 # SAMPLES=1` (no consensus, no accel clamp). Adopt [plr] for the
 # consensus touch.
+#
+# RECOVERY-UX KEYS — these also live in printer.cfg's [plr] section (NOT
+# here), each parsed tolerantly and re-validated by plrd against a hard
+# band; an out-of-band value REFUSES recovery (never silently clamped):
+#   max_probe_nozzle_temp  hard ceiling for ANY contact op, C  [80,160] (150)
+#                          Clamps the probe band to
+#                          [probe_temp_min, min(probe_temp_max, this)];
+#                          an empty clamped band is refused. The drag path
+#                          has NO warm minimum — cold dragging is fine; a
+#                          hot nozzle melts the part and corrupts the
+#                          accelerometer readings — so it gates the
+#                          ceiling only.
+#
+#                          THIS CEILING IS THE KLIPPY PLUGIN'S HARD
+#                          REFUSAL POINT: the plugin rejects PLR_TOUCH /
+#                          PLR_DRAG_PROBE when max(current, target)
+#                          exceeds it. plrd therefore deliberately targets
+#                          BELOW it (see probe_nozzle_temp) and forgives
+#                          measured overshoot by a small tolerance:
+#                            commanded target  <= ceiling - 5 C (headroom)
+#                            measured temp     <= ceiling + 2 C (tolerance,
+#                              mirrors the plugin's
+#                              MAX_TOUCH_TEMPERATURE_EPSILON)
+#                            commanded target  <= ceiling (never forgiven)
+#                          The asymmetry is intentional: PID overshoot
+#                          around a legitimate target is absorbed;
+#                          commanding a hotter nozzle is not.
+#
+#                          !! Setting max_probe_nozzle_temp and
+#                          probe_nozzle_temp (or probe_temp_min) too close
+#                          together is what WEDGES a recovery: the probe
+#                          step runs after the Z frame is declared, so a
+#                          temperature refusal there aborts with the frame
+#                          unknown, blocks re-execution, and regenerates an
+#                          identical plan that fails identically. plrd
+#                          refuses such a config up front rather than
+#                          letting it wedge: the band must be wide enough
+#                          to hold the 5 C headroom below the ceiling.
+#   probe_nozzle_temp      nozzle temperature COMMANDED for probing, C.
+#                          Pulled into
+#                          [probe_temp_min, ceiling - 5] before it is
+#                          emitted, so with the defaults the plan sends
+#                          M104 S145 under a 150 C ceiling. Raising this
+#                          to the ceiling does NOT raise what is sent.
+#   pre_home_z_lift        Z lift added to the believed Z BEFORE XY homing,
+#                          mm, so the homing moves clear the part  (0,20] (5)
+#   reheat_park_x/y        nozzle park XY while reheating to print temps.
+#                          OPTIONAL: when unset, each side of the part's
+#                          bounding box (+10mm) is tried, clamped to the
+#                          axis limits, and the first candidate VERIFIED to
+#                          land outside the footprint is used; a plan
+#                          warning recommends setting it explicitly. If no
+#                          side stays clear (or a configured point sits
+#                          inside the part), the plan says so explicitly
+#                          instead of claiming a clearance it does not have.
+#   reheat_park_delta_z    Z lift above the current Z when parking, mm
+#                          (0,10] (2). plrd computes the ABSOLUTE target
+#                          min(current_z + this, position_max) at execute
+#                          time and commands that: Klipper does NOT clamp
+#                          an out-of-range move, it raises "Move out of
+#                          range" (kinematics/cartesian.py), which here
+#                          would abort AFTER the probe established the Z
+#                          reference and force a full re-run.
+#   drag_nozzle_temp       nozzle temperature the ADXL DRAG path heats to
+#                          AND HOLDS FOR before dragging, C.
+#                          [0, ceiling - 5] (145)
+#                          Default equals the touch path's commanded probe
+#                          temp so both oracles reference at the same
+#                          thermal state. Without it a drag could reference
+#                          anywhere from ambient upward.
+#                          *** 0 = OPT OUT: do not heat for the drag and do
+#                          NOT wait. Use this for a deliberate cold drag —
+#                          otherwise a cold-drag operator would be left
+#                          waiting for the nozzle to cool to ambient, which
+#                          it may never reach. At 0 the plan emits no M104,
+#                          no M109 and no hold step at all; the contact
+#                          ceiling still applies. ***
+#                          *** FLOOR: a NONZERO value must be >= 50 C. ***
+#                          THE CHAMBER-AMBIENT TRAP: a nonzero target makes
+#                          the plan WAIT (M109), and on a PID hotend that
+#                          includes waiting to COOL. On an enclosed or
+#                          heated-chamber printer a 30-60 C target is at or
+#                          below chamber ambient: the nozzle takes longer
+#                          than the 15-minute step timeout to reach it, or
+#                          NEVER reaches it — every retry burns the full
+#                          timeout before aborting. If you want a cold
+#                          drag, say 0 (no wait at all); do not approximate
+#                          it with a low target.
+#                          If the hold does time out, the abort is CLEAN:
+#                          this step runs before the Z frame is declared,
+#                          so no frame-invalid marker is written and you
+#                          can simply retry after fixing the thermal issue.
+#                          The hold is an M109, which Klipper blocks on. On
+#                          a PID-controlled extruder M109 waits for the
+#                          heater to SETTLE in BOTH directions, so a nozzle
+#                          hotter than the target waits while it COOLS;
+#                          with bang-bang control it only waits to heat.
+#
+#   *** KEEP THE PROBE/DRAG TEMPERATURE THE SAME BETWEEN CALIBRATION AND
+#   RECOVERY. *** Run PLR_PROBE_TEST / PLR_NOISE_TEST at the same nozzle
+#   temperature recovery will use. Nozzle thermal expansion shifts the
+#   effective Z reference by tens of microns across a 100 C swing, so a
+#   reference taken at one temperature and used at another carries a
+#   systematic Z error — not noise you can average away.
+#
+# PURGE — exactly three coherent paths. Pick one; the precedence is:
+#
+#   1. purge_enable = False
+#        No purge of any kind. Nothing is emitted.
+#   2. purge_enable = True AND purge_macro set AND that macro exists
+#        The MACRO owns the purge completely: its own positioning, amount
+#        and speed. plr emits the call and nothing else, and does NOT
+#        reposition the toolhead for it (a macro's motion is unknowable to
+#        plr, exactly as with clean_nozzle_macro).
+#   3. purge_enable = True AND purge_macro set BUT the macro is MISSING
+#        plrd REFUSES to plan, naming the macro. It does NOT fall back to
+#        the built-in purge: you asked for specific behavior, and quietly
+#        extruding somewhere else instead is how filament ends up where
+#        you never intended. (clean_nozzle_macro degrades to asking you to
+#        confirm instead — that is safe because a human confirming a clean
+#        tip is a real substitute. A purge has no such human fallback.)
+#   4. purge_enable = True AND no purge_macro
+#        The BUILT-IN purge, fully specified by the keys below.
+#
+#   purge_enable           purge before resuming (in the recovery file) (true)
+#   purge_macro            OPTIONAL macro that OWNS the purge (path 2/3).
+#                          If you have a wipe or a purge bucket, put it
+#                          here — the macro can move to it, purge, and wipe.
+#   purge_x, purge_y       OPTIONAL built-in purge location, mm.
+#                          DEFAULT: the reheat park point (already
+#                          computed part-clear and bounds-checked).
+#   purge_z                OPTIONAL built-in purge ABSOLUTE Z, mm.
+#                          DEFAULT: the elevated park Z already in effect.
+#                          Set it to purge low over a defined spot instead
+#                          of dropping filament from mid-air.
+#                          *** FLOOR: purge_z MUST be >= 0. *** This is the
+#                          only raw absolute Z you supply, and the recovery
+#                          file runs in the TRUE frame where Z = 0 IS THE
+#                          BED SURFACE. A negative value drives the nozzle
+#                          into the bed at print temperature and extrudes
+#                          into it, so plrd refuses it outright. Do NOT
+#                          reason from stepper_z's position_min: that is
+#                          deliberately BELOW the bed (typically -2) to give
+#                          the probe envelope room, and is not a usable
+#                          floor here.
+#                          GUIDANCE: pick a height clear of the part. plrd
+#                          warns if purge_z is below the resume Z (the top
+#                          of what is already printed) — safe only if the
+#                          purge point is over bare bed — and warns with a
+#                          COLLISION RISK if the purge point is inside the
+#                          part footprint AND purge_z is set, because the
+#                          file descends to that Z over printed geometry.
+#                          The descent runs at the slow entry feedrate.
+#   purge_amount           built-in purge extrusion length, mm [0,100] (5)
+#   purge_speed            built-in purge extrusion feedrate,
+#                          mm/min (0,3000] (300)
+#   purge_retract          filament retracted after the built-in purge to
+#                          help break the string, mm [0,10] (0)
+#
+#   Every built-in purge coordinate is bounds-checked against the axis
+#   limits before the plan is accepted, and plrd warns (does not refuse)
+#   if the purge point lands inside the part's footprint — deliberate
+#   sacrificial areas are legitimate, but you should see it stated.
+#   clean_nozzle_macro     macro the clean-nozzle step calls when it exists
+#                          (default CLEAN_NOZZLE). When NO such macro
+#                          exists, that step emits no command and the plan
+#                          asks the operator to confirm the nozzle is clean.
+#
+# The recovery no longer seeks the original file with M26. It writes a
+# generated <original>_RECOVERY.gcode into the virtual_sdcard root and
+# selects it with M23/M24. That file reheats to print temperature, re-homes
+# XY, travels BACK to a known destination (G28 discards the park position,
+# and purging at the homed XY would leave a nozzle-attached string the
+# entry moves drag over the print), purges, does the entry moves, then
+# streams the original's verbatim tail. That destination is the built-in
+# purge point when you set purge_x/purge_y, else the reheat park point.
+# The park point is computed to clear the part; a purge point YOU set is
+# only warned about, not moved, if it lands inside the part — structured so no part-directed move can
+# precede the blocking M190/M109 heat waits (the heating gate). The tail is
+# copied byte-for-byte, so non-UTF-8 slicer metadata and binary thumbnails
+# survive intact. An existing file is never overwritten: the writer claims
+# its name exclusively and picks <name>-2, -3, ... if it was taken.
+#
 # Recovery is REFUSED until every prerequisite validates; keys mirror
 # plr-recovery's MachineConfig (see crates/plrd/src/config.rs for the
 # full table). All attestations default to false: recovery must be

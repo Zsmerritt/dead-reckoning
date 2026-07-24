@@ -49,6 +49,99 @@ pub enum RecoveryError {
         /// Name of the offending field.
         field: &'static str,
     },
+    /// The probe temperature band is too narrow to hold
+    /// [`crate::build::PROBE_TEMP_HEADROOM`] below the contact ceiling.
+    /// Probing AT the ceiling is refused by the Klipper plugin on any PID
+    /// overshoot, which wedges the recovery permanently (see the
+    /// constant's docs), so the config is refused up front instead.
+    #[error(
+        "probe temperature band too narrow: probe_temp_min {probe_temp_min} C leaves no room \
+         below the contact ceiling {ceiling} C for the required {headroom} C headroom. \
+         Lower probe_temp_min, or raise probe_temp_max / max_probe_nozzle_temp \
+         (the ceiling is min(probe_temp_max, max_probe_nozzle_temp))"
+    )]
+    ProbeTempHeadroomUnavailable {
+        /// The configured lower bound of the probing band, °C.
+        probe_temp_min: f64,
+        /// The effective contact ceiling `min(probe_temp_max,
+        /// max_probe_nozzle_temp)`, °C.
+        ceiling: f64,
+        /// The required headroom, °C
+        /// ([`crate::build::PROBE_TEMP_HEADROOM`]).
+        headroom: f64,
+    },
+    /// `drag_nozzle_temp` is negative, or sits within
+    /// [`crate::build::PROBE_TEMP_HEADROOM`] of the contact ceiling —
+    /// which would let the plan command a drag temperature the Klipper
+    /// plugin's ceiling gate then refuses, aborting after the Z frame is
+    /// declared and wedging the recovery. `0` (the cold-drag opt-out) is
+    /// always accepted.
+    #[error(
+        "drag_nozzle_temp {drag_nozzle_temp} C is outside [0, {ceiling} - {headroom}]: it must \
+         leave {headroom} C of headroom below the contact ceiling {ceiling} C \
+         (= min(probe_temp_max, max_probe_nozzle_temp)), or be exactly 0 to opt out of \
+         heating for the drag. Lower drag_nozzle_temp, or raise probe_temp_max / \
+         max_probe_nozzle_temp"
+    )]
+    DragTempOutOfRange {
+        /// The rejected drag hold temperature, °C.
+        drag_nozzle_temp: f64,
+        /// The effective contact ceiling, °C.
+        ceiling: f64,
+        /// The required headroom, °C.
+        headroom: f64,
+    },
+    /// `purge_macro` names a `[gcode_macro ...]` that does not exist on
+    /// the machine. Planning refuses rather than silently substituting
+    /// the built-in purge: the operator asked for specific behaviour, and
+    /// quietly extruding filament at a different place and rate is not an
+    /// acceptable substitute (unlike the clean-nozzle macro, which
+    /// degrades safely to asking the operator).
+    #[error(
+        "purge_macro names {name:?} but no [gcode_macro {name}] exists in the printer config; \
+         refusing to substitute the built-in purge. Add the macro, correct purge_macro, or \
+         unset purge_macro to use the built-in purge (or set purge_enable = False)"
+    )]
+    PurgeMacroMissing {
+        /// The configured macro name that was not found.
+        name: String,
+    },
+    /// `purge_z` is negative. The generated recovery file runs in the
+    /// TRUE frame, whose zero is the BED SURFACE, so a negative purge Z
+    /// drives the nozzle into the bed at print temperature and extrudes
+    /// into it. The Z rail's `position_min` is deliberately below the bed
+    /// in this design (it gives the shifted-frame probe envelope room), so
+    /// it is not a usable floor for this key — hence an explicit refusal.
+    #[error(
+        "purge_z {purge_z} mm is below the bed. In the recovery file's true frame Z=0 IS the \
+         bed surface, so a negative purge_z extrudes into the bed. Set purge_z >= 0 (and at \
+         or above the resume Z to clear the part), or unset it to purge at the parked height"
+    )]
+    PurgeZBelowBed {
+        /// The rejected purge Z, mm.
+        purge_z: f64,
+    },
+    /// A NONZERO `drag_nozzle_temp` below
+    /// [`crate::build::DRAG_TEMP_FLOOR`]. Such a target makes the
+    /// blocking `M109` wait for a passive cooldown, which on an enclosed
+    /// or heated-chamber machine can exceed the executor's 15-minute
+    /// timeout — or never converge, if chamber ambient is above the
+    /// target. `0` (the cold-drag opt-out, which emits no wait) is
+    /// exempt.
+    #[error(
+        "drag_nozzle_temp {drag_nozzle_temp} C is below the {floor} C floor. A nonzero drag \
+         temperature makes the plan WAIT (M109) for the nozzle to settle, and on a PID hotend \
+         that includes waiting to COOL — on an enclosed or heated-chamber printer a target at \
+         or below chamber ambient may never be reached, burning the full 15-minute step \
+         timeout on every retry. Raise it to at least {floor}, or set drag_nozzle_temp = 0 \
+         for a deliberate cold drag (no heating and no wait at all)"
+    )]
+    DragTempBelowFloor {
+        /// The rejected drag temperature, °C.
+        drag_nozzle_temp: f64,
+        /// The refusal floor, °C.
+        floor: f64,
+    },
     /// One or more machine prerequisites failed
     /// ([`crate::machine::validate_machine`]). Recovery must not be
     /// attempted on this machine until every failure is resolved.

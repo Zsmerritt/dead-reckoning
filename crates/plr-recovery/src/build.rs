@@ -40,8 +40,8 @@ use crate::error::RecoveryError;
 use crate::machine::{validate_machine, MachineConfig, ProbeKind, ValidatedMachine};
 use crate::plan::{
     fmt_num, AbortReason, FailureAction, Phase, PlanWarning, Predicate, RecoveryPlan, RecoveryStep,
-    RuntimeComputation, TriggerSource, TrueZFormula, Verification, RESTORE_ACCEL_PLACEHOLDER,
-    TRUE_Z_PLACEHOLDER,
+    RuntimeComputation, TriggerSource, TrueZFormula, Verification, PARK_Z_PLACEHOLDER,
+    RESTORE_ACCEL_PLACEHOLDER, TRUE_Z_PLACEHOLDER,
 };
 use crate::preflight::{preflight_itinerary, ItineraryBounds};
 use crate::preheat::{derive_preheat, FileTemps};
@@ -152,6 +152,219 @@ pub struct PlanConfig {
     /// touch). Ignored on the drag path (drag always uses
     /// `PLR_DRAG_PROBE`).
     pub legacy_single_probe: bool,
+    /// FROZEN `[plr]` key `max_probe_nozzle_temp` — the hard ceiling, °C,
+    /// for ANY contact operation. Range `[80, 160]`. Clamps the probe
+    /// temperature band: the effective band is
+    /// `[probe_temp_min, min(probe_temp_max, max_probe_nozzle_temp)]`; a
+    /// config whose clamped band is empty is REFUSED. The probe/drag
+    /// `pre_verify` predicates (current AND target) use this ceiling.
+    pub max_probe_nozzle_temp: f64,
+    /// FROZEN `[plr]` key `reheat_park_x` — nozzle park X while reheating
+    /// to print temperatures. `None` computes a park point outside the
+    /// analyzer's part bounding box (+ margin), clamped inside the axis
+    /// limits, with a plan warning recommending explicit configuration.
+    pub reheat_park_x: Option<f64>,
+    /// FROZEN `[plr]` key `reheat_park_y` — nozzle park Y (see
+    /// [`Self::reheat_park_x`]).
+    pub reheat_park_y: Option<f64>,
+    /// FROZEN `[plr]` key `reheat_park_delta_z` — Z lift above the
+    /// current (post-probe true-frame) Z for parking, mm. Range
+    /// `(0, 10]`. Klipper's own rail limit clamps the resulting absolute
+    /// Z below `position_max`.
+    pub reheat_park_delta_z: f64,
+    /// FROZEN `[plr]` key `pre_home_z_lift` — added to the believed Z
+    /// before XY homing, mm. Range `(0, 20]`. Clamped against `z_max`
+    /// when known.
+    pub pre_home_z_lift: f64,
+    /// FROZEN `[plr]` key `purge_enable` — whether the recovery file
+    /// purges before resuming. `false` means no purge of ANY kind.
+    pub purge_enable: bool,
+    /// FROZEN `[plr]` key `purge_amount` — built-in purge extrusion
+    /// length, mm. Range `[0, 100]`.
+    pub purge_amount: f64,
+    /// FROZEN `[plr]` key `purge_macro` — when set, the macro OWNS the
+    /// purge entirely (its own positioning, amount and speed).
+    ///
+    /// If it is set but the macro does not exist on the machine, planning
+    /// is REFUSED ([`RecoveryError::PurgeMacroMissing`]) — never silently
+    /// downgraded to the built-in purge. See the precedence table on
+    /// [`resolve_purge`].
+    pub purge_macro: Option<String>,
+    /// FROZEN `[plr]` key `purge_x` — X of the built-in purge, mm.
+    /// `None` defaults to the reheat park point's X.
+    pub purge_x: Option<f64>,
+    /// FROZEN `[plr]` key `purge_y` — Y of the built-in purge, mm.
+    /// `None` defaults to the reheat park point's Y.
+    pub purge_y: Option<f64>,
+    /// FROZEN `[plr]` key `purge_z` — ABSOLUTE Z of the built-in purge,
+    /// mm. `None` keeps the elevated park Z already in effect; setting it
+    /// lets an operator purge low over a defined spot instead of dropping
+    /// filament from mid-air.
+    ///
+    /// **Must be `>= 0`.** This is the ONE raw operator-chosen absolute Z
+    /// in the generated file, and the file runs in the TRUE frame, where
+    /// `Z = 0` is the bed surface — so a negative value drives the nozzle
+    /// into the bed at print temperature and extrudes into it. It cannot
+    /// be validated against the Z RAIL's `position_min`, which this design
+    /// deliberately places BELOW the bed (typically −2 mm) so the
+    /// shifted-frame probe envelope has room; that check would accept
+    /// `purge_z = -1.9`. [`PlanConfig::validate`] refuses negatives
+    /// outright, and the builder warns when the value sits below the
+    /// resume Z (i.e. below the part's current top).
+    pub purge_z: Option<f64>,
+    /// FROZEN `[plr]` key `purge_retract` — filament retracted after the
+    /// built-in purge, mm, to help break the string. Range `[0, 10]`;
+    /// `0` disables it.
+    pub purge_retract: f64,
+    /// FROZEN `[plr]` key `clean_nozzle_macro` — the macro the
+    /// clean-nozzle step calls when it exists (default `CLEAN_NOZZLE`).
+    pub clean_nozzle_macro: String,
+    /// FROZEN `[plr]` key `drag_nozzle_temp` — the nozzle temperature, °C,
+    /// the ADXL drag path heats to AND HOLDS FOR before dragging.
+    ///
+    /// Closes a real asymmetry: the touch path commands a probe
+    /// temperature and effectively holds for it (its band `pre_verify`
+    /// polls until satisfied), while the drag path historically carried
+    /// only an upper ceiling — so a drag probe could reference at any
+    /// temperature from ambient upward, and two runs of the same machine
+    /// could take their Z reference at different thermal states. Nozzle
+    /// thermal expansion moves the effective reference by tens of microns
+    /// across a 100 °C swing, so that inconsistency is a systematic Z
+    /// error, not noise.
+    ///
+    /// Default 145.0 — deliberately equal to the touch path's commanded
+    /// probe temperature, so both oracles reference at the same thermal
+    /// state.
+    ///
+    /// **`0` is an explicit opt-out**: "do not heat for dragging, and do
+    /// not hold". A cold drag is legitimate (see the drag path's
+    /// temperature gate), and an operator who wants one must not be left
+    /// waiting for the nozzle to cool to ambient — which it may never
+    /// reach. At `0` the plan emits no drag `M104`, no `M109`, and no
+    /// [`Phase::ProbeTempHold`] step at all; the contact ceiling still
+    /// applies.
+    ///
+    /// Valid range `[0, clamped_probe_max - PROBE_TEMP_HEADROOM]`: the
+    /// same headroom rule as [`Self::probe_nozzle_temp`], so plrd can
+    /// never command a temperature the plugin's ceiling gate would then
+    /// refuse (the finding-9 interlock).
+    pub drag_nozzle_temp: f64,
+    /// FROZEN `[plr]` key `purge_speed` — built-in purge extrusion
+    /// feedrate, mm/min. Range `(0, 3000]`; deliberately slow by default.
+    pub purge_speed: f64,
+}
+
+/// Headroom, °C, between the nozzle temperature the plan COMMANDS for
+/// probing and the hard contact ceiling it verifies against.
+///
+/// The Klipper plugin refuses `PLR_TOUCH` / `PLR_DRAG_PROBE` when
+/// `max(current, target) > max_probe_nozzle_temp`. If the plan commanded
+/// the ceiling exactly, ordinary PID overshoot (150.4 °C under a 150 °C
+/// ceiling is unremarkable) would trip that refusal — and because the
+/// probe runs AFTER the shifted-frame declare, the abort invalidates the Z
+/// frame, a re-execute is refused, and the fresh dry run regenerates an
+/// identical plan that fails identically: the recovery wedges permanently
+/// with the nozzle parked over the part.
+///
+/// The plan therefore targets `clamped_probe_max - PROBE_TEMP_HEADROOM`
+/// (145 °C under the default 150 °C ceiling) while still VERIFYING against
+/// the full band up to the ceiling — the target leaves room, the band does
+/// not tighten. [`PlanConfig::validate`] refuses any config where the
+/// headroom cannot be honored.
+pub const PROBE_TEMP_HEADROOM: f64 = 5.0;
+
+/// Tolerance, °C, added to the contact ceiling when checking the MEASURED
+/// nozzle temperature before a contact operation.
+///
+/// Mirrors the Klipper plugin's `MAX_TOUCH_TEMPERATURE_EPSILON` (itself
+/// following Cartographer's `MAX_TOUCH_TEMPERATURE_EPSILON = 2`,
+/// `probe/touch_mode.py:34`). The two sides must agree on the identical
+/// boundary, not merely be ordered: without this tolerance the probe step
+/// gates measured temperature at exactly the ceiling, and a measured
+/// overshoot aborts at [`Phase::Probe`] — which sits AFTER
+/// [`Phase::ShiftedFrame`], so the abort invalidates the Z frame, refuses
+/// re-execution, and regenerates an identical plan. The wedge would then
+/// be plrd's own doing rather than the plugin's.
+///
+/// The asymmetry is deliberate and load-bearing:
+///
+/// * the **measured** (`extruder.temperature`) bound is
+///   `clamped_probe_max + PROBE_TEMP_MEASURED_TOLERANCE` — measurement
+///   noise and PID overshoot around a legitimately-commanded temperature
+///   are forgiven;
+/// * the **target** (`extruder.target`) bound stays exactly
+///   `clamped_probe_max` — commanding a hotter nozzle is never forgiven.
+///
+/// The preheat step's own band is deliberately NOT widened: it runs
+/// before any frame declaration, so a refusal there is a clean early
+/// abort with nothing to unwind.
+pub const PROBE_TEMP_MEASURED_TOLERANCE: f64 = 2.0;
+
+/// Refusal floor, °C, for a NONZERO [`PlanConfig::drag_nozzle_temp`].
+///
+/// A nonzero drag temperature makes the plan emit a blocking `M109`, and
+/// on a PID hotend that waits in BOTH directions — so a low target means
+/// waiting for a PASSIVE COOLDOWN. On the enclosed / heated-chamber
+/// machines this project targets, 30–60 °C is at or below chamber
+/// ambient: the nozzle can take longer than the executor's 15-minute
+/// `temp_timeout` to get there, and if ambient EXCEEDS the target it can
+/// never converge at all — every retry burns the full timeout before
+/// aborting.
+///
+/// So sub-50 °C targets are refused, and the honest way to ask for a cold
+/// drag is `drag_nozzle_temp = 0`: the documented opt-out, which emits no
+/// heat command and no wait at all.
+pub const DRAG_TEMP_FLOOR: f64 = 50.0;
+
+/// Half-width, °C, of the band the [`Phase::ProbeTempHold`] step verifies
+/// the held nozzle temperature landed inside.
+///
+/// Deliberately a named constant, not another config knob: `M109` already
+/// blocks natively until Klipper is satisfied, so this verification is
+/// belt-and-braces confirmation that the temperature really landed — not
+/// a control parameter an operator should be tuning. ±5 °C comfortably
+/// covers steady-state PID ripple on a settled hotend while still
+/// catching a heater that never converged (or converged somewhere else).
+pub const PROBE_HOLD_BAND: f64 = 5.0;
+
+impl PlanConfig {
+    /// The effective probe-temperature ceiling: `probe_temp_max` clamped
+    /// down to `max_probe_nozzle_temp`. Both the current-temperature band
+    /// and the extruder-target interlock use this as their upper bound.
+    #[must_use]
+    pub fn clamped_probe_max(&self) -> f64 {
+        self.probe_temp_max.min(self.max_probe_nozzle_temp)
+    }
+
+    /// The nozzle temperature the plan actually COMMANDS for probing:
+    /// the configured `probe_nozzle_temp` pulled into
+    /// `[probe_temp_min, clamped_probe_max - PROBE_TEMP_HEADROOM]`.
+    ///
+    /// This is what the `M104` carries; the verification band's upper
+    /// bound stays at [`Self::clamped_probe_max`] (see
+    /// [`PROBE_TEMP_HEADROOM`] for why the two differ).
+    #[must_use]
+    pub fn commanded_probe_temp(&self) -> f64 {
+        let ceiling = self.clamped_probe_max() - PROBE_TEMP_HEADROOM;
+        self.probe_nozzle_temp.clamp(self.probe_temp_min, ceiling)
+    }
+
+    /// The nozzle temperature this machine heats to AND HOLDS FOR before
+    /// the probe, or `None` when no hold applies.
+    ///
+    /// * ADXL drag → [`Self::drag_nozzle_temp`], or `None` when that is
+    ///   `0` (the documented cold-drag opt-out: never wait for the nozzle
+    ///   to cool to ambient).
+    /// * Tap / load-cell → [`Self::commanded_probe_temp`].
+    #[must_use]
+    pub fn probe_hold_target(&self, kind: &ProbeKind) -> Option<f64> {
+        match kind {
+            ProbeKind::AdxlDrag { .. } => {
+                (self.drag_nozzle_temp > 0.0).then_some(self.drag_nozzle_temp)
+            }
+            ProbeKind::Tap | ProbeKind::LoadCell => Some(self.commanded_probe_temp()),
+        }
+    }
 }
 
 impl Default for PlanConfig {
@@ -183,6 +396,24 @@ impl Default for PlanConfig {
             touch_retract: 2.0,
             touch_accel: 100.0,
             legacy_single_probe: false,
+            // FROZEN [plr] recovery-UX keys (see the field docs).
+            max_probe_nozzle_temp: 150.0,
+            reheat_park_x: None,
+            reheat_park_y: None,
+            reheat_park_delta_z: 2.0,
+            pre_home_z_lift: 5.0,
+            purge_enable: true,
+            purge_amount: 5.0,
+            purge_macro: None,
+            purge_x: None,
+            purge_y: None,
+            purge_z: None,
+            purge_retract: 0.0,
+            clean_nozzle_macro: "CLEAN_NOZZLE".to_owned(),
+            // Matches commanded_probe_temp() under the default ceiling, so
+            // drag and touch reference at the same thermal state.
+            drag_nozzle_temp: 145.0,
+            purge_speed: 300.0,
         }
     }
 }
@@ -195,8 +426,9 @@ impl PlanConfig {
     /// [`RecoveryError::InvalidPlanConfig`] naming the first offending
     /// field. The probe speed band is enforced later by
     /// [`compute_envelope`].
+    #[allow(clippy::too_many_lines)] // one flat table of field-bound checks
     pub fn validate(&self) -> Result<(), RecoveryError> {
-        let checks: [(&'static str, f64, bool); 21] = [
+        let checks: [(&'static str, f64, bool); 27] = [
             ("margin", self.margin, self.margin >= 0.0),
             (
                 "sag_allowance",
@@ -278,6 +510,37 @@ impl PlanConfig {
                 self.touch_accel,
                 self.touch_accel >= 50.0 && self.touch_accel <= 1000.0,
             ),
+            // FROZEN [plr] recovery-UX bands.
+            (
+                "max_probe_nozzle_temp",
+                self.max_probe_nozzle_temp,
+                self.max_probe_nozzle_temp >= 80.0 && self.max_probe_nozzle_temp <= 160.0,
+            ),
+            (
+                "reheat_park_delta_z",
+                self.reheat_park_delta_z,
+                self.reheat_park_delta_z > 0.0 && self.reheat_park_delta_z <= 10.0,
+            ),
+            (
+                "pre_home_z_lift",
+                self.pre_home_z_lift,
+                self.pre_home_z_lift > 0.0 && self.pre_home_z_lift <= 20.0,
+            ),
+            (
+                "purge_amount",
+                self.purge_amount,
+                self.purge_amount >= 0.0 && self.purge_amount <= 100.0,
+            ),
+            (
+                "purge_speed",
+                self.purge_speed,
+                self.purge_speed > 0.0 && self.purge_speed <= 3000.0,
+            ),
+            (
+                "purge_retract",
+                self.purge_retract,
+                self.purge_retract >= 0.0 && self.purge_retract <= 10.0,
+            ),
         ];
         for (field, value, in_range) in checks {
             if !value.is_finite() {
@@ -285,6 +548,78 @@ impl PlanConfig {
             }
             if !in_range {
                 return Err(RecoveryError::InvalidPlanConfig { field });
+            }
+        }
+        // The probe temperature band clamps to the ceiling; refuse a
+        // config whose clamped band is empty.
+        let clamped_max = self.clamped_probe_max();
+        if clamped_max <= self.probe_temp_min {
+            return Err(RecoveryError::InvalidPlanConfig {
+                field: "max_probe_nozzle_temp",
+            });
+        }
+        // The commanded probe temperature must be able to sit at least
+        // PROBE_TEMP_HEADROOM below the ceiling (see the constant's docs:
+        // targeting the ceiling wedges the recovery on PID overshoot).
+        // When the band is too narrow to hold that headroom, refuse with
+        // the offending bounds named rather than silently probing at the
+        // ceiling.
+        if self.probe_temp_min > clamped_max - PROBE_TEMP_HEADROOM {
+            return Err(RecoveryError::ProbeTempHeadroomUnavailable {
+                probe_temp_min: self.probe_temp_min,
+                ceiling: clamped_max,
+                headroom: PROBE_TEMP_HEADROOM,
+            });
+        }
+        // The drag hold temperature obeys the SAME interlock: plrd must
+        // never command a temperature the plugin's ceiling gate would
+        // then refuse. `0` is the documented cold-drag opt-out.
+        if !self.drag_nozzle_temp.is_finite() {
+            return Err(RecoveryError::NonFinite {
+                field: "drag_nozzle_temp",
+            });
+        }
+        if self.drag_nozzle_temp < 0.0 || self.drag_nozzle_temp > clamped_max - PROBE_TEMP_HEADROOM
+        {
+            return Err(RecoveryError::DragTempOutOfRange {
+                drag_nozzle_temp: self.drag_nozzle_temp,
+                ceiling: clamped_max,
+                headroom: PROBE_TEMP_HEADROOM,
+            });
+        }
+        // A nonzero target below the floor means waiting for a passive
+        // cooldown that may never converge on a heated-chamber machine
+        // (see DRAG_TEMP_FLOOR). `0` — the cold-drag opt-out — is exempt
+        // precisely because it emits no wait at all.
+        if self.drag_nozzle_temp > 0.0 && self.drag_nozzle_temp < DRAG_TEMP_FLOOR {
+            return Err(RecoveryError::DragTempBelowFloor {
+                drag_nozzle_temp: self.drag_nozzle_temp,
+                floor: DRAG_TEMP_FLOOR,
+            });
+        }
+        // purge_z is the only raw operator-chosen ABSOLUTE Z in the
+        // generated file, and that file runs in the TRUE frame where zero
+        // is the bed surface. The Z rail's position_min is NOT a usable
+        // floor here — this design puts it below the bed on purpose (see
+        // the field docs) — so negatives are refused outright.
+        if let Some(z) = self.purge_z {
+            if z.is_finite() && z < 0.0 {
+                return Err(RecoveryError::PurgeZBelowBed { purge_z: z });
+            }
+        }
+        // Optional reheat park coordinates: finite when present (axis
+        // bounds are checked by the whole-itinerary pre-flight).
+        for (field, v) in [
+            ("reheat_park_x", self.reheat_park_x),
+            ("reheat_park_y", self.reheat_park_y),
+            ("purge_x", self.purge_x),
+            ("purge_y", self.purge_y),
+            ("purge_z", self.purge_z),
+        ] {
+            if let Some(v) = v {
+                if !v.is_finite() {
+                    return Err(RecoveryError::NonFinite { field });
+                }
             }
         }
         // probe_speed: non-finite values fall out of the band check in
@@ -430,6 +765,23 @@ pub struct PlanInputs<'a> {
     pub file_temps: FileTemps,
     /// Exclude-object definitions to restore after `M23`.
     pub exclude_objects: &'a [ExcludeObjectDef],
+    /// `true` when a `[gcode_macro <clean_nozzle_macro>]` section exists
+    /// in the running printer config (the daemon resolves this from the
+    /// `configfile` sections it already queries). When `false` the
+    /// clean-nozzle step carries no command and the plan sets
+    /// [`RecoveryPlan::requires_clean_nozzle_confirmation`].
+    pub clean_nozzle_macro_present: bool,
+    /// `true` when the configured `purge_macro` exists as a
+    /// `[gcode_macro <purge_macro>]` section (only consulted when
+    /// `purge_macro` is set).
+    ///
+    /// When `purge_macro` is set and this is `false`, planning is
+    /// **REFUSED** ([`RecoveryError::PurgeMacroMissing`]) — it does NOT
+    /// fall back to the built-in purge. See the precedence table on
+    /// [`resolve_purge`] for the full mapping and why this asymmetry with
+    /// `clean_nozzle_macro` (which degrades to asking the operator) is
+    /// deliberate.
+    pub purge_macro_present: bool,
 }
 
 /// Validated numeric view of the WAL g-code state.
@@ -565,13 +917,19 @@ struct Ctx<'a> {
     candidate: &'a ProbeCandidate,
     formula: TrueZFormula,
     resume: ResumeTarget,
-    nozzle_print: f64,
     bed: Option<f64>,
     other_heaters: &'a [(String, f64)],
     fan_cmds: &'a [String],
-    file_name: &'a str,
-    file_path: &'a str,
     excludes: &'a [ExcludeObjectDef],
+    /// Upper bound of the possible-stop-set Z (the conservative believed
+    /// value declared before XY homing).
+    believed_z: f64,
+    /// The reheat park point `[x, y]` (configured or computed).
+    park: [f64; 2],
+    /// Whether the clean-nozzle macro exists on the machine.
+    clean_nozzle_present: bool,
+    /// The generated recovery file's top-level name (the `M23` target).
+    recovery_file_name: &'a str,
 }
 
 fn step(
@@ -638,16 +996,22 @@ fn step_stepper_enable(ctx: &Ctx<'_>) -> RecoveryStep {
     )
 }
 
-fn step_preheat(ctx: &Ctx<'_>) -> RecoveryStep {
+fn step_immediate_bed_heat(ctx: &Ctx<'_>) -> RecoveryStep {
+    // The FIRST heating action, non-blocking: bed heating is the long
+    // pole, so its M140 goes out before any motion; the nozzle is nudged
+    // toward the (clamped) probe temperature at the same time. Neither
+    // command WAITS here — convergence is gated later at the probe's
+    // pre_verify. The verifications only confirm the TARGETS were set.
     let mut commands = Vec::new();
     let mut verify = Vec::new();
     if let Some(bed) = ctx.bed {
         commands.push(format!("M140 S{}", fmt_num(bed)));
         verify.push(Verification::new(
             "heater_bed",
-            "temperature",
-            Predicate::NumAtLeast {
-                min: bed - ctx.cfg.temp_epsilon,
+            "target",
+            Predicate::NumWithin {
+                expected: bed,
+                epsilon: 1.0,
             },
         ));
     }
@@ -660,24 +1024,161 @@ fn step_preheat(ctx: &Ctx<'_>) -> RecoveryStep {
             ));
         }
     }
-    commands.push(format!("M104 S{}", fmt_num(ctx.cfg.probe_nozzle_temp)));
-    verify.push(Verification::new(
-        "extruder",
-        "temperature",
-        Predicate::TempWithin {
-            min: ctx.cfg.probe_temp_min,
-            max: ctx.cfg.probe_temp_max,
-        },
-    ));
+    // The COMMANDED probe temperature sits at least PROBE_TEMP_HEADROOM
+    // below the contact ceiling the probe step verifies against: the
+    // plugin refuses contact when max(current, target) exceeds the
+    // ceiling, and a target ON the ceiling trips that refusal on ordinary
+    // PID overshoot — wedging the recovery (see PROBE_TEMP_HEADROOM).
+    //
+    // Method-aware: a drag machine heads for `drag_nozzle_temp` (the
+    // temperature it will later HOLD for), a touch/load-cell machine for
+    // the commanded probe temp. A drag machine that opted out
+    // (`drag_nozzle_temp = 0`) gets NO nozzle command at all here — the
+    // cold-drag path must not be nudged warm behind the operator's back.
+    //
+    // These verifications stay as they are — confirming the TARGETS were
+    // accepted, not that they were reached. Convergence is now the
+    // explicit job of the ProbeTempHold step's blocking M109; making this
+    // step also wait would double the heat-up serialization for no gain,
+    // and it runs before any frame declaration where a stall is merely a
+    // clean early abort.
+    if let Some(target) = ctx.cfg.probe_hold_target(&ctx.machine.probe.kind) {
+        commands.push(format!("M104 S{}", fmt_num(target)));
+        verify.push(Verification::new(
+            "extruder",
+            "target",
+            Predicate::NumWithin {
+                expected: target,
+                epsilon: 1.0,
+            },
+        ));
+    }
     step(
-        Phase::Preheat,
-        "bed to target; nozzle to the warm-but-below-ooze probing band",
+        Phase::ImmediateBedHeat,
+        "FIRST heating action (non-blocking): bed toward target (the long pole) + nozzle toward the clamped probe temp",
         commands,
         vec![],
         verify,
         None,
-        AbortReason::PreheatFailed,
+        AbortReason::ImmediateBedHeatFailed,
     )
+}
+
+fn step_believed_z_declare(ctx: &Ctx<'_>) -> RecoveryStep {
+    // Declare the conservative believed Z (the upper bound of the
+    // possible-stop set) then lift by pre_home_z_lift so the following XY
+    // homing moves cannot drag the nozzle across the part. The lift is
+    // clamped so the commanded absolute Z never exceeds z_max when known.
+    let believed = ctx.believed_z;
+    let lift = clamp_lift(
+        ctx.cfg.pre_home_z_lift,
+        believed,
+        ctx.machine.axis_limits.z_max,
+    );
+    let target = believed + lift;
+    step(
+        Phase::BelievedZDeclare,
+        "declare the conservative believed Z (possible-stop upper bound) then lift before XY homing",
+        vec![
+            format!("SET_KINEMATIC_POSITION Z={}", fmt_num(believed)),
+            "G91".to_owned(),
+            format!("G1 Z{} F{}", fmt_num(lift), fmt_num(ctx.cfg.travel_feed)),
+            "G90".to_owned(),
+        ],
+        vec![],
+        vec![
+            Verification::new(
+                "toolhead",
+                "homed_axes",
+                Predicate::Contains {
+                    needle: "z".to_owned(),
+                },
+            ),
+            Verification::new(
+                "toolhead",
+                "position.2",
+                Predicate::NumWithin {
+                    expected: target,
+                    epsilon: ctx.cfg.z_epsilon,
+                },
+            ),
+        ],
+        None,
+        AbortReason::BelievedZDeclareFailed,
+    )
+}
+
+/// The probe-temperature HOLD step, or `None` on a drag machine that has
+/// opted out (`drag_nozzle_temp = 0`).
+///
+/// `M109` blocks natively until Klipper is satisfied the heater settled,
+/// so this step is where the recovery actually WAITS for temperature —
+/// closing the asymmetry where the drag path had only an upper ceiling
+/// and could therefore reference at any temperature from ambient upward.
+/// The band verification below is belt-and-braces: `M109` already
+/// returned, so a failure here means the reading disagrees with what
+/// Klipper concluded.
+fn step_probe_temp_hold(ctx: &Ctx<'_>) -> Option<RecoveryStep> {
+    let target = ctx.cfg.probe_hold_target(&ctx.machine.probe.kind)?;
+    let summary = match &ctx.machine.probe.kind {
+        ProbeKind::AdxlDrag { .. } => {
+            "heat to the drag temperature and HOLD (M109 blocks; a PID hotend also waits to COOL)"
+        }
+        ProbeKind::Tap | ProbeKind::LoadCell => {
+            "heat to the probe temperature and HOLD (M109 blocks; a PID hotend also waits to COOL)"
+        }
+    };
+    Some(step(
+        Phase::ProbeTempHold,
+        summary,
+        vec![format!("M109 S{}", fmt_num(target))],
+        vec![],
+        vec![Verification::new(
+            "extruder",
+            "temperature",
+            Predicate::TempWithin {
+                min: target - PROBE_HOLD_BAND,
+                max: target + PROBE_HOLD_BAND,
+            },
+        )],
+        None,
+        AbortReason::ProbeTempHoldFailed,
+    ))
+}
+
+fn step_clean_nozzle(ctx: &Ctx<'_>) -> RecoveryStep {
+    // When the operator's clean-nozzle macro exists, call it (verify:
+    // none — macro semantics are unknowable). When it does not, emit NO
+    // command; the plan-level requires_clean_nozzle_confirmation flag
+    // tells the wizard/CLI to obtain the operator's confirmation instead.
+    let commands = if ctx.clean_nozzle_present {
+        vec![ctx.cfg.clean_nozzle_macro.clone()]
+    } else {
+        vec![]
+    };
+    let summary = if ctx.clean_nozzle_present {
+        "call the clean-nozzle macro (semantics unknowable; not verified)"
+    } else {
+        "no clean-nozzle macro: the operator must confirm the nozzle is clean (no command)"
+    };
+    step(
+        Phase::CleanNozzle,
+        summary,
+        commands,
+        vec![],
+        vec![],
+        None,
+        AbortReason::CleanNozzleFailed,
+    )
+}
+
+/// Clamps a Z lift so `base + lift` never exceeds `z_max` (when known),
+/// never returning a negative lift.
+fn clamp_lift(lift: f64, base: f64, z_max: Option<f64>) -> f64 {
+    match z_max {
+        Some(zm) if base + lift > zm => (zm - base).max(0.0),
+        _ => lift,
+    }
 }
 
 fn step_home_xy() -> RecoveryStep {
@@ -940,10 +1441,23 @@ fn step_probe(ctx: &Ctx<'_>) -> RecoveryStep {
 
 /// The mandatory, daemon-enforced probe pre-verifications: the nozzle
 /// temperature interlock (both CURRENT temperature and the extruder
-/// TARGET inside the probe band — the `max(current, target)` guard from
-/// Cartographer `touch_mode.py:299-303`, so a nozzle commanded to print
-/// temperature while transiently cool still refuses) and XYZ homed.
+/// TARGET at or below the clamped ceiling — the `max(current, target)`
+/// guard from Cartographer `touch_mode.py:299-303`, so a nozzle commanded
+/// to print temperature while transiently cool still refuses) and XYZ
+/// homed.
+///
+/// Touch / `PROBE` machines keep the warm band `[probe_temp_min,
+/// ceiling]` (a below-ooze warmth protects the tip on contact). The drag
+/// path has NO warm minimum — a bare ceiling: cold dragging is fine,
+/// while a hot nozzle melts the part and corrupts the accelerometer
+/// readings — so its current-temperature predicate is `NumAtMost` the
+/// ceiling, not a band.
 fn probe_pre_verify(ctx: &Ctx<'_>) -> Vec<Verification> {
+    let ceiling = ctx.cfg.clamped_probe_max();
+    // The MEASURED bound carries the plugin's tolerance so both sides
+    // refuse at the identical boundary; the TARGET bound does not (see
+    // PROBE_TEMP_MEASURED_TOLERANCE for why the asymmetry is the point).
+    let measured_max = ceiling + PROBE_TEMP_MEASURED_TOLERANCE;
     let homed = |axis: &str| {
         Verification::new(
             "toolhead",
@@ -953,22 +1467,24 @@ fn probe_pre_verify(ctx: &Ctx<'_>) -> Vec<Verification> {
             },
         )
     };
-    vec![
-        Verification::new(
+    let current_temp = match &ctx.machine.probe.kind {
+        ProbeKind::AdxlDrag { .. } => Verification::new(
+            "extruder",
+            "temperature",
+            Predicate::NumAtMost { max: measured_max },
+        ),
+        ProbeKind::Tap | ProbeKind::LoadCell => Verification::new(
             "extruder",
             "temperature",
             Predicate::TempWithin {
                 min: ctx.cfg.probe_temp_min,
-                max: ctx.cfg.probe_temp_max,
+                max: measured_max,
             },
         ),
-        Verification::new(
-            "extruder",
-            "target",
-            Predicate::NumAtMost {
-                max: ctx.cfg.probe_temp_max,
-            },
-        ),
+    };
+    vec![
+        current_temp,
+        Verification::new("extruder", "target", Predicate::NumAtMost { max: ceiling }),
         homed("x"),
         homed("y"),
         homed("z"),
@@ -1036,19 +1552,75 @@ fn step_final_declare(ctx: &Ctx<'_>) -> RecoveryStep {
     )
 }
 
+fn step_park_for_reheat(ctx: &Ctx<'_>) -> RecoveryStep {
+    // Park the nozzle away from the part before the recovery file reheats
+    // to print temperature: a nozzle dwelling at print temperature
+    // pressed against layer N−1 plastic melts a divot.
+    //
+    // The lift is an ABSOLUTE move to a runtime-computed, rail-clamped
+    // height (`RuntimeComputation::ParkZ` → min(current + delta, z_max)),
+    // not a blind relative `G1 Z<delta>`: Klipper does not clamp an
+    // out-of-range move, it raises "Move out of range"
+    // (kinematics/cartesian.py:105) — which here would abort AFTER the
+    // probe established the Z reference and force a full re-run. Then an
+    // absolute travel to the reheat park XY.
+    let [px, py] = ctx.park;
+    let commands = vec![
+        "G90".to_owned(),
+        format!("G1 Z{PARK_Z_PLACEHOLDER} F{}", fmt_num(ctx.cfg.entry_feed)),
+        format!(
+            "G0 X{} Y{} F{}",
+            fmt_num(px),
+            fmt_num(py),
+            fmt_num(ctx.cfg.travel_feed)
+        ),
+    ];
+    step(
+        Phase::ParkForReheat,
+        "lift off the part (rail-clamped) and park at the reheat XY (the file reheats to print temp here)",
+        commands,
+        vec![],
+        vec![
+            Verification::new(
+                "toolhead",
+                "position.0",
+                Predicate::NumWithin {
+                    expected: px,
+                    epsilon: ctx.cfg.xy_epsilon,
+                },
+            ),
+            Verification::new(
+                "toolhead",
+                "position.1",
+                Predicate::NumWithin {
+                    expected: py,
+                    epsilon: ctx.cfg.xy_epsilon,
+                },
+            ),
+            // The lift landed at the computed clamped height.
+            Verification::new(
+                "toolhead",
+                "position.2",
+                Predicate::NumWithinComputed {
+                    epsilon: ctx.cfg.z_epsilon,
+                },
+            ),
+        ],
+        Some(RuntimeComputation::ParkZ {
+            delta_z: ctx.cfg.reheat_park_delta_z,
+            z_max: ctx.machine.axis_limits.z_max,
+        }),
+        AbortReason::ParkForReheatFailed,
+    )
+}
+
 fn step_restore_frame(ctx: &Ctx<'_>) -> RecoveryStep {
     let g = &ctx.gcode;
-    // After the probe the nozzle rests pressed against layer N−1. It
-    // must lift off *before* the print temperature is restored — the
-    // temperature verification below polls for minutes, and a nozzle
-    // dwelling at print temperature against plastic melts a divot. The
-    // lift is a bounded relative move in the safe direction (away from
-    // the part), never less than 0.5 mm.
-    let lift = ctx.cfg.entry_hop.max(0.5);
+    // Replay the frame state: offsets, speed/extrude factors, skew, and
+    // fans. Print temperatures and the file feedrate are restored INSIDE
+    // the recovery file (the reheat is gated there), so they are absent
+    // here.
     let mut commands = vec![
-        "G91".to_owned(),
-        format!("G1 Z{} F{}", fmt_num(lift), fmt_num(ctx.cfg.entry_feed)),
-        "G90".to_owned(),
         format!(
             "SET_GCODE_OFFSET X={} Y={} Z={}",
             fmt_num(g.origin[0]),
@@ -1064,14 +1636,8 @@ fn step_restore_frame(ctx: &Ctx<'_>) -> RecoveryStep {
             commands.push(format!("SKEW_PROFILE LOAD={profile}"));
         }
     }
-    commands.push(format!("M104 S{}", fmt_num(ctx.nozzle_print)));
-    if let Some(bed) = ctx.bed {
-        commands.push(format!("M140 S{}", fmt_num(bed)));
-    }
     commands.extend_from_slice(ctx.fan_cmds);
-    // Raw F value in mm/min from the WAL; M220 restored above.
-    commands.push(format!("G1 F{}", fmt_num(g.speed_raw)));
-    let mut verify = vec![
+    let verify = vec![
         Verification::new(
             "gcode_move",
             "speed_factor",
@@ -1088,27 +1654,10 @@ fn step_restore_frame(ctx: &Ctx<'_>) -> RecoveryStep {
                 epsilon: 0.01,
             },
         ),
-        Verification::new(
-            "extruder",
-            "temperature",
-            Predicate::TempWithin {
-                min: ctx.nozzle_print - ctx.cfg.temp_epsilon,
-                max: ctx.nozzle_print + ctx.cfg.temp_epsilon,
-            },
-        ),
     ];
-    if let Some(bed) = ctx.bed {
-        verify.push(Verification::new(
-            "heater_bed",
-            "temperature",
-            Predicate::NumAtLeast {
-                min: bed - ctx.cfg.temp_epsilon,
-            },
-        ));
-    }
     step(
         Phase::RestoreFrame,
-        "lift off the part, then replay offsets, factors, skew, print temperatures, fans, feedrate",
+        "replay offsets, speed/extrude factors, skew, fans (print temps reheat in the file)",
         commands,
         vec![],
         verify,
@@ -1117,7 +1666,16 @@ fn step_restore_frame(ctx: &Ctx<'_>) -> RecoveryStep {
     )
 }
 
-fn step_entry(ctx: &Ctx<'_>) -> Result<RecoveryStep, RecoveryError> {
+/// The entry-move commands (travel above the part interior, descend,
+/// prime, restore E frame / modes / feedrate). These relocate INTO the
+/// generated recovery file (section e); the plan carries them only via
+/// the [`crate::resume_file::RecoveryFileSpec`]. The file has already
+/// re-homed XY and heated, so these run from home XY / park Z.
+///
+/// # Errors
+///
+/// [`RecoveryError::NonFinite`] on any non-finite derived coordinate.
+fn build_entry_commands(ctx: &Ctx<'_>) -> Result<Vec<String>, RecoveryError> {
     let g = &ctx.gcode;
     let [internal_x, internal_y, internal_z, internal_e] = ctx.resume.position;
     let gcode_x = internal_x - g.origin[0];
@@ -1154,39 +1712,17 @@ fn step_entry(ctx: &Ctx<'_>) -> Result<RecoveryStep, RecoveryError> {
     commands.push(format!("G92 E{}", fmt_num(file_e)));
     commands.push(if g.absolute_extrude { "M82" } else { "M83" }.to_owned());
     commands.push(if g.absolute_coordinates { "G90" } else { "G91" }.to_owned());
-    // Re-assert the file feedrate: the entry moves' F words overwrote
-    // the §8.9 restore.
+    // Re-assert the file feedrate: the entry moves' F words overwrote it.
     commands.push(format!("G1 F{}", fmt_num(g.speed_raw)));
-    Ok(step(
-        Phase::Entry,
-        "enter from above the part interior, speed-limited; prime; final E frame and modes",
-        commands,
-        vec![],
-        vec![
-            Verification::new(
-                "toolhead",
-                "position.0",
-                Predicate::NumWithin {
-                    expected: internal_x,
-                    epsilon: ctx.cfg.xy_epsilon,
-                },
-            ),
-            Verification::new(
-                "toolhead",
-                "position.1",
-                Predicate::NumWithin {
-                    expected: internal_y,
-                    epsilon: ctx.cfg.xy_epsilon,
-                },
-            ),
-        ],
-        None,
-        AbortReason::EntryFailed,
-    ))
+    Ok(commands)
 }
 
-fn step_file_select(ctx: &Ctx<'_>) -> RecoveryStep {
-    let mut commands = vec![format!("M23 {}", ctx.file_name)];
+fn step_recovery_file_select(ctx: &Ctx<'_>) -> RecoveryStep {
+    // Select the GENERATED recovery file and start it. No M26: the
+    // recovery file already begins at the resume boundary (its verbatim
+    // tail). Exclude-object state is restored between M23 (which resets
+    // it) and M24.
+    let mut commands = vec![format!("M23 {}", ctx.recovery_file_name)];
     for def in ctx.excludes {
         let mut cmd = format!("EXCLUDE_OBJECT_DEFINE NAME={}", def.name);
         if let Some([cx, cy]) = def.center {
@@ -1205,41 +1741,11 @@ fn step_file_select(ctx: &Ctx<'_>) -> RecoveryStep {
     for def in ctx.excludes.iter().filter(|d| d.currently_excluded) {
         commands.push(format!("EXCLUDE_OBJECT NAME={}", def.name));
     }
-    #[allow(clippy::cast_precision_loss)] // verification tolerance is 0.5
-    let offset_f = ctx.resume.offset as f64;
-    commands.push(format!("M26 S{}", ctx.resume.offset));
+    commands.push("M24".to_owned());
     step(
-        Phase::FileSelect,
-        "select the file (top level only), restore exclude-object state, seek to the line boundary",
+        Phase::RecoveryFileSelect,
+        "select the generated recovery file (M23), restore exclude-object state, start it (M24)",
         commands,
-        vec![],
-        vec![
-            Verification::new(
-                "virtual_sdcard",
-                "file_path",
-                Predicate::Equals {
-                    value: ctx.file_path.to_owned(),
-                },
-            ),
-            Verification::new(
-                "virtual_sdcard",
-                "file_position",
-                Predicate::NumWithin {
-                    expected: offset_f,
-                    epsilon: 0.5,
-                },
-            ),
-        ],
-        None,
-        AbortReason::FileSelectFailed,
-    )
-}
-
-fn step_resume_start() -> RecoveryStep {
-    step(
-        Phase::ResumeStart,
-        "start playback",
-        vec!["M24".to_owned()],
         vec![],
         vec![
             Verification::new("virtual_sdcard", "is_active", Predicate::BoolTrue),
@@ -1252,7 +1758,7 @@ fn step_resume_start() -> RecoveryStep {
             ),
         ],
         None,
-        AbortReason::ResumeStartFailed,
+        AbortReason::RecoveryFileSelectFailed,
     )
 }
 
@@ -1344,15 +1850,26 @@ fn collect_warnings(
     }
 }
 
-/// Assembles the steps in strict §8 order and renumbers them.
+/// Assembles the steps in the strict recovery-UX order and renumbers
+/// them.
 fn build_steps(ctx: &Ctx<'_>) -> Result<Vec<RecoveryStep>, RecoveryError> {
     let transforms = &ctx.context.transforms;
+    // 1–5: idle timeout, stepper enable, the FIRST heating action
+    // (non-blocking bed + nozzle), the believed-Z declare + pre-home
+    // lift, XY homing (now after the lift), and the clean-nozzle step.
     let mut steps = vec![
         step_idle_timeout(ctx),
         step_stepper_enable(ctx),
-        step_preheat(ctx),
+        step_immediate_bed_heat(ctx),
+        step_believed_z_declare(ctx),
         step_home_xy(),
     ];
+    // The temperature HOLD goes between homing and the clean: reaching
+    // temperature first means heat-up ooze is wiped by the clean rather
+    // than deposited during the probe. Absent on an opted-out cold drag.
+    steps.extend(step_probe_temp_hold(ctx));
+    steps.push(step_clean_nozzle(ctx));
+    // 6: the probe envelope machinery (unchanged content).
     if transforms.z_thermal_adjust_enabled.is_some() {
         steps.push(step_transform_freeze());
     }
@@ -1371,6 +1888,7 @@ fn build_steps(ctx: &Ctx<'_>) -> Result<Vec<RecoveryStep>, RecoveryError> {
     if clamp {
         steps.push(step_accel_restore());
     }
+    // 7: true-Z declare, mesh, final declare.
     steps.push(step_true_z_declare(ctx));
     if transforms.bed_mesh_active {
         if let Some(profile) = transforms
@@ -1383,10 +1901,11 @@ fn build_steps(ctx: &Ctx<'_>) -> Result<Vec<RecoveryStep>, RecoveryError> {
         }
     }
     steps.push(step_final_declare(ctx));
+    // 8: park for reheat, then the frame restore (offsets/factors/skew/
+    // fans). 9: select and start the generated recovery file.
+    steps.push(step_park_for_reheat(ctx));
     steps.push(step_restore_frame(ctx));
-    steps.push(step_entry(ctx)?);
-    steps.push(step_file_select(ctx));
-    steps.push(step_resume_start());
+    steps.push(step_recovery_file_select(ctx));
     for (index, s) in steps.iter_mut().enumerate() {
         s.id = u32::try_from(index + 1).unwrap_or(u32::MAX);
     }
@@ -1403,6 +1922,7 @@ fn build_steps(ctx: &Ctx<'_>) -> Result<Vec<RecoveryStep>, RecoveryError> {
 /// zone, too-coarse match) return
 /// [`PlanOutcome::ManualFallback`] instead of an error; a clean
 /// shutdown returns [`PlanOutcome::NoRecoveryNeeded`].
+#[allow(clippy::too_many_lines)] // linear input validation + assembly
 pub fn plan_recovery(
     inputs: &PlanInputs<'_>,
     config: &PlanConfig,
@@ -1471,6 +1991,31 @@ pub fn plan_recovery(
         config.drag_speed,
     ));
 
+    // The conservative believed Z: the upper bound of the possible-stop
+    // set (declared before XY homing so the homing moves clear the part).
+    let z_span = recovery.stop_set.z_span().ok_or(RecoveryError::NoZSpan)?;
+    let believed_z = z_span.hi;
+    if !believed_z.is_finite() {
+        return Err(RecoveryError::NonFinite {
+            field: "believed_z",
+        });
+    }
+
+    // The reheat park point: configured (cross-checked against the part
+    // footprint) or computed on a side that verifiably clears it.
+    let park_choice = reheat_park(config, inputs.model, &machine.axis_limits);
+    let park = park_choice.point;
+    if !park.iter().all(|v| v.is_finite()) {
+        return Err(RecoveryError::NonFinite {
+            field: "reheat_park",
+        });
+    }
+    warnings.extend(park_choice.warning);
+
+    // The generated recovery file's name (collision resolution is the
+    // daemon's job; the builder emits the plain desired name).
+    let recovery_name = crate::resume_file::recovery_file_name(&file_name, &|_| false);
+
     let ctx = Ctx {
         cfg: config,
         machine: &machine,
@@ -1480,24 +2025,304 @@ pub fn plan_recovery(
         candidate,
         formula,
         resume,
-        nozzle_print,
         bed: preheat.bed,
         other_heaters: &preheat.other_heaters,
         fan_cmds: &fan_cmds,
-        file_name: &file_name,
-        file_path: &vsd.file_path,
         excludes: inputs.exclude_objects,
+        believed_z,
+        park,
+        clean_nozzle_present: inputs.clean_nozzle_macro_present,
+        recovery_file_name: &recovery_name,
     };
     let steps = build_steps(&ctx)?;
+
+    // The recovery-file spec: the entry moves relocate into the file, and
+    // the print-temperature reheat / purge live there behind the heating
+    // gate. Built from the same ctx so the derivation is shared.
+    let entry_commands = build_entry_commands(&ctx)?;
+    // Purge precedence (see `resolve_purge`): disabled / macro-owned /
+    // REFUSE on a missing macro / built-in at the resolved location.
+    let purge = resolve_purge(config, inputs.purge_macro_present, park)?;
+    // A built-in purge that lands on printed geometry warns (never
+    // refuses — a sacrificial area is a legitimate target).
+    if let Some(point) = purge.as_ref().and_then(crate::PurgePlan::built_in_point) {
+        if part_bbox(inputs.model).is_some_and(|bb| inside_bbox(point, bb)) {
+            warnings.push(PlanWarning::PurgeInsidePart {
+                point,
+                configured: config.purge_x.is_some() || config.purge_y.is_some(),
+                // Carried so the warning can distinguish "drops filament
+                // from the parked height" from "DESCENDS into the part".
+                purge_z: config.purge_z,
+            });
+        }
+    }
+    // A purge Z below the resume Z is below the top of what is already
+    // printed. Not a refusal (the purge point may be over bare bed, where
+    // a low Z is exactly right) but the operator should see it.
+    if let Some(z) = config.purge_z {
+        // Both in the file's g-code frame (the frame the recovery file's
+        // own absolute moves run in), so they are directly comparable.
+        let resume_z = resume.position[2] - ctx.gcode.origin[2];
+        if resume_z.is_finite() && z < resume_z {
+            warnings.push(PlanWarning::PurgeZBelowResume {
+                purge_z: z,
+                resume_z,
+            });
+        }
+    }
+    let recovery_file = crate::resume_file::RecoveryFileSpec {
+        name: recovery_name.clone(),
+        source_name: file_name.clone(),
+        plan_id: format!("plr-{}", resume.offset),
+        tail_offset: resume.offset,
+        bed: preheat.bed,
+        nozzle: nozzle_print,
+        purge,
+        park,
+        park_feed: config.travel_feed,
+        // The purge descent is a near-part move: slow entry feedrate.
+        descend_feed: config.entry_feed,
+        entry_commands,
+        header_cap: RECOVERY_HEADER_CAP,
+    };
+
     let plan = RecoveryPlan {
         steps,
         envelope,
-        resume_file: file_name,
+        resume_file: recovery_name,
         resume_offset: resume.offset,
+        requires_clean_nozzle_confirmation: !inputs.clean_nozzle_macro_present,
+        recovery_file,
         warnings,
     };
     run_preflight(&plan, &machine, candidate.point)?;
     Ok(PlanOutcome::Plan(Box::new(plan)))
+}
+
+/// Pre-flights the GENERATED RECOVERY FILE's own absolute coordinates —
+/// the re-park travel, the purge, and the entry moves that used to be the
+/// plan's `Entry` step — against the same axis limits the plan itinerary
+/// is checked against.
+///
+/// The file is played back by Klipper with no per-step verification, so an
+/// out-of-range coordinate there would surface only as a mid-recovery
+/// "Move out of range" AFTER the probe established the Z reference. The
+/// daemon calls this on the same build path that generates the file, with
+/// the identical bounds, and refuses the recovery on any violation.
+///
+/// # Errors
+///
+/// [`RecoveryError::ItineraryRejected`] listing every violation.
+pub fn preflight_generated_file(
+    file: &crate::resume_file::GeneratedRecoveryFile,
+    machine: &MachineConfig,
+    contact_point: [f64; 2],
+) -> Result<(), RecoveryError> {
+    let validated = validate_machine(machine).map_err(|r| RecoveryError::MachineRejected {
+        failures: r.failures,
+    })?;
+    let bounds = ItineraryBounds {
+        x: validated.axis_limits.x,
+        y: validated.axis_limits.y,
+        z_max: validated.axis_limits.z_max,
+        position_min: validated.z_position_min,
+        contact_point,
+    };
+    crate::preflight::preflight_recovery_file(file, &bounds)?;
+    Ok(())
+}
+
+/// Cap on leading comment lines the recovery file copies from the
+/// original (slicer metadata header).
+const RECOVERY_HEADER_CAP: usize = 200;
+
+/// Resolves the `[plr]` purge precedence table into a [`PurgePlan`].
+///
+/// | `purge_enable` | `purge_macro` | macro exists | result |
+/// |---|---|---|---|
+/// | `false` | *(any)* | *(any)* | `None` — no purge of any kind |
+/// | `true` | set | yes | [`PurgePlan::Macro`] — the macro owns everything |
+/// | `true` | set | **no** | **REFUSE** ([`RecoveryError::PurgeMacroMissing`]) |
+/// | `true` | unset | — | [`PurgePlan::BuiltIn`] at the resolved location |
+///
+/// # Why a missing purge macro REFUSES rather than degrading
+///
+/// The clean-nozzle path degrades to asking the operator, and that is
+/// safe: a human confirming a clean tip is a real substitute for a macro
+/// that wipes it. A purge has no equivalent human fallback — substituting
+/// the built-in would extrude filament at a location and rate the
+/// operator never asked for, which is precisely how a nozzle ends up
+/// purging somewhere unintended. So the asymmetry is deliberate: the
+/// clean-nozzle macro degrades, the purge macro refuses.
+///
+/// # Errors
+///
+/// [`RecoveryError::PurgeMacroMissing`] when `purge_macro` names a macro
+/// that does not exist on the machine.
+fn resolve_purge(
+    config: &PlanConfig,
+    purge_macro_present: bool,
+    park: [f64; 2],
+) -> Result<Option<crate::PurgePlan>, RecoveryError> {
+    if !config.purge_enable {
+        return Ok(None);
+    }
+    let configured_macro = config
+        .purge_macro
+        .as_deref()
+        .map(str::trim)
+        .filter(|m| !m.is_empty());
+    if let Some(name) = configured_macro {
+        if !purge_macro_present {
+            return Err(RecoveryError::PurgeMacroMissing {
+                name: name.to_owned(),
+            });
+        }
+        return Ok(Some(crate::PurgePlan::Macro {
+            call: name.to_owned(),
+        }));
+    }
+    // Built-in: each coordinate defaults to the already-computed,
+    // part-clear, bounds-checked park point.
+    Ok(Some(crate::PurgePlan::BuiltIn {
+        point: [
+            config.purge_x.unwrap_or(park[0]),
+            config.purge_y.unwrap_or(park[1]),
+        ],
+        z: config.purge_z,
+        amount: config.purge_amount,
+        speed: config.purge_speed,
+        retract: config.purge_retract,
+        travel_feed: config.travel_feed,
+    }))
+}
+
+/// Margin, mm, by which a computed park point clears the part's XY
+/// bounding box.
+const PART_MARGIN: f64 = 10.0;
+
+/// The part's XY bounding box `[min_x, min_y, max_x, max_y]` from the
+/// model's deposition segments, or `None` when the model has no
+/// finite-coordinate deposition.
+fn part_bbox(model: &LayerModel) -> Option<[f64; 4]> {
+    let mut bbox: Option<[f64; 4]> = None;
+    for layer in &model.layers {
+        for path in &layer.paths {
+            for seg in &path.segments {
+                for p in [seg.start, seg.end] {
+                    if !p.iter().all(|v| v.is_finite()) {
+                        continue;
+                    }
+                    bbox = Some(match bbox {
+                        None => [p[0], p[1], p[0], p[1]],
+                        Some([mnx, mny, mxx, mxy]) => {
+                            [mnx.min(p[0]), mny.min(p[1]), mxx.max(p[0]), mxy.max(p[1])]
+                        }
+                    });
+                }
+            }
+        }
+    }
+    bbox
+}
+
+/// `true` when `[x, y]` lies inside (or on) the part's bounding box.
+fn inside_bbox(point: [f64; 2], bbox: [f64; 4]) -> bool {
+    let [mnx, mny, mxx, mxy] = bbox;
+    point[0] >= mnx && point[0] <= mxx && point[1] >= mny && point[1] <= mxy
+}
+
+/// Outcome of choosing the reheat park point.
+struct ParkChoice {
+    point: [f64; 2],
+    warning: Option<PlanWarning>,
+}
+
+/// The reheat park point.
+///
+/// * **Configured** `(reheat_park_x, reheat_park_y)` (both set) is used
+///   verbatim — validated finite by [`PlanConfig::validate`] and
+///   bounds-checked by the pre-flight — but is still cross-checked
+///   against the part footprint: a park point the operator placed INSIDE
+///   the part is the same hazard as a computed one, so it warns.
+/// * **Computed** otherwise: each side of the bounding box is tried in
+///   turn (+X, −X, +Y, −Y), clamped into the known axis limits, and the
+///   first candidate that actually lands OUTSIDE the footprint wins.
+///   Clamping can pull a candidate back into the part on a machine whose
+///   travel barely exceeds the print, which is exactly why every
+///   candidate is re-checked after clamping instead of assuming the
+///   +X side is clear.
+/// * When no candidate clears the part, the honest
+///   [`PlanWarning::ReheatParkInsidePart`] is emitted rather than
+///   claiming a clearance that does not exist.
+fn reheat_park(
+    config: &PlanConfig,
+    model: &LayerModel,
+    limits: &crate::machine::AxisLimits,
+) -> ParkChoice {
+    let bbox = part_bbox(model);
+    let clamp = |mut px: f64, mut py: f64| {
+        if let Some((lo, hi)) = limits.x {
+            px = px.clamp(lo, hi);
+        }
+        if let Some((lo, hi)) = limits.y {
+            py = py.clamp(lo, hi);
+        }
+        [px, py]
+    };
+
+    // Configured: honored as-is, but cross-checked against the footprint.
+    if let (Some(x), Some(y)) = (config.reheat_park_x, config.reheat_park_y) {
+        let point = [x, y];
+        let warning =
+            bbox.filter(|bb| inside_bbox(point, *bb))
+                .map(|_| PlanWarning::ReheatParkInsidePart {
+                    point,
+                    configured: true,
+                });
+        return ParkChoice { point, warning };
+    }
+
+    // No footprint known: park at a modest corner offset. There is
+    // nothing to verify the point against, so say exactly that rather
+    // than claiming a clearance that was never checked.
+    let Some(bb) = bbox else {
+        let point = clamp(PART_MARGIN, PART_MARGIN);
+        return ParkChoice {
+            point,
+            warning: Some(PlanWarning::ReheatParkUnverified { point }),
+        };
+    };
+    let [mnx, mny, mxx, mxy] = bb;
+    let (cx, cy) = ((mnx + mxx) * 0.5, (mny + mxy) * 0.5);
+    // Candidate park points, one per side of the footprint.
+    let candidates = [
+        [mxx + PART_MARGIN, cy],
+        [mnx - PART_MARGIN, cy],
+        [cx, mxy + PART_MARGIN],
+        [cx, mny - PART_MARGIN],
+    ];
+    for candidate in candidates {
+        let point = clamp(candidate[0], candidate[1]);
+        // Re-check AFTER clamping: the clamp may have pulled the point
+        // back over the part on a tight machine.
+        if !inside_bbox(point, bb) {
+            return ParkChoice {
+                point,
+                warning: Some(PlanWarning::ReheatParkComputed { point }),
+            };
+        }
+    }
+    // Every side clamps back inside the footprint: the part occupies the
+    // reachable bed. Park at the least-bad candidate and say so honestly.
+    let point = clamp(mxx + PART_MARGIN, cy);
+    ParkChoice {
+        point,
+        warning: Some(PlanWarning::ReheatParkInsidePart {
+            point,
+            configured: false,
+        }),
+    }
 }
 
 /// Sizes the probe envelope for the recovery. Overshoot per probe
