@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc dbbdd51e6a5b6807adf17574bb151a3dcf0a185d6bfe1f434b70af5ec6c1401c # shrinks to s = Scenario { z_lo: 0.2, hop: 0.0, probe_speed: 1.0259771008649252, margin: 0.0, sag: 0.0, point: [5.0, 5.0], origin_z: 0.0, speed_factor: 0.5, extrude_factor: 0.5, speed_raw: 600.0, nozzle: 170.0, bed: None, mesh: 0, z_thermal: None, skew: false, match_choice: 0, position_min: 0.0, exclude_count: 0 }
