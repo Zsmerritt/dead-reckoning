@@ -8,5 +8,18 @@ license.workspace = true
 repository.workspace = true
 publish = false
 
+[dependencies]
+plr-analyzer = { path = "../plr-analyzer" }
+plr-gcode = { path = "../plr-gcode" }
+plr-reconstruct = { path = "../plr-reconstruct" }
+plr-wal = { path = "../plr-wal" }
+serde = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+plr-klipper = { path = "../plr-klipper" }
+proptest = { workspace = true }
+serde_json = { workspace = true }
+
 [lints]
 workspace = true

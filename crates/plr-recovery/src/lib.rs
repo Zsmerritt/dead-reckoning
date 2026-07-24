@@ -1,29 +1,71 @@
-//! Recovery planning: turns reconstructed printer state and probe results
-//! into a resume plan and the G-code to restart a print in place. Pure
-//! logic; execution is `plrd`'s job.
+//! Recovery orchestration for power-loss recovery on a moving-bed-Z
+//! machine: machine-prerequisite validation, probe-envelope arithmetic,
+//! and generation of the strictly ordered, verifiable recovery/resume
+//! plan.
+//!
+//! # The machine
+//!
+//! The bed rises into a fixed gantry: XY can be re-homed at will, but
+//! **Z must NEVER be re-homed** — there is no Z homing move that does
+//! not risk driving the bed into the nozzle. Every Z motion in a
+//! recovery is a bounded move inside a frame this crate declares
+//! explicitly (`SET_KINEMATIC_POSITION`), sized by the probe envelope
+//! ([`envelope`]) so that Klipper's own rail-limit checking
+//! structurally bounds the descent even with a faulty probe.
+//!
+//! # Pure logic
+//!
+//! No I/O, no sockets. The plan is **data** ([`RecoveryPlan`]): typed
+//! steps carrying command strings, machine-readable verification
+//! predicates, and typed failure actions. The `plrd` daemon executes
+//! it and never continues past a failed verification.
+//!
+//! # Pipeline position
+//!
+//! ```text
+//! plr-reconstruct ──► plr-analyzer ──► plr-recovery ──► plrd (executes)
+//!   possible-stop      match + contact    validated plan
+//! ```
+//!
+//! [`build::plan_recovery`] consumes the sibling crates' outputs
+//! ([`plr_reconstruct::Reconstruction`],
+//! [`plr_analyzer::ContactOutcome`], [`plr_analyzer::MatchResult`]) and
+//! produces a [`build::PlanOutcome`]: a plan, a typed manual-recovery
+//! fallback, or "no recovery needed" for clean shutdowns.
+//!
+//! # Totality
+//!
+//! No public function panics on any input; hostile numbers (NaN,
+//! infinity) surface as [`RecoveryError`] and can never reach a
+//! generated plan (property-tested in `tests/properties.rs`).
 
-/// One-line statement of this crate's purpose, used in diagnostics.
-pub const PURPOSE: &str = "recovery planning and resume G-code generation";
+pub mod build;
+pub mod envelope;
+pub mod error;
+pub mod guard;
+pub mod machine;
+pub mod plan;
+pub mod preheat;
 
-/// Placeholder API: composes the crate's name and purpose.
-///
-/// Exists so the test harness, lints, and coverage gate exercise real code
-/// in this crate; feature APIs replace it.
-#[must_use]
-pub fn crate_summary() -> String {
-    let name = env!("CARGO_PKG_NAME");
-    format!("{name}: {PURPOSE}")
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{crate_summary, PURPOSE};
-
-    #[test]
-    fn summary_is_name_prefixed_and_ends_with_purpose() {
-        let summary = crate_summary();
-        assert!(summary.starts_with("plr-recovery: "));
-        assert!(summary.ends_with(PURPOSE));
-        assert_eq!(summary.len(), "plr-recovery: ".len() + PURPOSE.len());
-    }
-}
+pub use build::{
+    plan_recovery, select_resume_target, ExcludeObjectDef, FallbackReason, PlanConfig, PlanInputs,
+    PlanOutcome, ResumeTarget,
+};
+pub use envelope::{
+    compute_envelope, Envelope, EnvelopeParams, POST_TRIGGER_TRAVEL_S, PROBE_SPEED_MAX,
+    PROBE_SPEED_MIN,
+};
+pub use error::RecoveryError;
+pub use guard::{
+    sanitize_macro_text, scan_macro_text, GuardHit, GuardOutcome, GuardScan, GUARDED_COMMANDS,
+};
+pub use machine::{
+    validate_machine, MachineConfig, MachineRejection, PrereqFailure, ProbeConfig, ProbeKind,
+    ValidatedMachine, ZStepper,
+};
+pub use plan::{
+    fmt_num, true_z_at_halt, AbortReason, FailureAction, Phase, PlanWarning, Predicate,
+    RecoveryPlan, RecoveryStep, RuntimeComputation, TriggerSource, TrueZFormula, Verification,
+    TRUE_Z_PLACEHOLDER,
+};
+pub use preheat::{derive_preheat, scan_file_temps, FileTemps, PreheatTargets};

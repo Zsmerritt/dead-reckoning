@@ -1,0 +1,421 @@
+//! Machine-prerequisite validation (design doc §1).
+//!
+//! Recovery on a moving-bed-Z machine is only safe when the machine
+//! satisfies a set of structural prerequisites. This module validates a
+//! [`MachineConfig`] snapshot — assembled by the daemon from the
+//! Klipper config and operator attestations — and refuses recovery with
+//! **every** failed check listed (not just the first), so the operator
+//! can fix the machine in one pass.
+//!
+//! The checks, mapped to the design doc:
+//!
+//! * `[force_move]` present with `enable_force_move: True`;
+//! * self-locking Z leadscrews (operator attestation — software cannot
+//!   observe this);
+//! * every Z stepper on the primary MCU (multi-MCU Z is refused: the
+//!   shifted-frame bound relies on single-MCU step accounting);
+//! * slicer `;TYPE:` annotations present (contact-zone selection
+//!   refuses to classify geometry without them);
+//! * exactly one Tap-style `[probe]` or `[load_cell_probe]` (Klipper
+//!   allows a single probe object);
+//! * probe `activate_gcode`/`deactivate_gcode` empty or verified
+//!   no-move (a moving activate g-code would break the halt-position
+//!   arithmetic);
+//! * the Z rail's `position_min` known (fallback `[printer]
+//!   minimum_z_position`) — it anchors the probe envelope;
+//! * config-change detection: the running config hash must equal the
+//!   hash the prerequisites were last validated against.
+
+use serde::{Deserialize, Serialize};
+
+/// Which kind of nozzle-contact probe the machine carries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ProbeKind {
+    /// Tap-style `[probe]` (nozzle-actuated switch).
+    Tap,
+    /// `[load_cell_probe]`.
+    LoadCell,
+}
+
+/// One probe object from the Klipper config.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProbeConfig {
+    /// Probe kind.
+    pub kind: ProbeKind,
+    /// Configured `z_offset`, mm. For nozzle-as-stylus recovery this
+    /// must be handled explicitly per probe type (see
+    /// [`crate::plan::TriggerSource`]).
+    pub z_offset: f64,
+    /// `true` when `activate_gcode` is empty or has been verified to
+    /// command no motion.
+    pub activate_gcode_no_move: bool,
+    /// `true` when `deactivate_gcode` is empty or has been verified to
+    /// command no motion.
+    pub deactivate_gcode_no_move: bool,
+}
+
+/// One Z stepper and the MCU its step pin lives on.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ZStepper {
+    /// Config section name, e.g. `"stepper_z"`, `"stepper_z1"`.
+    pub name: String,
+    /// MCU name the stepper is wired to (`"mcu"` for the primary).
+    pub mcu: String,
+}
+
+/// Snapshot of everything prerequisite validation needs, assembled by
+/// the daemon from the Klipper config and operator attestations.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MachineConfig {
+    /// `[force_move]` present with `enable_force_move: True`.
+    pub force_move_enabled: bool,
+    /// Operator attestation that the Z leadscrews are self-locking
+    /// (the bed cannot back-drive under gravity when unpowered).
+    pub z_self_locking_attested: bool,
+    /// Every Z stepper with its MCU.
+    pub z_steppers: Vec<ZStepper>,
+    /// Name of the primary MCU (usually `"mcu"`).
+    pub primary_mcu: String,
+    /// `true` when the sliced file carries `;TYPE:` annotations.
+    pub type_annotations_present: bool,
+    /// Every probe object in the config. Must be exactly one.
+    pub probes: Vec<ProbeConfig>,
+    /// The Z rail's `position_min` (fallback `[printer]
+    /// minimum_z_position`), mm. `None` when neither is configured.
+    pub z_position_min: Option<f64>,
+    /// Hash of the running Klipper config.
+    pub config_hash: String,
+    /// Hash of the config these prerequisites were last validated
+    /// against; `None` when never validated.
+    pub validated_config_hash: Option<String>,
+    /// Root directory of `[virtual_sdcard]`; `None` when unknown.
+    pub virtual_sdcard_root: Option<String>,
+}
+
+/// One failed prerequisite check.
+#[derive(Debug, Clone, PartialEq, thiserror::Error, Serialize, Deserialize)]
+pub enum PrereqFailure {
+    /// `[force_move]` missing or `enable_force_move` not `True`.
+    #[error("[force_move] with enable_force_move: True is required")]
+    ForceMoveDisabled,
+    /// The operator has not attested self-locking Z leadscrews.
+    #[error("self-locking Z leadscrews are not attested")]
+    ZNotSelfLocking,
+    /// No Z steppers were listed at all.
+    #[error("no Z steppers in the machine snapshot")]
+    NoZSteppers,
+    /// A Z stepper lives on a secondary MCU.
+    #[error("Z stepper {stepper} is on MCU {mcu}, not the primary MCU")]
+    ZStepperOffPrimaryMcu {
+        /// The offending stepper.
+        stepper: String,
+        /// The MCU it is wired to.
+        mcu: String,
+    },
+    /// The sliced file carries no `;TYPE:` annotations.
+    #[error("slicer ;TYPE: annotations are required")]
+    NoTypeAnnotations,
+    /// No Tap-style `[probe]` / `[load_cell_probe]` configured.
+    #[error("a Tap-style [probe] or [load_cell_probe] is required")]
+    NoProbe,
+    /// More than one probe object was listed (Klipper allows one; a
+    /// multi-probe snapshot is inconsistent and refused).
+    #[error("{count} probe objects listed; exactly one is required")]
+    MultipleProbes {
+        /// How many probes were listed.
+        count: usize,
+    },
+    /// The probe `z_offset` was NaN or infinite.
+    #[error("probe z_offset is not finite")]
+    ProbeZOffsetNonFinite,
+    /// `activate_gcode` is neither empty nor verified no-move.
+    #[error("probe activate_gcode is not verified move-free")]
+    ProbeActivateGcodeMoves,
+    /// `deactivate_gcode` is neither empty nor verified no-move.
+    #[error("probe deactivate_gcode is not verified move-free")]
+    ProbeDeactivateGcodeMoves,
+    /// Neither the Z rail's `position_min` nor `[printer]
+    /// minimum_z_position` is known.
+    #[error("Z position_min (or [printer] minimum_z_position) is unknown")]
+    PositionMinUnknown,
+    /// `position_min` was NaN or infinite.
+    #[error("Z position_min is not finite")]
+    PositionMinNonFinite,
+    /// The prerequisites were never validated against any config.
+    #[error("machine prerequisites have never been validated")]
+    ConfigNeverValidated,
+    /// The running config hash differs from the validated one:
+    /// re-validation is required before recovery.
+    #[error("config changed since validation (validated {validated}, running {current})")]
+    ConfigChangedSinceValidation {
+        /// Hash the prerequisites were validated against.
+        validated: String,
+        /// Hash of the running config.
+        current: String,
+    },
+    /// The `[virtual_sdcard]` root is unknown; the `M23` top-level
+    /// check cannot run.
+    #[error("[virtual_sdcard] root directory is unknown")]
+    SdcardRootUnknown,
+}
+
+/// The values recovery planning actually consumes, extracted from a
+/// [`MachineConfig`] that passed every check. Obtain via
+/// [`validate_machine`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ValidatedMachine {
+    /// The single configured probe.
+    pub probe: ProbeConfig,
+    /// The Z rail's `position_min`, mm (finite).
+    pub z_position_min: f64,
+    /// Names of every Z stepper (all on the primary MCU).
+    pub z_stepper_names: Vec<String>,
+    /// Root directory of `[virtual_sdcard]`.
+    pub sdcard_root: String,
+}
+
+/// All prerequisite failures of one validation pass.
+#[derive(Debug, Clone, PartialEq, thiserror::Error, Serialize, Deserialize)]
+#[error("machine prerequisites failed: {} check(s) failed", failures.len())]
+pub struct MachineRejection {
+    /// Every failed check.
+    pub failures: Vec<PrereqFailure>,
+}
+
+/// Validates every machine prerequisite (design doc §1), collecting
+/// **all** failures.
+///
+/// # Errors
+///
+/// [`MachineRejection`] listing every failed check.
+pub fn validate_machine(config: &MachineConfig) -> Result<ValidatedMachine, MachineRejection> {
+    let mut failures = Vec::new();
+
+    if !config.force_move_enabled {
+        failures.push(PrereqFailure::ForceMoveDisabled);
+    }
+    if !config.z_self_locking_attested {
+        failures.push(PrereqFailure::ZNotSelfLocking);
+    }
+    if config.z_steppers.is_empty() {
+        failures.push(PrereqFailure::NoZSteppers);
+    }
+    for stepper in &config.z_steppers {
+        if stepper.mcu != config.primary_mcu {
+            failures.push(PrereqFailure::ZStepperOffPrimaryMcu {
+                stepper: stepper.name.clone(),
+                mcu: stepper.mcu.clone(),
+            });
+        }
+    }
+    if !config.type_annotations_present {
+        failures.push(PrereqFailure::NoTypeAnnotations);
+    }
+    match config.probes.len() {
+        0 => failures.push(PrereqFailure::NoProbe),
+        1 => {}
+        count => failures.push(PrereqFailure::MultipleProbes { count }),
+    }
+    if let Some(probe) = config.probes.first() {
+        if !probe.z_offset.is_finite() {
+            failures.push(PrereqFailure::ProbeZOffsetNonFinite);
+        }
+        if !probe.activate_gcode_no_move {
+            failures.push(PrereqFailure::ProbeActivateGcodeMoves);
+        }
+        if !probe.deactivate_gcode_no_move {
+            failures.push(PrereqFailure::ProbeDeactivateGcodeMoves);
+        }
+    }
+    match config.z_position_min {
+        None => failures.push(PrereqFailure::PositionMinUnknown),
+        Some(v) if !v.is_finite() => failures.push(PrereqFailure::PositionMinNonFinite),
+        Some(_) => {}
+    }
+    match config.validated_config_hash.as_deref() {
+        None => failures.push(PrereqFailure::ConfigNeverValidated),
+        Some(validated) if validated != config.config_hash => {
+            failures.push(PrereqFailure::ConfigChangedSinceValidation {
+                validated: validated.to_owned(),
+                current: config.config_hash.clone(),
+            });
+        }
+        Some(_) => {}
+    }
+    if config.virtual_sdcard_root.is_none() {
+        failures.push(PrereqFailure::SdcardRootUnknown);
+    }
+
+    if !failures.is_empty() {
+        return Err(MachineRejection { failures });
+    }
+    // All `unwrap_or` fallbacks below are unreachable (the checks above
+    // guarantee presence) but keep this path panic-free by construction.
+    Ok(ValidatedMachine {
+        probe: config.probes.first().cloned().unwrap_or(ProbeConfig {
+            kind: ProbeKind::Tap,
+            z_offset: 0.0,
+            activate_gcode_no_move: true,
+            deactivate_gcode_no_move: true,
+        }),
+        z_position_min: config.z_position_min.unwrap_or(0.0),
+        z_stepper_names: config.z_steppers.iter().map(|s| s.name.clone()).collect(),
+        sdcard_root: config.virtual_sdcard_root.clone().unwrap_or_default(),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{validate_machine, MachineConfig, PrereqFailure, ProbeConfig, ProbeKind, ZStepper};
+
+    /// A config that passes every check.
+    pub(crate) fn good_config() -> MachineConfig {
+        MachineConfig {
+            force_move_enabled: true,
+            z_self_locking_attested: true,
+            z_steppers: vec![
+                ZStepper {
+                    name: "stepper_z".to_owned(),
+                    mcu: "mcu".to_owned(),
+                },
+                ZStepper {
+                    name: "stepper_z1".to_owned(),
+                    mcu: "mcu".to_owned(),
+                },
+            ],
+            primary_mcu: "mcu".to_owned(),
+            type_annotations_present: true,
+            probes: vec![ProbeConfig {
+                kind: ProbeKind::Tap,
+                z_offset: -0.1,
+                activate_gcode_no_move: true,
+                deactivate_gcode_no_move: true,
+            }],
+            z_position_min: Some(-2.0),
+            config_hash: "abc".to_owned(),
+            validated_config_hash: Some("abc".to_owned()),
+            virtual_sdcard_root: Some("/home/pi/gcodes".to_owned()),
+        }
+    }
+
+    #[test]
+    fn good_config_validates_and_extracts() {
+        let v = validate_machine(&good_config()).unwrap();
+        assert_eq!(v.z_stepper_names, vec!["stepper_z", "stepper_z1"]);
+        assert!((v.z_position_min - (-2.0)).abs() < 1e-12);
+        assert_eq!(v.probe.kind, ProbeKind::Tap);
+        assert_eq!(v.sdcard_root, "/home/pi/gcodes");
+    }
+
+    #[test]
+    fn every_failure_is_collected_not_just_the_first() {
+        let config = MachineConfig {
+            force_move_enabled: false,
+            z_self_locking_attested: false,
+            z_steppers: vec![],
+            primary_mcu: "mcu".to_owned(),
+            type_annotations_present: false,
+            probes: vec![],
+            z_position_min: None,
+            config_hash: "abc".to_owned(),
+            validated_config_hash: None,
+            virtual_sdcard_root: None,
+        };
+        let rejection = validate_machine(&config).unwrap_err();
+        let f = &rejection.failures;
+        assert!(f.contains(&PrereqFailure::ForceMoveDisabled));
+        assert!(f.contains(&PrereqFailure::ZNotSelfLocking));
+        assert!(f.contains(&PrereqFailure::NoZSteppers));
+        assert!(f.contains(&PrereqFailure::NoTypeAnnotations));
+        assert!(f.contains(&PrereqFailure::NoProbe));
+        assert!(f.contains(&PrereqFailure::PositionMinUnknown));
+        assert!(f.contains(&PrereqFailure::ConfigNeverValidated));
+        assert!(f.contains(&PrereqFailure::SdcardRootUnknown));
+        assert_eq!(f.len(), 8);
+        assert!(rejection.to_string().contains("8 check(s)"));
+    }
+
+    #[test]
+    fn secondary_mcu_z_stepper_is_refused() {
+        let mut config = good_config();
+        config.z_steppers[1].mcu = "mcu2".to_owned();
+        let rejection = validate_machine(&config).unwrap_err();
+        assert_eq!(
+            rejection.failures,
+            vec![PrereqFailure::ZStepperOffPrimaryMcu {
+                stepper: "stepper_z1".to_owned(),
+                mcu: "mcu2".to_owned(),
+            }]
+        );
+    }
+
+    #[test]
+    fn multiple_probes_are_refused() {
+        let mut config = good_config();
+        config.probes.push(ProbeConfig {
+            kind: ProbeKind::LoadCell,
+            z_offset: 0.0,
+            activate_gcode_no_move: true,
+            deactivate_gcode_no_move: true,
+        });
+        let rejection = validate_machine(&config).unwrap_err();
+        assert_eq!(
+            rejection.failures,
+            vec![PrereqFailure::MultipleProbes { count: 2 }]
+        );
+    }
+
+    #[test]
+    fn moving_probe_gcode_and_bad_offset_are_refused() {
+        let mut config = good_config();
+        config.probes[0].z_offset = f64::NAN;
+        config.probes[0].activate_gcode_no_move = false;
+        config.probes[0].deactivate_gcode_no_move = false;
+        let rejection = validate_machine(&config).unwrap_err();
+        assert_eq!(
+            rejection.failures,
+            vec![
+                PrereqFailure::ProbeZOffsetNonFinite,
+                PrereqFailure::ProbeActivateGcodeMoves,
+                PrereqFailure::ProbeDeactivateGcodeMoves,
+            ]
+        );
+    }
+
+    #[test]
+    fn config_hash_mismatch_requires_revalidation() {
+        let mut config = good_config();
+        config.validated_config_hash = Some("old".to_owned());
+        let rejection = validate_machine(&config).unwrap_err();
+        assert_eq!(
+            rejection.failures,
+            vec![PrereqFailure::ConfigChangedSinceValidation {
+                validated: "old".to_owned(),
+                current: "abc".to_owned(),
+            }]
+        );
+    }
+
+    #[test]
+    fn non_finite_position_min_is_refused() {
+        let mut config = good_config();
+        config.z_position_min = Some(f64::INFINITY);
+        let rejection = validate_machine(&config).unwrap_err();
+        assert_eq!(
+            rejection.failures,
+            vec![PrereqFailure::PositionMinNonFinite]
+        );
+    }
+
+    #[test]
+    fn failures_render_and_serialize() {
+        let f = PrereqFailure::ZStepperOffPrimaryMcu {
+            stepper: "stepper_z1".to_owned(),
+            mcu: "mcu2".to_owned(),
+        };
+        assert!(f.to_string().contains("stepper_z1"));
+        let json = serde_json::to_string(&f).unwrap();
+        let back: PrereqFailure = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, f);
+    }
+}

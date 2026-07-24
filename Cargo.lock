@@ -343,6 +343,17 @@ dependencies = [
 [[package]]
 name = "plr-recovery"
 version = "0.1.0"
+dependencies = [
+ "plr-analyzer",
+ "plr-gcode",
+ "plr-klipper",
+ "plr-reconstruct",
+ "plr-wal",
+ "proptest",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
 
 [[package]]
 name = "plr-wal"
