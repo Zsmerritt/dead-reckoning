@@ -51,7 +51,7 @@ probe_method: tap
 | `noise_floor_temp_sensor` | none | sensor name | Optional klippy sensor object (e.g. `temperature_sensor chamber`) to read the current temperature from for the drag oracle's temperature covariate. When unset the covariate is skipped (no guessing). |
 | `wal_dir` | `/var/lib/plrd/wal` | path | plrd's WAL directory; the plugin reads `<wal_dir>/heartbeat.bin` as a recorder liveness hint. |
 | `control_socket` | `/var/lib/plrd/plrd.sock` | path | plrd's UNIX control socket for `PLR_STATUS`/`PLR_RECOVER`. |
-| `max_probe_nozzle_temp` | `150.0` | `[80, 160]` °C | Contact operations refuse while the active extruder's **current or target** temperature exceeds this. A molten nozzle oozes onto the part and skews contact readings — see [Nozzle cleanliness](#nozzle-cleanliness). |
+| `max_probe_nozzle_temp` | `150.0` | `[80, 160]` °C | Contact operations refuse while the extruder is hotter than this: the **target** strictly, the **measured** temperature with a 2 °C tolerance (so 151 °C probes fine at the default, 153 °C does not). A molten nozzle oozes onto the part and skews contact readings — see [Nozzle cleanliness](#nozzle-cleanliness). |
 | `clean_nozzle_macro` | `CLEAN_NOZZLE` | macro name | Name of the `[gcode_macro …]` recovery cleans the nozzle with before contact probing. Whether that macro exists selects auto-clean vs the wizard's manual clean-confirmation prompt — see [Nozzle cleanliness](#nozzle-cleanliness). |
 | `probe_speed` | `1.5` | `[1.0, 2.0]` mm/s | Recovery probe descent speed. |
 | `envelope_margin` | `0.5` | `>= 0` mm | Extra clearance around the reconstructed part envelope. |
@@ -529,14 +529,27 @@ against the part. Two mechanisms protect it:
 
 **1. The temperature gate (automatic, non-negotiable).** All four contact
 commands — `PLR_TOUCH`, `PLR_PROBE_TEST`, `PLR_DRAG_PROBE`,
-`PLR_DRAG_CALIBRATE` — refuse before any motion when the active
-extruder's **current or target** temperature exceeds
-`max_probe_nozzle_temp` (default 150 °C, range `[80, 160]`). The *target*
-is checked too: a nozzle at 45 °C but commanded to 250 °C is already on
-its way up and is refused now, not after it melts onto the part. The
-drag passes run at a guaranteed-clear Z, but a molten nozzle still drips,
-so they are gated identically. Remediation is always in the refusal:
-**cool the nozzle below the limit (`M104 S0`) and wait**, then retry.
+`PLR_DRAG_CALIBRATE` — refuse before any motion when the extruder is
+hotter than `max_probe_nozzle_temp` (default 150 °C, range `[80, 160]`).
+The *target* is checked too: a nozzle at 45 °C but commanded to 250 °C is
+already on its way up and is refused now, not after it melts onto the
+part. The drag passes run at a guaranteed-clear Z, but a molten nozzle
+still drips, so they are gated identically. Remediation is always in the
+refusal: **cool the nozzle below the limit (`M104 S0`) and wait**, then
+retry.
+
+The two comparisons are deliberately **asymmetric**, which is why a
+nozzle reading 151 °C still probes at the 150 °C default:
+
+- the **measured** temperature is allowed a **2 °C tolerance** — it
+  refuses only above `max_probe_nozzle_temp + 2`. Sensor noise and
+  ordinary PID overshoot put the reading a few tenths above whatever was
+  commanded, and recovery deliberately probes *at* this ceiling, so a
+  strict comparison would refuse the recovery plan's own probe command
+  mid-recovery;
+- the **target** is compared strictly, with no tolerance. A target above
+  the ceiling is an *intent* to get too hot, not measurement scatter, so
+  the tolerance never licenses commanding a hotter nozzle.
 
 **2. A clean tip (auto-macro or manual confirmation).** A cold nozzle can
 still carry dried filament. The recovery wizard makes cleanliness an

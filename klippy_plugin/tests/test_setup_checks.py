@@ -431,3 +431,69 @@ def test_plr_setup_auto_clean_row_when_macro_present(fake_printer, plr_config, r
     assert "auto:" in report
     # An auto-clean row is a [PASS], never a blocker.
     assert "[PASS] clean nozzle" in report
+
+
+# --- probe-temperature ceiling sanity row -----------------------------
+
+
+@pytest.mark.parametrize("ceiling", ["140", "150", "160"])
+def test_probe_temp_ceiling_at_or_above_plrd_default_passes(
+    fake_printer, plr_config, ceiling
+):
+    plugin = plr.load_config(plr_config(options={"max_probe_nozzle_temp": ceiling}))
+    res = setup_checks.probe_temp_ceiling_check_result(plugin)
+    assert res.verdict == "pass"
+    assert "max_probe_nozzle_temp" in res.detail
+
+
+@pytest.mark.parametrize("ceiling", ["80", "100", "139"])
+def test_probe_temp_ceiling_below_plrd_default_warns(fake_printer, plr_config, ceiling):
+    # plrd refuses to plan when its probing band is empty; the plugin
+    # accepts the whole [80,160] range, so warn at commissioning time
+    # rather than letting the operator find out during a recovery.
+    plugin = plr.load_config(plr_config(options={"max_probe_nozzle_temp": ceiling}))
+    res = setup_checks.probe_temp_ceiling_check_result(plugin)
+    assert res.verdict == "warn"
+    assert "refuse to plan" in res.hint
+    # Both remedies are offered: raise ours, or lower plrd's bound.
+    assert "raise" in res.hint and "probe_temp_min" in res.hint
+
+
+def test_probe_temp_ceiling_warning_does_not_claim_to_know_plrd_config(
+    fake_printer, plr_config
+):
+    # The plugin cannot read plrd's config: 140 must be presented as the
+    # daemon's DEFAULT, never as a fact about this machine.
+    plugin = plr.load_config(plr_config(options={"max_probe_nozzle_temp": "100"}))
+    res = setup_checks.probe_temp_ceiling_check_result(plugin)
+    assert "DEFAULT" in res.detail
+    assert "cannot read plrd's config" in res.detail
+    assert "may differ" in res.detail
+
+
+def test_probe_temp_ceiling_boundary_is_plrd_default(fake_printer, plr_config):
+    # Exactly at the default bound is fine (band is non-empty above it).
+    assert setup_checks.PLRD_DEFAULT_PROBE_TEMP_MIN == 140.0
+    plugin = plr.load_config(plr_config(options={"max_probe_nozzle_temp": "140"}))
+    assert setup_checks.probe_temp_ceiling_check_result(plugin).verdict == "pass"
+
+
+def test_plr_setup_shows_ceiling_warning_row(fake_printer, plr_config, run_cmd):
+    fake_printer.add_object("toolhead", fake_klippy.FakeToolhead())
+    fake_printer.add_object("idle_timeout", fake_klippy.FakeIdleTimeout())
+    plr.load_config(plr_config(options={"max_probe_nozzle_temp": "100"}))
+    report = run_cmd("PLR_SETUP").responses[-1]
+    assert "[WARN] probe temp ceiling" in report
+    # A caution, never a blocker: the row itself must not be a [FAIL]
+    # (the report's overall verdict here is driven by the absent
+    # heartbeat file, which is a separate, pre-existing check).
+    assert "[FAIL] probe temp ceiling" not in report
+
+
+def test_setup_wizard_shares_the_ceiling_row(fake_printer, plr_config, run_cmd):
+    # The shared assembly means the wizard cannot silently drop a row.
+    fake_printer.add_object("toolhead", fake_klippy.FakeToolhead())
+    fake_printer.add_object("idle_timeout", fake_klippy.FakeIdleTimeout())
+    plr.load_config(plr_config(options={"max_probe_nozzle_temp": "100"}))
+    joined = "\n".join(run_cmd("PLR_SETUP_WIZARD").responses)
+    assert "[WARN] probe temp ceiling" in joined

@@ -82,8 +82,9 @@ MAX_PROBE_NOZZLE_TEMP_MAX = 160.0
 # Tolerance applied to the MEASURED temperature only (never to the
 # target).  Ported from Cartographer3D's touch mode, which guards its own
 # max-temperature refusal exactly this way: MAX_TOUCH_TEMPERATURE_EPSILON
-# = 2.0 (src/cartographer/probe/touch_mode.py:34), used at
-# touch_mode.py:299-303 as ``if nozzle_temperature > max_temp + EPSILON``.
+# = 2.0 (src/cartographer/probe/touch_mode.py:34, pattern as of the 2025
+# rewrite layout), used at touch_mode.py:299-303 as
+# ``if nozzle_temperature > max_temp + EPSILON``.
 #
 # WHY THIS IS LOAD-BEARING, not cosmetic: plrd's recovery plan commands
 # ``probe_nozzle_temp`` (default 150.0) and verifies the extruder sits in
@@ -228,6 +229,52 @@ def gcode_macro_available(config, macro_name):
         if suffix == wanted:
             return True
     return False
+
+
+# plrd's DEFAULT lower bound of the probing band, °C.  Referenced only to
+# warn about a self-defeating ceiling (see below).  This plugin cannot
+# read plrd's config — the daemon owns that value and an operator may
+# have changed it — so every message built from this constant must
+# present it as plrd's default, never as a fact about this machine.
+PLRD_DEFAULT_PROBE_TEMP_MIN = 140.0
+
+
+def probe_temp_ceiling_check_result(plugin):
+    """PLR_SETUP row warning when ``max_probe_nozzle_temp`` is set so low
+    that recovery could never plan.
+
+    plrd probes in a band whose lower bound (``probe_temp_min``, default
+    140 °C) it clamps against our ceiling; a ceiling at or below that
+    bound leaves an empty band and the daemon refuses to build a plan at
+    all.  The plugin accepts the whole [80, 160] range at config time, so
+    without this row an operator who sets 100 would only discover it at
+    recovery time — the worst possible moment.
+
+    Deliberately a ``warn``, not a ``fail``: this plugin cannot read
+    plrd's config, so it does not KNOW the daemon's band; an operator who
+    lowered ``probe_temp_min`` to match has a perfectly valid setup.  The
+    wording says so.
+    """
+    ceiling = plugin.max_probe_nozzle_temp
+    if ceiling >= PLRD_DEFAULT_PROBE_TEMP_MIN:
+        return CheckResult(
+            "probe temp ceiling",
+            "pass",
+            "max_probe_nozzle_temp = %g °C" % (ceiling,),
+            "",
+        )
+    return CheckResult(
+        "probe temp ceiling",
+        "warn",
+        "max_probe_nozzle_temp = %g °C is below %g °C, plrd's DEFAULT "
+        "probe_temp_min (this plugin cannot read plrd's config, so the "
+        "daemon's actual lower bound may differ)"
+        % (ceiling, PLRD_DEFAULT_PROBE_TEMP_MIN),
+        "if plrd still uses its default band, recovery will refuse to plan "
+        "because the probing band is empty — either raise "
+        "max_probe_nozzle_temp to %g or above, or lower plrd's "
+        "probe_temp_min to match your ceiling" % (PLRD_DEFAULT_PROBE_TEMP_MIN,),
+    )
 
 
 def clean_nozzle_check_result(plugin):
@@ -639,13 +686,15 @@ def full_report_results(plugin):
 
     The single assembly point for the report: static config checks, the
     live recorder-heartbeat check, the persisted-calibration validity
-    rows, and the nozzle-cleanliness mode row.  Shared by ``PLR_SETUP``
-    and ``PLR_SETUP_WIZARD`` so a future check cannot appear in one and
+    rows, the probe-temperature ceiling sanity row, and the
+    nozzle-cleanliness mode row.  Shared by ``PLR_SETUP`` and
+    ``PLR_SETUP_WIZARD`` so a future check cannot appear in one and
     silently go missing from the other.
     """
     results = list(plugin.static_check_results)
     results.append(check_recorder_heartbeat(plugin.wal_dir))
     results.extend(calibration_check_results(plugin))
+    results.append(probe_temp_ceiling_check_result(plugin))
     results.append(clean_nozzle_check_result(plugin))
     return results
 
