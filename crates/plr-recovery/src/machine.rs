@@ -121,14 +121,15 @@ pub struct MachineConfig {
     #[serde(default)]
     pub noise_floor: Option<f64>,
     /// Drag speed the noise floor was measured at, mm/s (the OPTIONAL
-    /// `[plr]` `noise_floor_speed` autosave — not yet staged by the
-    /// plugin's `PLR_NOISE_TEST`; parsed tolerantly for forward
-    /// compatibility). The noise floor is speed-specific, so when this
-    /// is present and differs from the plan's `drag_speed` by more
-    /// than 20% the plan carries
+    /// `[plr]` `noise_floor_speed` autosave, staged by the plugin's
+    /// `PLR_NOISE_TEST` alongside the `noise_floor_*` measurements —
+    /// `klippy_plugin/plr/noise_test.py`). The noise floor is
+    /// speed-specific, so when this is present and differs from the
+    /// plan's `drag_speed` by more than 20% the plan carries
     /// [`crate::plan::PlanWarning::NoiseFloorSpeedMismatch`] — a
-    /// warning, never a refusal. `None` (the current plugin) checks
-    /// nothing.
+    /// warning, never a refusal. `None` — a calibration from before
+    /// the key existed — checks nothing (tolerant back-compat until
+    /// the operator re-runs `PLR_NOISE_TEST`).
     #[serde(default)]
     pub noise_floor_speed: Option<f64>,
 }
