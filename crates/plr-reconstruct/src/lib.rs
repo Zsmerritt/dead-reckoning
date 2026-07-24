@@ -49,6 +49,20 @@
 //! lines) never silently shrink the set; they surface as typed flags in
 //! [`stopset::Degradation`] with per-line vs per-layer confidence.
 //!
+//! # Cancelled (excluded) objects
+//!
+//! Recovery also has to know what the operator **cancelled** — usually
+//! because that object failed — so a resume does not print back into
+//! the debris. [`exclude`] resolves that from the WAL's journaled
+//! `exclude_object` state, falling back to the print file's
+//! `EXCLUDE_OBJECT_DEFINE` block, and always reports *where the answer
+//! came from* ([`ExclusionProvenance`]). The case where the WAL is
+//! silent but the file defines objects is never treated as "nothing was
+//! excluded": it raises
+//! [`ExclusionDiagnostic::CancellationRecordLost`] and requires
+//! operator confirmation. The report also answers "which object
+//! contains this XY?" from the journaled outlines.
+//!
 //! # Crash classes
 //!
 //! [`window::CrashClass`] classifies the stop: clean shutdown (reported
@@ -72,6 +86,7 @@
 
 pub mod config;
 pub mod error;
+pub mod exclude;
 pub mod reconstruct;
 pub mod stopset;
 pub mod timeline;
@@ -79,6 +94,10 @@ pub mod window;
 
 pub use config::ReconstructConfig;
 pub use error::{ContextDefect, ReconstructError};
+pub use exclude::{
+    parse_object_definitions, point_in_polygon, resolve_exclusions, ExclusionDiagnostic,
+    ExclusionProvenance, ExclusionReport, FileObjectScan, EDGE_TOLERANCE_MM,
+};
 pub use reconstruct::{reconstruct, ReconstructInputs, Reconstruction, RecoveryReconstruction};
 pub use stopset::{
     anchor_state_from_context, compute_stop_set, Confidence, Degradation, ExtensionSummary,
@@ -262,6 +281,7 @@ pub(crate) mod testutil {
             },
             heaters: Vec::new(),
             fans: Vec::new(),
+            exclude: None,
         }
     }
 }

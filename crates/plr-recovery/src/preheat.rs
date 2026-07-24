@@ -137,6 +137,7 @@ mod tests {
             },
             heaters,
             fans,
+            exclude: None,
         }
     }
 

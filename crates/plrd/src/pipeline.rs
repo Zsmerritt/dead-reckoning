@@ -1142,6 +1142,7 @@ G1 X60 Y60 E0.02
                 name: "fan".to_owned(),
                 speed: 0.5,
             }],
+            exclude: None,
         }
     }
 

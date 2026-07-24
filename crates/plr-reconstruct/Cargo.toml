@@ -12,6 +12,7 @@ publish = false
 plr-gcode = { path = "../plr-gcode" }
 plr-klipper = { path = "../plr-klipper" }
 plr-wal = { path = "../plr-wal" }
+serde_json.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]

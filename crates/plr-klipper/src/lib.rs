@@ -39,8 +39,8 @@ pub use message::{
 };
 pub use request::{Request, ResponseTemplate, SubscriptionObjects};
 pub use status::{
-    BedMeshStatus, ExcludeObjectDefinition, ExcludeObjectStatus, FanStatus, GcodeMoveStatus,
-    HeaterStatus, IdleTimeoutStatus, McuLastStats, McuStatus, ProbeStatus, SkewCorrectionStatus,
-    Status, StatusUpdate, ToolheadStatus, VirtualSdcardStatus, WebhooksStatus,
-    ZThermalAdjustStatus,
+    BedMeshStatus, ExcludeObjectChange, ExcludeObjectDefinition, ExcludeObjectSnapshot,
+    ExcludeObjectStatus, FanStatus, GcodeMoveStatus, HeaterStatus, IdleTimeoutStatus, McuLastStats,
+    McuStatus, ProbeStatus, SkewCorrectionStatus, Status, StatusUpdate, ToolheadStatus,
+    VirtualSdcardStatus, WebhooksStatus, ZThermalAdjustStatus,
 };

@@ -15,10 +15,10 @@
 use plr_wal::frame::{FRAME_HEADER_LEN, SEGMENT_HEADER_LEN};
 use plr_wal::heartbeat::{HEARTBEAT_FILE_LEN, HEARTBEAT_SLOT_LEN};
 use plr_wal::{
-    decode_slot, encode_slot, recover_heartbeat, scan, slot_for_sequence, Context, FanTarget,
-    GcodeState, Heartbeat, HeaterTarget, Marker, MarkerKind, ScanEnd, SegmentHeader, SlotError,
-    SlotId, StepChunk, StepperRange, TransformObservations, TrapqSegment, VirtualSdState,
-    WalRecord, WalWriter,
+    decode_slot, encode_slot, recover_heartbeat, scan, slot_for_sequence, Context,
+    ExcludeObjectDef, ExcludeState, FanTarget, GcodeState, Heartbeat, HeaterTarget, Marker,
+    MarkerKind, PolygonFidelity, ScanEnd, SegmentHeader, SlotError, SlotId, StepChunk,
+    StepperRange, TransformObservations, TrapqSegment, VirtualSdState, WalRecord, WalWriter,
 };
 use proptest::prelude::*;
 use proptest::test_runner::FileFailurePersistence;
@@ -153,8 +153,43 @@ prop_compose! {
             (".{0,10}", finite_f64()).prop_map(|(name, speed)| FanTarget { name, speed }),
             0..4,
         ),
+        exclude in prop::option::of(arb_exclude_state().prop_map(Box::new)),
     ) -> Context {
-        Context { mono_ns, virtual_sdcard, gcode, transforms, heaters, fans }
+        Context { mono_ns, virtual_sdcard, gcode, transforms, heaters, fans, exclude }
+    }
+}
+
+fn arb_polygon_fidelity() -> impl Strategy<Value = PolygonFidelity> {
+    prop_oneof![
+        Just(PolygonFidelity::Absent),
+        Just(PolygonFidelity::Exact),
+        any::<u32>().prop_map(|source_points| PolygonFidelity::BoundingBox { source_points }),
+        any::<u32>().prop_map(|source_points| PolygonFidelity::Unusable { source_points }),
+        Just(PolygonFidelity::Unknown),
+    ]
+}
+
+prop_compose! {
+    fn arb_exclude_def()(
+        name in "[A-Z_0-9]{0,16}",
+        center in prop::option::of((finite_f64(), finite_f64()).prop_map(|(x, y)| [x, y])),
+        polygon in prop::collection::vec(
+            (finite_f64(), finite_f64()).prop_map(|(x, y)| [x, y]),
+            0..6,
+        ),
+        fidelity in arb_polygon_fidelity(),
+    ) -> ExcludeObjectDef {
+        ExcludeObjectDef { name, center, polygon, fidelity }
+    }
+}
+
+prop_compose! {
+    fn arb_exclude_state()(
+        definitions in prop::option::of(prop::collection::vec(arb_exclude_def(), 0..4)),
+        excluded in prop::collection::vec("[A-Z_0-9]{0,16}", 0..4),
+        current in prop::option::of("[A-Z_0-9]{0,16}"),
+    ) -> ExcludeState {
+        ExcludeState { definitions, excluded, current }
     }
 }
 

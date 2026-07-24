@@ -10,8 +10,8 @@ use plr_analyzer::{
 use plr_gcode::ByteSpan;
 use plr_klipper::ClockCorrelator;
 use plr_reconstruct::{
-    CrashClass, Degradation, Interval, PossibleStopSet, Provenance, Reconstruction,
-    RecoveryReconstruction, StopWindow, TbSource, WalTimeline, ZCandidate, ZKind,
+    CrashClass, Degradation, ExclusionReport, Interval, PossibleStopSet, Provenance,
+    Reconstruction, RecoveryReconstruction, StopWindow, TbSource, WalTimeline, ZCandidate, ZKind,
 };
 use plr_recovery::{MachineConfig, ProbeConfig, ProbeKind, ZStepper};
 use plr_wal::{
@@ -131,6 +131,7 @@ pub fn wal_context(transforms: TransformObservations) -> Context {
             name: "fan".to_owned(),
             speed: 0.5,
         }],
+        exclude: None,
     }
 }
 
@@ -194,6 +195,7 @@ pub fn recovery(set: PossibleStopSet, context: Context) -> Reconstruction {
         timeline: timeline(context, false),
         window: stop_window(),
         stop_set: set,
+        exclusions: ExclusionReport::unknown(),
     }))
 }
 

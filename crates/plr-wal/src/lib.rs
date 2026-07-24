@@ -27,6 +27,7 @@ pub use heartbeat::{
     HeartbeatRecovery, SlotError, SlotId,
 };
 pub use record::{
-    Context, FanTarget, GcodeState, Heartbeat, HeaterTarget, Marker, MarkerKind, RecordKind,
-    StepChunk, StepperRange, TransformObservations, TrapqSegment, VirtualSdState, WalRecord,
+    Context, ExcludeObjectDef, ExcludeState, FanTarget, GcodeState, Heartbeat, HeaterTarget,
+    Marker, MarkerKind, PolygonFidelity, RecordKind, StepChunk, StepperRange,
+    TransformObservations, TrapqSegment, VirtualSdState, WalRecord, MAX_POLYGON_POINTS,
 };

@@ -421,3 +421,160 @@ fn correlator_over_status_stream() {
     let host = correlator.print_time_to_eventtime(812.760).unwrap();
     assert!((host - 3_052_153.644).abs() < 1e-9);
 }
+
+// --- exclude_object -------------------------------------------------
+//
+// Shapes below are exactly what `ExcludeObject.get_status`
+// (klippy/extras/exclude_object.py:174-180) puts on the wire:
+//     {"objects": [...], "excluded_objects": [...],
+//      "current_object": <name or null>}
+// The object dicts are what cmd_EXCLUDE_OBJECT_DEFINE builds
+// (exclude_object.py:248-270): a mandatory upper-cased "name", plus
+// "center" (json.loads('[%s]' % CENTER)) and "polygon"
+// (json.loads(POLYGON)) when the slicer supplied them.
+
+/// Parses an `exclude_object` status out of a subscription frame.
+fn exclude_status(bytes: &[u8]) -> plr_klipper::ExcludeObjectStatus {
+    notification(bytes)
+        .status_update()
+        .unwrap()
+        .status
+        .exclude_object()
+        .unwrap()
+        .expect("exclude_object must be present")
+}
+
+/// No `[exclude_object]` objects at all: the state after
+/// `_reset_state()` — empty lists and a null `current_object`.
+#[test]
+fn exclude_object_no_objects_defined() {
+    let bytes = b"{\"params\": {\"eventtime\": 3052153.382, \"status\": {\"exclude_object\": {\"objects\": [], \"excluded_objects\": [], \"current_object\": null}}}}\x03";
+    let status = exclude_status(bytes);
+    assert_eq!(status.objects.as_deref(), Some(&[][..]));
+    assert_eq!(status.excluded_objects.as_deref(), Some(&[][..]));
+    // Present-and-null, not absent: Klipper sent the field.
+    assert_eq!(status.current_object, Some(None));
+
+    let mut snapshot = plr_klipper::ExcludeObjectSnapshot::new();
+    let change = snapshot.merge(&status);
+    assert!(!change.any(), "empty state equals the default snapshot");
+    assert!(snapshot.objects.is_empty());
+    assert!(!snapshot.is_excluded("ANYTHING"));
+    assert!(snapshot.definition("ANYTHING").is_none());
+}
+
+/// Objects defined, none excluded, printing the first one — the normal
+/// mid-print shape produced by a PrusaSlicer/OrcaSlicer object header.
+#[test]
+fn exclude_object_defined_none_excluded() {
+    let bytes = b"{\"params\": {\"eventtime\": 3052153.382, \"status\": {\"exclude_object\": {\"objects\": [{\"name\": \"CUBE_ID_0_COPY_0\", \"center\": [50.0, 50.0], \"polygon\": [[45.0, 45.0], [55.0, 45.0], [55.0, 55.0], [45.0, 55.0]]}, {\"name\": \"CUBE_ID_1_COPY_0\", \"center\": [150.0, 50.0], \"polygon\": [[145.0, 45.0], [155.0, 45.0], [155.0, 55.0], [145.0, 55.0]]}], \"excluded_objects\": [], \"current_object\": \"CUBE_ID_0_COPY_0\"}}}}\x03";
+    let status = exclude_status(bytes);
+    let objects = status.objects.clone().unwrap();
+    assert_eq!(objects.len(), 2);
+    assert_eq!(objects[0].name, "CUBE_ID_0_COPY_0");
+    assert_eq!(objects[0].center_xy(), Some([50.0, 50.0]));
+    let polygon = objects[0].polygon_xy().unwrap().unwrap();
+    assert_eq!(polygon.len(), 4);
+    assert_eq!(polygon[0], [45.0, 45.0]);
+    assert_eq!(status.excluded_objects.as_deref(), Some(&[][..]));
+    assert_eq!(status.current_object, Some(Some("CUBE_ID_0_COPY_0".into())));
+
+    let mut snapshot = plr_klipper::ExcludeObjectSnapshot::new();
+    let change = snapshot.merge(&status);
+    assert!(change.definitions && change.current);
+    assert!(!change.excluded, "nothing was cancelled");
+    assert!(!snapshot.is_excluded("CUBE_ID_0_COPY_0"));
+    assert_eq!(
+        snapshot.definition("cube_id_1_copy_0").map(|d| &d.name),
+        Some(&"CUBE_ID_1_COPY_0".to_owned())
+    );
+}
+
+/// One object cancelled (`EXCLUDE_OBJECT NAME=...`). Klipper re-sends
+/// only the field that changed — diff semantics — so the update carries
+/// `excluded_objects` alone.
+#[test]
+fn exclude_object_one_excluded_arrives_as_a_diff() {
+    let defined = b"{\"params\": {\"eventtime\": 3052153.382, \"status\": {\"exclude_object\": {\"objects\": [{\"name\": \"CUBE_ID_0_COPY_0\"}, {\"name\": \"CUBE_ID_1_COPY_0\"}], \"excluded_objects\": [], \"current_object\": null}}}}\x03";
+    let mut snapshot = plr_klipper::ExcludeObjectSnapshot::new();
+    snapshot.merge(&exclude_status(defined));
+
+    let cancel = b"{\"params\": {\"eventtime\": 3052160.108, \"status\": {\"exclude_object\": {\"excluded_objects\": [\"CUBE_ID_1_COPY_0\"]}}}}\x03";
+    let status = exclude_status(cancel);
+    assert_eq!(status.objects, None, "unchanged fields are not re-sent");
+    assert_eq!(status.current_object, None);
+    let change = snapshot.merge(&status);
+    assert!(change.excluded);
+    assert!(!change.definitions && !change.current);
+    assert!(snapshot.is_excluded("CUBE_ID_1_COPY_0"));
+    assert!(!snapshot.is_excluded("CUBE_ID_0_COPY_0"));
+    assert_eq!(snapshot.objects.len(), 2, "definitions carried forward");
+
+    // Re-sending the same set is not a change.
+    assert!(!snapshot.merge(&exclude_status(cancel)).any());
+}
+
+/// Several objects cancelled; Klipper keeps `excluded_objects` sorted
+/// (`_exclude_object`, exclude_object.py:283).
+#[test]
+fn exclude_object_several_excluded() {
+    let bytes = b"{\"params\": {\"eventtime\": 3052171.9, \"status\": {\"exclude_object\": {\"objects\": [{\"name\": \"A\"}, {\"name\": \"B\"}, {\"name\": \"C\"}], \"excluded_objects\": [\"A\", \"C\"], \"current_object\": \"B\"}}}}\x03";
+    let status = exclude_status(bytes);
+    let mut snapshot = plr_klipper::ExcludeObjectSnapshot::new();
+    assert!(snapshot.merge(&status).any());
+    assert_eq!(
+        snapshot.excluded_objects,
+        vec!["A".to_owned(), "C".to_owned()]
+    );
+    assert_eq!(snapshot.current_object.as_deref(), Some("B"));
+    assert!(snapshot.is_excluded("A") && snapshot.is_excluded("C"));
+    assert!(!snapshot.is_excluded("B"));
+}
+
+/// `EXCLUDE_OBJECT RESET=1` clears every exclusion; the objects stay
+/// defined (exclude_object.py:226-231).
+#[test]
+fn exclude_object_reset_clears_the_excluded_set_only() {
+    let excluded = b"{\"params\": {\"eventtime\": 1.0, \"status\": {\"exclude_object\": {\"objects\": [{\"name\": \"A\"}, {\"name\": \"B\"}], \"excluded_objects\": [\"A\"], \"current_object\": \"B\"}}}}\x03";
+    let mut snapshot = plr_klipper::ExcludeObjectSnapshot::new();
+    snapshot.merge(&exclude_status(excluded));
+
+    let reset = b"{\"params\": {\"eventtime\": 2.0, \"status\": {\"exclude_object\": {\"excluded_objects\": []}}}}\x03";
+    let change = snapshot.merge(&exclude_status(reset));
+    assert!(change.excluded);
+    assert!(snapshot.excluded_objects.is_empty());
+    assert_eq!(snapshot.objects.len(), 2, "definitions survive the reset");
+}
+
+/// `EXCLUDE_OBJECT_DEFINE RESET=1` calls `_reset_file()`: objects,
+/// exclusions and the current object all clear at once
+/// (exclude_object.py:252-253, 75-83).
+#[test]
+fn exclude_object_define_reset_clears_everything() {
+    let loaded = b"{\"params\": {\"eventtime\": 1.0, \"status\": {\"exclude_object\": {\"objects\": [{\"name\": \"A\"}], \"excluded_objects\": [\"A\"], \"current_object\": \"A\"}}}}\x03";
+    let mut snapshot = plr_klipper::ExcludeObjectSnapshot::new();
+    snapshot.merge(&exclude_status(loaded));
+
+    let reset = b"{\"params\": {\"eventtime\": 2.0, \"status\": {\"exclude_object\": {\"objects\": [], \"excluded_objects\": [], \"current_object\": null}}}}\x03";
+    let change = snapshot.merge(&exclude_status(reset));
+    assert!(change.definitions && change.excluded && change.current);
+    assert_eq!(snapshot, plr_klipper::ExcludeObjectSnapshot::default());
+}
+
+/// Geometry Klipper will happily pass through from `json.loads`:
+/// a three-component centre, a degenerate point, and no geometry at
+/// all. The accessors must classify rather than panic.
+#[test]
+fn exclude_object_hostile_geometry_is_classified_not_trusted() {
+    let bytes = b"{\"params\": {\"eventtime\": 1.0, \"status\": {\"exclude_object\": {\"objects\": [{\"name\": \"XYZ\", \"center\": [10.0, 20.0, 0.3], \"polygon\": [[1.0], [2.0, 3.0]]}, {\"name\": \"NOGEO\"}, {\"name\": \"SHORTC\", \"center\": [7.0]}], \"excluded_objects\": [], \"current_object\": null}}}}\x03";
+    let objects = exclude_status(bytes).objects.unwrap();
+    // A three-component centre keeps its X/Y.
+    assert_eq!(objects[0].center_xy(), Some([10.0, 20.0]));
+    // A one-component point invalidates the whole ring.
+    assert_eq!(objects[0].polygon_xy(), Some(Err(2)));
+    // No geometry at all.
+    assert_eq!(objects[1].center_xy(), None);
+    assert_eq!(objects[1].polygon_xy(), None);
+    // A one-component centre is not a centre.
+    assert_eq!(objects[2].center_xy(), None);
+}

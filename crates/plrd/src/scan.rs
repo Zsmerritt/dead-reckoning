@@ -483,6 +483,7 @@ mod tests {
             },
             heaters: Vec::new(),
             fans: Vec::new(),
+            exclude: None,
         }
     }
 

@@ -337,6 +337,7 @@ dependencies = [
  "plr-klipper",
  "plr-wal",
  "proptest",
+ "serde_json",
  "thiserror",
 ]
 

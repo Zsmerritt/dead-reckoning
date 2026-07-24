@@ -5,6 +5,7 @@ use plr_wal::{HeartbeatRecovery, RecoveryScan};
 
 use crate::config::ReconstructConfig;
 use crate::error::ReconstructError;
+use crate::exclude::{resolve_exclusions, ExclusionReport};
 use crate::stopset::{compute_stop_set, FileTail, PossibleStopSet};
 use crate::timeline::{ingest, WalTimeline};
 use crate::window::{compute_stop_window, ReceiveSeqObservation, StopWindow};
@@ -31,7 +32,8 @@ pub struct ReconstructInputs<'a> {
     pub receive_seq: Option<ReceiveSeqObservation>,
 }
 
-/// A full recovery reconstruction: timeline, window, and stop set.
+/// A full recovery reconstruction: timeline, window, stop set, and the
+/// excluded-object picture.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RecoveryReconstruction {
     /// The ingested, validated WAL timeline.
@@ -40,6 +42,12 @@ pub struct RecoveryReconstruction {
     pub window: StopWindow,
     /// The possible-stop set.
     pub stop_set: PossibleStopSet,
+    /// Which objects the operator cancelled, and how much that answer
+    /// can be trusted. **Check
+    /// [`ExclusionReport::requires_operator_confirmation`] before
+    /// resuming**: an empty excluded set is only meaningful together
+    /// with its [`provenance`](ExclusionReport::provenance).
+    pub exclusions: ExclusionReport,
 }
 
 /// Outcome of [`reconstruct`].
@@ -72,20 +80,24 @@ pub fn reconstruct(
     }
     let window = compute_stop_window(&timeline, inputs.receive_seq.as_ref(), config)?;
     let stop_set = compute_stop_set(&timeline, &window, inputs.file_tail.as_ref(), config)?;
+    let exclusions = resolve_exclusions(&timeline, inputs.file_tail.as_ref());
     Ok(Reconstruction::Recovery(Box::new(RecoveryReconstruction {
         timeline,
         window,
         stop_set,
+        exclusions,
     })))
 }
 
 #[cfg(test)]
 mod tests {
-    use plr_wal::{Marker, MarkerKind, WalRecord};
+    use plr_wal::{ExcludeObjectDef, ExcludeState, Marker, MarkerKind, WalRecord};
 
     use super::{reconstruct, ReconstructInputs, Reconstruction};
     use crate::config::ReconstructConfig;
     use crate::error::ReconstructError;
+    use crate::exclude::{ExclusionDiagnostic, ExclusionProvenance};
+    use crate::stopset::FileTail;
     use crate::testutil::{context_at, heartbeat_at, scan_of};
     use crate::window::CrashClass;
 
@@ -160,5 +172,69 @@ mod tests {
             CrashClass::HostDeathOrPowerLoss { .. }
         ));
         assert!(recovery.stop_set.degradation.extension_unavailable);
+        // With no exclude state and no file, the exclusion picture is
+        // honestly unknown rather than "nothing was cancelled".
+        assert_eq!(recovery.exclusions.provenance, ExclusionProvenance::Unknown);
+        assert!(recovery.exclusions.requires_operator_confirmation());
+    }
+
+    #[test]
+    fn recovery_carries_the_journaled_exclusion_picture() {
+        let mut context = context_at(1_000_000_000, 0);
+        context.exclude = Some(Box::new(ExcludeState {
+            definitions: Some(vec![ExcludeObjectDef::name_only("PART_A")]),
+            excluded: vec!["PART_A".to_owned()],
+            current: None,
+        }));
+        let scan = scan_of(vec![
+            WalRecord::Heartbeat(heartbeat_at(1_000_000_000, 10.0)),
+            WalRecord::Context(context),
+        ]);
+        let outcome = reconstruct(&inputs(&scan), &ReconstructConfig::default()).unwrap();
+        let Reconstruction::Recovery(recovery) = outcome else {
+            panic!("expected Recovery");
+        };
+        assert_eq!(
+            recovery.exclusions.provenance,
+            ExclusionProvenance::Journaled
+        );
+        assert!(recovery.exclusions.is_excluded("PART_A"));
+        assert!(!recovery.exclusions.requires_operator_confirmation());
+    }
+
+    #[test]
+    fn recovery_flags_a_lost_cancellation_record() {
+        // The WAL predates the exclude field (or the module was never
+        // observed) but the file defines objects: a resume would print
+        // all of them.
+        let scan = scan_of(vec![
+            WalRecord::Heartbeat(heartbeat_at(1_000_000_000, 10.0)),
+            WalRecord::Context(context_at(1_000_000_000, 0)),
+        ]);
+        let file = b"EXCLUDE_OBJECT_DEFINE NAME=part_a\nEXCLUDE_OBJECT_DEFINE NAME=part_b\nG1 X1\n";
+        let inputs = ReconstructInputs {
+            scan: &scan,
+            heartbeat: None,
+            file_tail: Some(FileTail {
+                base_offset: 0,
+                bytes: file,
+            }),
+            receive_seq: None,
+        };
+        let outcome = reconstruct(&inputs, &ReconstructConfig::default()).unwrap();
+        let Reconstruction::Recovery(recovery) = outcome else {
+            panic!("expected Recovery");
+        };
+        assert_eq!(
+            recovery.exclusions.provenance,
+            ExclusionProvenance::RecordLost
+        );
+        assert_eq!(
+            recovery.exclusions.diagnostics,
+            vec![ExclusionDiagnostic::CancellationRecordLost {
+                objects: vec!["PART_A".to_owned(), "PART_B".to_owned()],
+            }]
+        );
+        assert!(recovery.exclusions.requires_operator_confirmation());
     }
 }
