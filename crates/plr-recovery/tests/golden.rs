@@ -27,6 +27,15 @@ fn build_plan(
     machine: &plr_recovery::MachineConfig,
     transforms: plr_wal::TransformObservations,
 ) -> RecoveryPlan {
+    build_plan_with(machine, transforms, &PlanConfig::default())
+}
+
+/// [`build_plan`] with an explicit plan config.
+fn build_plan_with(
+    machine: &plr_recovery::MachineConfig,
+    transforms: plr_wal::TransformObservations,
+    config: &PlanConfig,
+) -> RecoveryPlan {
     let reconstruction = recovery(stop_set(&[0.4]), wal_context(transforms));
     let contact = contact_at(0.4);
     let match_result = match_at(resume_offset());
@@ -42,7 +51,7 @@ fn build_plan(
         clean_nozzle_macro_present: true,
         purge_macro_present: false,
     };
-    match plan_recovery(&inputs, &PlanConfig::default()) {
+    match plan_recovery(&inputs, config) {
         Ok(PlanOutcome::Plan(plan)) => *plan,
         other => panic!("expected a plan, got {other:?}"),
     }
@@ -164,10 +173,16 @@ fn normal_tap_recovery_matches_the_golden_plan() {
         .steps_in_phase(Phase::ParkForReheat)
         .next()
         .expect("park step");
-    assert_eq!(park.commands[0], "G91");
-    assert!(park.commands[1].starts_with("G1 Z"));
-    assert_eq!(park.commands[2], "G90");
-    assert!(park.commands[3].starts_with("G0 X"));
+    // The lift is an ABSOLUTE move to a runtime-computed, rail-clamped
+    // height — never a blind relative lift Klipper would reject with
+    // "Move out of range" after the probe established the reference.
+    assert_eq!(park.commands[0], "G90");
+    assert!(park.commands[1].starts_with("G1 Z{park_z}"));
+    assert!(park.commands[2].starts_with("G0 X"));
+    assert!(matches!(
+        park.compute,
+        Some(RuntimeComputation::ParkZ { delta_z, .. }) if (delta_z - 2.0).abs() < 1e-12
+    ));
     // The blocking heat waits (M109/M190) are the recovery file's
     // heating gate — never in the plan. (The plan's ImmediateBedHeat
     // does a NON-blocking M104 toward the probe temp, which is fine.)
@@ -187,8 +202,9 @@ fn normal_tap_recovery_matches_the_golden_plan() {
         "TEST-TS",
     );
     assert!(plr_recovery::verify_heating_gate(&file).is_ok());
-    assert!(file.content.contains("M109 S210"));
-    assert!(file.content.contains("M190 S60"));
+    let file_text = file.preamble_text().into_owned();
+    assert!(file_text.contains("M109 S210"));
+    assert!(file_text.contains("M190 S60"));
 
     // The consensus Tap probe reads the plugin's consensus median.
     let probe_declare = plan
@@ -762,7 +778,7 @@ fn recovery_file_matches_the_golden_and_holds_the_heating_gate() {
     // The verbatim tail is byte-identical to the original from the
     // matched offset.
     assert_eq!(
-        &file.content.as_bytes()[file.tail_start..],
+        file.tail_bytes(),
         &common::MODEL_TEXT.as_bytes()[usize::try_from(plan.resume_offset).unwrap()..]
     );
 
@@ -775,7 +791,10 @@ fn recovery_file_matches_the_golden_and_holds_the_heating_gate() {
         std::fs::write(golden_path, &file.content).expect("write golden");
     }
     let golden = std::fs::read_to_string(golden_path).expect("golden file (run with PLR_BLESS=1)");
-    assert_eq!(file.content, golden.replace("\r\n", "\n"));
+    assert_eq!(
+        String::from_utf8(file.content).expect("ASCII fixture"),
+        golden.replace("\r\n", "\n")
+    );
 }
 
 #[test]
@@ -809,6 +828,104 @@ fn no_clean_nozzle_macro_requires_confirmation_and_emits_no_command() {
     assert!(plan
         .render()
         .contains("confirm the nozzle is clean before executing"));
+}
+
+/// Finding 3 regression: the ENTRY coordinates left the plan for the
+/// generated file, and must still be bounds-checked. On main these were
+/// `Phase::Entry` commands the itinerary pre-flight walked; the
+/// equivalent guarantee is now `preflight_recovery_file` over the file's
+/// preamble, run on the same build path.
+#[test]
+fn generated_file_entry_coordinates_are_bounds_checked() {
+    use plr_recovery::{
+        preflight_recovery_file, ItineraryBounds, PlanRejection, ViolationKind,
+        RECOVERY_FILE_STEP_ID,
+    };
+    let plan = build_plan(&machine_tap(), plain_transforms());
+    let file =
+        plr_recovery::build_recovery_file(&plan.recovery_file, common::MODEL_TEXT.as_bytes(), "TS");
+    let bounds = ItineraryBounds {
+        x: Some((0.0, 200.0)),
+        y: Some((0.0, 200.0)),
+        z_max: Some(250.0),
+        position_min: plan.envelope.position_min,
+        contact_point: [20.0, 10.0],
+    };
+    // The generated file passes with roomy limits.
+    assert!(preflight_recovery_file(&file, &bounds).is_ok());
+
+    // entry_z = resume_z + entry_hop must be checked against z_max: a
+    // machine whose Z travel ends below the entry hop is caught HERE, at
+    // plan time, instead of dying mid-file on "Move out of range".
+    let tight_z = ItineraryBounds {
+        z_max: Some(0.5), // entry emits G0 Z1.35 / G1 Z0.35
+        ..bounds
+    };
+    let Err(PlanRejection::ItineraryOutOfBounds { violations }) =
+        preflight_recovery_file(&file, &tight_z)
+    else {
+        panic!("an entry Z above z_max must be rejected");
+    };
+    assert!(
+        violations
+            .iter()
+            .any(|v| v.axis == 'Z' && v.kind == ViolationKind::AxisLimit && v.value > 1.0),
+        "the entry hop Z must be named: {violations:?}"
+    );
+    assert!(violations
+        .iter()
+        .all(|v| v.step_id == RECOVERY_FILE_STEP_ID));
+
+    // The entry XY is checked too (it is an absolute travel in the file).
+    let tight_xy = ItineraryBounds {
+        x: Some((0.0, 5.0)),
+        ..bounds
+    };
+    let Err(PlanRejection::ItineraryOutOfBounds { violations }) =
+        preflight_recovery_file(&file, &tight_xy)
+    else {
+        panic!("an entry X beyond the limit must be rejected");
+    };
+    assert!(violations.iter().any(|v| v.axis == 'X'));
+
+    // Aggregation: several bad axes are reported together, not first-fail.
+    let tight_all = ItineraryBounds {
+        x: Some((0.0, 5.0)),
+        y: Some((0.0, 5.0)),
+        z_max: Some(0.5),
+        ..bounds
+    };
+    let Err(PlanRejection::ItineraryOutOfBounds { violations }) =
+        preflight_recovery_file(&file, &tight_all)
+    else {
+        panic!("expected rejection");
+    };
+    assert!(violations.iter().any(|v| v.axis == 'X'));
+    assert!(violations.iter().any(|v| v.axis == 'Y'));
+    assert!(violations.iter().any(|v| v.axis == 'Z'));
+}
+
+/// Finding 3: an out-of-bounds entry coordinate must make the whole plan
+/// build fail, not merely be detectable by a test that remembers to look.
+#[test]
+fn a_resume_near_z_max_is_refused_at_plan_time() {
+    // z_max just above the resume Z but below resume_z + entry_hop: the
+    // file's entry hop would be out of range mid-recovery.
+    let mut machine = machine_tap();
+    machine.axis_limits = plr_recovery::AxisLimits {
+        x: Some((0.0, 200.0)),
+        y: Some((0.0, 200.0)),
+        z_max: Some(0.5),
+    };
+    let plan = build_plan(&machine, plain_transforms());
+    let file =
+        plr_recovery::build_recovery_file(&plan.recovery_file, common::MODEL_TEXT.as_bytes(), "TS");
+    let err = plr_recovery::preflight_generated_file(&file, &machine, [20.0, 10.0])
+        .expect_err("entry hop above z_max must be refused");
+    assert!(
+        matches!(err, RecoveryError::ItineraryRejected(_)),
+        "{err:?}"
+    );
 }
 
 #[test]
@@ -845,6 +962,101 @@ fn configured_reheat_park_is_used_without_a_warning() {
         .warnings
         .iter()
         .any(|w| matches!(w, plr_recovery::PlanWarning::ReheatParkComputed { .. })));
+}
+
+/// Finding 7 regression: the park warning must assert only what it
+/// checked. A CONFIGURED park point inside the part footprint warns
+/// honestly instead of being waved through.
+#[test]
+fn a_configured_park_inside_the_part_warns() {
+    // The fixture part spans X 10..30, Y 10..30; park at its centre.
+    let config = PlanConfig {
+        reheat_park_x: Some(20.0),
+        reheat_park_y: Some(20.0),
+        ..PlanConfig::default()
+    };
+    let plan = build_plan_with(&machine_tap(), plain_transforms(), &config);
+    let warning = plan
+        .warnings
+        .iter()
+        .find_map(|w| match w {
+            plr_recovery::PlanWarning::ReheatParkInsidePart { point, configured } => {
+                Some((*point, *configured))
+            }
+            _ => None,
+        })
+        .expect("a park inside the part must warn");
+    assert!(warning.1, "the warning must say it was configured");
+    assert!((warning.0[0] - 20.0).abs() < 1e-12);
+    let rendered = plan.render();
+    assert!(
+        rendered.contains("INSIDE the part bounding box"),
+        "{rendered}"
+    );
+    assert!(
+        rendered.contains("configured via reheat_park_x/y"),
+        "{rendered}"
+    );
+}
+
+/// Finding 7 regression: a COMPUTED park point is only described as
+/// "clear of the part" when it verifiably is. With axis limits that clamp
+/// every side back over the footprint, the honest
+/// `ReheatParkInsidePart` warning is emitted instead.
+#[test]
+fn a_computed_park_that_clamps_back_inside_the_part_warns_honestly() {
+    // Travel limits inside the part footprint (part spans X 10..30,
+    // Y 10..30): every candidate side clamps back over the part. The
+    // limits still contain the analyzer's contact point (20, 10), so the
+    // plan itself is valid — only the park has nowhere clear to go.
+    let mut machine = machine_tap();
+    machine.axis_limits = plr_recovery::AxisLimits {
+        x: Some((12.0, 28.0)),
+        y: Some((10.0, 28.0)),
+        z_max: Some(250.0),
+    };
+    let plan = build_plan(&machine, plain_transforms());
+    assert!(
+        plan.warnings.iter().any(|w| matches!(
+            w,
+            plr_recovery::PlanWarning::ReheatParkInsidePart {
+                configured: false,
+                ..
+            }
+        )),
+        "no side clears the part; the warning must say so: {:?}",
+        plan.warnings
+    );
+    // ...and it must NOT claim the point is clear of the part.
+    assert!(!plan
+        .warnings
+        .iter()
+        .any(|w| matches!(w, plr_recovery::PlanWarning::ReheatParkComputed { .. })));
+}
+
+/// Finding 7: when a side DOES clear the part, the computed warning is
+/// used and the point is genuinely outside the footprint.
+#[test]
+fn a_computed_park_that_clears_the_part_says_so_truthfully() {
+    let mut machine = machine_tap();
+    machine.axis_limits = plr_recovery::AxisLimits {
+        x: Some((0.0, 200.0)),
+        y: Some((0.0, 200.0)),
+        z_max: Some(250.0),
+    };
+    let plan = build_plan(&machine, plain_transforms());
+    let point = plan
+        .warnings
+        .iter()
+        .find_map(|w| match w {
+            plr_recovery::PlanWarning::ReheatParkComputed { point } => Some(*point),
+            _ => None,
+        })
+        .expect("a clear computed park must use the computed warning");
+    // The fixture part spans X 10..30, Y 10..30: verify the claim.
+    let inside = point[0] >= 10.0 && point[0] <= 30.0 && point[1] >= 10.0 && point[1] <= 30.0;
+    assert!(!inside, "computed park {point:?} is inside the part bbox");
+    assert!(plan.render().contains("verified clear of the part"));
 }
 
 #[test]
@@ -896,18 +1108,159 @@ fn empty_clamped_temp_band_is_refused() {
             field: "max_probe_nozzle_temp"
         })
     ));
-    // A probe temp above the ceiling is refused too.
+    // A band too narrow to hold the headroom below the ceiling is
+    // refused, naming both bounds and the headroom (finding 9).
     let config = PlanConfig {
-        max_probe_nozzle_temp: 145.0,
-        probe_nozzle_temp: 150.0,
+        max_probe_nozzle_temp: 143.0, // ceiling 143, min 140 -> only 3 C
         ..PlanConfig::default()
     };
-    assert!(matches!(
-        config.validate(),
-        Err(RecoveryError::InvalidPlanConfig {
-            field: "probe_nozzle_temp"
+    let err = config.validate().unwrap_err();
+    assert!(
+        matches!(
+            err,
+            RecoveryError::ProbeTempHeadroomUnavailable { headroom, .. }
+                if (headroom - plr_recovery::PROBE_TEMP_HEADROOM).abs() < 1e-12
+        ),
+        "{err:?}"
+    );
+    let msg = err.to_string();
+    assert!(msg.contains("140"), "{msg}");
+    assert!(msg.contains("143"), "{msg}");
+    assert!(msg.contains("max_probe_nozzle_temp"), "{msg}");
+}
+
+/// Finding 9 (cross-component interlock): the plan must NEVER command a
+/// probe nozzle target at the plugin's contact ceiling. The plugin
+/// refuses `PLR_TOUCH`/`PLR_DRAG_PROBE` when `max(current, target)`
+/// exceeds `max_probe_nozzle_temp`; a target ON the ceiling trips that on
+/// ordinary PID overshoot, and because the probe runs after the
+/// shifted-frame declare the abort wedges the recovery permanently.
+#[test]
+fn probe_target_leaves_headroom_below_the_contact_ceiling() {
+    let headroom = plr_recovery::PROBE_TEMP_HEADROOM;
+
+    // Default config: the emitted M104 sits at least `headroom` below the
+    // ceiling (145 under the default 150).
+    let plan = build_plan(&machine_tap(), plain_transforms());
+    let heat = plan
+        .steps_in_phase(Phase::ImmediateBedHeat)
+        .next()
+        .expect("immediate-bed-heat step");
+    let m104 = heat
+        .commands
+        .iter()
+        .find(|c| c.starts_with("M104 S"))
+        .expect("nozzle preheat command");
+    let emitted: f64 = m104.trim_start_matches("M104 S").parse().expect("number");
+    let ceiling = PlanConfig::default().clamped_probe_max();
+    assert!(
+        emitted + headroom <= ceiling + 1e-9,
+        "emitted probe target {emitted} must be >= {headroom} C below the ceiling {ceiling}"
+    );
+    assert!(
+        (emitted - 145.0).abs() < 1e-12,
+        "expected 145, got {emitted}"
+    );
+
+    // An operator asking for the ceiling (or above it) is pulled down to
+    // the headroom, never emitted at the ceiling.
+    for asked in [150.0, 155.0, 160.0] {
+        let config = PlanConfig {
+            probe_nozzle_temp: asked,
+            probe_temp_max: 160.0,
+            max_probe_nozzle_temp: 160.0,
+            ..PlanConfig::default()
+        };
+        config.validate().expect("config is valid");
+        let commanded = config.commanded_probe_temp();
+        assert!(
+            commanded + headroom <= config.clamped_probe_max() + 1e-9,
+            "asked {asked}: commanded {commanded} must leave {headroom} C of headroom"
+        );
+    }
+
+    // The VERIFICATION band is not tightened by the headroom: it stays at
+    // the ceiling (plus the measured tolerance, see the next test).
+    let probe = plan.steps_in_phase(Phase::Probe).next().expect("probe");
+    let band_max = probe
+        .pre_verify
+        .iter()
+        .find_map(|v| match v.predicate {
+            plr_recovery::Predicate::TempWithin { max, .. } if v.field == "temperature" => {
+                Some(max)
+            }
+            _ => None,
         })
-    ));
+        .expect("temperature band");
+    assert!(
+        band_max >= ceiling,
+        "band max {band_max} must not tighten below the ceiling {ceiling}"
+    );
+}
+
+/// Finding 10 (cross-language contract): the Probe step's MEASURED
+/// temperature bound must equal `max_probe_nozzle_temp +
+/// PROBE_TEMP_MEASURED_TOLERANCE`, and its TARGET bound exactly
+/// `max_probe_nozzle_temp`.
+///
+/// The tolerance mirrors the Klipper plugin's
+/// `MAX_TOUCH_TEMPERATURE_EPSILON` (Cartographer
+/// `probe/touch_mode.py:34`, value 2). plrd and the plugin must refuse at
+/// the IDENTICAL boundary — if either side changes its tolerance, this
+/// test is what fails first. The asymmetry is deliberate: measured
+/// overshoot is forgiven, a hotter commanded target is not.
+#[test]
+fn probe_temperature_bounds_stay_in_lockstep_with_the_plugin() {
+    // Keep in sync with klippy_plugin's MAX_TOUCH_TEMPERATURE_EPSILON.
+    const PLUGIN_MAX_TOUCH_TEMPERATURE_EPSILON: f64 = 2.0;
+    assert!(
+        (plr_recovery::PROBE_TEMP_MEASURED_TOLERANCE - PLUGIN_MAX_TOUCH_TEMPERATURE_EPSILON).abs()
+            < 1e-12,
+        "plrd's measured tolerance must equal the plugin's MAX_TOUCH_TEMPERATURE_EPSILON"
+    );
+
+    let ceiling = PlanConfig::default().max_probe_nozzle_temp;
+    // Both probe paths carry the same bounds (the drag path's measured
+    // predicate is a bare ceiling, the touch path's a band).
+    for machine in [machine_tap(), machine_adxl_drag()] {
+        let plan = build_plan(&machine, plain_transforms());
+        let probe = plan.steps_in_phase(Phase::Probe).next().expect("probe");
+
+        let measured_max = probe
+            .pre_verify
+            .iter()
+            .filter(|v| v.object == "extruder" && v.field == "temperature")
+            .find_map(|v| match v.predicate {
+                plr_recovery::Predicate::TempWithin { max, .. }
+                | plr_recovery::Predicate::NumAtMost { max } => Some(max),
+                _ => None,
+            })
+            .expect("measured temperature bound");
+        assert!(
+            (measured_max - (ceiling + PLUGIN_MAX_TOUCH_TEMPERATURE_EPSILON)).abs() < 1e-12,
+            "measured bound {measured_max} must be the ceiling {ceiling} + {PLUGIN_MAX_TOUCH_TEMPERATURE_EPSILON}"
+        );
+
+        let target_max = probe
+            .pre_verify
+            .iter()
+            .filter(|v| v.object == "extruder" && v.field == "target")
+            .find_map(|v| match v.predicate {
+                plr_recovery::Predicate::NumAtMost { max } => Some(max),
+                _ => None,
+            })
+            .expect("target bound");
+        assert!(
+            (target_max - ceiling).abs() < 1e-12,
+            "target bound {target_max} must stay exactly at the ceiling {ceiling} \
+             (commanding a hotter nozzle is never forgiven)"
+        );
+        // The asymmetry itself.
+        assert!(
+            measured_max > target_max,
+            "the measured bound must be the forgiving one"
+        );
+    }
 }
 
 #[test]

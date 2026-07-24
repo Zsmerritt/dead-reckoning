@@ -49,6 +49,27 @@ pub enum RecoveryError {
         /// Name of the offending field.
         field: &'static str,
     },
+    /// The probe temperature band is too narrow to hold
+    /// [`crate::build::PROBE_TEMP_HEADROOM`] below the contact ceiling.
+    /// Probing AT the ceiling is refused by the Klipper plugin on any PID
+    /// overshoot, which wedges the recovery permanently (see the
+    /// constant's docs), so the config is refused up front instead.
+    #[error(
+        "probe temperature band too narrow: probe_temp_min {probe_temp_min} C leaves no room \
+         below the contact ceiling {ceiling} C for the required {headroom} C headroom. \
+         Lower probe_temp_min, or raise probe_temp_max / max_probe_nozzle_temp \
+         (the ceiling is min(probe_temp_max, max_probe_nozzle_temp))"
+    )]
+    ProbeTempHeadroomUnavailable {
+        /// The configured lower bound of the probing band, °C.
+        probe_temp_min: f64,
+        /// The effective contact ceiling `min(probe_temp_max,
+        /// max_probe_nozzle_temp)`, °C.
+        ceiling: f64,
+        /// The required headroom, °C
+        /// ([`crate::build::PROBE_TEMP_HEADROOM`]).
+        headroom: f64,
+    },
     /// One or more machine prerequisites failed
     /// ([`crate::machine::validate_machine`]). Recovery must not be
     /// attempted on this machine until every failure is resolved.

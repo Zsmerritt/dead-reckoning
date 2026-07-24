@@ -40,8 +40,8 @@ use crate::error::RecoveryError;
 use crate::machine::{validate_machine, MachineConfig, ProbeKind, ValidatedMachine};
 use crate::plan::{
     fmt_num, AbortReason, FailureAction, Phase, PlanWarning, Predicate, RecoveryPlan, RecoveryStep,
-    RuntimeComputation, TriggerSource, TrueZFormula, Verification, RESTORE_ACCEL_PLACEHOLDER,
-    TRUE_Z_PLACEHOLDER,
+    RuntimeComputation, TriggerSource, TrueZFormula, Verification, PARK_Z_PLACEHOLDER,
+    RESTORE_ACCEL_PLACEHOLDER, TRUE_Z_PLACEHOLDER,
 };
 use crate::preflight::{preflight_itinerary, ItineraryBounds};
 use crate::preheat::{derive_preheat, FileTemps};
@@ -192,6 +192,52 @@ pub struct PlanConfig {
     pub purge_feed: f64,
 }
 
+/// Headroom, °C, between the nozzle temperature the plan COMMANDS for
+/// probing and the hard contact ceiling it verifies against.
+///
+/// The Klipper plugin refuses `PLR_TOUCH` / `PLR_DRAG_PROBE` when
+/// `max(current, target) > max_probe_nozzle_temp`. If the plan commanded
+/// the ceiling exactly, ordinary PID overshoot (150.4 °C under a 150 °C
+/// ceiling is unremarkable) would trip that refusal — and because the
+/// probe runs AFTER the shifted-frame declare, the abort invalidates the Z
+/// frame, a re-execute is refused, and the fresh dry run regenerates an
+/// identical plan that fails identically: the recovery wedges permanently
+/// with the nozzle parked over the part.
+///
+/// The plan therefore targets `clamped_probe_max - PROBE_TEMP_HEADROOM`
+/// (145 °C under the default 150 °C ceiling) while still VERIFYING against
+/// the full band up to the ceiling — the target leaves room, the band does
+/// not tighten. [`PlanConfig::validate`] refuses any config where the
+/// headroom cannot be honored.
+pub const PROBE_TEMP_HEADROOM: f64 = 5.0;
+
+/// Tolerance, °C, added to the contact ceiling when checking the MEASURED
+/// nozzle temperature before a contact operation.
+///
+/// Mirrors the Klipper plugin's `MAX_TOUCH_TEMPERATURE_EPSILON` (itself
+/// following Cartographer's `MAX_TOUCH_TEMPERATURE_EPSILON = 2`,
+/// `probe/touch_mode.py:34`). The two sides must agree on the identical
+/// boundary, not merely be ordered: without this tolerance the probe step
+/// gates measured temperature at exactly the ceiling, and a measured
+/// overshoot aborts at [`Phase::Probe`] — which sits AFTER
+/// [`Phase::ShiftedFrame`], so the abort invalidates the Z frame, refuses
+/// re-execution, and regenerates an identical plan. The wedge would then
+/// be plrd's own doing rather than the plugin's.
+///
+/// The asymmetry is deliberate and load-bearing:
+///
+/// * the **measured** (`extruder.temperature`) bound is
+///   `clamped_probe_max + PROBE_TEMP_MEASURED_TOLERANCE` — measurement
+///   noise and PID overshoot around a legitimately-commanded temperature
+///   are forgiven;
+/// * the **target** (`extruder.target`) bound stays exactly
+///   `clamped_probe_max` — commanding a hotter nozzle is never forgiven.
+///
+/// The preheat step's own band is deliberately NOT widened: it runs
+/// before any frame declaration, so a refusal there is a clean early
+/// abort with nothing to unwind.
+pub const PROBE_TEMP_MEASURED_TOLERANCE: f64 = 2.0;
+
 impl PlanConfig {
     /// The effective probe-temperature ceiling: `probe_temp_max` clamped
     /// down to `max_probe_nozzle_temp`. Both the current-temperature band
@@ -199,6 +245,19 @@ impl PlanConfig {
     #[must_use]
     pub fn clamped_probe_max(&self) -> f64 {
         self.probe_temp_max.min(self.max_probe_nozzle_temp)
+    }
+
+    /// The nozzle temperature the plan actually COMMANDS for probing:
+    /// the configured `probe_nozzle_temp` pulled into
+    /// `[probe_temp_min, clamped_probe_max - PROBE_TEMP_HEADROOM]`.
+    ///
+    /// This is what the `M104` carries; the verification band's upper
+    /// bound stays at [`Self::clamped_probe_max`] (see
+    /// [`PROBE_TEMP_HEADROOM`] for why the two differ).
+    #[must_use]
+    pub fn commanded_probe_temp(&self) -> f64 {
+        let ceiling = self.clamped_probe_max() - PROBE_TEMP_HEADROOM;
+        self.probe_nozzle_temp.clamp(self.probe_temp_min, ceiling)
     }
 }
 
@@ -370,17 +429,24 @@ impl PlanConfig {
             }
         }
         // The probe temperature band clamps to the ceiling; refuse a
-        // config whose clamped band is empty, and require the commanded
-        // probe temp to lie at or below the ceiling.
+        // config whose clamped band is empty.
         let clamped_max = self.clamped_probe_max();
         if clamped_max <= self.probe_temp_min {
             return Err(RecoveryError::InvalidPlanConfig {
                 field: "max_probe_nozzle_temp",
             });
         }
-        if self.probe_nozzle_temp > clamped_max {
-            return Err(RecoveryError::InvalidPlanConfig {
-                field: "probe_nozzle_temp",
+        // The commanded probe temperature must be able to sit at least
+        // PROBE_TEMP_HEADROOM below the ceiling (see the constant's docs:
+        // targeting the ceiling wedges the recovery on PID overshoot).
+        // When the band is too narrow to hold that headroom, refuse with
+        // the offending bounds named rather than silently probing at the
+        // ceiling.
+        if self.probe_temp_min > clamped_max - PROBE_TEMP_HEADROOM {
+            return Err(RecoveryError::ProbeTempHeadroomUnavailable {
+                probe_temp_min: self.probe_temp_min,
+                ceiling: clamped_max,
+                headroom: PROBE_TEMP_HEADROOM,
             });
         }
         // Optional reheat park coordinates: finite when present (axis
@@ -791,12 +857,18 @@ fn step_immediate_bed_heat(ctx: &Ctx<'_>) -> RecoveryStep {
             ));
         }
     }
-    commands.push(format!("M104 S{}", fmt_num(ctx.cfg.probe_nozzle_temp)));
+    // The COMMANDED probe temperature sits at least PROBE_TEMP_HEADROOM
+    // below the contact ceiling the probe step verifies against: the
+    // plugin refuses contact when max(current, target) exceeds the
+    // ceiling, and a target ON the ceiling trips that refusal on ordinary
+    // PID overshoot — wedging the recovery (see PROBE_TEMP_HEADROOM).
+    let probe_temp = ctx.cfg.commanded_probe_temp();
+    commands.push(format!("M104 S{}", fmt_num(probe_temp)));
     verify.push(Verification::new(
         "extruder",
         "target",
         Predicate::NumWithin {
-            expected: ctx.cfg.probe_nozzle_temp,
+            expected: probe_temp,
             epsilon: 1.0,
         },
     ));
@@ -1163,6 +1235,10 @@ fn step_probe(ctx: &Ctx<'_>) -> RecoveryStep {
 /// ceiling, not a band.
 fn probe_pre_verify(ctx: &Ctx<'_>) -> Vec<Verification> {
     let ceiling = ctx.cfg.clamped_probe_max();
+    // The MEASURED bound carries the plugin's tolerance so both sides
+    // refuse at the identical boundary; the TARGET bound does not (see
+    // PROBE_TEMP_MEASURED_TOLERANCE for why the asymmetry is the point).
+    let measured_max = ceiling + PROBE_TEMP_MEASURED_TOLERANCE;
     let homed = |axis: &str| {
         Verification::new(
             "toolhead",
@@ -1176,14 +1252,14 @@ fn probe_pre_verify(ctx: &Ctx<'_>) -> Vec<Verification> {
         ProbeKind::AdxlDrag { .. } => Verification::new(
             "extruder",
             "temperature",
-            Predicate::NumAtMost { max: ceiling },
+            Predicate::NumAtMost { max: measured_max },
         ),
         ProbeKind::Tap | ProbeKind::LoadCell => Verification::new(
             "extruder",
             "temperature",
             Predicate::TempWithin {
                 min: ctx.cfg.probe_temp_min,
-                max: ceiling,
+                max: measured_max,
             },
         ),
     };
@@ -1260,20 +1336,19 @@ fn step_final_declare(ctx: &Ctx<'_>) -> RecoveryStep {
 fn step_park_for_reheat(ctx: &Ctx<'_>) -> RecoveryStep {
     // Park the nozzle away from the part before the recovery file reheats
     // to print temperature: a nozzle dwelling at print temperature
-    // pressed against layer N−1 plastic melts a divot. First a bounded
-    // relative Z lift in the SAFE direction (away from the part) —
-    // Klipper's own rail limit structurally rejects a lift past
-    // position_max, so no build-time z_max clamp is possible or needed —
-    // then an absolute travel to the reheat park XY.
+    // pressed against layer N−1 plastic melts a divot.
+    //
+    // The lift is an ABSOLUTE move to a runtime-computed, rail-clamped
+    // height (`RuntimeComputation::ParkZ` → min(current + delta, z_max)),
+    // not a blind relative `G1 Z<delta>`: Klipper does not clamp an
+    // out-of-range move, it raises "Move out of range"
+    // (kinematics/cartesian.py:105) — which here would abort AFTER the
+    // probe established the Z reference and force a full re-run. Then an
+    // absolute travel to the reheat park XY.
     let [px, py] = ctx.park;
     let commands = vec![
-        "G91".to_owned(),
-        format!(
-            "G1 Z{} F{}",
-            fmt_num(ctx.cfg.reheat_park_delta_z),
-            fmt_num(ctx.cfg.entry_feed)
-        ),
         "G90".to_owned(),
+        format!("G1 Z{PARK_Z_PLACEHOLDER} F{}", fmt_num(ctx.cfg.entry_feed)),
         format!(
             "G0 X{} Y{} F{}",
             fmt_num(px),
@@ -1283,7 +1358,7 @@ fn step_park_for_reheat(ctx: &Ctx<'_>) -> RecoveryStep {
     ];
     step(
         Phase::ParkForReheat,
-        "lift off the part and park at the reheat XY (the file reheats to print temp here)",
+        "lift off the part (rail-clamped) and park at the reheat XY (the file reheats to print temp here)",
         commands,
         vec![],
         vec![
@@ -1303,8 +1378,19 @@ fn step_park_for_reheat(ctx: &Ctx<'_>) -> RecoveryStep {
                     epsilon: ctx.cfg.xy_epsilon,
                 },
             ),
+            // The lift landed at the computed clamped height.
+            Verification::new(
+                "toolhead",
+                "position.2",
+                Predicate::NumWithinComputed {
+                    epsilon: ctx.cfg.z_epsilon,
+                },
+            ),
         ],
-        None,
+        Some(RuntimeComputation::ParkZ {
+            delta_z: ctx.cfg.reheat_park_delta_z,
+            z_max: ctx.machine.axis_limits.z_max,
+        }),
         AbortReason::ParkForReheatFailed,
     )
 }
@@ -1692,17 +1778,16 @@ pub fn plan_recovery(
         });
     }
 
-    // The reheat park point: configured, or computed outside the part
-    // bounding box with a plan warning.
-    let (park, park_computed) = reheat_park(config, inputs.model, &machine.axis_limits);
+    // The reheat park point: configured (cross-checked against the part
+    // footprint) or computed on a side that verifiably clears it.
+    let park_choice = reheat_park(config, inputs.model, &machine.axis_limits);
+    let park = park_choice.point;
     if !park.iter().all(|v| v.is_finite()) {
         return Err(RecoveryError::NonFinite {
             field: "reheat_park",
         });
     }
-    if park_computed {
-        warnings.push(PlanWarning::ReheatParkComputed { point: park });
-    }
+    warnings.extend(park_choice.warning);
 
     // The generated recovery file's name (collision resolution is the
     // daemon's job; the builder emits the plain desired name).
@@ -1741,6 +1826,8 @@ pub fn plan_recovery(
         bed: preheat.bed,
         nozzle: nozzle_print,
         purge,
+        park,
+        park_feed: config.travel_feed,
         entry_commands,
         header_cap: RECOVERY_HEADER_CAP,
     };
@@ -1756,6 +1843,39 @@ pub fn plan_recovery(
     };
     run_preflight(&plan, &machine, candidate.point)?;
     Ok(PlanOutcome::Plan(Box::new(plan)))
+}
+
+/// Pre-flights the GENERATED RECOVERY FILE's own absolute coordinates —
+/// the re-park travel, the purge, and the entry moves that used to be the
+/// plan's `Entry` step — against the same axis limits the plan itinerary
+/// is checked against.
+///
+/// The file is played back by Klipper with no per-step verification, so an
+/// out-of-range coordinate there would surface only as a mid-recovery
+/// "Move out of range" AFTER the probe established the Z reference. The
+/// daemon calls this on the same build path that generates the file, with
+/// the identical bounds, and refuses the recovery on any violation.
+///
+/// # Errors
+///
+/// [`RecoveryError::ItineraryRejected`] listing every violation.
+pub fn preflight_generated_file(
+    file: &crate::resume_file::GeneratedRecoveryFile,
+    machine: &MachineConfig,
+    contact_point: [f64; 2],
+) -> Result<(), RecoveryError> {
+    let validated = validate_machine(machine).map_err(|r| RecoveryError::MachineRejected {
+        failures: r.failures,
+    })?;
+    let bounds = ItineraryBounds {
+        x: validated.axis_limits.x,
+        y: validated.axis_limits.y,
+        z_max: validated.axis_limits.z_max,
+        position_min: validated.z_position_min,
+        contact_point,
+    };
+    crate::preflight::preflight_recovery_file(file, &bounds)?;
+    Ok(())
 }
 
 /// Cap on leading comment lines the recovery file copies from the
@@ -1781,22 +1901,15 @@ fn build_purge(config: &PlanConfig, purge_macro_present: bool) -> Option<crate::
     })
 }
 
-/// The reheat park point: the configured `(reheat_park_x, reheat_park_y)`
-/// when BOTH are set (validated finite in [`PlanConfig::validate`], and
-/// bounds-checked by the pre-flight), otherwise a point computed outside
-/// the part's XY bounding box by a 10 mm margin, clamped inside the known
-/// axis limits. Returns `(point, computed?)`.
-fn reheat_park(
-    config: &PlanConfig,
-    model: &LayerModel,
-    limits: &crate::machine::AxisLimits,
-) -> ([f64; 2], bool) {
-    const PART_MARGIN: f64 = 10.0;
-    if let (Some(x), Some(y)) = (config.reheat_park_x, config.reheat_park_y) {
-        return ([x, y], false);
-    }
-    // Part XY bounding box from the model's deposition segments.
-    let mut bbox: Option<[f64; 4]> = None; // [min_x, min_y, max_x, max_y]
+/// Margin, mm, by which a computed park point clears the part's XY
+/// bounding box.
+const PART_MARGIN: f64 = 10.0;
+
+/// The part's XY bounding box `[min_x, min_y, max_x, max_y]` from the
+/// model's deposition segments, or `None` when the model has no
+/// finite-coordinate deposition.
+fn part_bbox(model: &LayerModel) -> Option<[f64; 4]> {
+    let mut bbox: Option<[f64; 4]> = None;
     for layer in &model.layers {
         for path in &layer.paths {
             for seg in &path.segments {
@@ -1814,19 +1927,104 @@ fn reheat_park(
             }
         }
     }
-    // Prefer parking just past the part's max X; fall back to the axis
-    // midpoint when the part footprint is unknown.
-    let (mut px, mut py) = match bbox {
-        Some([_mnx, mny, mxx, mxy]) => (mxx + PART_MARGIN, (mny + mxy) * 0.5),
-        None => (PART_MARGIN, PART_MARGIN),
+    bbox
+}
+
+/// `true` when `[x, y]` lies inside (or on) the part's bounding box.
+fn inside_bbox(point: [f64; 2], bbox: [f64; 4]) -> bool {
+    let [mnx, mny, mxx, mxy] = bbox;
+    point[0] >= mnx && point[0] <= mxx && point[1] >= mny && point[1] <= mxy
+}
+
+/// Outcome of choosing the reheat park point.
+struct ParkChoice {
+    point: [f64; 2],
+    warning: Option<PlanWarning>,
+}
+
+/// The reheat park point.
+///
+/// * **Configured** `(reheat_park_x, reheat_park_y)` (both set) is used
+///   verbatim — validated finite by [`PlanConfig::validate`] and
+///   bounds-checked by the pre-flight — but is still cross-checked
+///   against the part footprint: a park point the operator placed INSIDE
+///   the part is the same hazard as a computed one, so it warns.
+/// * **Computed** otherwise: each side of the bounding box is tried in
+///   turn (+X, −X, +Y, −Y), clamped into the known axis limits, and the
+///   first candidate that actually lands OUTSIDE the footprint wins.
+///   Clamping can pull a candidate back into the part on a machine whose
+///   travel barely exceeds the print, which is exactly why every
+///   candidate is re-checked after clamping instead of assuming the
+///   +X side is clear.
+/// * When no candidate clears the part, the honest
+///   [`PlanWarning::ReheatParkInsidePart`] is emitted rather than
+///   claiming a clearance that does not exist.
+fn reheat_park(
+    config: &PlanConfig,
+    model: &LayerModel,
+    limits: &crate::machine::AxisLimits,
+) -> ParkChoice {
+    let bbox = part_bbox(model);
+    let clamp = |mut px: f64, mut py: f64| {
+        if let Some((lo, hi)) = limits.x {
+            px = px.clamp(lo, hi);
+        }
+        if let Some((lo, hi)) = limits.y {
+            py = py.clamp(lo, hi);
+        }
+        [px, py]
     };
-    if let Some((lo, hi)) = limits.x {
-        px = px.clamp(lo, hi);
+
+    // Configured: honored as-is, but cross-checked against the footprint.
+    if let (Some(x), Some(y)) = (config.reheat_park_x, config.reheat_park_y) {
+        let point = [x, y];
+        let warning =
+            bbox.filter(|bb| inside_bbox(point, *bb))
+                .map(|_| PlanWarning::ReheatParkInsidePart {
+                    point,
+                    configured: true,
+                });
+        return ParkChoice { point, warning };
     }
-    if let Some((lo, hi)) = limits.y {
-        py = py.clamp(lo, hi);
+
+    // No footprint known: park at a modest corner offset and say so.
+    let Some(bb) = bbox else {
+        let point = clamp(PART_MARGIN, PART_MARGIN);
+        return ParkChoice {
+            point,
+            warning: Some(PlanWarning::ReheatParkComputed { point }),
+        };
+    };
+    let [mnx, mny, mxx, mxy] = bb;
+    let (cx, cy) = ((mnx + mxx) * 0.5, (mny + mxy) * 0.5);
+    // Candidate park points, one per side of the footprint.
+    let candidates = [
+        [mxx + PART_MARGIN, cy],
+        [mnx - PART_MARGIN, cy],
+        [cx, mxy + PART_MARGIN],
+        [cx, mny - PART_MARGIN],
+    ];
+    for candidate in candidates {
+        let point = clamp(candidate[0], candidate[1]);
+        // Re-check AFTER clamping: the clamp may have pulled the point
+        // back over the part on a tight machine.
+        if !inside_bbox(point, bb) {
+            return ParkChoice {
+                point,
+                warning: Some(PlanWarning::ReheatParkComputed { point }),
+            };
+        }
     }
-    ([px, py], true)
+    // Every side clamps back inside the footprint: the part occupies the
+    // reachable bed. Park at the least-bad candidate and say so honestly.
+    let point = clamp(mxx + PART_MARGIN, cy);
+    ParkChoice {
+        point,
+        warning: Some(PlanWarning::ReheatParkInsidePart {
+            point,
+            configured: false,
+        }),
+    }
 }
 
 /// Sizes the probe envelope for the recovery. Overshoot per probe

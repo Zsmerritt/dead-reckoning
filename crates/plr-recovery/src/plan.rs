@@ -46,6 +46,18 @@ pub const TRUE_Z_PLACEHOLDER: &str = "{true_z}";
 /// substitutes the recorded value it captured before clamping.
 pub const RESTORE_ACCEL_PLACEHOLDER: &str = "{restore_accel}";
 
+/// The placeholder substituted by the daemon with the ABSOLUTE park Z
+/// computed by [`RuntimeComputation::ParkZ`] — `min(current_z + delta,
+/// z_max)`.
+///
+/// The park lift cannot be a blind relative `G1 Z<delta>`: Klipper does
+/// NOT clamp an out-of-range move, it raises "Move out of range"
+/// (`klippy/kinematics/cartesian.py:105`, `check_move`), which would abort
+/// the recovery AFTER the probe established the Z reference and force a
+/// full re-run. Computing the clamped absolute target at execute time —
+/// when the true Z is finally known — keeps the lift inside the rail.
+pub const PARK_Z_PLACEHOLDER: &str = "{park_z}";
+
 /// Which phase a step belongs to. The builder emits phases in exactly
 /// this declaration order (the strict recovery-UX order that replaces
 /// the old §8 ordering); the ordering invariants
@@ -476,6 +488,47 @@ pub enum RuntimeComputation {
     /// then `set_max_accel(TOUCH_ACCEL)`). The recorded value persists
     /// across the intervening steps in the daemon's execution state.
     RecordMaxAccel,
+    /// Read `toolhead.position[2]` **before** the step's commands run and
+    /// substitute `min(current_z + delta_z, z_max)` for
+    /// [`PARK_Z_PLACEHOLDER`] — the rail-clamped absolute park height (see
+    /// that constant for why a blind relative lift is unsafe). `z_max`
+    /// `None` (limit unknown, the legacy path) leaves the lift unclamped.
+    ParkZ {
+        /// Lift above the current Z, mm.
+        delta_z: f64,
+        /// The Z rail's `position_max`, mm, when known.
+        z_max: Option<f64>,
+    },
+}
+
+/// Evaluates [`RuntimeComputation::ParkZ`]: the rail-clamped absolute park
+/// height `min(current_z + delta_z, z_max)`.
+///
+/// # Errors
+///
+/// [`RecoveryError::NonFinite`] on any non-finite input or result — the
+/// daemon must abort, never substitute, on such an error.
+pub fn park_z_at(current_z: f64, delta_z: f64, z_max: Option<f64>) -> Result<f64, RecoveryError> {
+    if !current_z.is_finite() {
+        return Err(RecoveryError::NonFinite { field: "current_z" });
+    }
+    if !delta_z.is_finite() {
+        return Err(RecoveryError::NonFinite { field: "delta_z" });
+    }
+    let mut target = current_z + delta_z;
+    if let Some(zm) = z_max {
+        if !zm.is_finite() {
+            return Err(RecoveryError::NonFinite { field: "z_max" });
+        }
+        // Clamp DOWN to the rail only: never push the nozzle lower than
+        // where it already is (a z_max below the current Z would
+        // otherwise command a descent into the part).
+        target = target.min(zm).max(current_z);
+    }
+    if !target.is_finite() {
+        return Err(RecoveryError::NonFinite { field: "park_z" });
+    }
+    Ok(target)
 }
 
 /// One strictly ordered recovery step.
@@ -527,11 +580,24 @@ pub enum PlanWarning {
     /// unheated.
     NoBedTarget,
     /// No `reheat_park_x`/`reheat_park_y` was configured, so the park
-    /// point was computed outside the part bounding box. Configure an
-    /// explicit park position to control where the nozzle reheats.
+    /// point was computed and VERIFIED to clear the part's bounding box.
+    /// Configure an explicit park position to control where the nozzle
+    /// reheats.
     ReheatParkComputed {
         /// The computed park point `[x, y]`, mm.
         point: [f64; 2],
+    },
+    /// The reheat park point lies INSIDE the part's XY bounding box: the
+    /// nozzle will reheat to print temperature (and purge) over printed
+    /// geometry. Either the operator configured it there, or no side of
+    /// the footprint stayed clear once clamped into the machine's travel
+    /// limits.
+    ReheatParkInsidePart {
+        /// The park point `[x, y]`, mm.
+        point: [f64; 2],
+        /// `true` when the operator configured this point explicitly;
+        /// `false` when it was computed and no clear side existed.
+        configured: bool,
     },
     /// The resume point is not on infill (the match did not allow an
     /// infill start).
@@ -573,10 +639,21 @@ impl PlanWarning {
                 "no bed target found in the WAL or the file; the bed is left unheated".to_owned()
             }
             PlanWarning::ReheatParkComputed { point } => format!(
-                "no reheat_park_x/y configured; parking at computed ({}, {}) outside the part \
-                 bounding box — set an explicit park position",
+                "no reheat_park_x/y configured; parking at computed ({}, {}), verified clear of \
+                 the part bounding box — set an explicit park position",
                 fmt_num(point[0]),
                 fmt_num(point[1])
+            ),
+            PlanWarning::ReheatParkInsidePart { point, configured } => format!(
+                "the reheat park point ({}, {}) is INSIDE the part bounding box{} — the nozzle \
+                 will reheat and purge over printed geometry; move it clear of the part",
+                fmt_num(point[0]),
+                fmt_num(point[1]),
+                if *configured {
+                    " (configured via reheat_park_x/y)"
+                } else {
+                    " (computed: no side of the part stayed clear within the axis limits)"
+                }
             ),
             PlanWarning::ResumeNotOnInfill => {
                 "the resume point is not on infill; the seam may be visible".to_owned()

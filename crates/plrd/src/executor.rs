@@ -30,7 +30,8 @@ use std::time::Duration;
 
 use plr_recovery::{
     fmt_num, true_z_at_halt, FailureAction, Phase, Predicate, RecoveryPlan, RecoveryStep,
-    RuntimeComputation, TriggerSource, Verification, RESTORE_ACCEL_PLACEHOLDER, TRUE_Z_PLACEHOLDER,
+    RuntimeComputation, TriggerSource, Verification, PARK_Z_PLACEHOLDER, RESTORE_ACCEL_PLACEHOLDER,
+    TRUE_Z_PLACEHOLDER,
 };
 use serde_json::{json, Value};
 
@@ -438,8 +439,9 @@ async fn send_step_commands(
     transcript: &mut Transcript<'_>,
 ) -> Result<(), StopCause> {
     for command in &step.commands {
-        let has_placeholder =
-            command.contains(TRUE_Z_PLACEHOLDER) || command.contains(RESTORE_ACCEL_PLACEHOLDER);
+        let has_placeholder = command.contains(TRUE_Z_PLACEHOLDER)
+            || command.contains(RESTORE_ACCEL_PLACEHOLDER)
+            || command.contains(PARK_Z_PLACEHOLDER);
         let resolved = if has_placeholder {
             let Some(value) = computed else {
                 // A placeholder without a computed value cannot be sent;
@@ -452,6 +454,7 @@ async fn send_step_commands(
             command
                 .replace(TRUE_Z_PLACEHOLDER, &fmt_num(value))
                 .replace(RESTORE_ACCEL_PLACEHOLDER, &fmt_num(value))
+                .replace(PARK_Z_PLACEHOLDER, &fmt_num(value))
         } else {
             command.clone()
         };
@@ -508,6 +511,28 @@ async fn resolve_compute(
                         "true_z": true_z,
                     }));
                     Ok(Some(true_z))
+                }
+                // Never substitute on error (plr-recovery contract).
+                Err(e) => Err(StopCause::ComputeFailed(e.to_string())),
+            }
+        }
+        Some(RuntimeComputation::ParkZ { delta_z, z_max }) => {
+            // Read the CURRENT Z (before the step's lift runs) and compute
+            // the rail-clamped absolute park height. Klipper does not clamp
+            // an out-of-range move — it raises "Move out of range" — so the
+            // clamp must happen here, where the true Z is finally known.
+            let current_z = query_number(client, "toolhead", "position.2").await?;
+            match plr_recovery::park_z_at(current_z, delta_z, z_max) {
+                Ok(park_z) => {
+                    transcript.entry(&json!({
+                        "event": "compute",
+                        "step": step.id,
+                        "current_z": current_z,
+                        "delta_z": delta_z,
+                        "z_max": z_max,
+                        "park_z": park_z,
+                    }));
+                    Ok(Some(park_z))
                 }
                 // Never substitute on error (plr-recovery contract).
                 Err(e) => Err(StopCause::ComputeFailed(e.to_string())),

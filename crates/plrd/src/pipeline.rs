@@ -88,12 +88,23 @@ pub struct PlanBundle {
     pub machine: MachineConfig,
     /// The generated recovery-file content the executor writes into the
     /// `virtual_sdcard` root before execution (the file the final `M23`
-    /// step selects). Empty only when the sdcard root is unknown (then
-    /// the plan cannot have been produced anyway).
-    pub recovery_file_content: String,
+    /// step selects). Raw BYTES: the tail is a byte-verbatim copy of the
+    /// original print file, which may not be UTF-8.
+    pub recovery_file_content: Vec<u8>,
     /// Absolute path the recovery-file content is written to (the sdcard
     /// root joined with the collision-resolved recovery file name).
+    ///
+    /// Chosen here, written later by the executor's `WriteRecoveryFile`
+    /// gate — so the write is `create_new` with a bounded re-resolve
+    /// retry, never an unconditional truncate: a file that appeared in
+    /// between must never be silently clobbered.
     pub recovery_file_path: std::path::PathBuf,
+    /// The sdcard root the recovery file lives in, kept so the write gate
+    /// can re-resolve a fresh collision-free name if the chosen path was
+    /// taken between planning and writing.
+    pub sdcard_root: std::path::PathBuf,
+    /// The original print file's basename, for that re-resolve.
+    pub recovery_source_name: String,
 }
 
 /// Every outcome the pipeline can reach. Only `Plan` is executable.
@@ -537,7 +548,15 @@ fn plan_from_recovery(
             PipelineOutcome::ManualFallback(format!("planner declined: {reason:?}"))
         }
         Ok(PlanOutcome::Plan(plan)) => {
-            match finalize_recovery_file(*plan, machine, file_bytes, say) {
+            // The contact point the pre-flight anchors on (the analyzer's
+            // selected probe site).
+            let contact_point = match &contact {
+                ContactOutcome::Candidates(c) => {
+                    c.first().map_or([0.0, 0.0], |candidate| candidate.point)
+                }
+                ContactOutcome::Declined(_) => [0.0, 0.0],
+            };
+            match finalize_recovery_file(*plan, machine, contact_point, file_bytes, say) {
                 Ok(bundle) => PipelineOutcome::Plan(Box::new(PlanBundle {
                     file_path: file_path.to_owned(),
                     machine: machine.clone(),
@@ -558,6 +577,7 @@ fn plan_from_recovery(
 fn finalize_recovery_file(
     mut plan: RecoveryPlan,
     machine: &MachineConfig,
+    contact_point: [f64; 2],
     file_bytes: &[u8],
     say: &mut dyn FnMut(&str),
 ) -> Result<PlanBundle, String> {
@@ -609,14 +629,26 @@ fn finalize_recovery_file(
             "generated recovery file violates the heating gate: {violation}"
         ));
     }
+    // The file's OWN absolute coordinates — the re-park travel, the purge,
+    // and the entry moves that used to be the plan's Entry step — get the
+    // same axis-limit pre-flight the plan itinerary gets. Klipper plays
+    // the file back with no verification, so an out-of-range coordinate
+    // here would only surface as a mid-recovery "Move out of range" AFTER
+    // the probe established the Z reference.
+    if let Err(e) = plr_recovery::preflight_generated_file(&generated, machine, contact_point) {
+        return Err(format!("generated recovery file failed pre-flight: {e}"));
+    }
 
     let recovery_file_path = root_path.join(&plan.recovery_file.name);
+    let recovery_source_name = plan.recovery_file.source_name.clone();
     Ok(PlanBundle {
         plan,
         file_path: String::new(),
         machine: machine.clone(),
         recovery_file_content: generated.content,
         recovery_file_path,
+        sdcard_root: root_path.to_path_buf(),
+        recovery_source_name,
     })
 }
 
@@ -982,7 +1014,16 @@ G1 X30 Y30 E1
         assert_eq!(plan.recovery_file.tail_offset, plan.resume_offset);
         // The pipeline generated the recovery-file content and resolved
         // its write path under the sdcard root.
-        assert!(bundle.recovery_file_content.contains("G28 X Y"));
+        let content = String::from_utf8_lossy(&bundle.recovery_file_content).into_owned();
+        assert!(content.contains("G28 X Y"));
+        // The purge runs AFTER travelling back to the part-clear park
+        // point, never at the homed XY G28 leaves behind (finding 1).
+        let g28 = content.find("G28 X Y").expect("re-home");
+        let purge = content.find("G1 E").expect("purge");
+        assert!(
+            content[g28..purge].contains("G0 X"),
+            "a re-park travel must sit between G28 and the purge"
+        );
         assert!(bundle
             .recovery_file_path
             .to_string_lossy()

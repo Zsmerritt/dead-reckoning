@@ -458,7 +458,7 @@ proptest! {
         );
         prop_assert!(plr_recovery::verify_heating_gate(&file).is_ok());
         prop_assert_eq!(
-            &file.content.as_bytes()[file.tail_start..],
+            file.tail_bytes(),
             &MODEL_TEXT.as_bytes()[usize::try_from(plan.resume_offset).unwrap()..]
         );
 
@@ -761,6 +761,88 @@ proptest! {
             Err(RecoveryError::NonFinite { .. }) => {}
             Err(other) => prop_assert!(false, "unexpected error {other:?}"),
         }
+    }
+
+    /// Finding 2 (byte fidelity): for ARBITRARY original bytes —
+    /// including non-UTF-8 sequences a lossy decode would rewrite as
+    /// `EF BF BD` — the generated tail is byte-identical to
+    /// `original[offset..]`, and the tail length matches exactly.
+    ///
+    /// Varying the BYTES (not just the offset over a fixed ASCII fixture)
+    /// is what makes this able to catch a lossy copy at all.
+    #[test]
+    fn recovery_file_tail_is_byte_verbatim_for_arbitrary_bytes(
+        original in proptest::collection::vec(any::<u8>(), 0..600),
+        offset_frac in 0.0..1.0_f64,
+        bed in proptest::option::of(40.0..110.0_f64),
+        nozzle in 170.0..300.0_f64,
+        purge_on in any::<bool>(),
+    ) {
+        #[allow(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            clippy::cast_precision_loss
+        )]
+        let offset = ((original.len() as f64) * offset_frac) as usize;
+        let spec = plr_recovery::RecoveryFileSpec {
+            name: "p_RECOVERY.gcode".to_owned(),
+            source_name: "p.gcode".to_owned(),
+            plan_id: "plr-1".to_owned(),
+            tail_offset: offset as u64,
+            bed,
+            nozzle,
+            purge: purge_on.then_some(plr_recovery::PurgeSpec {
+                macro_call: None,
+                amount: 5.0,
+                feed: 300.0,
+            }),
+            park: [180.0, 20.0],
+            park_feed: 6000.0,
+            entry_commands: vec!["G90".to_owned(), "G0 X30 Y30 F1200".to_owned()],
+            header_cap: 200,
+        };
+        let file = plr_recovery::build_recovery_file(&spec, &original, "TS");
+        // Byte-exact tail, exact length: no transcoding anywhere.
+        prop_assert_eq!(file.tail_bytes(), &original[offset..]);
+        prop_assert_eq!(file.tail_bytes().len(), original.len() - offset);
+        // The whole file is preamble ++ tail, with nothing lost between.
+        prop_assert_eq!(file.content.len(), file.tail_start + original.len() - offset);
+        // The heating gate holds regardless of what the original carried.
+        prop_assert!(plr_recovery::verify_heating_gate(&file).is_ok());
+    }
+
+    /// Finding 9 (cross-component interlock): for ANY valid `[plr]`
+    /// temperature configuration, the COMMANDED probe target stays at
+    /// least `PROBE_TEMP_HEADROOM` below the contact ceiling the plugin
+    /// refuses at — so PID overshoot can never wedge the recovery.
+    #[test]
+    fn commanded_probe_temp_always_leaves_headroom(
+        probe_temp_min in 140.0..=145.0_f64,
+        probe_temp_max in 145.001..=160.0_f64,
+        max_probe_nozzle_temp in 80.0..=160.0_f64,
+        asked in 100.0..=200.0_f64,
+    ) {
+        let config = PlanConfig {
+            probe_temp_min,
+            probe_temp_max,
+            max_probe_nozzle_temp,
+            probe_nozzle_temp: asked,
+            ..PlanConfig::default()
+        };
+        // Only configs the validator ACCEPTS make a claim; the rest are
+        // refused up front (which is the other half of the fix).
+        if config.validate().is_err() {
+            return Ok(());
+        }
+        let ceiling = config.clamped_probe_max();
+        let commanded = config.commanded_probe_temp();
+        prop_assert!(
+            commanded + plr_recovery::PROBE_TEMP_HEADROOM <= ceiling + 1e-9,
+            "commanded {} must be >= {} C below the ceiling {}",
+            commanded, plr_recovery::PROBE_TEMP_HEADROOM, ceiling
+        );
+        // ...and still inside the verification band's lower bound.
+        prop_assert!(commanded >= config.probe_temp_min - 1e-9);
     }
 
     /// `fmt_num` is total and value-faithful for finite inputs.

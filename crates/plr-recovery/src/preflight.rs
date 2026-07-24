@@ -37,10 +37,26 @@
 //!
 //! Every finding is a [`BoundsViolation`]; a non-empty set is a
 //! [`PlanRejection`].
+//!
+//! # The generated recovery file is checked too
+//!
+//! Motion that used to live in the plan's `Entry` step — the entry moves
+//! (travel above the part, descend, prime) — now lives inside the
+//! GENERATED RECOVERY FILE, together with the post-`G28` re-park travel
+//! and the purge. That file is played back by Klipper directly, so it has
+//! no per-step verification mechanism and a bad coordinate there surfaces
+//! only as a mid-recovery "Move out of range" — AFTER the probe
+//! established the Z reference. [`preflight_recovery_file`] therefore
+//! applies the identical absolute-frame bounds walk to the generated
+//! file's preamble, aggregating into the same
+//! [`PlanRejection::ItineraryOutOfBounds`]. Both are run on the same build
+//! path, so "every commanded coordinate is bounds-checked before the plan
+//! is returned" remains literally true across the plan/file split.
 
 use serde::Serialize;
 
 use crate::plan::{fmt_num, Phase, RecoveryPlan, RESTORE_ACCEL_PLACEHOLDER, TRUE_Z_PLACEHOLDER};
+use crate::resume_file::GeneratedRecoveryFile;
 
 /// Quantization slack: commands render coordinates at five decimals
 /// ([`fmt_num`]), so a re-parsed value may differ from the exact one by
@@ -328,6 +344,56 @@ fn z_word(command: &str) -> Option<f64> {
     None
 }
 
+/// Bounds-checks one ABSOLUTE-frame motion command's literal X/Y/Z
+/// against the machine limits, attributing findings to `step_id`. Shared
+/// by the plan walk and the recovery-file walk so both enforce exactly
+/// the same rule.
+fn check_absolute_command(
+    command: &str,
+    step_id: u32,
+    bounds: &ItineraryBounds,
+    out: &mut Vec<BoundsViolation>,
+) {
+    if let (Some((lo, hi)), Some(x)) = (bounds.x, axis_literal(command, 'X')) {
+        if x < lo - SLACK || x > hi + SLACK {
+            out.push(BoundsViolation {
+                step_id,
+                axis: 'X',
+                value: x,
+                min: Some(lo),
+                max: Some(hi),
+                kind: ViolationKind::AxisLimit,
+            });
+        }
+    }
+    if let (Some((lo, hi)), Some(y)) = (bounds.y, axis_literal(command, 'Y')) {
+        if y < lo - SLACK || y > hi + SLACK {
+            out.push(BoundsViolation {
+                step_id,
+                axis: 'Y',
+                value: y,
+                min: Some(lo),
+                max: Some(hi),
+                kind: ViolationKind::AxisLimit,
+            });
+        }
+    }
+    if let Some(z) = axis_literal(command, 'Z') {
+        let below = z < bounds.position_min - SLACK;
+        let above = bounds.z_max.is_some_and(|zm| z > zm + SLACK);
+        if below || above {
+            out.push(BoundsViolation {
+                step_id,
+                axis: 'Z',
+                value: z,
+                min: Some(bounds.position_min),
+                max: bounds.z_max,
+                kind: ViolationKind::AxisLimit,
+            });
+        }
+    }
+}
+
 /// Walk the plan tracking `G90`/`G91`; bounds-check every absolute
 /// `G0`/`G1` literal coordinate.
 fn check_absolute_travel(
@@ -344,44 +410,7 @@ fn check_absolute_travel(
                 "G90" => absolute = true,
                 "G91" => absolute = false,
                 "G0" | "G1" if absolute => {
-                    if let (Some((lo, hi)), Some(x)) = (bounds.x, axis_literal(command, 'X')) {
-                        if x < lo - SLACK || x > hi + SLACK {
-                            out.push(BoundsViolation {
-                                step_id: step.id,
-                                axis: 'X',
-                                value: x,
-                                min: Some(lo),
-                                max: Some(hi),
-                                kind: ViolationKind::AxisLimit,
-                            });
-                        }
-                    }
-                    if let (Some((lo, hi)), Some(y)) = (bounds.y, axis_literal(command, 'Y')) {
-                        if y < lo - SLACK || y > hi + SLACK {
-                            out.push(BoundsViolation {
-                                step_id: step.id,
-                                axis: 'Y',
-                                value: y,
-                                min: Some(lo),
-                                max: Some(hi),
-                                kind: ViolationKind::AxisLimit,
-                            });
-                        }
-                    }
-                    if let Some(z) = axis_literal(command, 'Z') {
-                        let below = z < bounds.position_min - SLACK;
-                        let above = bounds.z_max.is_some_and(|zm| z > zm + SLACK);
-                        if below || above {
-                            out.push(BoundsViolation {
-                                step_id: step.id,
-                                axis: 'Z',
-                                value: z,
-                                min: Some(bounds.position_min),
-                                max: bounds.z_max,
-                                kind: ViolationKind::AxisLimit,
-                            });
-                        }
-                    }
+                    check_absolute_command(command, step.id, bounds, out);
                 }
                 _ => {}
             }
@@ -395,6 +424,51 @@ fn check_absolute_travel(
         "no NaN coordinate should be reported: {out:?}"
     );
     let _ = (RESTORE_ACCEL_PLACEHOLDER, TRUE_Z_PLACEHOLDER); // documented as skipped
+}
+
+/// Step id attributed to violations found in the generated recovery
+/// file's preamble (the file is not a plan step; `0` marks "the generated
+/// file" in [`BoundsViolation::describe`] output).
+pub const RECOVERY_FILE_STEP_ID: u32 = 0;
+
+/// Whole-file pre-flight for the GENERATED RECOVERY FILE: the same
+/// absolute-frame bounds walk [`preflight_itinerary`] applies to the plan,
+/// applied to the file's preamble — the re-park travel, the purge, and the
+/// entry moves that used to be the plan's `Entry` step (see the module
+/// docs).
+///
+/// Only the preamble is walked: the verbatim tail is the operator's own
+/// sliced file, whose coordinates the printer already accepted before the
+/// crash, and re-validating it would false-positive on every legitimate
+/// g-code-frame move.
+///
+/// # Errors
+///
+/// [`PlanRejection::ItineraryOutOfBounds`] listing every violation.
+pub fn preflight_recovery_file(
+    file: &GeneratedRecoveryFile,
+    bounds: &ItineraryBounds,
+) -> Result<(), PlanRejection> {
+    let mut v: Vec<BoundsViolation> = Vec::new();
+    // Klipper powers up absolute; the generated preamble asserts G90
+    // before its own moves, and the entry moves may switch modes.
+    let mut absolute = true;
+    for line in String::from_utf8_lossy(file.preamble()).lines() {
+        let command = line.trim();
+        match first_word(command).as_str() {
+            "G90" => absolute = true,
+            "G91" => absolute = false,
+            "G0" | "G1" if absolute => {
+                check_absolute_command(command, RECOVERY_FILE_STEP_ID, bounds, &mut v);
+            }
+            _ => {}
+        }
+    }
+    if v.is_empty() {
+        Ok(())
+    } else {
+        Err(PlanRejection::ItineraryOutOfBounds { violations: v })
+    }
 }
 
 #[cfg(test)]

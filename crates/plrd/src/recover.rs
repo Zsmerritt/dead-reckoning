@@ -304,10 +304,15 @@ pub(crate) async fn execute_with_gates(
     let _ = writeln!(out, "recover: transcript: {}", transcript_path.display());
 
     // WriteRecoveryFile phase gate (before step 1): a write failure
-    // aborts before any motion — no client has sent anything yet.
-    if !write_recovery_file(bundle, &mut transcript_file, out) {
+    // aborts before any motion — no client has sent anything yet. The
+    // gate may re-resolve the file name (and patch the plan's M23) if the
+    // planned name was claimed since planning, so it works on a local
+    // copy of the bundle which is what actually gets executed.
+    let mut bundle = bundle.clone();
+    if !write_recovery_file(&mut bundle, &mut transcript_file, out) {
         return EXIT_RUNTIME;
     }
+    let bundle = &bundle;
 
     let mut gate_fn = |step: &plr_recovery::RecoveryStep| -> bool {
         let _ = writeln!(
@@ -417,54 +422,140 @@ fn preview_recovery_file(bundle: &PlanBundle, out: &mut (dyn Write + Send)) {
         out,
         "recover: --- recovery file preview (first {PREVIEW_LINES} lines) ---"
     );
-    for line in bundle.recovery_file_content.lines().take(PREVIEW_LINES) {
+    // The content is raw bytes (the tail may not be UTF-8); the preview is
+    // display-only, so a lossy decode is correct HERE and only here.
+    let text = String::from_utf8_lossy(&bundle.recovery_file_content);
+    for line in text.lines().take(PREVIEW_LINES) {
         let _ = writeln!(out, "  {line}");
     }
-    let total = bundle.recovery_file_content.lines().count();
+    let total = text.lines().count();
     if total > PREVIEW_LINES {
         let _ = writeln!(out, "  ... ({} more lines)", total - PREVIEW_LINES);
     }
     let _ = writeln!(out, "recover: --- end preview ---");
 }
 
+/// How many times the write gate re-resolves a fresh recovery-file name
+/// when the chosen one was taken between planning and writing.
+const RECOVERY_NAME_RETRIES: u32 = 16;
+
+/// Creates `path` exclusively and writes `content`. `Ok(None)` means the
+/// path already existed (caller re-resolves); `Ok(Some(()))` means written.
+fn create_new_write(path: &std::path::Path, content: &[u8]) -> std::io::Result<Option<()>> {
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+    {
+        Ok(mut file) => {
+            file.write_all(content)?;
+            file.flush()?;
+            Ok(Some(()))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
 /// The `WriteRecoveryFile` phase gate: writes the generated recovery file
 /// into the sdcard root BEFORE any step runs (before step 1). A write
-/// failure aborts the recovery before any motion; the path is recorded in
-/// the transcript. Returns `false` on failure (the caller refuses).
+/// failure aborts the recovery before any motion; the final path is
+/// recorded in the transcript. Returns the written path, or `None` on
+/// failure (the caller refuses).
+///
+/// The name was chosen at plan time by scanning the directory, but the
+/// write happens later — so this uses `create_new` (never an
+/// unconditional truncate) and, when the chosen name has since appeared,
+/// re-resolves a fresh collision-free name and patches the plan's `M23`
+/// to match. A file that showed up in between is never clobbered.
 fn write_recovery_file(
-    bundle: &PlanBundle,
+    bundle: &mut PlanBundle,
     transcript_file: &mut std::fs::File,
     out: &mut (dyn Write + Send),
 ) -> bool {
-    match std::fs::write(&bundle.recovery_file_path, &bundle.recovery_file_content) {
-        Ok(()) => {
-            let _ = writeln!(
-                transcript_file,
-                "{}",
-                serde_json::json!({
-                    "event": "recovery-file-written",
-                    "path": bundle.recovery_file_path.display().to_string(),
-                    "bytes": bundle.recovery_file_content.len(),
-                })
-            );
-            let _ = transcript_file.flush();
-            let _ = writeln!(
-                out,
-                "recover: wrote recovery file {} ({} bytes)",
-                bundle.recovery_file_path.display(),
-                bundle.recovery_file_content.len()
-            );
-            true
-        }
-        Err(e) => {
-            let _ = writeln!(
-                out,
-                "recover: REFUSED — cannot write recovery file {}: {e}; nothing was sent.",
-                bundle.recovery_file_path.display()
-            );
-            false
+    let mut path = bundle.recovery_file_path.clone();
+    for attempt in 0..RECOVERY_NAME_RETRIES {
+        match create_new_write(&path, &bundle.recovery_file_content) {
+            Ok(Some(())) => {
+                if path != bundle.recovery_file_path {
+                    // The name changed: keep the plan's M23 and the
+                    // bundle's path consistent with what was written.
+                    let new_name = path
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_default();
+                    let _ = writeln!(
+                        out,
+                        "recover: recovery file name was taken since planning; wrote {new_name}"
+                    );
+                    retarget_recovery_file(bundle, &new_name);
+                    bundle.recovery_file_path.clone_from(&path);
+                }
+                let _ = writeln!(
+                    transcript_file,
+                    "{}",
+                    serde_json::json!({
+                        "event": "recovery-file-written",
+                        "path": path.display().to_string(),
+                        "bytes": bundle.recovery_file_content.len(),
+                        "attempt": attempt,
+                    })
+                );
+                let _ = transcript_file.flush();
+                let _ = writeln!(
+                    out,
+                    "recover: wrote recovery file {} ({} bytes)",
+                    path.display(),
+                    bundle.recovery_file_content.len()
+                );
+                return true;
+            }
+            // Taken since planning: re-resolve against the live directory.
+            Ok(None) => {
+                let taken: std::collections::BTreeSet<String> =
+                    std::fs::read_dir(&bundle.sdcard_root)
+                        .into_iter()
+                        .flatten()
+                        .filter_map(Result::ok)
+                        .filter_map(|e| e.file_name().into_string().ok())
+                        .collect();
+                let name = plr_recovery::recovery_file_name(&bundle.recovery_source_name, &|n| {
+                    taken.contains(n)
+                });
+                path = bundle.sdcard_root.join(name);
+            }
+            Err(e) => {
+                let _ = writeln!(
+                    out,
+                    "recover: REFUSED — cannot write recovery file {}: {e}; nothing was sent.",
+                    path.display()
+                );
+                return false;
+            }
         }
     }
+    let _ = writeln!(
+        out,
+        "recover: REFUSED — could not claim a free recovery file name in {} \
+         under {}; nothing was sent.",
+        RECOVERY_NAME_RETRIES,
+        bundle.sdcard_root.display()
+    );
+    false
+}
+
+/// Points the plan's `M23` (and the plan/spec name fields) at `new_name`.
+fn retarget_recovery_file(bundle: &mut PlanBundle, new_name: &str) {
+    let old = bundle.plan.recovery_file.name.clone();
+    for step in &mut bundle.plan.steps {
+        for command in &mut step.commands {
+            if command.strip_prefix("M23 ") == Some(old.as_str()) {
+                *command = format!("M23 {new_name}");
+            }
+        }
+    }
+    new_name.clone_into(&mut bundle.plan.recovery_file.name);
+    new_name.clone_into(&mut bundle.plan.resume_file);
 }
 
 /// Gate 4 predicate (see module docs for the exact fields, cited from
@@ -538,8 +629,10 @@ mod tests {
             plan: test_plan(),
             file_path: "/g/x.gcode".to_owned(),
             machine,
-            recovery_file_content: "; recovery\nG28 X Y\n".to_owned(),
+            recovery_file_content: b"; recovery\nG28 X Y\n".to_vec(),
             recovery_file_path: dir.join("x_RECOVERY.gcode"),
+            sdcard_root: dir.to_path_buf(),
+            recovery_source_name: "x.gcode".to_owned(),
         }))
     }
 
@@ -750,6 +843,52 @@ mod tests {
         assert!(text.contains("x_RECOVERY.gcode"), "{text}");
     }
 
+    /// Finding 8 regression: the recovery file name is chosen at plan
+    /// time but written later. A file that appeared in between must NEVER
+    /// be clobbered — the write gate uses `create_new`, re-resolves a
+    /// fresh name, and repoints the plan's `M23` at what it actually
+    /// wrote.
+    #[test]
+    fn a_file_appearing_after_planning_is_never_clobbered() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let fake = rt.block_on(FakeMoonraker::spawn(happy_handler));
+        let config = test_config("toctou", &fake.url());
+        let rec_dir = temp_wal_dir("toctou-sdcard");
+        // Somebody else claimed the planned name between planning and
+        // execution, with content that must survive untouched.
+        let squatter = rec_dir.join("x_RECOVERY.gcode");
+        std::fs::write(&squatter, b"PRECIOUS DO NOT CLOBBER").unwrap();
+
+        let outcome = plan_outcome_in(&rec_dir);
+        let (code, output) = run_drive(&outcome, &config, &fast_recover(true, true, false), "y\n");
+        assert_eq!(code, crate::EXIT_OK, "{output}");
+
+        // The pre-existing file is byte-identical: never truncated.
+        assert_eq!(
+            std::fs::read(&squatter).unwrap(),
+            b"PRECIOUS DO NOT CLOBBER"
+        );
+        // The recovery went to a fresh, re-resolved name.
+        let fresh = rec_dir.join("x_RECOVERY-2.gcode");
+        assert!(fresh.exists(), "{output}");
+        assert!(String::from_utf8(std::fs::read(&fresh).unwrap())
+            .unwrap()
+            .contains("G28 X Y"));
+        assert!(output.contains("name was taken since planning"), "{output}");
+        // The transcript records the path actually written.
+        let transcript = std::fs::read_dir(&config.wal_dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .find(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with("recovery-transcript-")
+            })
+            .expect("transcript");
+        let text = std::fs::read_to_string(transcript.path()).unwrap();
+        assert!(text.contains("x_RECOVERY-2.gcode"), "{text}");
+    }
+
     #[test]
     fn recovery_file_write_failure_aborts_before_any_gcode() {
         let rt = tokio::runtime::Runtime::new().unwrap();
@@ -763,10 +902,12 @@ mod tests {
             plan: test_plan(),
             file_path: "/g/x.gcode".to_owned(),
             machine,
-            recovery_file_content: "; recovery\nG28 X Y\n".to_owned(),
+            recovery_file_content: b"; recovery\nG28 X Y\n".to_vec(),
             recovery_file_path: std::path::PathBuf::from(
                 "/nonexistent-plrd-dir-xyzzy/x_RECOVERY.gcode",
             ),
+            sdcard_root: std::path::PathBuf::from("/nonexistent-plrd-dir-xyzzy"),
+            recovery_source_name: "x.gcode".to_owned(),
         };
         let (code, output) = run_drive(
             &PipelineOutcome::Plan(Box::new(bundle)),
@@ -981,8 +1122,10 @@ mod tests {
             plan,
             file_path: "/g/x.gcode".to_owned(),
             machine: machine_config(&crate::config::MachineSection::default(), true, None),
-            recovery_file_content: "; recovery\nG28 X Y\n".to_owned(),
+            recovery_file_content: b"; recovery\nG28 X Y\n".to_vec(),
             recovery_file_path: config.wal_dir.join("x_RECOVERY.gcode"),
+            sdcard_root: config.wal_dir.clone(),
+            recovery_source_name: "x.gcode".to_owned(),
         };
         let opts = fast_recover(true, true, false);
         let mut out = Vec::new();

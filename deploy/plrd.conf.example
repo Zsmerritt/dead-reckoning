@@ -94,22 +94,62 @@ control_socket = /var/lib/plrd/plrd.sock
 #   max_probe_nozzle_temp  hard ceiling for ANY contact op, C  [80,160] (150)
 #                          Clamps the probe band to
 #                          [probe_temp_min, min(probe_temp_max, this)];
-#                          an empty clamped band is refused. The probe AND
-#                          drag pre-checks (current + target temp) use it.
-#                          The drag path has NO warm minimum — cold
-#                          dragging is fine; a hot nozzle melts the part
-#                          and corrupts the accelerometer readings — so it
-#                          gates the ceiling only.
+#                          an empty clamped band is refused. The drag path
+#                          has NO warm minimum — cold dragging is fine; a
+#                          hot nozzle melts the part and corrupts the
+#                          accelerometer readings — so it gates the
+#                          ceiling only.
+#
+#                          THIS CEILING IS THE KLIPPY PLUGIN'S HARD
+#                          REFUSAL POINT: the plugin rejects PLR_TOUCH /
+#                          PLR_DRAG_PROBE when max(current, target)
+#                          exceeds it. plrd therefore deliberately targets
+#                          BELOW it (see probe_nozzle_temp) and forgives
+#                          measured overshoot by a small tolerance:
+#                            commanded target  <= ceiling - 5 C (headroom)
+#                            measured temp     <= ceiling + 2 C (tolerance,
+#                              mirrors the plugin's
+#                              MAX_TOUCH_TEMPERATURE_EPSILON)
+#                            commanded target  <= ceiling (never forgiven)
+#                          The asymmetry is intentional: PID overshoot
+#                          around a legitimate target is absorbed;
+#                          commanding a hotter nozzle is not.
+#
+#                          !! Setting max_probe_nozzle_temp and
+#                          probe_nozzle_temp (or probe_temp_min) too close
+#                          together is what WEDGES a recovery: the probe
+#                          step runs after the Z frame is declared, so a
+#                          temperature refusal there aborts with the frame
+#                          unknown, blocks re-execution, and regenerates an
+#                          identical plan that fails identically. plrd
+#                          refuses such a config up front rather than
+#                          letting it wedge: the band must be wide enough
+#                          to hold the 5 C headroom below the ceiling.
+#   probe_nozzle_temp      nozzle temperature COMMANDED for probing, C.
+#                          Pulled into
+#                          [probe_temp_min, ceiling - 5] before it is
+#                          emitted, so with the defaults the plan sends
+#                          M104 S145 under a 150 C ceiling. Raising this
+#                          to the ceiling does NOT raise what is sent.
 #   pre_home_z_lift        Z lift added to the believed Z BEFORE XY homing,
 #                          mm, so the homing moves clear the part  (0,20] (5)
 #   reheat_park_x/y        nozzle park XY while reheating to print temps.
-#                          OPTIONAL: when unset, a point outside the part
-#                          bounding box (+10mm) is computed (clamped to the
-#                          axis limits) and a plan warning recommends
-#                          setting it explicitly.
+#                          OPTIONAL: when unset, each side of the part's
+#                          bounding box (+10mm) is tried, clamped to the
+#                          axis limits, and the first candidate VERIFIED to
+#                          land outside the footprint is used; a plan
+#                          warning recommends setting it explicitly. If no
+#                          side stays clear (or a configured point sits
+#                          inside the part), the plan says so explicitly
+#                          instead of claiming a clearance it does not have.
 #   reheat_park_delta_z    Z lift above the current Z when parking, mm
-#                          (0,10] (2); Klipper's rail limit clamps the
-#                          absolute Z below position_max.
+#                          (0,10] (2). plrd computes the ABSOLUTE target
+#                          min(current_z + this, position_max) at execute
+#                          time and commands that: Klipper does NOT clamp
+#                          an out-of-range move, it raises "Move out of
+#                          range" (kinematics/cartesian.py), which here
+#                          would abort AFTER the probe established the Z
+#                          reference and force a full re-run.
 #   purge_enable           purge before resuming (in the recovery file) (true)
 #   purge_amount           built-in purge extrusion length, mm  [0,50] (5)
 #   purge_macro            OPTIONAL macro to call instead of the built-in
@@ -122,9 +162,14 @@ control_socket = /var/lib/plrd/plrd.sock
 # The recovery no longer seeks the original file with M26. It writes a
 # generated <original>_RECOVERY.gcode into the virtual_sdcard root and
 # selects it with M23/M24. That file reheats to print temperature, re-homes
-# XY, purges, does the entry moves, then streams the original's verbatim
-# tail — structured so no part-directed move can precede the blocking
-# M190/M109 heat waits (the heating gate).
+# XY, travels BACK to the part-clear park point (G28 discards it, and
+# purging at the homed XY would leave a nozzle-attached string the entry
+# moves drag over the print), purges, does the entry moves, then streams
+# the original's verbatim tail — structured so no part-directed move can
+# precede the blocking M190/M109 heat waits (the heating gate). The tail is
+# copied byte-for-byte, so non-UTF-8 slicer metadata and binary thumbnails
+# survive intact. An existing file is never overwritten: the writer claims
+# its name exclusively and picks <name>-2, -3, ... if it was taken.
 #
 # Recovery is REFUSED until every prerequisite validates; keys mirror
 # plr-recovery's MachineConfig (see crates/plrd/src/config.rs for the

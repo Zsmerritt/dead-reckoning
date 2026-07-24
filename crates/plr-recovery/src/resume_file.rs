@@ -1,6 +1,6 @@
 //! The recovery-file generator: pure logic that emits the CONTENT of a
 //! standalone `<original_stem>_RECOVERY.gcode` file the plan's final step
-//! selects with `M23`/`M24`. The daemon writes the returned string into
+//! selects with `M23`/`M24`. The daemon writes the returned bytes into
 //! the `virtual_sdcard` root before execution begins.
 //!
 //! # Why a separate file (not `M26` into the original)
@@ -24,25 +24,54 @@
 //!    part-directed motion may precede these waits.
 //! 3. **`G28 X Y`** — the final re-home, done at the parked Z with Z
 //!    untouched (safe: XY homes at the park height).
-//! 4. **Purge** — a configured `purge_macro` call, or the built-in purge
+//! 4. **Re-park** — `G0 X<park> Y<park>` back to the part-clear park
+//!    point. `G28` in step 3 drives the toolhead to the machine's homing
+//!    XY, DISCARDING the part-clear park position the plan established
+//!    and verified. The purge below must not run there: at the homed XY
+//!    the nozzle may sit over the part (or, at the park Z which is
+//!    `resume_z + delta`, in mid-air above it), so extruding would drop a
+//!    string that is still attached to the tip — which the entry moves
+//!    would then drag across the print, defeating the `CLEAN_NOZZLE` the
+//!    plan ran minutes earlier precisely to guarantee a clean tip. The
+//!    park point is already computed, part-clear and bounds-checked, so
+//!    the file simply travels back to it.
+//! 5. **Purge** — a configured `purge_macro` call, or the built-in purge
 //!    (`G92 E0` / `G1 E<amount> F<slow>` / `G92 E0`); only when enabled.
-//! 5. **Entry moves** — travel above the part interior, descend, prime,
+//!    Runs at the re-parked, part-clear position (step 4).
+//! 6. **Entry moves** — travel above the part interior, descend, prime,
 //!    restore modes/feedrate (the plan builder pre-computes these).
-//! 6. **The original file's byte tail** from the matched line-boundary
-//!    offset, verbatim.
+//! 7. **The original file's byte tail** from the matched line-boundary
+//!    offset, **byte-verbatim**.
+//!
+//! # Byte fidelity
+//!
+//! The file is assembled as `Vec<u8>` and the tail is
+//! `extend_from_slice`d, never transcoded: print files legitimately carry
+//! non-UTF-8 bytes (latin-1 in slicer comments, binary thumbnail
+//! payloads), and a lossy decode would rewrite them as `EF BF BD` and
+//! change the tail's length. [`GeneratedRecoveryFile::tail_bytes`] is
+//! byte-identical to `original[tail_offset..]` (property-tested over
+//! arbitrary bytes).
 //!
 //! # Heating-gate guarantee ([`verify_heating_gate`])
 //!
 //! The structure makes it IMPOSSIBLE for part-directed motion to precede
-//! temperature attainment: between the blocking `M190`/`M109` and the
-//! re-home / purge / entry there is no positioning `G0`/`G1` carrying an
-//! X/Y word. The invariant re-parses the emitted preamble with
+//! temperature attainment: before the blocking `M190`/`M109` there is no
+//! motion command (`G0`/`G1`/`G2`/`G3`) carrying an X/Y word, and no Z
+//! DESCENT (a relative lift is the only Z motion tolerated — see
+//! [`ZIntent`]). The invariant re-parses the emitted preamble with
 //! `plr-gcode` and asserts exactly that.
 
 use plr_gcode::{LineBody, LineIter};
 use serde::{Deserialize, Serialize};
 
 use crate::plan::fmt_num;
+
+/// Motion commands for the heating gate. Mirrors
+/// `crate::plan::is_motion_command`'s g-code set (arcs included: `G2`/`G3`
+/// position the toolhead exactly as `G0`/`G1` do, and a gate that ignored
+/// them would let an arc walk to the part before the waits).
+const MOTION_COMMANDS: [&str; 4] = ["G0", "G1", "G2", "G3"];
 
 /// The built-in / configured purge behaviour of a recovery file.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -83,6 +112,12 @@ pub struct RecoveryFileSpec {
     pub nozzle: f64,
     /// Purge behaviour, or `None` when purging is disabled.
     pub purge: Option<PurgeSpec>,
+    /// The part-clear reheat park point `[x, y]`, mm — the same point the
+    /// plan's park step travelled to. The file travels BACK to it after
+    /// `G28 X Y` (which discards it) so the purge runs clear of the part.
+    pub park: [f64; 2],
+    /// Feedrate of the post-`G28` re-park travel, mm/min.
+    pub park_feed: f64,
     /// The entry-move commands (travel above the part, descend, prime,
     /// restore modes/feedrate), pre-built by the plan builder so the
     /// file and the old plan share one derivation.
@@ -94,12 +129,39 @@ pub struct RecoveryFileSpec {
 /// A generated recovery file plus the offset into `content` at which the
 /// verbatim original tail begins (the boundary between the generated
 /// preamble and the streamed copy).
-#[derive(Debug, Clone, PartialEq)]
+///
+/// `content` is raw BYTES, not a `String`: the tail is copied
+/// byte-verbatim from the original print file, which may contain non-UTF-8
+/// sequences (see the module docs).
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GeneratedRecoveryFile {
-    /// The full file content.
-    pub content: String,
+    /// The full file content, as bytes.
+    pub content: Vec<u8>,
     /// Byte offset in `content` where the verbatim original tail starts.
     pub tail_start: usize,
+}
+
+impl GeneratedRecoveryFile {
+    /// The generated preamble (everything before the verbatim tail).
+    /// Always valid UTF-8: the generator writes only ASCII commands and
+    /// the copied header comment lines, which came through `plr-gcode`'s
+    /// lossy line decode.
+    #[must_use]
+    pub fn preamble(&self) -> &[u8] {
+        &self.content[..self.tail_start]
+    }
+
+    /// The verbatim tail: byte-identical to `original[tail_offset..]`.
+    #[must_use]
+    pub fn tail_bytes(&self) -> &[u8] {
+        &self.content[self.tail_start..]
+    }
+
+    /// The preamble as text (for rendering / previews / assertions).
+    #[must_use]
+    pub fn preamble_text(&self) -> std::borrow::Cow<'_, str> {
+        String::from_utf8_lossy(self.preamble())
+    }
 }
 
 /// Emits the recovery file content for `spec`, streaming the verbatim
@@ -116,71 +178,91 @@ pub fn build_recovery_file(
     timestamp: &str,
 ) -> GeneratedRecoveryFile {
     use std::fmt::Write as _;
-    let mut out = String::new();
+    // The preamble is pure ASCII, so it is built as text and then
+    // appended as bytes; the tail is copied byte-verbatim (module docs).
+    let mut pre = String::new();
 
     // (a) Header comment block. (`write!` into a String is infallible.)
-    out.push_str("; generated-by dead-reckoning power-loss recovery\n");
-    let _ = writeln!(out, "; generated-at {timestamp}");
-    let _ = writeln!(out, "; source-file {}", spec.source_name);
-    let _ = writeln!(out, "; matched-offset {}", spec.tail_offset);
-    let _ = writeln!(out, "; plan-id {}", spec.plan_id);
-    out.push_str("; --- original file header (metadata) ---\n");
+    pre.push_str("; generated-by dead-reckoning power-loss recovery\n");
+    let _ = writeln!(pre, "; generated-at {timestamp}");
+    let _ = writeln!(pre, "; source-file {}", spec.source_name);
+    let _ = writeln!(pre, "; matched-offset {}", spec.tail_offset);
+    let _ = writeln!(pre, "; plan-id {}", spec.plan_id);
+    pre.push_str("; --- original file header (metadata) ---\n");
     for line in leading_comment_lines(original, spec.header_cap) {
-        out.push_str(&line);
-        out.push('\n');
+        pre.push_str(&line);
+        pre.push('\n');
     }
-    out.push_str("; --- end original file header ---\n");
+    pre.push_str("; --- end original file header ---\n");
 
     // (b) Temperatures AT the park position: set targets, then BLOCK on
     // attainment. This is the heating gate: nothing part-directed below
     // may run until both waits clear.
     if let Some(bed) = spec.bed {
-        let _ = writeln!(out, "M140 S{}", fmt_num(bed));
+        let _ = writeln!(pre, "M140 S{}", fmt_num(bed));
     }
-    let _ = writeln!(out, "M104 S{}", fmt_num(spec.nozzle));
+    let _ = writeln!(pre, "M104 S{}", fmt_num(spec.nozzle));
     if let Some(bed) = spec.bed {
-        let _ = writeln!(out, "M190 S{}", fmt_num(bed));
+        let _ = writeln!(pre, "M190 S{}", fmt_num(bed));
     }
-    let _ = writeln!(out, "M109 S{}", fmt_num(spec.nozzle));
+    let _ = writeln!(pre, "M109 S{}", fmt_num(spec.nozzle));
 
     // (c) The final re-home. Z is untouched, so homing XY at the parked
     // height is safe.
-    out.push_str("G28 X Y\n");
+    pre.push_str("G28 X Y\n");
 
-    // (d) Purge (only when enabled).
+    // (d) Re-park: `G28` drove the toolhead to the machine's homing XY,
+    // discarding the part-clear park point. Travel back to it BEFORE the
+    // purge — purging at the homed XY would drop a nozzle-attached string
+    // over the part (or in mid-air above it at the park Z) that the entry
+    // moves would then drag across the print, undoing the plan's
+    // CLEAN_NOZZLE. Absolute mode is asserted first: the file's own entry
+    // moves may later switch to relative.
+    pre.push_str("G90\n");
+    let _ = writeln!(
+        pre,
+        "G0 X{} Y{} F{}",
+        fmt_num(spec.park[0]),
+        fmt_num(spec.park[1]),
+        fmt_num(spec.park_feed)
+    );
+
+    // (e) Purge, at the re-parked part-clear position (only when enabled).
     if let Some(purge) = &spec.purge {
         if let Some(macro_call) = &purge.macro_call {
-            out.push_str(macro_call);
-            out.push('\n');
+            pre.push_str(macro_call);
+            pre.push('\n');
         } else {
-            out.push_str("G92 E0\n");
+            pre.push_str("G92 E0\n");
             let _ = writeln!(
-                out,
+                pre,
                 "G1 E{} F{}",
                 fmt_num(purge.amount),
                 fmt_num(purge.feed)
             );
-            out.push_str("G92 E0\n");
+            pre.push_str("G92 E0\n");
         }
     }
 
-    // (e) Entry moves (from above the part interior into the resume
+    // (f) Entry moves (from above the part interior into the resume
     // point), pre-built by the plan builder.
     for command in &spec.entry_commands {
-        out.push_str(command);
-        out.push('\n');
+        pre.push_str(command);
+        pre.push('\n');
     }
 
-    // (f) The verbatim original tail. `tail_start` marks where the
-    // streamed copy begins so callers can prove it byte-for-byte.
-    let tail_start = out.len();
+    // (g) The verbatim original tail, copied as raw BYTES (never
+    // transcoded). `tail_start` marks where the copy begins so callers can
+    // prove it byte-for-byte.
+    let mut content = pre.into_bytes();
+    let tail_start = content.len();
     let offset = usize::try_from(spec.tail_offset).unwrap_or(usize::MAX);
     if offset < original.len() {
-        out.push_str(&String::from_utf8_lossy(&original[offset..]));
+        content.extend_from_slice(&original[offset..]);
     }
 
     GeneratedRecoveryFile {
-        content: out,
+        content,
         tail_start,
     }
 }
@@ -241,6 +323,42 @@ pub enum HeatingGateViolation {
         /// The offending command.
         command: String,
     },
+    /// A Z move that is (or may be) a DESCENT appears before the blocking
+    /// temperature waits. Only an unambiguous relative lift is tolerated
+    /// there; see [`ZIntent`].
+    #[error("Z move {command:?} may descend before the blocking temperature waits")]
+    ZDescentBeforeTempWait {
+        /// The offending command.
+        command: String,
+    },
+    /// The post-`G28` re-park travel back to the part-clear park point is
+    /// missing, so the purge/entry would run at the machine's homing XY.
+    #[error("the preamble does not travel back to the park point after G28 X Y")]
+    MissingRePark,
+}
+
+/// What a motion command's Z word does, as far as the gate can prove it
+/// from the file alone.
+///
+/// The gate has no runtime Z, so it can only trust motion whose direction
+/// is unambiguous from the text:
+///
+/// * [`ZIntent::None`] — no Z word: irrelevant to Z safety.
+/// * [`ZIntent::Lift`] — a RELATIVE (`G91`) move with a strictly positive
+///   Z: provably away from the part. This is the carve-out the park lift
+///   needs.
+/// * [`ZIntent::MaybeDescent`] — anything else: a relative non-positive Z
+///   (a descent), or ANY absolute Z (whose direction depends on the
+///   unknown current Z, so it may descend into the part). Refused before
+///   the waits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ZIntent {
+    /// The command carries no Z word.
+    None,
+    /// A provable relative lift (strictly positive Z in `G91`).
+    Lift,
+    /// A descent, or a Z whose direction cannot be proven.
+    MaybeDescent,
 }
 
 /// Classifies a preamble command line.
@@ -248,31 +366,63 @@ struct PreLine {
     name: String,
     has_xy: bool,
     is_g28: bool,
+    z_intent: ZIntent,
 }
 
-fn classify_preamble(content: &str) -> Vec<PreLine> {
+fn classify_preamble(preamble: &[u8]) -> Vec<PreLine> {
     let mut out = Vec::new();
-    for line in LineIter::new(content.as_bytes(), 0) {
+    // Klipper powers up in absolute mode; the generated preamble asserts
+    // G90 explicitly before its own moves.
+    let mut absolute = true;
+    for line in LineIter::new(preamble, 0) {
         let LineBody::Command { command, .. } = &line.body else {
             continue;
         };
         let name = command.name.to_ascii_uppercase();
+        match name.as_str() {
+            "G90" => absolute = true,
+            "G91" => absolute = false,
+            _ => {}
+        }
         let has_xy = command.get("X").is_some() || command.get("Y").is_some();
         // `G28 X Y` parses as command G28 with X/Y flag params.
         let is_g28 = name == "G28";
+        let z_intent = match command.get("Z").map(str::parse::<f64>) {
+            None => ZIntent::None,
+            // A relative, strictly-positive Z is a provable lift; a
+            // non-positive one descends. An absolute Z (or an unparsable
+            // one) cannot be proven safe without the runtime Z.
+            Some(Ok(v)) if !absolute && v > 0.0 => ZIntent::Lift,
+            Some(_) => ZIntent::MaybeDescent,
+        };
         out.push(PreLine {
             name,
             has_xy,
             is_g28,
+            z_intent,
         });
     }
     out
 }
 
-/// Verifies the heating-gate invariant on a generated recovery file: no
-/// positioning `G0`/`G1` XY move precedes the blocking temperature waits,
-/// the `G28 X Y` re-home follows them, and entry moves follow the
-/// re-home. Only the generated PREAMBLE (`content[..tail_start]`) is
+/// `true` when the command is a toolhead-positioning move. Includes the
+/// arcs `G2`/`G3` (see [`MOTION_COMMANDS`]).
+fn is_motion(name: &str) -> bool {
+    MOTION_COMMANDS.contains(&name)
+}
+
+/// Verifies the heating-gate invariant on a generated recovery file:
+///
+/// 1. no motion command (`G0`/`G1`/`G2`/`G3`) carrying X/Y, and no Z move
+///    that is not a provable relative lift ([`ZIntent`]), precedes the
+///    blocking temperature waits;
+/// 2. the `G28 X Y` re-home exists and follows those waits;
+/// 3. no positioning move precedes the re-home;
+/// 4. the preamble travels BACK to the park point after `G28` (so the
+///    purge and entry never run at the machine's homing XY — see the
+///    module docs, layout step 4).
+///
+/// Only the generated PREAMBLE ([`GeneratedRecoveryFile::preamble`]) is
 /// checked — the verbatim tail is the operator's own file and is out of
 /// scope.
 ///
@@ -280,8 +430,7 @@ fn classify_preamble(content: &str) -> Vec<PreLine> {
 ///
 /// A [`HeatingGateViolation`] naming the first structural problem.
 pub fn verify_heating_gate(file: &GeneratedRecoveryFile) -> Result<(), HeatingGateViolation> {
-    let preamble = &file.content[..file.tail_start];
-    let lines = classify_preamble(preamble);
+    let lines = classify_preamble(file.preamble());
 
     // Was a bed target set? Then M190 is required.
     let bed_target = lines.iter().any(|l| l.name == "M140");
@@ -297,11 +446,20 @@ pub fn verify_heating_gate(file: &GeneratedRecoveryFile) -> Result<(), HeatingGa
     // The gate clears only after BOTH blocking waits.
     let gate_idx = m190_idx.map_or(m109_idx, |m190| m109_idx.max(m190));
 
-    // Rule 1: no positioning XY move before the gate clears (the re-home
-    // is homing, not a positioning move, and comes after anyway).
+    // Rule 1: before the gate clears, no XY motion and no Z motion whose
+    // direction is not a provable lift. (The re-home is homing, not a
+    // positioning move, and comes after anyway.)
     for line in lines.iter().take(gate_idx) {
-        if matches!(line.name.as_str(), "G0" | "G1") && line.has_xy {
+        if !is_motion(&line.name) {
+            continue;
+        }
+        if line.has_xy {
             return Err(HeatingGateViolation::XyBeforeTempWait {
+                command: line.name.clone(),
+            });
+        }
+        if line.z_intent == ZIntent::MaybeDescent {
+            return Err(HeatingGateViolation::ZDescentBeforeTempWait {
                 command: line.name.clone(),
             });
         }
@@ -315,13 +473,23 @@ pub fn verify_heating_gate(file: &GeneratedRecoveryFile) -> Result<(), HeatingGa
         return Err(HeatingGateViolation::ReHomeBeforeTempWait);
     }
 
-    // Rule 3: entry positioning moves follow the re-home.
+    // Rule 3: positioning moves follow the re-home.
     for line in lines.iter().take(g28_idx) {
-        if matches!(line.name.as_str(), "G0" | "G1") && line.has_xy {
+        if is_motion(&line.name) && line.has_xy {
             return Err(HeatingGateViolation::EntryBeforeReHome {
                 command: line.name.clone(),
             });
         }
+    }
+
+    // Rule 4: the re-park travel exists after the re-home. Without it the
+    // purge would run at the homing XY the G28 just moved to.
+    let re_parked = lines
+        .iter()
+        .skip(g28_idx + 1)
+        .any(|l| is_motion(&l.name) && l.has_xy);
+    if !re_parked {
+        return Err(HeatingGateViolation::MissingRePark);
     }
     Ok(())
 }
@@ -381,6 +549,15 @@ mod tests {
         GeneratedRecoveryFile, HeatingGateViolation, PurgeSpec, RecoveryFileSpec,
     };
 
+    /// Wraps hand-written preamble text as a generated file with an empty
+    /// tail (hostile-shape tests for the heating gate).
+    fn hand_built(preamble: &str) -> GeneratedRecoveryFile {
+        GeneratedRecoveryFile {
+            content: preamble.as_bytes().to_vec(),
+            tail_start: preamble.len(),
+        }
+    }
+
     fn spec() -> RecoveryFileSpec {
         RecoveryFileSpec {
             name: "part_RECOVERY.gcode".to_owned(),
@@ -394,6 +571,8 @@ mod tests {
                 amount: 5.0,
                 feed: 300.0,
             }),
+            park: [180.0, 20.0],
+            park_feed: 6000.0,
             entry_commands: vec![
                 "G90".to_owned(),
                 "M83".to_owned(),
@@ -410,10 +589,10 @@ mod tests {
     fn layout_is_in_the_documented_order() {
         let original = b"; slicer 1.0\n; filament PLA\nG28\nG1 X10 Y10 E1\nG1 X20 Y20 E2\n";
         let mut s = spec();
-        // Tail starts at the second depositing line boundary.
-        s.tail_offset = (b"; slicer 1.0\n; filament PLA\nG28\nG1 X10 Y10 E1\n".len()) as u64;
+        s.tail_offset =
+            u64::try_from(b"; slicer 1.0\n; filament PLA\nG28\nG1 X10 Y10 E1\n".len()).unwrap();
         let file = build_recovery_file(&s, original, "TS");
-        let c = &file.content;
+        let c = file.preamble_text().into_owned();
         // Header carries the metadata and the original slicer comments.
         assert!(c.contains("; generated-by dead-reckoning"));
         assert!(c.contains("; generated-at TS"));
@@ -426,29 +605,77 @@ mod tests {
         let m190 = c.find("M190 S60").unwrap();
         let m109 = c.find("M109 S210").unwrap();
         assert!(m140 < m104 && m104 < m190 && m190 < m109);
-        // Re-home then purge then entry then tail.
-        let g28 = c.rfind("G28 X Y").unwrap();
+        // Re-home, then the RE-PARK travel, then purge, then entry.
+        let g28 = c.find("G28 X Y").unwrap();
+        let repark = c.find("G0 X180 Y20 F6000").unwrap();
         let purge = c.find("G1 E5 F300").unwrap();
         let entry = c.find("G0 X30 Y30").unwrap();
-        assert!(m109 < g28 && g28 < purge && purge < entry);
+        assert!(m109 < g28, "waits precede the re-home");
+        assert!(g28 < repark, "the re-park follows the re-home");
+        assert!(
+            repark < purge,
+            "the purge must run AFTER travelling back to the part-clear park point"
+        );
+        assert!(purge < entry);
         // The verbatim tail is byte-identical to the original slice.
         assert_eq!(
-            file.content.as_bytes()[file.tail_start..],
-            original[usize::try_from(s.tail_offset).unwrap()..]
+            file.tail_bytes(),
+            &original[usize::try_from(s.tail_offset).unwrap()..]
         );
+    }
+
+    /// Finding 1 regression: the built-in purge must never run at the
+    /// homed XY that `G28 X Y` leaves the toolhead at.
+    #[test]
+    fn purge_never_runs_at_the_homed_xy() {
+        let file = build_recovery_file(&spec(), b"; h\nG1 X1 Y1 E1\n", "TS");
+        let text = file.preamble_text().into_owned();
+        let g28 = text.find("G28 X Y").expect("re-home");
+        let purge = text.find("G1 E5 F300").expect("purge");
+        let between = &text[g28..purge];
+        assert!(
+            between.contains("G0 X180 Y20"),
+            "a travel back to the park point must sit between G28 and the purge: {between}"
+        );
+        // ...and the gate agrees.
+        assert!(verify_heating_gate(&file).is_ok());
+    }
+
+    /// Finding 2 regression: non-UTF-8 tails survive byte-for-byte.
+    #[test]
+    fn tail_is_byte_verbatim_for_non_utf8_originals() {
+        // A latin-1 e-acute (0xE9) in a slicer comment, plus a stray 0xFF:
+        // a lossy decode would rewrite both as EF BF BD and change the len.
+        let original: Vec<u8> = b"; caf\xE9 \xFF\nG1 X1 Y1 E1\nG1 X2 Y2 E2\n".to_vec();
+        let mut s = spec();
+        s.tail_offset = u64::try_from(original.iter().position(|&b| b == b'\n').unwrap() + 1)
+            .expect("offset fits");
+        let file = build_recovery_file(&s, &original, "TS");
+        let expected = &original[usize::try_from(s.tail_offset).unwrap()..];
+        assert_eq!(file.tail_bytes(), expected);
+        // Byte-for-byte: no replacement characters were introduced.
+        assert!(!file
+            .tail_bytes()
+            .windows(3)
+            .any(|w| w == [0xEF, 0xBF, 0xBD]));
+
+        // A tail that IS the non-UTF-8 region round-trips too.
+        let mut s2 = spec();
+        s2.tail_offset = 0;
+        let file2 = build_recovery_file(&s2, &original, "TS");
+        assert_eq!(file2.tail_bytes(), &original[..]);
     }
 
     #[test]
     fn tail_is_byte_verbatim_for_arbitrary_offsets() {
         let original = b"; h\nG28\nG1 X1 Y1 E1\nG1 X2 Y2 E2\nG1 X3 Y3 E3\nG1 X4 Y4 E4\n";
-        // Every line boundary is a valid resume offset.
         let mut offset = 0usize;
         for line in original.split_inclusive(|&b| b == b'\n') {
             let mut s = spec();
-            s.tail_offset = offset as u64;
+            s.tail_offset = u64::try_from(offset).unwrap();
             let file = build_recovery_file(&s, original, "TS");
             assert_eq!(
-                &file.content.as_bytes()[file.tail_start..],
+                file.tail_bytes(),
                 &original[offset..],
                 "tail mismatch at offset {offset}"
             );
@@ -458,7 +685,6 @@ mod tests {
 
     #[test]
     fn header_is_capped() {
-        // 500 comment lines, cap 200.
         use std::fmt::Write as _;
         let mut original = String::new();
         for i in 0..500 {
@@ -468,16 +694,13 @@ mod tests {
         let mut s = spec();
         s.header_cap = 200;
         let file = build_recovery_file(&s, original.as_bytes(), "TS");
-        // Count only within the generated preamble (the verbatim tail
-        // repeats the original comments and is out of the cap's scope).
-        let copied = file.content[..file.tail_start].matches("; meta ").count();
+        let copied = file.preamble_text().matches("; meta ").count();
         assert_eq!(copied, 200);
     }
 
     #[test]
     fn heating_gate_holds_for_a_normal_file() {
-        let original = b"; h\nG1 X1 Y1 E1\n";
-        let file = build_recovery_file(&spec(), original, "TS");
+        let file = build_recovery_file(&spec(), b"; h\nG1 X1 Y1 E1\n", "TS");
         assert!(verify_heating_gate(&file).is_ok());
     }
 
@@ -491,13 +714,7 @@ mod tests {
 
     #[test]
     fn heating_gate_catches_an_xy_move_before_the_wait() {
-        // Hostile entry commands: an XY move injected such that it lands
-        // in the preamble before the temperature waits is impossible via
-        // the builder (entry comes last), so hand-craft the content.
-        let file = GeneratedRecoveryFile {
-            content: "M104 S210\nG1 X5 Y5\nM109 S210\nG28 X Y\n; tail\n".to_owned(),
-            tail_start: "M104 S210\nG1 X5 Y5\nM109 S210\nG28 X Y\n".len(),
-        };
+        let file = hand_built("M104 S210\nG1 X5 Y5\nM109 S210\nG28 X Y\nG0 X1 Y1\n");
         assert_eq!(
             verify_heating_gate(&file),
             Err(HeatingGateViolation::XyBeforeTempWait {
@@ -506,40 +723,93 @@ mod tests {
         );
     }
 
+    /// Finding 4 regression: arcs are motion too.
+    #[test]
+    fn heating_gate_catches_arc_moves_before_the_wait() {
+        for arc in ["G2", "G3"] {
+            let file = hand_built(&format!(
+                "M104 S210\n{arc} X5 Y5 I1 J1\nM109 S210\nG28 X Y\nG0 X1 Y1\n"
+            ));
+            assert_eq!(
+                verify_heating_gate(&file),
+                Err(HeatingGateViolation::XyBeforeTempWait {
+                    command: arc.to_owned()
+                }),
+                "{arc} must be treated as motion"
+            );
+        }
+        // An arc between the waits and the re-home is caught too.
+        let file = hand_built("M104 S210\nM109 S210\nG3 X5 Y5 I1 J1\nG28 X Y\nG0 X1 Y1\n");
+        assert_eq!(
+            verify_heating_gate(&file),
+            Err(HeatingGateViolation::EntryBeforeReHome {
+                command: "G3".to_owned()
+            })
+        );
+    }
+
+    /// Finding 5 regression: a Z-only DESCENT before the waits is a
+    /// violation; only a provable relative lift is tolerated.
+    #[test]
+    fn heating_gate_catches_a_z_descent_before_the_wait() {
+        // Absolute Z: direction unknowable without the runtime Z, refused.
+        let file = hand_built("M104 S210\nG90\nG1 Z-20\nM109 S210\nG28 X Y\nG0 X1 Y1\n");
+        assert_eq!(
+            verify_heating_gate(&file),
+            Err(HeatingGateViolation::ZDescentBeforeTempWait {
+                command: "G1".to_owned()
+            })
+        );
+        // Relative negative Z: an unambiguous descent, refused.
+        let file = hand_built("M104 S210\nG91\nG1 Z-20\nM109 S210\nG28 X Y\nG0 X1 Y1\n");
+        assert_eq!(
+            verify_heating_gate(&file),
+            Err(HeatingGateViolation::ZDescentBeforeTempWait {
+                command: "G1".to_owned()
+            })
+        );
+        // A relative LIFT is the documented carve-out and passes.
+        let file = hand_built("M104 S210\nG91\nG1 Z5\nG90\nM109 S210\nG28 X Y\nG0 X1 Y1\n");
+        assert!(verify_heating_gate(&file).is_ok());
+        // An absolute Z even in the "up" direction is still unprovable.
+        let file = hand_built("M104 S210\nG90\nG1 Z200\nM109 S210\nG28 X Y\nG0 X1 Y1\n");
+        assert_eq!(
+            verify_heating_gate(&file),
+            Err(HeatingGateViolation::ZDescentBeforeTempWait {
+                command: "G1".to_owned()
+            })
+        );
+    }
+
+    /// Finding 1 regression at the gate level: a file that forgets to
+    /// travel back to the park point after G28 is refused.
+    #[test]
+    fn heating_gate_catches_a_missing_re_park() {
+        let file = hand_built("M104 S210\nM109 S210\nG28 X Y\nG92 E0\nG1 E5 F300\n");
+        assert_eq!(
+            verify_heating_gate(&file),
+            Err(HeatingGateViolation::MissingRePark)
+        );
+    }
+
     #[test]
     fn heating_gate_catches_missing_and_early_rehome() {
-        // No M109 at all.
-        let no_wait = GeneratedRecoveryFile {
-            content: "M104 S210\nG28 X Y\n".to_owned(),
-            tail_start: "M104 S210\nG28 X Y\n".len(),
-        };
+        let no_wait = hand_built("M104 S210\nG28 X Y\n");
         assert_eq!(
             verify_heating_gate(&no_wait),
             Err(HeatingGateViolation::MissingNozzleWait)
         );
-        // Bed target set but no M190.
-        let no_bed_wait = GeneratedRecoveryFile {
-            content: "M140 S60\nM104 S210\nM109 S210\nG28 X Y\n".to_owned(),
-            tail_start: "M140 S60\nM104 S210\nM109 S210\nG28 X Y\n".len(),
-        };
+        let no_bed_wait = hand_built("M140 S60\nM104 S210\nM109 S210\nG28 X Y\n");
         assert_eq!(
             verify_heating_gate(&no_bed_wait),
             Err(HeatingGateViolation::MissingBedWait)
         );
-        // Re-home before the wait.
-        let early = GeneratedRecoveryFile {
-            content: "M104 S210\nG28 X Y\nM109 S210\n".to_owned(),
-            tail_start: "M104 S210\nG28 X Y\nM109 S210\n".len(),
-        };
+        let early = hand_built("M104 S210\nG28 X Y\nM109 S210\n");
         assert_eq!(
             verify_heating_gate(&early),
             Err(HeatingGateViolation::ReHomeBeforeTempWait)
         );
-        // No re-home at all.
-        let no_home = GeneratedRecoveryFile {
-            content: "M104 S210\nM109 S210\n".to_owned(),
-            tail_start: "M104 S210\nM109 S210\n".len(),
-        };
+        let no_home = hand_built("M104 S210\nM109 S210\n");
         assert_eq!(
             verify_heating_gate(&no_home),
             Err(HeatingGateViolation::MissingReHome)
@@ -548,11 +818,7 @@ mod tests {
 
     #[test]
     fn heating_gate_catches_entry_before_rehome() {
-        // An entry XY move between the waits and the re-home.
-        let file = GeneratedRecoveryFile {
-            content: "M104 S210\nM109 S210\nG1 X5 Y5\nG28 X Y\n".to_owned(),
-            tail_start: "M104 S210\nM109 S210\nG1 X5 Y5\nG28 X Y\n".len(),
-        };
+        let file = hand_built("M104 S210\nM109 S210\nG1 X5 Y5\nG28 X Y\nG0 X1 Y1\n");
         assert_eq!(
             verify_heating_gate(&file),
             Err(HeatingGateViolation::EntryBeforeReHome {
@@ -570,16 +836,23 @@ mod tests {
             feed: 300.0,
         });
         let file = build_recovery_file(&s, b"; h\nG1 X1 Y1\n", "TS");
-        assert!(file.content.contains("CLEAN_AND_PURGE"));
-        assert!(!file.content.contains("G92 E0"));
+        let text = file.preamble_text().into_owned();
+        assert!(text.contains("CLEAN_AND_PURGE"));
+        assert!(!text.contains("G92 E0"));
+        // Even a macro purge runs after the re-park.
+        assert!(text.find("G0 X180 Y20").unwrap() < text.find("CLEAN_AND_PURGE").unwrap());
     }
 
     #[test]
-    fn purge_disabled_emits_no_purge() {
+    fn purge_disabled_emits_no_purge_but_still_re_parks() {
         let mut s = spec();
         s.purge = None;
         let file = build_recovery_file(&s, b"; h\nG1 X1 Y1\n", "TS");
-        assert!(!file.content.contains("G92 E0"));
+        let text = file.preamble_text().into_owned();
+        assert!(!text.contains("G92 E0"));
+        // The re-park is unconditional: the entry moves start from a
+        // known, part-clear position either way.
+        assert!(text.contains("G0 X180 Y20"));
         assert!(verify_heating_gate(&file).is_ok());
     }
 
@@ -588,18 +861,15 @@ mod tests {
         assert_eq!(sanitize_name("part 1"), "part_1");
         assert_eq!(sanitize_name("a/b\\c"), "a_b_c");
         assert_eq!(sanitize_name(""), "recovery");
-        // No collision: the plain name.
         assert_eq!(
             recovery_file_name("/g/part.gcode", &|_| false),
             "part_RECOVERY.gcode"
         );
-        // First two taken → -2, then -3.
         let taken = |n: &str| matches!(n, "part_RECOVERY.gcode" | "part_RECOVERY-2.gcode");
         assert_eq!(
             recovery_file_name("part.gcode", &taken),
             "part_RECOVERY-3.gcode"
         );
-        // A spaced/subdir original stem is sanitized.
         assert_eq!(
             recovery_file_name("/g/my part.gcode", &|_| false),
             "my_part_RECOVERY.gcode"
@@ -612,5 +882,6 @@ mod tests {
         s.tail_offset = 10_000;
         let file = build_recovery_file(&s, b"; h\nG1 X1\n", "TS");
         assert_eq!(file.tail_start, file.content.len());
+        assert!(file.tail_bytes().is_empty());
     }
 }

@@ -2,7 +2,7 @@
 # recovery file: part_RECOVERY.gcode (verbatim tail from original byte 128)
 # envelope: gap 0.2 + drag_z_step 0.05 + margin 0.5 = 0.75 mm
 # shifted frame: Z declared 0.75 above position_min -2
-# warning: no reheat_park_x/y configured; parking at computed (40, 15) outside the part bounding box — set an explicit park position
+# warning: no reheat_park_x/y configured; parking at computed (40, 15), verified clear of the part bounding box — set an explicit park position
  1. [idle-timeout] disarm the idle timeout FIRST (its default M84 would clear all homed state)
       send: SET_IDLE_TIMEOUT TIMEOUT=86400
       ok?:  idle_timeout.idle_timeout within 0.5 of 86400
@@ -15,9 +15,9 @@
       fail: abort (stepper-enable-failed)
  3. [immediate-bed-heat] FIRST heating action (non-blocking): bed toward target (the long pole) + nozzle toward the clamped probe temp
       send: M140 S60
-      send: M104 S150
+      send: M104 S145
       ok?:  heater_bed.target within 1 of 60
-      ok?:  extruder.target within 1 of 150
+      ok?:  extruder.target within 1 of 145
       fail: abort (immediate-bed-heat-failed)
  4. [believed-z-declare] declare the conservative believed Z (possible-stop upper bound) then lift before XY homing
       send: SET_KINEMATIC_POSITION Z=0.4
@@ -47,7 +47,7 @@
       ok?:  toolhead.position.1 within 0.25 of 10
       fail: abort (approach-failed)
  9. [probe] ADXL drag probe (bounded fixed-Z staircase; the accelerometer hears the contact)
-      pre:  extruder.temperature <= 150
+      pre:  extruder.temperature <= 152
       pre:  extruder.target <= 150
       pre:  toolhead.homed_axes contains "x"
       pre:  toolhead.homed_axes contains "y"
@@ -64,13 +64,13 @@
       ok?:  toolhead.homed_axes contains "z"
       ok?:  toolhead.position.2 within 0.05 of the step's computed value
       fail: abort (final-declare-failed)
-12. [park-for-reheat] lift off the part and park at the reheat XY (the file reheats to print temp here)
-      send: G91
-      send: G1 Z2 F1200
+12. [park-for-reheat] lift off the part (rail-clamped) and park at the reheat XY (the file reheats to print temp here)
       send: G90
+      send: G1 Z{park_z} F1200
       send: G0 X40 Y15 F6000
       ok?:  toolhead.position.0 within 0.25 of 40
       ok?:  toolhead.position.1 within 0.25 of 15
+      ok?:  toolhead.position.2 within 0.05 of the step's computed value
       fail: abort (park-for-reheat-failed)
 13. [restore-frame] replay offsets, speed/extrude factors, skew, fans (print temps reheat in the file)
       send: SET_GCODE_OFFSET X=0 Y=0 Z=0.05
