@@ -374,6 +374,7 @@ class FakeToolhead:
         homed_axes="xyz",
         position=(150.0, 150.0, 5.0, 0.0),
         position_min=None,
+        max_accel=3000.0,
     ):
         self.homed_axes = homed_axes
         self.position = list(position)
@@ -382,9 +383,31 @@ class FakeToolhead:
         self.wait_moves_calls = 0
         self.dwells = []
         self._last_move_time = 0.0
+        # Velocity-limit surface (klippy/toolhead.py:503-550): max_accel
+        # is reported in get_status and mutated by set_max_velocities,
+        # the SET_VELOCITY_LIMIT primitive the touch accel-clamp uses.
+        self.max_accel = max_accel
+        self.velocity_limits = []
 
     def get_status(self, eventtime):
-        return {"homed_axes": self.homed_axes, "position": tuple(self.position)}
+        return {
+            "homed_axes": self.homed_axes,
+            "position": tuple(self.position),
+            "max_accel": self.max_accel,
+        }
+
+    def set_max_velocities(
+        self, max_velocity, max_accel, square_corner_velocity, min_cruise_ratio
+    ):
+        # Mirrors klippy/toolhead.py:538-550: only non-None fields are
+        # applied; every call is recorded so tests can assert the
+        # touch clamp/restore sequence (SET_VELOCITY_LIMIT-equivalent).
+        self.velocity_limits.append(
+            (max_velocity, max_accel, square_corner_velocity, min_cruise_ratio)
+        )
+        if max_accel is not None:
+            self.max_accel = max_accel
+        return (0.0, self.max_accel, 0.0, 0.0)
 
     def get_position(self):
         return list(self.position)
@@ -520,8 +543,13 @@ class FakeProbeSession:
         self._results = []
         self.ended = False
         self.run_gcmds = []
+        # Toolhead Z at the moment each probe descent begins, so the
+        # touch retract-invariant test can assert no descent starts from
+        # below the retract height.
+        self.probe_start_zs = []
 
     def run_probe(self, gcmd):
+        self.probe_start_zs.append(self._toolhead.get_position()[2])
         if not self._heights:
             raise FakeCommandError("FakeProbeSession: out of canned heights")
         self.run_gcmds.append(gcmd)

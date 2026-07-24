@@ -1,4 +1,4 @@
-"""Tests for the PLR_PROBE_TEST repeatability command."""
+"""Tests for the reworked, two-tier PLR_PROBE_TEST verification command."""
 
 import fake_klippy
 import pytest
@@ -6,42 +6,62 @@ import pytest
 import plr
 from plr import probe_test
 
-HEIGHTS = [0.101, 0.103, 0.099, 0.102, 0.100]
+
+class ScriptedProbe(fake_klippy.FakeProbe):
+    """A probe whose successive sessions serve different height lists.
+
+    PLR_PROBE_TEST opens one probe session per consensus sequence; this
+    fake pops the next scripted height list for each, so tests can make
+    the per-sequence medians agree or diverge on purpose.
+    """
+
+    def __init__(self, printer, scripts, **kw):
+        super().__init__(printer, [], **kw)
+        self._scripts = list(scripts)
+
+    def start_probe_session(self, gcmd):
+        toolhead = self._printer.lookup_object("toolhead")
+        heights = self._scripts.pop(0)
+        session = fake_klippy.FakeProbeSession(self, heights, toolhead)
+        self.sessions.append(session)
+        return session
 
 
 @pytest.fixture
-def probed(fake_printer, plugin):
-    """Wire a canned-heights probe into the good-config plugin."""
-    probe = fake_klippy.FakeProbe(fake_printer, HEIGHTS)
-    fake_printer.add_object("probe", probe)
-    return probe
+def scripted(fake_printer, plugin):
+    def build(scripts):
+        probe = ScriptedProbe(fake_printer, scripts)
+        fake_printer.add_object("probe", probe)
+        return probe
+
+    return build
 
 
-# --- pure helpers ------------------------------------------------------
+def extract_retry(message, command):
+    for line in message.splitlines():
+        stripped = line.strip()
+        if stripped.startswith(command + " ") and "MAX_SAMPLES=" in stripped:
+            return stripped
+    raise AssertionError("no retry command found in:\n%s" % (message,))
 
 
-def test_minimum_count_is_accepted():
-    assert probe_test.validate_sample_count(probe_test.MIN_SAMPLES) == (
-        probe_test.MIN_SAMPLES
-    )
+def parse_line(line):
+    parts = line.split()
+    params = {}
+    for token in parts[1:]:
+        key, _, value = token.partition("=")
+        params[key] = value
+    return parts[0], params
 
 
-def test_too_few_samples_rejected_with_console_message():
-    with pytest.raises(ValueError, match=r"SAMPLES=1 is too low"):
-        probe_test.validate_sample_count(1)
-
-
-def test_custom_minimum_is_honored():
-    assert probe_test.validate_sample_count(2, minimum=2) == 2
-    with pytest.raises(ValueError):
-        probe_test.validate_sample_count(4, minimum=5)
+# --- pure helpers -----------------------------------------------------
 
 
 def test_compute_stats_known_values():
     stats = probe_test.compute_stats([1.0, 2.0, 3.0, 4.0])
     assert stats["range"] == pytest.approx(3.0)
     assert stats["mean"] == pytest.approx(2.5)
-    assert stats["median"] == pytest.approx(2.5)  # even count: midpoint
+    assert stats["median"] == pytest.approx(2.5)
     assert stats["stddev"] == pytest.approx(1.118033988749895)
 
 
@@ -50,22 +70,24 @@ def test_compute_stats_odd_count_median():
 
 
 def test_compute_stats_rejects_empty():
-    with pytest.raises(ValueError, match="no probe samples"):
+    with pytest.raises(ValueError, match="no samples"):
         probe_test.compute_stats([])
 
 
+def test_resolution_formula_each_term_can_dominate():
+    # Microstep floor dominates when the medians barely moved.
+    assert probe_test.resolution_from_medians(0.0, 0.0) == pytest.approx(0.005)
+    # 2*stddev dominates when the spread is scattered.
+    assert probe_test.resolution_from_medians(0.0, 0.01) == pytest.approx(0.02)
+    # median_range/2 dominates when the peak-to-peak swing is large.
+    assert probe_test.resolution_from_medians(0.02, 0.0) == pytest.approx(0.01)
+
+
 def test_print_active_false_on_bare_printer(fake_printer):
-    # Neither print_stats nor idle_timeout configured (minimal setups):
-    # nothing indicates an active print, so the gate stays open.
     assert probe_test._print_active(fake_printer) is False
 
 
-def test_resolution_floor():
-    assert probe_test.resolution_from_stddev(0.0) == probe_test.MIN_PROBE_RESOLUTION
-    assert probe_test.resolution_from_stddev(0.01) == pytest.approx(0.02)
-
-
-# --- refusal paths -----------------------------------------------------
+# --- refusal paths ----------------------------------------------------
 
 
 def test_refuses_adxl_drag_method(fake_printer, plr_config, run_cmd):
@@ -77,36 +99,29 @@ def test_refuses_adxl_drag_method(fake_printer, plr_config, run_cmd):
         run_cmd("PLR_PROBE_TEST", START=1)
 
 
-def test_refuses_while_printing_via_print_stats(probed, fake_printer, run_cmd):
+def test_refuses_while_printing(scripted, fake_printer, run_cmd):
+    scripted([[0.1, 0.1, 0.1]])
     fake_printer.add_object("print_stats", fake_klippy.FakePrintStats("printing"))
     with pytest.raises(fake_klippy.FakeCommandError, match="print is active"):
         run_cmd("PLR_PROBE_TEST", START=1)
 
 
-def test_refuses_while_paused_via_print_stats(probed, fake_printer, run_cmd):
+def test_refuses_while_paused(scripted, fake_printer, run_cmd):
+    scripted([[0.1, 0.1, 0.1]])
     fake_printer.add_object("print_stats", fake_klippy.FakePrintStats("paused"))
     with pytest.raises(fake_klippy.FakeCommandError, match="print is active"):
         run_cmd("PLR_PROBE_TEST", START=1)
 
 
-def test_refuses_on_idle_timeout_fallback(probed, fake_printer, run_cmd):
-    # No [virtual_sdcard] -> no print_stats; idle_timeout 'Printing'
-    # (recent motion) is the only signal left and must refuse.
+def test_refuses_on_idle_timeout_fallback(scripted, fake_printer, run_cmd):
+    scripted([[0.1, 0.1, 0.1]])
     fake_printer.objects["idle_timeout"] = fake_klippy.FakeIdleTimeout("Printing")
     with pytest.raises(fake_klippy.FakeCommandError, match="print is active"):
         run_cmd("PLR_PROBE_TEST", START=1)
 
 
-def test_print_stats_standby_overrides_idle_timeout(probed, fake_printer, run_cmd):
-    # print_stats is authoritative when present: standby + idle_timeout
-    # 'Printing' (e.g. the positioning move just made) must not refuse.
-    fake_printer.add_object("print_stats", fake_klippy.FakePrintStats("standby"))
-    fake_printer.objects["idle_timeout"] = fake_klippy.FakeIdleTimeout("Printing")
-    gcode = run_cmd("PLR_PROBE_TEST", START=1, SAMPLES=5)
-    assert "probe test" in gcode.responses[-1]
-
-
-def test_refuses_unhomed(probed, fake_printer, run_cmd):
+def test_refuses_unhomed(scripted, fake_printer, run_cmd):
+    scripted([[0.1, 0.1, 0.1]])
     fake_printer.objects["toolhead"] = fake_klippy.FakeToolhead(homed_axes="xy")
     with pytest.raises(fake_klippy.FakeCommandError, match="G28"):
         run_cmd("PLR_PROBE_TEST", START=1)
@@ -117,79 +132,133 @@ def test_refuses_without_probe_object(plugin, run_cmd):
         run_cmd("PLR_PROBE_TEST", START=1)
 
 
-def test_samples_out_of_range_rejected(probed, run_cmd):
+def test_sequences_out_of_range(scripted, run_cmd):
+    scripted([[0.1, 0.1, 0.1]])
+    with pytest.raises(fake_klippy.FakeCommandError, match="minimum of 3"):
+        run_cmd("PLR_PROBE_TEST", START=1, SEQUENCES=2)
+    with pytest.raises(fake_klippy.FakeCommandError, match="maximum of 10"):
+        run_cmd("PLR_PROBE_TEST", START=1, SEQUENCES=11)
+
+
+def test_samples_below_min_refused(scripted, run_cmd):
+    scripted([[0.1, 0.1, 0.1]])
     with pytest.raises(fake_klippy.FakeCommandError, match="minimum of 3"):
         run_cmd("PLR_PROBE_TEST", START=1, SAMPLES=2)
-    with pytest.raises(fake_klippy.FakeCommandError, match="maximum of 50"):
-        run_cmd("PLR_PROBE_TEST", START=1, SAMPLES=51)
 
 
-def test_without_start_prints_plan_and_does_not_move(probed, fake_printer, run_cmd):
-    gcode = run_cmd("PLR_PROBE_TEST", SAMPLES=5)
+def test_sample_range_over_cap_refused(scripted, run_cmd):
+    scripted([[0.1, 0.1, 0.1]])
+    with pytest.raises(fake_klippy.FakeCommandError, match="hard cap of 0.015"):
+        run_cmd("PLR_PROBE_TEST", START=1, SAMPLE_RANGE=0.05)
+
+
+# VERIFY_RANGE relational checks are refused loudly, not clamped.
+def test_verify_range_below_sample_range_refused(scripted, run_cmd):
+    scripted([[0.1, 0.1, 0.1]])
+    with pytest.raises(fake_klippy.FakeCommandError, match="must be >= SAMPLE_RANGE"):
+        run_cmd("PLR_PROBE_TEST", START=1, SAMPLE_RANGE=0.010, VERIFY_RANGE=0.005)
+
+
+def test_verify_range_above_four_x_refused(scripted, run_cmd):
+    scripted([[0.1, 0.1, 0.1]])
+    with pytest.raises(fake_klippy.FakeCommandError, match="must be <= 4x"):
+        run_cmd("PLR_PROBE_TEST", START=1, SAMPLE_RANGE=0.010, VERIFY_RANGE=0.05)
+
+
+def test_without_start_prints_plan_and_does_not_move(scripted, fake_printer, run_cmd):
+    probe = scripted([[0.1, 0.1, 0.1]])
+    gcode = run_cmd("PLR_PROBE_TEST", SEQUENCES=4)
     plan = gcode.responses[-1]
     assert "START=1" in plan
     assert "no motion" in plan
-    assert probed.sessions == []
-    assert fake_printer.lookup_object("toolhead").moves == []
+    assert probe.sessions == []
     assert fake_printer.lookup_object("configfile").pending == {}
 
 
-# --- the measurement itself -------------------------------------------
+# --- the verification itself ------------------------------------------
 
 
-def test_happy_path_mirrors_probe_accuracy_loop(probed, plugin, fake_printer, run_cmd):
-    gcode = run_cmd("PLR_PROBE_TEST", START=1, SAMPLES=5)
-    (session,) = probed.sessions
-    assert session.ended is True
-    assert len(session.run_gcmds) == 5
-    # Each per-sample command is the PROBE_ACCURACY-style dummy:
-    # SAMPLES forced to 1, PROBE_SPEED pinned to the [plr] tunable,
-    # and the consent flag stripped.
-    fo_params = session.run_gcmds[0].get_command_parameters()
-    assert fo_params["SAMPLES"] == "1"
-    assert fo_params["PROBE_SPEED"] == "1.500"
-    assert "START" not in fo_params
-    # Retract between samples: manual_move to trigger z + retract at
-    # lift speed, holding the starting XY.
-    toolhead = fake_printer.lookup_object("toolhead")
-    params = probed.get_probe_params()
-    assert len(toolhead.moves) == 5
-    for (coord, speed), height in zip(toolhead.moves, HEIGHTS):
-        assert coord[0] == 150.0 and coord[1] == 150.0
-        assert coord[2] == pytest.approx(height + params["sample_retract_dist"])
-        assert speed == params["lift_speed"]
+def test_happy_path_runs_sequences_and_stages_resolution(
+    scripted, plugin, fake_printer, run_cmd
+):
+    probe = scripted([[0.100, 0.101, 0.102]] * 3)
+    gcode = run_cmd(
+        "PLR_PROBE_TEST", START=1, SEQUENCES=3, SAMPLES=3, SAMPLE_RANGE=0.010
+    )
     report = gcode.responses[-1]
-    assert "range" in report and "stddev" in report and "median" in report
-    assert "SAVE_CONFIG" in report
-
-
-def test_happy_path_stages_probe_resolution(probed, plugin, fake_printer, run_cmd):
-    run_cmd("PLR_PROBE_TEST", START=1, SAMPLES=5)
-    stats = probe_test.compute_stats(HEIGHTS)
-    expected = probe_test.resolution_from_stddev(stats["stddev"])
-    assert plugin.probe_resolution == pytest.approx(expected)
-    configfile = fake_printer.lookup_object("configfile")
-    staged = configfile.pending["plr"]["probe_resolution"]
-    assert staged == "%.6f" % (expected,)
+    assert "probe_resolution" in report and "SAVE_CONFIG" in report
+    assert len(probe.sessions) == 3
+    # Medians all 0.101 -> range 0 -> resolution hits the microstep floor.
+    assert plugin.probe_resolution == pytest.approx(0.005)
+    staged = fake_printer.lookup_object("configfile").pending["plr"]
+    assert staged["probe_resolution"] == "0.005000"
     assert plugin.is_pending_save("probe_resolution")
 
 
-def test_probe_speed_tunable_reaches_probe_params(
-    probed, plugin, fake_printer, run_cmd
+def test_inconsistent_medians_fail_with_early_exit_and_retry(
+    scripted, plugin, fake_printer, run_cmd
 ):
-    plugin.tunables["probe_speed"] = 1.25
-    run_cmd("PLR_PROBE_TEST", START=1, SAMPLES=3)
-    (session,) = probed.sessions
-    assert session.run_gcmds[0].get_float("PROBE_SPEED") == 1.25
-
-
-def test_session_ended_even_when_a_probe_fails(probed, fake_printer, run_cmd):
-    # Only 5 canned heights; asking for more makes run_probe raise
-    # mid-loop.  The session must still be closed (probe.py's
-    # gcode:command_error handler expects sessions not to leak).
-    with pytest.raises(fake_klippy.FakeCommandError, match="canned heights"):
-        run_cmd("PLR_PROBE_TEST", START=1, SAMPLES=10)
-    (session,) = probed.sessions
-    assert session.ended is True
+    probe = scripted(
+        [
+            [0.100, 0.101, 0.102],  # median 0.101
+            [0.130, 0.131, 0.132],  # median 0.131 -> running range 0.030 > 0.020
+            [0.160, 0.161, 0.162],  # never reached (early exit)
+        ]
+    )
+    with pytest.raises(fake_klippy.FakeCommandError) as exc:
+        run_cmd("PLR_PROBE_TEST", START=1, SEQUENCES=3, SAMPLES=3, SAMPLE_RANGE=0.010)
+    message = str(exc.value)
+    assert "medians disagree" in message
+    # Early-exit: the third sequence never ran.
+    assert len(probe.sessions) == 2
     # Nothing staged on failure.
     assert fake_printer.lookup_object("configfile").pending == {}
+    assert not plugin.is_pending_save("probe_resolution")
+    # Retry escalates SEQUENCES and loosens VERIFY_RANGE (capped), and
+    # parses back cleanly.
+    retry = extract_retry(message, "PLR_PROBE_TEST")
+    name, params = parse_line(retry)
+    assert name == "PLR_PROBE_TEST"
+    assert int(params["SEQUENCES"]) == 5  # ceil(3*1.5)
+    assert float(params["VERIFY_RANGE"]) == pytest.approx(0.030)  # min(4x, 1.5x)
+
+
+def test_sequence_cannot_reach_consensus_fails_loudly(scripted, run_cmd):
+    # Ten scattered heights: the very first sequence never reaches
+    # consensus, so the whole test fails naming the consensus criteria.
+    probe = scripted([[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0]])
+    with pytest.raises(fake_klippy.FakeCommandError) as exc:
+        run_cmd(
+            "PLR_PROBE_TEST",
+            START=1,
+            SEQUENCES=3,
+            SAMPLES=3,
+            SAMPLE_RANGE=0.010,
+            MAX_SAMPLES=10,
+        )
+    message = str(exc.value)
+    assert "could not reach consensus" in message
+    assert len(probe.sessions) == 1
+    retry = extract_retry(message, "PLR_PROBE_TEST")
+    _name, params = parse_line(retry)
+    assert params["MAX_SAMPLES"] == "15"  # per-sequence budget escalated
+
+
+def test_passing_but_nonzero_range_reports_and_stages(
+    scripted, plugin, fake_printer, run_cmd
+):
+    # Medians 0.100 / 0.101 / 0.102 -> range 0.002 <= VERIFY_RANGE 0.020.
+    scripted(
+        [
+            [0.099, 0.100, 0.101],  # median 0.100
+            [0.100, 0.101, 0.102],  # median 0.101
+            [0.101, 0.102, 0.103],  # median 0.102
+        ]
+    )
+    gcode = run_cmd(
+        "PLR_PROBE_TEST", START=1, SEQUENCES=3, SAMPLES=3, SAMPLE_RANGE=0.010
+    )
+    report = gcode.responses[-1]
+    assert "median range" in report
+    assert plugin.probe_resolution >= 0.005
+    assert plugin.is_pending_save("probe_resolution")

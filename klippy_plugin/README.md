@@ -113,18 +113,65 @@ SAVE_CONFIG        ; optional, persists across restarts
 Unknown names and out-of-range values are refused with the valid list /
 range in the error.
 
-### `PLR_PROBE_TEST [SAMPLES=10] START=1`
+### `PLR_TOUCH [SAMPLES=3] [MAX_SAMPLES=10] [SAMPLE_RANGE=0.010] [SPEED=] [RETRACT=2.0] [TOUCH_ACCEL=100]`
 
-Probe repeatability test (probe_method `tap`/`load_cell` only), the
-same loop as Klipper's `PROBE_ACCURACY` but at the `[plr]`
-`probe_speed`. **This command moves the toolhead** (the probe descends
-at the current XY): without `START=1` it only prints what it would do;
-it also refuses while a print is active or the printer is not fully
-homed. `SAMPLES` accepts 3–50.
+One **sliding-window consensus touch** at the current XY (probe_method
+`tap`/`load_cell` only). Ported from Cartographer3D's Survey Touch: the
+command touches the bed one descent at a time and, once it has at least
+`SAMPLES` touches, searches only the most recent `SAMPLES + 2` touches
+(the sliding window) for `SAMPLES` touches that agree within
+`SAMPLE_RANGE`. It reports the **median** of that agreeing subset as the
+trigger height and returns as soon as a window agrees.
 
-Prints range/stddev/median of the trigger heights and stages
-`probe_resolution = max(2*stddev, 0.005)` for `SAVE_CONFIG` — plrd uses
-this as the trust radius for recovery probing.
+The sliding window is deliberate: it stops a consensus being assembled
+from touches taken at unrelated moments across a noisy run — the
+agreeing touches must be contemporaneous. Each touch is wrapped in three
+safety invariants: a **retract-before-arm** (a descent never begins
+below `RETRACT`, default 2.0 mm, min 1.0), an **accel clamp** to
+`TOUCH_ACCEL` (default 100, range 50–1000 mm/s²) restored after the
+descent on every path, and a **retract-after-trigger** back to a safe
+standoff.
+
+- `SAMPLES` (≥3), `MAX_SAMPLES` (the touch budget; `SAMPLES`–20), and
+  the window `SAMPLES + 2` is capped at 10.
+- `SAMPLE_RANGE` has a **hard cap of 0.015 mm** — a larger value is
+  refused, not clamped (a consensus looser than that is not worth
+  trusting for recovery).
+- `SPEED` is the descent speed (defaults to the `[plr]` `probe_speed`).
+
+**This command moves the toolhead.** It refuses while a print is active,
+when unhomed, and for `probe_method: adxl_drag` (use `PLR_DRAG_PROBE`).
+On success the result surfaces in `get_status` as
+`last_touch_result: {median_z, range, samples_used, touches}` for plrd.
+If the touch budget is exhausted without a consensus, the error names
+the criteria that failed and prints a copy-pasteable retry with
+`MAX_SAMPLES` escalated 1.5×.
+
+### `PLR_PROBE_TEST [SEQUENCES=5] [VERIFY_RANGE=] START=1` (plus the `PLR_TOUCH` parameters)
+
+Probe repeatability **verification** (probe_method `tap`/`load_cell`
+only). Where the old command ran N single probes, it now runs
+`SEQUENCES` full consensus touch sequences (each exactly what
+`PLR_TOUCH` does, so it accepts all the `PLR_TOUCH` parameters) and
+checks that their per-sequence medians agree:
+
+- acceptance = range of the sequence medians ≤ `VERIFY_RANGE` (default
+  2× `SAMPLE_RANGE`, capped at 4×; a `VERIFY_RANGE` below `SAMPLE_RANGE`
+  or above 4× is refused loudly);
+- it **early-exits** the moment the running median range exceeds the
+  limit — no point taking more sequences once inconsistent;
+- `SEQUENCES` accepts 3–10.
+
+**This command moves the toolhead** (repeated descents at the current
+XY): without `START=1` it only prints what it would do; it also refuses
+while a print is active or the printer is not fully homed.
+
+On success it prints a `PROBE_ACCURACY`-style block and stages
+`probe_resolution = max(2*stddev_of_medians, median_range/2, 0.005)` for
+`SAVE_CONFIG` — plrd uses this as the trust radius for recovery probing.
+On failure (medians disagree, or a sequence cannot reach consensus at
+all) it prints a copy-pasteable retry with `SEQUENCES` escalated and
+`VERIFY_RANGE` loosened (still capped).
 
 ### `PLR_STATUS`
 
