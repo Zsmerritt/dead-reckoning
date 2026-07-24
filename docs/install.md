@@ -322,9 +322,12 @@ Step by step:
    is physically true of your machine.
 3. **`G28`** — `PLR_PROBE_TEST` moves the toolhead and refuses while
    unhomed or printing.
-4. **`PLR_PROBE_TEST START=1`** probes repeatedly at the current XY
-   (default 10 samples) and stages `probe_resolution` — the trust
-   radius recovery gives your probe.
+4. **`PLR_PROBE_TEST START=1`** verifies the probe with the same
+   consensus sampler recovery uses: it runs 5 full `PLR_TOUCH`
+   consensus sequences at the current XY and requires their medians to
+   agree (early-exiting the moment they cannot), then stages
+   `probe_resolution` — the trust radius recovery gives your probe. On
+   failure it prints a copy-pasteable retry with the knobs escalated.
 5. **`SAVE_CONFIG`** writes both staged values into the `[plr]`
    autosave block and restarts Klipper.
 
@@ -332,10 +335,11 @@ After the restart, `PLR_SETUP` reports
 `COMMISSIONED — plr is ready to protect prints` and `PLR_STATUS` shows
 the plugin state plus the daemon's own report.
 
-### adxl_drag: one extra calibration
+### adxl_drag: two extra calibrations
 
-Same flow, with `PLR_NOISE_TEST` as the calibration step (and
-`accel_chip` set in `[plr]`):
+Same flow, with `PLR_NOISE_TEST` (required) and `PLR_DRAG_CALIBRATE`
+(recommended) as the calibration steps (and `accel_chip` set in
+`[plr]`):
 
 ```text
 PLR_SETUP                          ; fix any [FAIL]
@@ -343,13 +347,23 @@ PLR_SETUP ACCEPT_SELF_LOCKING_Z=1  ; attest self-locking Z
 G28                                ; home
 ; move the toolhead well AWAY from any printed part, at a safe Z:
 PLR_NOISE_TEST START=1             ; measure the accel noise floor
-SAVE_CONFIG                        ; persist attestation + noise_floor_*
+PLR_DRAG_CALIBRATE START=1         ; pick drag_sensitivity empirically
+SAVE_CONFIG                        ; persist attestation + noise_floor_* + sensitivity
 ```
 
 `PLR_NOISE_TEST` measures the noise floor the drag oracle thresholds
 against (still + moving captures); recovery planning refuses `adxl_drag`
-without a calibrated noise floor. Re-run it after changing `drag_speed`
-or the machine's mechanics — see
+without a calibrated noise floor. `PLR_DRAG_CALIBRATE` then finds the
+most sensitive `drag_sensitivity` that never false-triggers — sweeping
+**entirely in clear air** (it refuses to descend; an over-sensitive
+candidate can only fail as a harmless false contact at height) — and
+stages the accepted knob minus a safety margin. Skipping it means
+trusting the default sensitivity instead of a measured one. Optional:
+set `noise_floor_temp_sensor` in `[plr]` first and the noise test also
+records its staging temperature, letting recovery-time drag probes
+widen their threshold on large temperature drift instead of running
+blind. Re-run both after changing `drag_speed` or the machine's
+mechanics — see
 [operations → drag-probe notes](operations.md#operating-the-adxl-drag-oracle).
 Honest status: the drag oracle's safety bounds are tested, its detection
 quality is bench-unvalidated (E5).
@@ -358,6 +372,20 @@ Tunables (probe speed, envelope margin, drag knobs…) are adjusted the
 same console way: `PLR_SET PARAM=<name> VALUE=<v>`, then `SAVE_CONFIG`
 when you want them to survive a restart. `PLR_SET` alone lists
 everything with live values and ranges.
+
+**Calibrations are stamped — and hardware changes un-commission them.**
+Everything a calibration command stages is saved together with a
+fingerprint of the Z-stepper / probe / accel-chip config it was
+measured under (plus the plugin and Klipper versions; staging refuses
+outright if the Klipper version cannot be read — retry after klippy is
+fully up). If you later change that hardware — new Z steppers or
+leadscrews, a different probe, a moved accelerometer — the dependent
+calibration is treated as absent and recovery refuses until you re-run
+it (`PLR_PROBE_TEST` / `PLR_NOISE_TEST` [+ `PLR_DRAG_CALIBRATE`], then
+`SAVE_CONFIG`). Plan for it: **recalibration after hardware changes is
+part of the machine's maintenance**, and
+[operations → Calibration staleness](operations.md#calibration-staleness-when-recovery-stops-trusting-your-numbers)
+is the field guide when a refusal surprises you.
 
 Finally, commission **empirically**: the first execution should be a
 supervised run on a scrap print after a deliberate power-cut drill —

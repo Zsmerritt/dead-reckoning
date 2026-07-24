@@ -224,8 +224,11 @@ re-homing Z. The full story, including the on-disk formats and the math:
 
 ## Safety guarantees — and their limits
 
-Documented in full in [docs/architecture.md](docs/architecture.md). The
-summary, stated as honestly as the code states it:
+Documented in full in [docs/architecture.md](docs/architecture.md).
+Several of the newer mechanisms are pattern ports from the
+Cartographer3D probe plugin's collision-avoidance discipline — see
+[Acknowledgements](#acknowledgements). The summary, stated as honestly
+as the code states it:
 
 - **Possible-stop-set containment.** The true stop state is always contained
   in the reconstructed set — enforced by a fault-injection property test that
@@ -248,12 +251,44 @@ summary, stated as honestly as the code states it:
   (`G28 X Y`), verify that no `G28` appears after the shifted-frame
   declaration, and a guard scan strips `G28` / `Z_TILT_ADJUST` /
   `QUAD_GANTRY_LEVEL` from any user macro text recovery would execute.
-- **Abort-only failure policy.** Every plan step carries machine-readable
-  verification predicates; the executor never continues past a failed
-  verification (there is no code path that does — any predicate failure,
-  poll timeout, or non-finite computation aborts with a typed reason).
-  There is no "retry and hope" path in v1, and everything sent and checked
-  is transcribed to a JSONL file.
+- **Consensus, not a lone touch.** In `[plr]` mode, Tap/load-cell
+  recovery probes with `PLR_TOUCH`: a sliding-window consensus
+  multi-touch (the trigger is the median of `SAMPLES` touches that
+  agree within `SAMPLE_RANGE` inside a recent window — agreement must
+  be *contemporaneous*, so a passing consensus cannot be cherry-picked
+  from a noisy run). `SAMPLE_RANGE` is hard-capped at 0.015 mm and a
+  looser value is refused, never clamped; each touch runs under a
+  retract-before-arm standoff and an accel clamp that is restored on
+  every path, including aborts. *Limit:* the legacy non-plugin mode
+  keeps the single `PROBE SAMPLES=1` (it cannot assume `PLR_TOUCH`
+  exists in your Klipper).
+- **Whole-itinerary pre-flight.** Every coordinate a plan would command
+  is validated *before the plan is returned* — travel limits, the
+  probe-approach target equals the selected contact point, the
+  shifted-frame Z matches the envelope — and all violations are
+  reported at once as a typed rejection. An out-of-bounds itinerary is
+  refused at planning time, never discovered mid-motion.
+- **Abort-only failure policy, with typed failures and cleanup.** Every
+  plan step carries machine-readable verification predicates; the
+  executor never continues past a failed verification (any predicate
+  failure, poll timeout, or non-finite computation aborts with a typed
+  reason, and Klipper error strings are classified — early trigger /
+  no trigger / move out of range). Declared cleanup commands run as an
+  abort-finally (restoring the pre-touch accel), transcribed but never
+  masking the original reason. There is no "retry and hope" path in v1,
+  and everything sent and checked is transcribed to a JSONL file.
+- **Frame invalidation.** An abort at or after the shifted-frame
+  declaration marks the Z frame unknown (`frame_invalid.json`);
+  re-execution is refused — CLI and console alike — until a fresh dry
+  run regenerates the plan. A stale plan is never re-run against a
+  frame it was not computed for.
+- **Stamped calibrations.** Every persisted calibration
+  (`probe_resolution`, the drag noise floor) carries a fingerprint of
+  the hardware config it was measured under plus plugin/Klipper
+  versions. Change your Z steppers or probe hardware and the dependent
+  calibration is **treated as absent** (with a re-run remediation)
+  rather than silently trusted; the daemon recomputes the fingerprint
+  independently, so a plugin bug cannot launder a stale value past it.
 - **Consent-gated execution.** Recovery is a dry run unless you
   explicitly consent twice — console: `PLR_RECOVER EXECUTE=1
   CONFIRM=YES`; CLI: `plrd recover --execute --confirm` plus an
@@ -319,10 +354,13 @@ Implemented and tested:
   transcript in the WAL directory.
 - **The Klipper console plugin** (`klippy_plugin/plr`, the `[plr]`
   section): `PLR_SETUP` commissioning checks + attestation, `PLR_SET`
-  tunables with `SAVE_CONFIG` staging, `PLR_PROBE_TEST` /
-  `PLR_NOISE_TEST` calibration, `PLR_STATUS`, `PLR_RECOVER`, and the
-  `PLR_DRAG_PROBE` staircase drag oracle — talking to the daemon over
-  its control socket. Command reference:
+  tunables with `SAVE_CONFIG` staging, the `PLR_TOUCH` consensus
+  multi-touch and the two-tier `PLR_PROBE_TEST` verifier,
+  `PLR_NOISE_TEST` + `PLR_DRAG_CALIBRATE` calibration for the
+  `PLR_DRAG_PROBE` staircase drag oracle, `PLR_STATUS`, and
+  `PLR_RECOVER` — talking to the daemon over its control socket, with
+  every calibration fingerprint-stamped against the hardware it was
+  measured on. Command reference:
   [klippy_plugin/README.md](klippy_plugin/README.md).
 
 Known limits, stated plainly:
@@ -332,9 +370,12 @@ Known limits, stated plainly:
   infill, WAL write-load measurement — are open. Commission on a scrap
   print with your hand near the power switch, using `--step`:
   [docs/install.md](docs/install.md#commissioning-checklist).
-- ADXL drag probing is implemented with tested safety bounds, but its
-  detection quality is **bench-unvalidated (E5)**; multi-extruder
-  machines are out of scope.
+- ADXL drag probing is implemented with tested safety bounds — a
+  structurally-clear-air `PLR_DRAG_CALIBRATE` sweep, typed staircase
+  aborts with three independent bounds, and a widen-only temperature
+  covariate — but its **detection quality is still bench-unvalidated
+  (E5)**: the bounds are proven by tests, "does it hear real contact
+  reliably" is not. Multi-extruder machines are out of scope.
 - The MCU `CLOCK_FREQ` is not journaled yet, so reconstruction falls back to
   Klipper-converted step times (reported as a `NoMcuFrequency` anomaly).
 - Automation declines rather than guesses: vase mode, single-wall parts,
@@ -406,6 +447,24 @@ CI ([`.github/workflows/ci.yml`](.github/workflows/ci.yml),
 [runs](https://github.com/Zsmerritt/dead-reckoning/actions)) executes on
 push/PR: full-workspace lint and tests on Linux, default-member tests on
 Windows, and the coverage gate.
+
+## Acknowledgements
+
+Several of this project's probing-safety mechanisms are **pattern
+ports** from the excellent
+[Cartographer3D Klipper plugin](https://github.com/Cartographer3D/cartographer-klipper)
+— its collision-avoidance discipline around touch probing is the best
+prior art we know of in the Klipper ecosystem. Specifically: the
+sliding-window consensus sampler behind `PLR_TOUCH` (including the
+anti-cherry-pick windowing and the 0.015 mm sample-range ceiling), the
+two-tier screen/verify calibration shape and its escalating
+copy-pasteable retry hints, the per-touch retract/accel-clamp/restore
+invariants, up-front whole-itinerary validation, typed promotion of
+Klipper error strings, and the version/fingerprint stamping of saved
+calibrations. We ported the *patterns*, with `file:line` citations at
+each adoption site in our source — not the code; all code here is
+original to this repository and any defects are ours, not theirs.
+Thank you, Cartographer3D.
 
 ## License
 

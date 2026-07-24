@@ -343,17 +343,64 @@ band's floor exists because the safety analysis was validated for [1, 2]
 only, and because slower speeds park a hot nozzle near the part for
 arbitrarily long.
 
-The probe is a single bounded `PROBE PROBE_SPEED=<v> SAMPLES=1` — one
-sample, so the toolhead rests exactly at the halt position, and the true Z
-at halt is computed as:
+### The touch itself: consensus, not a single sample
+
+What the probe step sends depends on the mode. In `[plr]` mode on Tap /
+load-cell machines, the plan probes with **`PLR_TOUCH` — a
+sliding-window consensus multi-touch** (a pattern port of
+Cartographer3D's Survey Touch sampler; see
+[Acknowledgements](../README.md#acknowledgements)):
+
+- the plugin touches the part one descent at a time and, once at least
+  `SAMPLES` (default 3) touches exist, searches **only the most recent
+  `SAMPLES + 2` touches** (the sliding window, capped at 10) for a
+  subset of `SAMPLES` that agree within `SAMPLE_RANGE` (default
+  0.010 mm); the reported trigger Z is the **median** of the agreeing
+  subset;
+- the sliding window is the anti-cherry-pick invariant: a naive
+  "tightest N-of-M subset" would happily assemble a passing consensus
+  from touches taken at unrelated moments across a noisy run. Windowing
+  forces the agreeing touches to be *contemporaneous* — a property test
+  pins that a stream whose good touches are scattered MUST fail even
+  though a global search would "pass";
+- `SAMPLE_RANGE` has a **hard cap of 0.015 mm**, refused rather than
+  clamped — a touch consensus looser than 15 µm is not a consensus
+  worth trusting for recovery;
+- every individual touch is wrapped in three invariants:
+  retract-before-arm (a descent never starts below the `RETRACT`
+  standoff, min 1 mm), an **accel clamp** to `TOUCH_ACCEL` (default
+  100 mm/s², band 50–1000) restored on every path including a
+  mid-descent exception, and retract-after-trigger;
+- the plan brackets the touch with its own accel discipline too: an
+  `accel-clamp` step records the pre-clamp `max_accel`
+  (`RecordMaxAccel`) and declares an **abort cleanup** that restores it
+  (`SET_VELOCITY_LIMIT ACCEL={restore_accel}`, rendered as `undo:` in
+  the plan), and an `accel-restore` step restores it on the success
+  path — deliberately *without* re-reading `max_accel`, which would
+  read back the clamped value;
+- the step's post-verifications check the consensus actually converged:
+  `plr.last_touch_result.range ≤ SAMPLE_RANGE` and
+  `samples_used ≥ SAMPLES`, plus a finite median.
+
+The **legacy `/etc/plrd.conf [machine]` mode keeps the single
+`PROBE PROBE_SPEED=<v> SAMPLES=1`** (`PlanConfig::legacy_single_probe`):
+that mode exists precisely for installs without the Klipper plugin, so a
+plan may not assume the `PLR_TOUCH` command exists in klippy at all.
+Single-sample also keeps that path's halt semantics trivially exact (the
+toolhead rests at the halt position). Drag machines are never
+touch-consensus — they probe with `PLR_DRAG_PROBE`
+([below](#the-adxl-drag-oracle)).
+
+Either way, the true Z at halt is computed as:
 
 ```text
 true_Z_at_halt = z_prev_top + (halt − trigger)
 ```
 
-where `trigger` is the **raw** trigger Z (read per probe type: Tap probes
-expose it as `probe.last_z_result`; load-cell probes report `bed_z` with
-`z_offset` subtracted, so the formula adds it back; the drag oracle
+where `trigger` is the **raw** trigger Z (read per probe method:
+consensus touch reports `plr.last_touch_result.median_z`; legacy Tap
+probes expose `probe.last_z_result`; load-cell probes report `bed_z`
+with `z_offset` subtracted, so the formula adds it back; the drag oracle
 reports `last_drag_result.trigger_z` on the `plr` status object) and
 `halt` is the raw kinematic `toolhead.position[2]` — never
 `gcode_move.position`, which reads back through the transform stack.
@@ -363,15 +410,24 @@ reports `last_drag_result.trigger_z` on the `plr` status object) and
 A `RecoveryPlan` is a strictly ordered list of typed steps. The crate never
 executes anything; each step carries:
 
-- **commands** — the G-code / extended commands to send, in order (the only
-  placeholder is `{true_z}`, substituted by the executor from the typed
-  formula above — an executor must abort, never substitute, if the formula
-  evaluates non-finite);
+- **commands** — the G-code / extended commands to send, in order (two
+  placeholders exist: `{true_z}`, substituted by the executor from the
+  typed formula above, and `{restore_accel}`, substituted from the
+  pre-clamp `max_accel` the accel-clamp step recorded — an executor must
+  abort, never substitute, if a computation evaluates non-finite);
+- **cleanup_commands** — the step's **abort-finally**: commands the
+  executor must send when the recovery aborts at or after this step
+  (rendered as `undo:` in the plan). Today exactly one step declares
+  cleanup — the accel clamp, whose cleanup restores the pre-clamp
+  `max_accel` so an aborted recovery does not leave the printer limping
+  at touch accel. Cleanups are best-effort by design (the abort already
+  happened; a cleanup failure is transcribed, never escalated) and are
+  themselves plan data — the executor still never invents G-code;
 - **pre_verify / verify** — machine-readable predicates over named Klipper
-  status fields (`NumWithin`, `TempWithin`, `Contains`, `BoolTrue`,
-  `NonEmptyMatrix`, …) that must hold before / after the commands.
-  Slow-converging predicates (temperatures) are polled until they hold or a
-  timeout fires — a timeout is a verification failure;
+  status fields (`NumWithin`, `NumAtMost`, `TempWithin`, `Contains`,
+  `BoolTrue`, `NonEmptyMatrix`, …) that must hold before / after the
+  commands. Slow-converging predicates (temperatures) are polled until
+  they hold or a timeout fires — a timeout is a verification failure;
 - **on_failure** — always `Abort` with a typed reason code in v1. The
   executor contract: **never continue past a failed verification**.
 
@@ -392,22 +448,31 @@ convention — it is checked by invariant accessors used in tests
    (when configured)
 6. `shifted-frame` — `SET_KINEMATIC_POSITION` per the envelope
 7. `probe-approach` — XY travel to the selected contact point (no Z motion)
-8. `probe` — the single-sample probe, with a mandatory nozzle-temperature
-   pre-check (no probe type has a temperature interlock of its own)
-9. `true-z-declare` — the true-Z arithmetic and kinematic re-declaration
-   (never a G-code offset)
-10. `mesh-load` — load the bed-mesh profile (probe already done, so the
+8. `accel-clamp` — consensus-touch plans only: record the pre-clamp
+   `max_accel` and clamp to the touch accel, declaring the abort cleanup
+   that restores it
+9. `probe` — the consensus `PLR_TOUCH` (or, legacy mode, single-sample
+   `PROBE`; drag mode, `PLR_DRAG_PROBE`), with mandatory pre-checks: the
+   nozzle temperature **and the heater target** inside the probe band —
+   the `max(current, target)` guard, so a nozzle *commanded* to print
+   temperature while transiently cool still refuses (no probe type has a
+   temperature interlock of its own) — plus XYZ homed
+10. `accel-restore` — consensus-touch plans only: restore the recorded
+    pre-clamp accel on the success path
+11. `true-z-declare` — the true-Z arithmetic and kinematic re-declaration
+    (never a G-code offset)
+12. `mesh-load` — load the bed-mesh profile (probe already done, so the
     probe was transform-free)
-11. `final-declare` — final true-frame declaration
-12. `restore-frame` — a bounded relative Z **lift off the part first** (the
+13. `final-declare` — final true-frame declaration
+14. `restore-frame` — a bounded relative Z **lift off the part first** (the
     nozzle must not dwell at print temperature pressed into plastic while
     temperature verification polls), then offsets, factors, skew, print
     temperatures, fans, feedrate
-13. `entry` — enter from above the part interior, speed-limited (≤ 30 mm/s),
+15. `entry` — enter from above the part interior, speed-limited (≤ 30 mm/s),
     prime, restore E frame and modes
-14. `file-select` — `M23` (top-level files only), restore exclude-object
+16. `file-select` — `M23` (top-level files only), restore exclude-object
     state, `M26 S<byte>` to a line-boundary offset
-15. `resume-start` — `M24`
+17. `resume-start` — `M24`
 
 A rendered plan (from the checked-in golden test output) is shown in the
 [walkthrough](../examples/recovery-walkthrough.md#from-evidence-to-a-plan-plrd-recover).
@@ -425,6 +490,43 @@ Additionally, any user macro text an executor would run must pass the
 lethal-command guard scan first: `G28`, `Z_TILT_ADJUST` and
 `QUAD_GANTRY_LEVEL` are stripped (commented occurrences are reported but
 inert; Jinja-templated occurrences are conservatively treated as live).
+
+### Whole-itinerary pre-flight
+
+Before a plan is ever returned, every coordinate it will command is
+validated (`plr-recovery::preflight`, run at the end of
+`plan_recovery`) — the Cartographer discipline of validating a whole
+itinerary up front and **aggregating every violation** rather than
+failing at the first (its `axis_twist_compensation` option validator).
+A recovery plan runs in several coordinate frames (homed XY, the
+shifted kinematic frame, and — after the true-frame re-declaration —
+the file's G-code frame), so a naive "every Z within the rail limits"
+would false-positive on G-code-frame moves; the pre-flight checks only
+what is frame-sound:
+
+- **contact anchoring** — the probe-approach travel target must equal
+  the analyzer's selected contact point (both are absolute homed XY):
+  the central "the emitted travel targets equal the selected zone"
+  guarantee;
+- **probe site within the machine** — the contact point lies inside the
+  known X/Y travel limits;
+- **absolute-frame travel bounds** — walking the plan while tracking
+  `G90`/`G91`, every *absolute* literal X/Y is inside the known travel
+  limits and every absolute literal Z is at or above the rail floor
+  (and below `z_max` when known); relative moves carry deltas, not
+  positions, and placeholders (`{true_z}`, `{restore_accel}`) are
+  runtime values — both are skipped;
+- **shifted-frame declaration** — the declared Z equals the envelope's
+  `shifted_declare_z` and sits within the rail.
+
+Axis limits come from the machine snapshot (`AxisLimits`; in `[plr]`
+mode read from the live `[stepper_x/y/z]` config, unknown limits
+honestly skip their checks). A non-empty violation set is a typed
+`ItineraryOutOfBounds` rejection listing **every** finding
+(step id, axis, value, bounds, and which check failed) — the plan is
+never returned, so nothing downstream can execute an out-of-bounds
+itinerary. Coverage includes a proptest that corrupts arbitrary plan
+coordinates and asserts the pre-flight catches them.
 
 ## Stage 5 — Execute (`plrd recover`)
 
@@ -481,16 +583,42 @@ failure listed), manual fallback, not possible.
 1. dry run cannot send (no client parameter exists);
 2. **only plan commands are ever sent** — the single G-code call site
    iterates a validated plan's step commands; no ad-hoc G-code exists in
-   the execution path, and the only substitution is the typed `{true_z}`
-   computation defined by the plan (non-finite ⇒ abort, never
-   substitute);
+   the execution path, and the only substitutions are the typed
+   `{true_z}` and `{restore_accel}` computations defined by the plan
+   (non-finite ⇒ abort, never substitute);
 3. **any verification failure aborts** with the step's typed reason —
    predicate failure, poll timeout, query error, or bad computation;
    there is no code path that continues past a failed verification;
 4. **everything is transcribed**: commands, responses, verification
-   evaluations, computations, prompts, and the outcome, as JSON lines in
-   `recovery-transcript-<unix-seconds>.jsonl` in the WAL directory —
-   refusing to create the transcript refuses to execute.
+   evaluations, computations, prompts, cleanups, and the outcome, as
+   JSON lines in `recovery-transcript-<unix-seconds>.jsonl` in the WAL
+   directory — refusing to create the transcript refuses to execute.
+
+Three hardening behaviors around an abort:
+
+- **Typed step failures.** Klipper G-code failures are classified by
+  their exact error strings into `StepFailure` — `ProbeTriggeredEarly`
+  ("Probe triggered prior to movement"), `NoTrigger` ("No trigger on
+  probe after full movement", which also covers a `PLR_TOUCH` consensus
+  failure, matched by a stable substring of its message),
+  `MoveOutOfRange` ("Move out of range"), or `Unknown`. All still
+  abort — the type only enriches the transcript and abort record so a
+  post-mortem can tell an early trigger from a no-trigger without
+  string archaeology.
+- **Cleanup as abort-finally.** A step's `cleanup_commands` are
+  registered *before* its commands run (its side effect is about to be
+  in force); on abort they run in reverse registration order, each
+  transcribed. A cleanup failure is transcribed but **never masks or
+  replaces the original abort reason** — like a `finally` that cannot
+  swallow the raising error.
+- **Frame invalidation.** An abort **at or after the shifted-frame
+  declaration** means Klipper's Z frame is in an unknown state: the
+  outcome carries `frame_invalid: true` and the caller writes
+  `frame_invalid.json` (step, phase, reason, time) into the WAL
+  directory. From then on `--execute` — CLI and control socket alike —
+  is **refused** until a fresh dry run regenerates the plan and clears
+  the marker (a completed recovery clears it too). Re-executing a stale
+  plan against an unknown frame is the precise mistake this forbids.
 
 The Moonraker client (`moonraker.rs`) is a minimal WebSocket JSON-RPC 2.0
 client doing read-only queries plus `printer.gcode.script`, leaning on the
@@ -607,12 +735,72 @@ builds a **staircase with between-pass classification**:
   starting Z, and reports an error — reconstruction and reality
   disagree, and continuing would be guessing;
 - a pass that cannot be classified (too few samples, non-finite values,
-  frozen signal, collapsed sample rate) **aborts** the probe — it is
-  never assumed clean;
+  frozen signal, collapsed sample rate, or a **coverage gap** — the
+  sample window must bracket the pass motion, first sample no later
+  than motion start and last no earlier than motion end within a small
+  grace, or a contact burst could have landed in an uncaptured span)
+  **aborts** the probe — it is never assumed clean;
 - in a recovery plan, the whole staircase still runs inside the shifted
   frame, so Klipper's rail-limit checking bounds it exactly as it
   bounds a continuous probe descent — a dead accelerometer cannot drive
   the nozzle past `position_min`.
+
+**Staircase hardening** — every abort restores the starting Z and
+embeds a stable `[code]` token in `last_drag_error` so humans and
+machines can tell the failure kinds apart:
+
+- **three independent bounds** on the descent: the up-front iteration
+  bound (`[drag_envelope_exhausted]`), a wall-clock budget —
+  `MAX_SECONDS`, default 120 s, range [30, 600]
+  (`[drag_time_budget]`) — and a no-progress **stall detector**
+  (`[drag_stalled]`): `STALL_PASSES` (default 8) consecutive clean
+  passes whose ratio-to-threshold stays flat (< 5% movement, no upward
+  trend) across ≥ 8 × `drag_z_step` of descent warns once at half the
+  budget and aborts at the full budget, with the wall clock as the
+  outer cap;
+- an **implausible-signal refusal** (`[drag_implausible_signal]`):
+  vibration should *rise* as the nozzle nears the part, so a
+  substantial signal (≥ 50% of threshold) that instead falls
+  monotonically over three consecutive descending clean passes means
+  the baseline drifted or the site is wrong — the probe refuses rather
+  than chase a receding signal to the floor;
+- a **temperature covariate** that can only widen: when
+  `noise_floor_temp_sensor` is configured and `PLR_NOISE_TEST` staged a
+  `noise_floor_temp`, a current temperature more than ±15 °C from the
+  staging temperature widens the classification threshold by +2% per °C
+  beyond the band, capped at +50% — and **never narrows** (a
+  hotter/colder machine is noisier, not quieter, so the covariate
+  cannot manufacture a false contact by construction). No sensor, no
+  staged temperature, or within-band: bit-for-bit the prior behavior.
+
+### Drag calibration: `PLR_DRAG_CALIBRATE`
+
+The sensitivity knob is calibrated by a **sensitive-first sweep run
+entirely in clear air** — a port of Cartographer's touch-calibration
+sweep with our knob direction inverted. The structural property comes
+first: every pass runs at `CLEAR_Z` exactly (which must sit ≥ 5 mm
+above the kinematic Z floor), and the command **never descends** — its
+only Z motion is an upward lift to `CLEAR_Z`. An over-sensitive
+candidate therefore fails *safely*, as a false contact in clear air,
+never as a crash into a part.
+
+The sweep starts at the most sensitive knob (100) and steps **down** in
+sensitivity only as far as needed (adaptive step: 20% of the knob when
+failing badly, 10% when close, clamped to [2, 15] knob units), running
+a two-tier screen-then-verify at each candidate: a quick
+`SCREEN_PASSES` (default 3) screen, then — for a screening survivor — a
+`VERIFY_PASSES` (default 6) verification that must be entirely
+false-contact-free, early-exiting on the first false trigger. The first
+(most sensitive) survivor is accepted, and
+`drag_sensitivity = accepted − MARGIN` (default 5 knob units, floored
+at 0) is staged for `SAVE_CONFIG` — a deliberate safety cushion below
+the edge of what survived. Exhausting the sweep (even the least
+sensitive knob false-triggers) is **not an exception**: it prints a
+copy-pasteable retry plus the real remediation (re-run
+`PLR_NOISE_TEST`, check the accelerometer mounting). Every pass runs
+through the same capture helper `PLR_DRAG_PROBE` uses, so calibration
+passes and recovery passes share geometry, settle, and capture
+lifecycle by construction.
 
 **The envelope overshoot derivation** (`OvershootTerm::DragStep`,
 `crates/plr-recovery/src/envelope.rs`): a pass never moves in Z, so
@@ -649,6 +837,60 @@ pure-python fallback producing identical verdicts (numpy stays optional
 inside klippy); both are tested against each other. Honesty note: the
 bounds above are what the tests establish — bench validation of
 *detection quality* on real hardware is the open E5 task.
+
+### Stamped calibrations: fingerprints and three-tier validation
+
+A calibration is only as good as the machine it was measured on. Every
+value the plugin persists (`probe_resolution`, the `noise_floor_*`
+group) is therefore **stamped at staging time** with the identity it
+was measured under — a pattern port of Cartographer3D's stale-model
+defense (`config/model_validator.py`), adapted from named models to
+`[plr]` autosave options:
+
+- `cal_fingerprint_<group>` — a CRC-32 (8 hex digits) over the
+  **calibration-relevant config slice**: every `stepper_z*` section,
+  the group's hardware section (the active touch-probe section for
+  `probe_resolution`; the accel-chip section for the noise floor), and
+  the group's `[plr]` hardware-selection keys (`probe_method`, plus
+  `accel_chip` for the noise floor) — deliberately *not* the whole
+  `[plr]` section, whose tunables and calibration values must never
+  feed their own fingerprint. The slice is canonicalized (sections and
+  keys sorted, whitespace collapsed, numbers normalized so `-2` and
+  `-2.0` agree) so formatting churn never invalidates anything, while
+  any real change to Z kinematics or probe hardware does. The two
+  groups are fingerprinted **independently**: swapping the
+  accelerometer invalidates the noise floor without touching a
+  still-good `probe_resolution`, and vice versa.
+- `cal_plugin_version` and `cal_klipper_version` — the software the
+  calibration was staged under. If the running Klipper version cannot
+  be resolved at staging time, the calibration commands **refuse to
+  stage anything** (checked before any motion, and again at staging so
+  a refused staging writes nothing — no partial value/stamp).
+
+At validation time (plugin load, and surfaced by `PLR_SETUP` /
+`get_status`) each group is classified into three tiers: **VALID**
+(stamps match — used normally), **LEGACY** (value present but
+pre-stamping — accepted with a warn-once), **INVALID** (recomputed
+fingerprint differs, or the plugin's `major.minor` regressed below the
+staging version — the value is **treated as absent everywhere**). The
+treat-as-absent choice is a documented divergence from Cartographer,
+which deletes an incompatible model: Klipper has no plugin-reachable
+way to delete an autosave option, so the stale text stays in
+printer.cfg until a re-calibration overwrites it — it is simply never
+trusted, by any consumer (the drag commands, `get_status`, and plrd
+through the API socket all see an uncalibrated machine).
+
+**Defense in depth, cross-language:** plrd independently recomputes the
+fingerprint from klippy's `configfile.config` status view — the raw,
+**file-only**, string-valued config — with a byte-identical CRC-32
+canonicalization (pinned by shared literal-hash fixtures on both
+sides). A mismatch means the values are treated as missing on the Rust
+side too, so a plugin bug cannot launder a stale calibration past the
+daemon. `config` rather than the `settings` view is load-bearing:
+`settings` is the access-tracked, *default-resolved* view and carries
+keys the operator never wrote, which would diverge from the plugin's
+file-only hash on essentially every real machine and spuriously refuse
+correctly-calibrated printers (a real bug, fixed and pinned by test).
 
 ### [plr] mode machine config: why the blessing is obsolete
 
