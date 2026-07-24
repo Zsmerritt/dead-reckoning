@@ -382,7 +382,10 @@ On this path, `plrd recover`
 assembles a machine snapshot from the `[machine]` section of
 `/etc/plrd.conf` and refuses — listing every failed check — until all
 prerequisites validate. Every attestation defaults to `false`, so a fresh
-install is deliberately not commissioned.
+install is deliberately not commissioned. The legacy path supports only
+`tap` and `load_cell` probes; the ADXL drag oracle exists exclusively in
+`[plr]` mode (its noise-floor calibration lives in the `[plr]` autosave
+block).
 
 The keys (each maps 1:1 onto a `plr-recovery` prerequisite; the
 [commissioning checklist](#commissioning-checklist) is the physical truth
