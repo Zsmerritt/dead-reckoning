@@ -14,9 +14,11 @@ plrd - dead-reckoning power-loss recovery daemon
 
 USAGE:
     plrd run --config <path>       run the recorder daemon (Linux only)
-    plrd scan --wal <dir> [--heartbeat <path>]
+    plrd scan --wal <dir> [--heartbeat <path>] [--config <path>]
                                    offline: scan a WAL directory and print
-                                   a recovery report
+                                   a recovery report. With --config, also
+                                   report which machine-config mode applies
+                                   ([plr] live config vs legacy [machine])
     plrd recover --config <path> [--execute --confirm] [--step]
                                    plan a print recovery. DEFAULT IS DRY
                                    RUN: prints the plan and every command
@@ -49,6 +51,9 @@ pub enum Command {
         wal: PathBuf,
         /// Heartbeat file path override (default `<wal>/heartbeat.bin`).
         heartbeat: Option<PathBuf>,
+        /// Optional daemon config: when given, the report also states
+        /// which machine-config mode applies ([plr] vs legacy).
+        config: Option<PathBuf>,
     },
     /// `plrd recover`: plan (and optionally execute) a recovery.
     Recover {
@@ -138,15 +143,21 @@ fn parse_recover<'a>(it: &mut impl Iterator<Item = &'a String>) -> Result<Comman
 fn parse_scan<'a>(it: &mut impl Iterator<Item = &'a String>) -> Result<Command, String> {
     let mut wal: Option<PathBuf> = None;
     let mut heartbeat: Option<PathBuf> = None;
+    let mut config: Option<PathBuf> = None;
     while let Some(flag) = it.next() {
         match flag.as_str() {
             "--wal" => assign_value(it, "--wal", &mut wal)?,
             "--heartbeat" => assign_value(it, "--heartbeat", &mut heartbeat)?,
+            "--config" => assign_value(it, "--config", &mut config)?,
             other => return Err(format!("scan: unknown flag `{other}`")),
         }
     }
     let wal = wal.ok_or_else(|| "scan: missing required --wal <dir>".to_owned())?;
-    Ok(Command::Scan { wal, heartbeat })
+    Ok(Command::Scan {
+        wal,
+        heartbeat,
+        config,
+    })
 }
 
 /// Consumes the value for `flag` into `slot`, rejecting duplicates and a
@@ -211,20 +222,33 @@ mod tests {
             parse(&args(&["scan", "--wal", "/var/lib/plrd/wal"])),
             Ok(Command::Scan {
                 wal: "/var/lib/plrd/wal".into(),
-                heartbeat: None
+                heartbeat: None,
+                config: None,
             })
         );
         assert_eq!(
             parse(&args(&["scan", "--heartbeat", "/tmp/hb", "--wal", "w"])),
             Ok(Command::Scan {
                 wal: "w".into(),
-                heartbeat: Some("/tmp/hb".into())
+                heartbeat: Some("/tmp/hb".into()),
+                config: None,
+            })
+        );
+        assert_eq!(
+            parse(&args(&["scan", "--wal", "w", "--config", "/etc/plrd.conf"])),
+            Ok(Command::Scan {
+                wal: "w".into(),
+                heartbeat: None,
+                config: Some("/etc/plrd.conf".into()),
             })
         );
         assert!(parse(&args(&["scan"])).unwrap_err().contains("--wal"));
         assert!(parse(&args(&["scan", "--wal", "a", "b"]))
             .unwrap_err()
             .contains("unknown flag"));
+        assert!(parse(&args(&["scan", "--wal", "a", "--config"]))
+            .unwrap_err()
+            .contains("requires a value"));
     }
 
     #[test]

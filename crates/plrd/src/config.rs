@@ -79,6 +79,12 @@ pub struct Config {
     /// (`ws://host:port/websocket`, Moonraker docs
     /// `external_api/introduction`).
     pub moonraker_url: String,
+    /// Path of the daemon's control socket (the UNIX stream socket
+    /// `plrd run` serves; the Klipper plugin's client side reads the
+    /// same path from its `[plr]` `control_socket` setting). The two
+    /// values must agree — install defaults keep them aligned; change
+    /// both together or the plugin will talk to a dead path.
+    pub control_socket: PathBuf,
     /// The `[machine]` section (see the module docs table).
     pub machine: MachineSection,
 }
@@ -158,6 +164,7 @@ impl Default for Config {
             segment_rotate_bytes: 16 * 1024 * 1024,
             channel_capacity: 1024,
             moonraker_url: "ws://127.0.0.1:7125/websocket".to_owned(),
+            control_socket: PathBuf::from("/var/lib/plrd/plrd.sock"),
             machine: MachineSection::default(),
         }
     }
@@ -249,6 +256,7 @@ impl Config {
                 }
                 value.clone_into(&mut self.moonraker_url);
             }
+            "control_socket" => self.control_socket = parse_path(value)?,
             "machine.force_move_enabled" => self.machine.force_move_enabled = parse_bool(value)?,
             "machine.z_self_locking_attested" => {
                 self.machine.z_self_locking_attested = parse_bool(value)?;
@@ -487,6 +495,18 @@ channel_capacity = 64
     fn load_reports_missing_file() {
         let err = Config::load(std::path::Path::new("/nonexistent/plrd.conf")).unwrap_err();
         assert!(err.contains("cannot read config"), "{err}");
+    }
+
+    #[test]
+    fn control_socket_key_parses_and_defaults() {
+        let config = Config::parse("").unwrap();
+        assert_eq!(
+            config.control_socket,
+            PathBuf::from("/var/lib/plrd/plrd.sock")
+        );
+        let config = Config::parse("control_socket = /run/plrd/ctl.sock").unwrap();
+        assert_eq!(config.control_socket, PathBuf::from("/run/plrd/ctl.sock"));
+        assert!(Config::parse("control_socket =").is_err());
     }
 
     #[test]

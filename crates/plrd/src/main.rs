@@ -36,6 +36,10 @@ mod detect;
 mod executor;
 mod moonraker;
 mod pipeline;
+// `[plr]` machine-config sourcing: parsing is pure and cross-platform;
+// the one-shot klippy query is Unix-only with a documented stub
+// elsewhere (there is no Unix-socket transport off Unix).
+mod plrcfg;
 mod recover;
 mod scan;
 
@@ -60,6 +64,8 @@ mod testmoon;
 
 #[cfg(target_os = "linux")]
 mod client;
+#[cfg(target_os = "linux")]
+mod ctrlsock;
 #[cfg(target_os = "linux")]
 mod daemon;
 #[cfg(target_os = "linux")]
@@ -105,10 +111,32 @@ fn run(command: &Command) -> u8 {
             println!("{}", cli::USAGE);
             EXIT_OK
         }
-        Command::Scan { wal, heartbeat } => {
+        Command::Scan {
+            wal,
+            heartbeat,
+            config,
+        } => {
             let mut stdout = std::io::stdout();
             match scan::run_scan(wal, heartbeat.as_deref(), &mut stdout) {
-                Ok(()) => EXIT_OK,
+                Ok(()) => {
+                    // Optional machine-config-mode report: an unreadable
+                    // config is an error, but only after the WAL report
+                    // (which never needed it) has been printed.
+                    if let Some(config_path) = config {
+                        match config::Config::load(config_path) {
+                            Ok(config) => {
+                                pipeline::report_machine_mode(&config, &mut stdout);
+                                EXIT_OK
+                            }
+                            Err(e) => {
+                                eprintln!("plrd: {e}");
+                                EXIT_RUNTIME
+                            }
+                        }
+                    } else {
+                        EXIT_OK
+                    }
+                }
                 Err(e) => {
                     eprintln!("plrd: {e}");
                     EXIT_RUNTIME
@@ -180,8 +208,35 @@ mod tests {
             run(&Command::Scan {
                 wal: "/nonexistent-plrd-wal".into(),
                 heartbeat: None,
+                config: None,
             }),
             EXIT_RUNTIME
+        );
+    }
+
+    #[test]
+    fn scan_with_unreadable_config_is_a_runtime_error_after_the_report() {
+        // A valid WAL is required first; reuse the pipeline fixture.
+        let (dir, _config) = crate::pipeline::e2e_tests::fixture("main-scan-cfg");
+        assert_eq!(
+            run(&Command::Scan {
+                wal: dir.clone(),
+                heartbeat: None,
+                config: Some("/nonexistent/plrd.conf".into()),
+            }),
+            EXIT_RUNTIME
+        );
+        // With a readable config the mode report succeeds (klippy
+        // unreachable -> legacy/undetermined text, still exit 0).
+        let config_path = dir.join("plrd.conf");
+        std::fs::write(&config_path, format!("wal_dir = {}\n", dir.display())).unwrap();
+        assert_eq!(
+            run(&Command::Scan {
+                wal: dir,
+                heartbeat: None,
+                config: Some(config_path),
+            }),
+            EXIT_OK
         );
     }
 

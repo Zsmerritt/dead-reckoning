@@ -167,27 +167,80 @@ pub(crate) fn drive(
             return EXIT_RUNTIME;
         }
     };
-    runtime.block_on(execute_gated(bundle, config, options, stdin, out))
+    let mut gate = PromptGate {
+        stdin,
+        step_mode: options.step,
+    };
+    runtime.block_on(execute_with_gates(
+        bundle,
+        config,
+        &options.exec_options,
+        options.connect_timeout,
+        &mut gate,
+        out,
+    ))
 }
 
-/// Gates 4–6 and execution proper.
-async fn execute_gated(
+/// Per-step confirmation policy for [`execute_with_gates`]. The CLI
+/// prompts on the operator's terminal ([`PromptGate`]); the control
+/// socket has no interactive channel and always proceeds
+/// ([`AutoGate`]) — its consent is the request's explicit
+/// `confirm: true` flag, and per-step mode is rejected up front as
+/// CLI-only.
+pub(crate) trait StepGate {
+    /// Decides whether `step` may run; may write a prompt to `out`.
+    fn confirm(&mut self, step: &plr_recovery::RecoveryStep, out: &mut dyn Write) -> bool;
+}
+
+/// The CLI gate: with `--step`, ask before every step.
+struct PromptGate<'a> {
+    stdin: &'a mut dyn BufRead,
+    step_mode: bool,
+}
+
+impl StepGate for PromptGate<'_> {
+    fn confirm(&mut self, step: &plr_recovery::RecoveryStep, out: &mut dyn Write) -> bool {
+        if !self.step_mode {
+            return true;
+        }
+        let _ = write!(out, "  proceed with step {}? [y/N] ", step.id);
+        let _ = out.flush();
+        read_yes(self.stdin)
+    }
+}
+
+/// The non-interactive gate used by the control socket (Linux-only
+/// caller; the type itself is cross-platform).
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) struct AutoGate;
+
+impl StepGate for AutoGate {
+    fn confirm(&mut self, _step: &plr_recovery::RecoveryStep, _out: &mut dyn Write) -> bool {
+        true
+    }
+}
+
+/// Gates 4–6 and execution proper — the SAME stack for the CLI and the
+/// control socket: Moonraker reachability, klippy ready + printer
+/// idle, transcript-or-refuse, abort on any failed verification. Only
+/// the per-step confirmation policy differs (`gate`).
+pub(crate) async fn execute_with_gates(
     bundle: &PlanBundle,
     config: &Config,
-    options: &RecoverOptions,
-    stdin: &mut dyn BufRead,
+    exec_options: &ExecOptions,
+    connect_timeout: Duration,
+    gate: &mut dyn StepGate,
     out: &mut dyn Write,
 ) -> u8 {
-    let mut client =
-        match MoonrakerClient::connect(&config.moonraker_url, options.connect_timeout).await {
-            Ok(client) => client,
-            Err(e) => {
-                let _ = writeln!(out, "recover: cannot reach Moonraker: {e}");
-                return EXIT_RUNTIME;
-            }
-        };
+    let mut client = match MoonrakerClient::connect(&config.moonraker_url, connect_timeout).await {
+        Ok(client) => client,
+        Err(e) => {
+            let _ = writeln!(out, "recover: cannot reach Moonraker: {e}");
+            return EXIT_RUNTIME;
+        }
+    };
     // G-code scripts legitimately run for minutes (heat soak, probe).
-    client.set_call_timeout(options.exec_options.temp_timeout);
+    client.set_call_timeout(exec_options.temp_timeout);
 
     // Gate 4: ready + idle.
     if let Err(reason) = printer_ready_and_idle(&mut client).await {
@@ -215,8 +268,7 @@ async fn execute_gated(
     };
     let _ = writeln!(out, "recover: transcript: {}", transcript_path.display());
 
-    let step_mode = options.step;
-    let mut gate = |step: &plr_recovery::RecoveryStep| -> bool {
+    let mut gate_fn = |step: &plr_recovery::RecoveryStep| -> bool {
         let _ = writeln!(
             out,
             "recover: step {} [{}] {}",
@@ -224,12 +276,7 @@ async fn execute_gated(
             step.phase.name(),
             step.summary
         );
-        if !step_mode {
-            return true;
-        }
-        let _ = write!(out, "  proceed with step {}? [y/N] ", step.id);
-        let _ = out.flush();
-        read_yes(stdin)
+        gate.confirm(step, out)
     };
 
     let outcome = {
@@ -237,8 +284,8 @@ async fn execute_gated(
         execute(
             &bundle.plan,
             &mut client,
-            &options.exec_options,
-            &mut gate,
+            exec_options,
+            &mut gate_fn,
             &mut transcript,
         )
         .await

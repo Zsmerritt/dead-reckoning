@@ -278,10 +278,13 @@ async fn runtime_compute(
         return Ok(None);
     };
     // Trigger reading, per probe type (plr-recovery documents the
-    // Klipper field semantics behind each source).
+    // Klipper field semantics behind each source). The drag result is
+    // read off the plugin's own `plr` status object exactly like the
+    // stock probe status.
     let (object, field) = match formula.trigger_source {
         TriggerSource::RawLastZResult => ("probe", "last_z_result"),
         TriggerSource::BedZPlusOffset { .. } => ("probe", "last_probe_position.2"),
+        TriggerSource::DragResult => ("plr", "last_drag_result.trigger_z"),
     };
     let trigger_reading = query_number(client, object, field).await?;
     let halt_z = query_number(client, "toolhead", "position.2").await?;
@@ -497,7 +500,7 @@ pub(crate) mod tests {
             envelope: compute_envelope(
                 EnvelopeParams {
                     expected_gap: 0.5,
-                    probe_speed: 1.0,
+                    overshoot: plr_recovery::OvershootTerm::PostTriggerTravel { probe_speed: 1.0 },
                     margin: 0.5,
                 },
                 -2.0,
@@ -692,6 +695,46 @@ pub(crate) mod tests {
         assert_eq!(*gates.lock().expect("gate counter"), 2);
         assert_eq!(fake.gcode_sent(), vec!["SET_IDLE_TIMEOUT TIMEOUT=86400"]);
         assert!(transcript.contains("operator-declined"), "{transcript}");
+    }
+
+    #[tokio::test]
+    async fn drag_trigger_source_reads_the_plr_status_object() {
+        // Same plan, but the computation reads the plugin's
+        // last_drag_result instead of the probe object.
+        let mut plan = test_plan();
+        plan.steps[2].compute = Some(RuntimeComputation::TrueZ(TrueZFormula {
+            z_prev_top: 12.4,
+            trigger_source: TriggerSource::DragResult,
+            frozen_z_adjust: None,
+        }));
+        let fake = FakeMoonraker::spawn(|method, params| {
+            let mut v = happy_handler(method, params)?;
+            if method == "printer.objects.query" {
+                if let Some(status) = v.get_mut("status") {
+                    if let Some(plr) = status.get_mut("plr") {
+                        *plr = json!({
+                            "method": "adxl_drag",
+                            "last_drag_result": {
+                                "trigger_z": 0.75,
+                                "passes": 4,
+                                "confidence": 0.97,
+                            },
+                        });
+                    }
+                }
+            }
+            Ok(v)
+        })
+        .await;
+        let (outcome, transcript) = run(&plan, &fake, &mut |_| true).await;
+        assert_eq!(outcome, ExecOutcome::Completed { steps: 3 }, "{transcript}");
+        // trigger 0.75 (drag), halt 0.75 (toolhead): true Z = 12.4.
+        assert!(
+            fake.gcode_sent()
+                .contains(&"SET_KINEMATIC_POSITION Z=12.4".to_owned()),
+            "{:?}",
+            fake.gcode_sent()
+        );
     }
 
     #[tokio::test]
