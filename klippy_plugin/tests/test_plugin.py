@@ -83,10 +83,44 @@ def test_persisted_autosave_options_read_back(plr_config):
     # SAVE_CONFIG writes these into the [plr] autosave block; a restart
     # hands them back as ordinary config options.
     plugin = plr.load_config(
-        plr_config(options={"self_locking_z": "True", "probe_resolution": "0.012"})
+        plr_config(
+            options={
+                "self_locking_z": "True",
+                "probe_resolution": "0.012",
+                "noise_floor_rms": "42.5",
+                "noise_floor_still_rms": "10.25",
+                "noise_floor_peak": "88.0",
+            }
+        )
     )
     assert plugin.self_locking_z is True
     assert plugin.probe_resolution == 0.012
+    assert plugin.noise_floor_rms == 42.5
+    assert plugin.noise_floor_still_rms == 10.25
+    assert plugin.noise_floor_peak == 88.0
+
+
+def test_noise_floor_defaults_none(plugin):
+    assert plugin.noise_floor_rms is None
+    assert plugin.noise_floor_still_rms is None
+    assert plugin.noise_floor_peak is None
+
+
+def test_mangled_noise_floor_fails_config_parse(plr_config):
+    # A hand-edited autosave value outside the schema is a config-time
+    # error (klippy's standard message), not a mid-probe surprise.
+    with pytest.raises(fake_klippy.FakeConfigError, match="noise_floor_rms"):
+        plr.load_config(plr_config(options={"noise_floor_rms": "0"}))
+
+
+def test_z_position_min_cached_from_good_sections(plugin):
+    # good_sections() carries [stepper_z] position_min = -2.
+    assert plugin.z_position_min == -2.0
+
+
+def test_drag_state_initialized_null(plugin):
+    assert plugin.last_drag_result is None
+    assert plugin.last_drag_error is None
 
 
 def test_all_commands_registered_with_help(plugin, fake_printer):
@@ -94,13 +128,6 @@ def test_all_commands_registered_with_help(plugin, fake_printer):
     for name in ALL_COMMANDS:
         assert name in gcode.commands, name
         assert gcode.command_help[name], name
-
-
-def test_drag_milestone_commands_respond_not_implemented(plugin, run_cmd):
-    gcode = run_cmd("PLR_NOISE_TEST")
-    assert "not implemented yet" in gcode.responses[-1]
-    gcode = run_cmd("PLR_DRAG_PROBE")
-    assert "not implemented yet" in gcode.responses[-1]
 
 
 def test_get_status_shape_on_good_config(plugin):
@@ -111,6 +138,9 @@ def test_get_status_shape_on_good_config(plugin):
         "attested": False,
         "probe_resolution": None,
         "daemon_alive": False,
+        "noise_floor_rms": None,
+        "last_drag_result": None,
+        "last_drag_error": None,
     }
 
 

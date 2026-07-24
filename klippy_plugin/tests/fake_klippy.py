@@ -357,13 +357,31 @@ class FakeToolhead:
     get_status mirrors klippy/toolhead.py:503-513 merged with the
     kinematics dict (klippy/kinematics/cartesian.py:123 'homed_axes');
     manual_move records the request and applies the coordinate, which
-    is bookkeeping, not motion physics.
+    is bookkeeping, not motion physics.  wait_moves/dwell are recorded
+    no-ops (klippy/toolhead.py:417-427).
+
+    ``position_min`` gives the fake klippy's kinematic Z-limit BACKSTOP
+    semantics: a commanded move ending below it is recorded, then
+    rejected without applying, mirroring cartesian check_move ->
+    _check_endstops raising move_error "Move out of range"
+    (klippy/kinematics/cartesian.py:97-115).  Hostile drag-oracle tests
+    set it to prove the plugin's own floor check fires FIRST — the
+    backstop must never be the mechanism.
     """
 
-    def __init__(self, homed_axes="xyz", position=(150.0, 150.0, 5.0, 0.0)):
+    def __init__(
+        self,
+        homed_axes="xyz",
+        position=(150.0, 150.0, 5.0, 0.0),
+        position_min=None,
+    ):
         self.homed_axes = homed_axes
         self.position = list(position)
+        self.position_min = position_min
         self.moves = []
+        self.wait_moves_calls = 0
+        self.dwells = []
+        self._last_move_time = 0.0
 
     def get_status(self, eventtime):
         return {"homed_axes": self.homed_axes, "position": tuple(self.position)}
@@ -373,9 +391,89 @@ class FakeToolhead:
 
     def manual_move(self, coord, speed):
         self.moves.append((list(coord), speed))
+        if (
+            self.position_min is not None
+            and len(coord) > 2
+            and coord[2] is not None
+            and coord[2] < self.position_min
+        ):
+            raise FakeCommandError("Move out of range")
         for i, value in enumerate(coord):
             if value is not None:
                 self.position[i] = value
+
+    def wait_moves(self):
+        self.wait_moves_calls += 1
+
+    def dwell(self, delay):
+        self.dwells.append(delay)
+        self._last_move_time += delay
+
+    def get_last_move_time(self):
+        return self._last_move_time
+
+
+class FakeAccelClient:
+    """Stands in for adxl345.AccelQueryHelper (klippy/extras/
+    adxl345.py:34-87): finish_measurements waits for motion
+    (adxl345.py:42-46), has_valid_samples reports whether any batch
+    arrived (adxl345.py:55-71), get_samples yields (t, ax, ay, az)
+    tuples (adxl345.py:72-87).
+
+    Samples are canned by the test's script — the WHAT of the stream is
+    glue; the classifier math over it is never faked.  ``samples=None``
+    scripts a no-data capture (has_valid_samples False).
+    """
+
+    def __init__(self, samples, toolhead):
+        self._samples = samples
+        self._toolhead = toolhead
+        self.finished = False
+
+    def finish_measurements(self):
+        self._toolhead.wait_moves()
+        self.finished = True
+
+    def has_valid_samples(self):
+        return bool(self._samples)
+
+    def get_samples(self):
+        return list(self._samples or [])
+
+
+class FakeAccelChip:
+    """Stands in for an accel chip's internal-client surface
+    (klippy/extras/adxl345.py:251-254 ``start_internal_client``).
+
+    ``script`` is a list consumed one entry per client: each entry is a
+    sample list, None (no-data capture), or a callable(toolhead) ->
+    sample list evaluated when the client starts (so a hostile script
+    can key the stream off the CURRENT toolhead Z).  ``default`` (also
+    callable(toolhead) or a list) serves any capture after the script
+    runs out — e.g. "always clean" for iteration-bound tests.  With
+    neither left, starting a client raises, mirroring an exhausted
+    test plan (a plugin bug, loudly).
+    """
+
+    def __init__(self, printer, script=None, default=None):
+        self._printer = printer
+        self.script = list(script) if script is not None else []
+        self.default = default
+        self.clients = []
+
+    def start_internal_client(self):
+        toolhead = self._printer.lookup_object("toolhead")
+        if self.script:
+            entry = self.script.pop(0)
+        elif self.default is not None:
+            entry = self.default
+        else:
+            raise FakeCommandError("FakeAccelChip: out of scripted captures")
+        if callable(entry):
+            entry = entry(toolhead)
+        client = FakeAccelClient(entry, toolhead)
+        self.clients.append(client)
+        return client
 
 
 class FakeIdleTimeout:

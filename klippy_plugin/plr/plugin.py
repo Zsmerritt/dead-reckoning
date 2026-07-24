@@ -22,8 +22,13 @@ config options — klippy/configfile.py:311-324):
 
 * ``self_locking_z`` — operator attestation staged by PLR_SETUP;
 * ``probe_resolution`` — measured by PLR_PROBE_TEST;
-* ``noise_floor_*`` — staged by the drag-oracle milestone (read
-  lazily by those modules, not parsed here).
+* ``noise_floor_rms`` / ``noise_floor_still_rms`` / ``noise_floor_peak``
+  — measured by PLR_NOISE_TEST.  Parsed here at config time (not read
+  lazily by the drag modules) for the same reason probe_resolution is:
+  the live value doubles as this-session state that PLR_NOISE_TEST
+  updates in place, and config-time getfloat bounds reject a
+  hand-mangled autosave value with klippy's standard error instead of
+  a mid-probe surprise.
 """
 
 import os
@@ -76,6 +81,18 @@ class PLRPlugin:
         # keep a fresh install working before first SAVE_CONFIG) ------
         self.self_locking_z = config.getboolean("self_locking_z", False)
         self.probe_resolution = config.getfloat("probe_resolution", None, above=0.0)
+        self.noise_floor_rms = config.getfloat("noise_floor_rms", None, above=0.0)
+        self.noise_floor_still_rms = config.getfloat(
+            "noise_floor_still_rms", None, minval=0.0
+        )
+        self.noise_floor_peak = config.getfloat("noise_floor_peak", None, minval=0.0)
+        # --- drag-oracle session state (PLR_DRAG_PROBE outcome; plrd
+        # reads these through get_status like probe status) ------------
+        self.last_drag_result = None
+        self.last_drag_error = None
+        # Z floor input for the drag staircase, cached at config time
+        # (config is immutable per session).
+        self.z_position_min, _ = setup_checks.z_position_min(config)
         # Options PLR_SET / PLR_SETUP / PLR_PROBE_TEST staged this
         # session (live but not yet written by SAVE_CONFIG).
         self._pending_save = set()
@@ -110,10 +127,12 @@ class PLRPlugin:
         "EXECUTE=1 CONFIRM=YES executes"
     )
     cmd_PLR_NOISE_TEST_help = (
-        "Measure the accel-chip noise floor for the drag oracle (drag-oracle milestone)"
+        "Measure the accel-chip noise floor (requires START=1; moves the "
+        "toolhead) and stage noise_floor_* for SAVE_CONFIG"
     )
     cmd_PLR_DRAG_PROBE_help = (
-        "Drag-probe surface diagnostic for the drag oracle (drag-oracle milestone)"
+        "Locate the part surface by dragging lateral passes down a Z "
+        "staircase with the accel chip (CHIP= SPEED= Z_STEP= SENSITIVITY=)"
     )
 
     def _register_commands(self):
@@ -214,4 +233,7 @@ class PLRPlugin:
             "attested": self.self_locking_z,
             "probe_resolution": self.probe_resolution,
             "daemon_alive": self._daemon_alive_now(eventtime),
+            "noise_floor_rms": self.noise_floor_rms,
+            "last_drag_result": self.last_drag_result,
+            "last_drag_error": self.last_drag_error,
         }

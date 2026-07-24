@@ -59,8 +59,9 @@ cross-repo breaking change.
 Values the plugin persists itself (never hand-edit; they live in the
 `SAVE_CONFIG` autosave block under `[plr]`): `self_locking_z` (operator
 attestation staged by `PLR_SETUP ACCEPT_SELF_LOCKING_Z=1`),
-`probe_resolution` (measured by `PLR_PROBE_TEST`), and `noise_floor_*`
-(drag-oracle milestone).
+`probe_resolution` (measured by `PLR_PROBE_TEST`), and
+`noise_floor_rms` / `noise_floor_still_rms` / `noise_floor_peak`
+(measured by `PLR_NOISE_TEST`).
 
 ## Command reference
 
@@ -142,10 +143,101 @@ Power-loss recovery, driven by plrd:
   ready+idle, transcript), so the console consent is additive.
 - `STEP=1` — single-step mode (pause between plan steps).
 
-### `PLR_NOISE_TEST`, `PLR_DRAG_PROBE`
+### `PLR_NOISE_TEST [CHIP=] [SPEED=] [DURATION=2.0] START=1`
 
-Registered but pending the drag-oracle milestone; they currently
-respond with a "not implemented yet" notice.
+Measures the accelerometer noise floor the drag oracle thresholds
+against. Two captures: ~2 s standing still, then four no-contact
+lateral passes at the drag `SPEED` at the current Z (the same pass
+geometry `PLR_DRAG_PROBE` uses). Stages three keys for `SAVE_CONFIG`:
+
+- `noise_floor_rms` — the **moving** capture's RMS. This is the
+  reference the threshold is built from, deliberately not the still
+  RMS: drag passes classify samples taken *while moving*, so stepper
+  harmonics and frame vibration must be inside the baseline or every
+  pass would false-trigger on the machine's own motion.
+- `noise_floor_still_rms` — diagnostics; a large moving/still gap hints
+  at a loose accel mount or a resonant frame.
+- `noise_floor_peak` — the moving capture's max windowed RMS, the exact
+  statistic the classifier thresholds, so the report can show your
+  headroom at the current sensitivity.
+
+**This command moves the toolhead** — without `START=1` it only prints
+the plan. It refuses while printing or unhomed.
+
+> **Warning:** run it with the toolhead well away from any printed
+> part. The command cannot know where parts are; a pass that touches
+> one corrupts the noise floor (it would read as "normal", making real
+> contact invisible).
+
+### `PLR_DRAG_PROBE [CHIP=] [SPEED=] [Z_STEP=] [SENSITIVITY=] [PASS_LENGTH=8]`
+
+Locates the top of a solidified part with the accelerometer: the drag
+oracle for `probe_method: adxl_drag`. Arguments default to the `[plr]`
+tunables; `CHIP` accepts quoted spaced names (`CHIP="adxl345 bed"`).
+Like Klipper's own `PROBE`, this command is a primitive and runs when
+typed — no `START=` consent parameter (the scripted multi-move
+diagnostics keep theirs).
+
+How it works — **staircase with between-pass classification**, because
+accelerometer data arrives in batches and there is no real-time halt:
+
+1. Every lateral pass (default 8 mm back-and-forth, centered on the
+   current XY) runs at a **fixed Z** — a pass physically cannot
+   descend.
+2. After each pass, the complete sample window is classified: contact
+   iff its peak windowed RMS exceeds
+   `noise_floor_rms x multiplier(sensitivity)`.
+3. Clean pass → descend exactly `drag_z_step` and repeat. Contact →
+   stop, lift `2 x drag_z_step` (never above the starting height).
+4. Hard bounds computed **up front**: at most
+   `ceil(available_travel / drag_z_step)` passes, where the travel
+   floor is the kinematic Z limit plus one `drag_z_step` of reserve. No
+   descent is ever commanded below the floor; hitting the bound with no
+   contact aborts, restores the starting Z, and reports an error.
+5. A pass that cannot be classified (too few samples, non-finite
+   values, frozen signal, collapsed sample rate) **aborts** the probe —
+   it is never assumed clean.
+
+`trigger_z` semantics: the reported height is the Z of the **last
+clean pass**. The surface lies within `(trigger_z - drag_z_step,
+trigger_z]`; reporting the conservative endpoint means the executor's
+true-Z arithmetic can treat overshoot as bounded by one `Z_STEP`.
+Results surface in `get_status` as
+`last_drag_result: {trigger_z, passes, confidence}` (toolhead-frame Z);
+failures null it and set `last_drag_error`.
+
+Sensitivity guidance (`drag_sensitivity`, 0–100): the knob maps to a
+threshold multiplier over the noise floor, log-interpolated between
+anchors — 0 → 8.0x (least sensitive), 50 → 4.0x, 100 → 1.5x (most
+sensitive). **Wobbly or noisy machines should run low numbers**: a
+higher multiplier means fewer false triggers at the cost of needing a
+firmer contact signature. Rigid, quiet machines can run high numbers to
+catch fainter contact.
+
+The intended flow:
+
+```
+G28                                  ; home
+; position the head well AWAY from any part, at a safe Z
+PLR_NOISE_TEST START=1               ; measure the baseline
+SAVE_CONFIG                          ; persist noise_floor_* (restarts)
+; ... after a power loss, plrd's plan issues:
+PLR_DRAG_PROBE                       ; or with CHIP=/SPEED=/Z_STEP=/SENSITIVITY=
+```
+
+**Honest limitations:**
+
+- Batched accelerometer data means a *staircase*, not a continuous
+  descent: the surface is only ever bracketed to within one
+  `drag_z_step`, and each pass drags laterally at the Z where the
+  previous pass was clean — expect (bounded) nozzle contact with the
+  part surface by design.
+- The noise floor is measured at one place and speed; classification
+  compares against it wherever the probe runs. Big changes in speed or
+  location can shift the real baseline — re-run `PLR_NOISE_TEST` after
+  changing `drag_speed` or mechanics.
+- Bench validation on real hardware is still pending (E5); until then
+  treat detection quality (not the safety bounds) as unproven.
 
 ## Commissioning in 5 console commands
 
@@ -182,6 +274,9 @@ in `PLR_SET` / `PLR_STATUS` listings.
 - Version split: code under `plr/` must stay **Python 3.7
   syntax-compatible** (it runs inside klippy; Klipper supports 3.7+).
   The dev tooling floor is **Python 3.9** — see `pyproject.toml`.
+- numpy is **optional at runtime** (the drag classifier has a
+  pure-python fallback producing identical verdicts) but a pinned dev
+  dependency, so the two code paths are tested against each other.
 - Tests run against the fakes in `tests/fake_klippy.py` (wiring-only
   stand-ins for klippy objects; no physics). The plrd control-socket
   client is tested over real sockets; the AF_UNIX transport tests skip
