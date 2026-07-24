@@ -56,6 +56,34 @@ jobs:
       - name: cargo test (default members)
         run: cargo test
 
+  # Klippy plugin gates (klippy_plugin/): same pins developers get from
+  # scripts/setup-py.sh (klippy_plugin/requirements-dev.txt), and the
+  # same gate script the pre-commit hook runs. 3.9 is the dev-tooling
+  # floor; 3.12 catches deprecations. The plugin SOURCE additionally
+  # stays 3.7 syntax-compatible for klippy — enforced by ruff's
+  # target-version in klippy_plugin/pyproject.toml.
+  python:
+    name: python (klippy_plugin) lint + tests + coverage
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.9", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: klippy_plugin/requirements-dev.txt
+      - name: Install pinned dev deps
+        run: python -m pip install -r klippy_plugin/requirements-dev.txt
+      - name: ruff check
+        run: python -m ruff check klippy_plugin
+      - name: ruff format --check
+        run: python -m ruff format --check klippy_plugin
+      - name: pytest + coverage gate (>=90% lines of plr/)
+        run: PYTHON=python sh scripts/coverage-py.sh
+
   coverage:
     name: coverage gate (>=90% lines, full workspace)
     runs-on: ubuntu-latest

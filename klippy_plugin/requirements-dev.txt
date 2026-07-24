@@ -1,0 +1,18 @@
+# Dev/test dependencies for the klippy plugin gates (lint + tests +
+# coverage).  Exact pins so the pre-commit hook, CI, and developers run
+# identical tools; installed into .venv by scripts/setup-py.sh and
+# directly by the CI python job.
+#
+# Pins resolved 2026-07-23 as the newest releases still supporting
+# Python 3.9 (the dev-tooling floor and the older CI matrix leg):
+# pytest 9.x and coverage >=7.11 require Python >=3.10, so they are
+# deliberately NOT used.  Bump all four together and keep the 3.9 CI leg
+# green.
+#
+# These are DEV deps only — the plugin's runtime deps inside klippy are
+# exclusively what klippy already ships with (numpy optional, handled by
+# plr.setup_checks.require_numpy).
+pytest==8.4.2
+pytest-cov==7.1.0
+coverage==7.10.7
+ruff==0.16.0

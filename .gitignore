@@ -8,3 +8,10 @@
 *.profraw
 *.profdata
 /.claude/
+
+# Python dev environment (scripts/setup-py.sh) and tool caches
+/.venv/
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+.coverage

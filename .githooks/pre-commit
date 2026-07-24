@@ -4,8 +4,12 @@
 #   2. cargo clippy (-D warnings; plrd included only on Linux)
 #   3. cargo test (workspace default members)
 #   4. scripts/coverage.sh (>=90% line coverage)
+#   5. ruff check (klippy_plugin)
+#   6. ruff format --check (klippy_plugin)
+#   7. scripts/coverage-py.sh (pytest, >=90% line coverage of plr/)
 #
 # Install with: sh scripts/setup-hooks.sh
+# Python stages need the repo .venv: sh scripts/setup-py.sh (one-time).
 # POSIX sh only — this must run under Git Bash on Windows unchanged.
 set -u
 
@@ -30,18 +34,41 @@ case "$(uname -s)" in
     *) clippy_scope="--workspace --exclude plrd" ;;
 esac
 
-banner "1/4: cargo fmt --all --check"
+banner "1/7: cargo fmt --all --check"
 cargo fmt --all --check || fail "formatting — run 'cargo fmt --all'"
 
-banner "2/4: cargo clippy $clippy_scope --all-targets -- -D warnings"
+banner "2/7: cargo clippy $clippy_scope --all-targets -- -D warnings"
 # $clippy_scope is intentionally word-split: it holds flags, not a path.
 # shellcheck disable=SC2086
 cargo clippy $clippy_scope --all-targets -- -D warnings || fail "clippy"
 
-banner "3/4: cargo test (default members)"
+banner "3/7: cargo test (default members)"
 cargo test || fail "tests"
 
-banner "4/4: coverage gate (scripts/coverage.sh)"
+banner "4/7: coverage gate (scripts/coverage.sh)"
 sh scripts/coverage.sh || fail "coverage below threshold"
+
+# --- Python gates (klippy_plugin) ------------------------------------
+# A missing python environment FAILS the commit with setup instructions;
+# it must never silently skip — a skipped gate is a quality hole.
+if [ -x ".venv/bin/python" ]; then
+    venv_py=".venv/bin/python"
+elif [ -x ".venv/Scripts/python.exe" ]; then
+    venv_py=".venv/Scripts/python.exe"
+else
+    printf '\nerror: python dev environment (.venv) not found.\n' >&2
+    printf '       create it once with: sh scripts/setup-py.sh\n' >&2
+    fail "python environment missing"
+fi
+
+banner "5/7: ruff check (klippy_plugin)"
+"$venv_py" -m ruff check klippy_plugin || fail "ruff check"
+
+banner "6/7: ruff format --check (klippy_plugin)"
+"$venv_py" -m ruff format --check klippy_plugin \
+    || fail "python formatting — run '$venv_py -m ruff format klippy_plugin'"
+
+banner "7/7: python coverage gate (scripts/coverage-py.sh)"
+sh scripts/coverage-py.sh || fail "python tests/coverage below threshold"
 
 printf '\npre-commit RESULT: PASS\n'
