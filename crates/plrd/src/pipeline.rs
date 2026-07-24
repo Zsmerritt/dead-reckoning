@@ -184,53 +184,12 @@ pub fn run_pipeline(config: &Config, out: &mut dyn Write) -> Result<PipelineOutc
     // Machine prerequisites run FIRST — before any planning — and a
     // refusal is fatal for every mode. Which snapshot source applies
     // ([plr] live config vs legacy /etc/plrd.conf) is resolved here.
-    let source = resolve_machine_source(config);
     let type_annotations = contains_type_annotations(file_bytes);
-    let (machine, plan_config, contact_config, legacy) = match &source {
-        MachineSource::Unavailable { reason } => {
-            return Ok(PipelineOutcome::NotPossible(format!(
-                "machine configuration unavailable: {reason}"
-            )))
-        }
-        MachineSource::Plr {
-            snapshot,
-            plr,
-            notes,
-        } => {
-            say("pipeline: machine config from the [plr] section of the live Klipper config");
-            say("pipeline: note: /etc/plrd.conf [machine] is ignored while [plr] exists");
-            for note in notes {
-                say(&format!("pipeline: note: {note}"));
-            }
-            let (machine, assembly_notes) =
-                plrcfg::machine_from_settings(&snapshot.settings, plr, type_annotations);
-            for note in assembly_notes {
-                say(&format!("pipeline: note: {note}"));
-            }
-            let contact = ContactConfig {
-                exclusion_radius: plr.exclusion_radius,
-                ..ContactConfig::default()
-            };
-            (machine, plr.plan_config(), contact, false)
-        }
-        MachineSource::Legacy { note } => {
-            say("pipeline: machine config from /etc/plrd.conf [machine] (legacy mode)");
-            if let Some(note) = note {
-                say(&format!("pipeline: note: {note}"));
-            }
-            let machine = machine_config(
-                &config.machine,
-                type_annotations,
-                config.machine.klipper_config_path.as_deref(),
-            );
-            (
-                machine,
-                PlanConfig::default(),
-                ContactConfig::default(),
-                true,
-            )
-        }
-    };
+    let (machine, plan_config, contact_config, legacy) =
+        match machine_inputs(config, type_annotations, &mut say) {
+            Ok(inputs) => inputs,
+            Err(outcome) => return Ok(outcome),
+        };
     if let Err(rejection) = validate_machine(&machine) {
         if legacy {
             // Only legacy mode has a hash to re-bless; [plr] mode reads
@@ -255,17 +214,73 @@ pub fn run_pipeline(config: &Config, out: &mut dyn Write) -> Result<PipelineOutc
     ))
 }
 
+/// Assembles the mode-dependent planning inputs
+/// `(machine, plan config, contact config, legacy?)`, narrating the
+/// mode decision. `Err` carries the early pipeline outcome.
+fn machine_inputs(
+    config: &Config,
+    type_annotations: bool,
+    say: &mut dyn FnMut(&str),
+) -> Result<(MachineConfig, PlanConfig, ContactConfig, bool), PipelineOutcome> {
+    match resolve_machine_source(config) {
+        MachineSource::Unavailable { reason } => Err(PipelineOutcome::NotPossible(format!(
+            "machine configuration unavailable: {reason}"
+        ))),
+        MachineSource::Plr(source) => {
+            say("pipeline: machine config from the [plr] section of the live Klipper config");
+            say("pipeline: note: /etc/plrd.conf [machine] is ignored while [plr] exists");
+            for note in &source.notes {
+                say(&format!("pipeline: note: {note}"));
+            }
+            let (machine, assembly_notes) = plrcfg::machine_from_settings(
+                &source.snapshot.settings,
+                &source.plr,
+                type_annotations,
+            );
+            for note in assembly_notes {
+                say(&format!("pipeline: note: {note}"));
+            }
+            let contact = ContactConfig {
+                exclusion_radius: source.plr.exclusion_radius,
+                ..ContactConfig::default()
+            };
+            Ok((machine, source.plr.plan_config(), contact, false))
+        }
+        MachineSource::Legacy { note } => {
+            say("pipeline: machine config from /etc/plrd.conf [machine] (legacy mode)");
+            if let Some(note) = note {
+                say(&format!("pipeline: note: {note}"));
+            }
+            let machine = machine_config(
+                &config.machine,
+                type_annotations,
+                config.machine.klipper_config_path.as_deref(),
+            );
+            Ok((
+                machine,
+                PlanConfig::default(),
+                ContactConfig::default(),
+                true,
+            ))
+        }
+    }
+}
+
+/// The `[plr]`-mode payload of [`MachineSource`] (boxed: the settings
+/// snapshot dwarfs the other variants).
+pub(crate) struct PlrSource {
+    /// The queried `configfile.settings` (+ `plr` status object).
+    pub snapshot: KlippySnapshot,
+    /// The parsed `[plr]` section.
+    pub plr: PlrSettings,
+    /// Non-fatal observations surfaced to the operator.
+    pub notes: Vec<String>,
+}
+
 /// Which snapshot source `plrd recover` uses this run.
 pub(crate) enum MachineSource {
     /// The Klipper config has a `[plr]` section: it is authoritative.
-    Plr {
-        /// The queried `configfile.settings` (+ `plr` status object).
-        snapshot: KlippySnapshot,
-        /// The parsed `[plr]` section.
-        plr: PlrSettings,
-        /// Non-fatal observations surfaced to the operator.
-        notes: Vec<String>,
-    },
+    Plr(Box<PlrSource>),
     /// No `[plr]` section (or klippy unreachable with a commissioned
     /// legacy snapshot): the `/etc/plrd.conf [machine]` path applies.
     Legacy {
@@ -289,7 +304,7 @@ pub(crate) enum MachineSource {
 /// recorded copy to plan from honestly (the context format carries
 /// interpreter state, not printer.cfg). Therefore:
 ///
-/// * a commissioned legacy `[machine]` snapshot (probe_kind set) is
+/// * a commissioned legacy `[machine]` snapshot (`probe_kind` set) is
 ///   trusted with an info note — back-compat: that path never needed
 ///   klippy, and its crc32c blessing still detects a printer.cfg that
 ///   changed since blessing (including one that has since grown a
@@ -319,11 +334,11 @@ pub(crate) fn resolve_machine_source(config: &Config) -> MachineSource {
                                 .to_owned(),
                         ),
                     }
-                    MachineSource::Plr {
+                    MachineSource::Plr(Box::new(PlrSource {
                         snapshot,
                         plr,
                         notes,
-                    }
+                    }))
                 }
                 // A [plr] section that cannot be read faithfully must
                 // refuse — falling back to legacy would contradict the
@@ -364,13 +379,13 @@ pub(crate) fn report_machine_mode(config: &Config, out: &mut dyn Write) {
         let _ = writeln!(out, "{text}");
     };
     match resolve_machine_source(config) {
-        MachineSource::Plr { plr, notes, .. } => {
+        MachineSource::Plr(source) => {
             line("machine-config mode: [plr] (live Klipper config; /etc/plrd.conf [machine] ignored)");
             line(&format!(
                 "  probe_method = {}, control_socket = {}",
-                plr.probe_method, plr.control_socket
+                source.plr.probe_method, source.plr.control_socket
             ));
-            for note in notes {
+            for note in &source.notes {
                 line(&format!("  note: {note}"));
             }
         }

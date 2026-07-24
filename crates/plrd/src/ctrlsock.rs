@@ -26,7 +26,7 @@
 //! aborts are `ok: false` with the full report in `text` and a stable
 //! `data.outcome` tag.
 //!
-//! # recover_execute
+//! # `recover_execute`
 //!
 //! Runs the SAME gate stack as `plrd recover --execute --confirm`
 //! (`recover::execute_with_gates`): machine validation inside the
@@ -57,7 +57,7 @@
 //!
 //! # Socket permissions: mode 0666, deliberately
 //!
-//! The stock install runs plrd as root (systemd unit, StateDirectory)
+//! The stock install runs plrd as root (systemd unit, `StateDirectory`)
 //! while klippy — the socket's one intended client — runs as an
 //! unprivileged user whose identity plrd cannot know at bind time, so
 //! a same-user or fixed-group mode would break the plugin out of the
@@ -192,9 +192,8 @@ async fn read_request_line(stream: &mut tokio::net::UnixStream) -> Result<Option
     let mut buf = [0_u8; 4096];
     loop {
         let n = match stream.read(&mut buf).await {
-            Ok(0) => break,
+            Ok(0) | Err(_) => break,
             Ok(n) => n,
-            Err(_) => break,
         };
         if let Some(pos) = buf[..n].iter().position(|&b| b == b'\n') {
             line.extend_from_slice(&buf[..pos]);
@@ -221,7 +220,7 @@ fn error_response(outcome: &str, text: &str) -> Value {
     json!({"ok": false, "text": text, "data": {"outcome": outcome}})
 }
 
-fn ok_response(text: &str, data: Value) -> Value {
+fn ok_response(text: &str, data: &Value) -> Value {
     json!({"ok": true, "text": text, "data": data})
 }
 
@@ -243,7 +242,7 @@ pub(crate) async fn respond_line(state: &CtrlState, line: &str) -> Value {
     match cmd {
         "ping" => ok_response(
             &format!("plrd {}", env!("CARGO_PKG_VERSION")),
-            json!({"version": env!("CARGO_PKG_VERSION")}),
+            &json!({"version": env!("CARGO_PKG_VERSION")}),
         ),
         "status" => cmd_status(state).await,
         "recover_dryrun" => cmd_recover_dryrun(state).await,
@@ -258,7 +257,7 @@ async fn cmd_status(state: &CtrlState) -> Value {
     let config = state.config.clone();
     let result = tokio::task::spawn_blocking(move || build_status(&config)).await;
     match result {
-        Ok((text, data)) => ok_response(&text, data),
+        Ok((text, data)) => ok_response(&text, &data),
         Err(e) => error_response("error", &format!("status task failed: {e}")),
     }
 }
@@ -294,6 +293,9 @@ fn build_status(config: &Config) -> (String, Value) {
     match crate::scan::load_heartbeat(&config.heartbeat_file()) {
         Ok(recovery) => {
             let now = crate::hostclock::now_wall_ns();
+            // Sub-microsecond precision loss is irrelevant for an age
+            // display measured in seconds.
+            #[allow(clippy::cast_precision_loss)]
             let age_s = (now.saturating_sub(recovery.heartbeat.wall_ns)) as f64 / 1_000_000_000.0;
             let _ = writeln!(
                 text,
@@ -310,30 +312,27 @@ fn build_status(config: &Config) -> (String, Value) {
 
     // Pending recovery.
     let pending_path = config.wal_dir.join(crate::detect::PENDING_FILE_NAME);
-    match std::fs::read_to_string(&pending_path)
+    if let Some(pending) = std::fs::read_to_string(&pending_path)
         .ok()
         .and_then(|text| serde_json::from_str::<crate::detect::PendingRecovery>(&text).ok())
     {
-        Some(pending) => {
-            let _ = writeln!(
-                text,
-                "pending recovery: {} at byte {}{} ({})",
-                pending.file,
-                pending.file_position,
-                pending
-                    .percent
-                    .map_or(String::new(), |p| format!(" (~{p:.0}%)")),
-                pending.crash_class,
-            );
-            data.insert(
-                "pending".to_owned(),
-                serde_json::to_value(&pending).unwrap_or(Value::Null),
-            );
-        }
-        None => {
-            let _ = writeln!(text, "pending recovery: none");
-            data.insert("pending".to_owned(), Value::Null);
-        }
+        let _ = writeln!(
+            text,
+            "pending recovery: {} at byte {}{} ({})",
+            pending.file,
+            pending.file_position,
+            pending
+                .percent
+                .map_or(String::new(), |p| format!(" (~{p:.0}%)")),
+            pending.crash_class,
+        );
+        data.insert(
+            "pending".to_owned(),
+            serde_json::to_value(&pending).unwrap_or(Value::Null),
+        );
+    } else {
+        let _ = writeln!(text, "pending recovery: none");
+        data.insert("pending".to_owned(), Value::Null);
     }
 
     // Machine-config mode + validation summary. `;TYPE:` annotations
@@ -364,12 +363,9 @@ fn machine_summary(config: &Config) -> (String, String) {
         }
     };
     match pipeline::resolve_machine_source(config) {
-        MachineSource::Plr {
-            snapshot,
-            plr,
-            notes: _,
-        } => {
-            let (machine, _) = crate::plrcfg::machine_from_settings(&snapshot.settings, &plr, true);
+        MachineSource::Plr(source) => {
+            let (machine, _) =
+                crate::plrcfg::machine_from_settings(&source.snapshot.settings, &source.plr, true);
             ("plr".to_owned(), validated(&machine))
         }
         MachineSource::Legacy { note } => {
@@ -553,7 +549,8 @@ mod tests {
     }
 
     /// Binds a server in a temp dir and returns (socket path, state).
-    async fn spawn_server(tag: &str, config: Config) -> (PathBuf, Arc<CtrlState>) {
+    /// Must run inside a tokio runtime (tests are `#[tokio::test]`).
+    fn spawn_server(tag: &str, config: Config) -> (PathBuf, Arc<CtrlState>) {
         let path = temp_dir(tag).join("plrd.sock");
         let std_listener = bind(&path).expect("bind");
         let listener = tokio::net::UnixListener::from_std(std_listener).expect("tokio listener");
@@ -579,7 +576,7 @@ mod tests {
 
     #[tokio::test]
     async fn ping_answers_with_the_version() {
-        let (path, _state) = spawn_server("ping", Config::default()).await;
+        let (path, _state) = spawn_server("ping", Config::default());
         let response = roundtrip(&path, "{\"cmd\": \"ping\"}\n").await;
         assert_eq!(response["ok"], json!(true));
         assert_eq!(
@@ -592,7 +589,7 @@ mod tests {
     #[tokio::test]
     async fn eof_terminated_requests_are_accepted() {
         // No trailing newline: the client half-closes instead.
-        let (path, _state) = spawn_server("eof", Config::default()).await;
+        let (path, _state) = spawn_server("eof", Config::default());
         let mut stream = tokio::net::UnixStream::connect(&path).await.unwrap();
         stream.write_all(b"{\"cmd\": \"ping\"}").await.unwrap();
         stream.shutdown().await.unwrap();
@@ -604,7 +601,7 @@ mod tests {
 
     #[tokio::test]
     async fn partial_writes_are_reassembled() {
-        let (path, _state) = spawn_server("partial", Config::default()).await;
+        let (path, _state) = spawn_server("partial", Config::default());
         let mut stream = tokio::net::UnixStream::connect(&path).await.unwrap();
         for chunk in ["{\"cmd\"", ": \"pi", "ng\"}\n"] {
             stream.write_all(chunk.as_bytes()).await.unwrap();
@@ -619,7 +616,7 @@ mod tests {
 
     #[tokio::test]
     async fn malformed_and_unknown_requests_answer_instead_of_dropping() {
-        let (path, _state) = spawn_server("malformed", Config::default()).await;
+        let (path, _state) = spawn_server("malformed", Config::default());
         for (request, outcome) in [
             ("this is not json\n", "malformed"),
             ("[1, 2, 3]\n", "malformed"),
@@ -636,7 +633,7 @@ mod tests {
 
     #[tokio::test]
     async fn oversized_request_line_gets_an_error_then_close() {
-        let (path, _state) = spawn_server("oversized", Config::default()).await;
+        let (path, _state) = spawn_server("oversized", Config::default());
         let mut stream = tokio::net::UnixStream::connect(&path).await.unwrap();
         // A newline-free flood beyond the cap.
         let flood = vec![b'x'; MAX_REQUEST_BYTES + 4096];
@@ -652,7 +649,7 @@ mod tests {
 
     #[tokio::test]
     async fn concurrent_connections_are_all_served() {
-        let (path, _state) = spawn_server("concurrent", Config::default()).await;
+        let (path, _state) = spawn_server("concurrent", Config::default());
         let mut tasks = Vec::new();
         for _ in 0..8 {
             let path = path.clone();
@@ -682,7 +679,7 @@ mod tests {
             crash_class: "HostDeathOrPowerLoss".to_owned(),
         };
         crate::detect::write_pending(&config.wal_dir, &pending).unwrap();
-        let (path, _state) = spawn_server("status", config).await;
+        let (path, _state) = spawn_server("status", config);
         let response = roundtrip(&path, "{\"cmd\": \"status\"}\n").await;
         assert_eq!(response["ok"], json!(true), "{response}");
         let text = response["text"].as_str().unwrap();
@@ -700,7 +697,7 @@ mod tests {
         let (_dir, config) = crate::pipeline::e2e_tests::fixture("ctrl-dryrun");
         // Unreachable Moonraker on purpose: the dry-run path must
         // never need it.
-        let (path, _state) = spawn_server("dryrun", config).await;
+        let (path, _state) = spawn_server("dryrun", config);
         let response = roundtrip(&path, "{\"cmd\": \"recover_dryrun\"}\n").await;
         assert_eq!(response["ok"], json!(true), "{response}");
         assert_eq!(response["data"]["outcome"], json!("plan"));
@@ -712,7 +709,7 @@ mod tests {
 
     #[tokio::test]
     async fn recover_execute_demands_confirm_and_rejects_step_mode() {
-        let (path, _state) = spawn_server("consent", Config::default()).await;
+        let (path, _state) = spawn_server("consent", Config::default());
         let response = roundtrip(&path, "{\"cmd\": \"recover_execute\"}\n").await;
         assert_eq!(response["ok"], json!(false));
         assert!(response["text"]
@@ -946,7 +943,7 @@ mod tests {
         // the CLI path).
         std::fs::write(config.wal_dir.join(crate::detect::PENDING_FILE_NAME), b"{}").unwrap();
         let wal_dir = config.wal_dir.clone();
-        let (path, _state) = spawn_server("exec", config).await;
+        let (path, _state) = spawn_server("exec", config);
         let response = roundtrip(
             &path,
             "{\"cmd\": \"recover_execute\", \"args\": {\"confirm\": true}}\n",
@@ -997,7 +994,7 @@ mod tests {
         .await;
         let (_dir, mut config) = crate::pipeline::e2e_tests::fixture("ctrl-notidle");
         config.moonraker_url = fake.url();
-        let (path, _state) = spawn_server("notidle", config).await;
+        let (path, _state) = spawn_server("notidle", config);
         let response = roundtrip(
             &path,
             "{\"cmd\": \"recover_execute\", \"args\": {\"confirm\": true}}\n",
@@ -1032,7 +1029,7 @@ mod tests {
             wal_dir: dir,
             ..Config::default()
         };
-        let (path, _state) = spawn_server("dryrun-empty", config).await;
+        let (path, _state) = spawn_server("dryrun-empty", config);
         let response = roundtrip(&path, "{\"cmd\": \"recover_dryrun\"}\n").await;
         assert_eq!(response["ok"], json!(false));
         assert!(response["text"]
@@ -1043,6 +1040,7 @@ mod tests {
 
     #[test]
     fn bind_replaces_a_stale_socket_and_reports_bad_paths() {
+        use std::os::unix::fs::PermissionsExt as _;
         let dir = temp_dir("bind");
         let path = dir.join("plrd.sock");
         // First bind creates it; a second bind (stale file present)
@@ -1053,7 +1051,6 @@ mod tests {
         let second = bind(&path).expect("rebind over stale socket");
         drop(second);
         // Permissions: 0666 (module docs).
-        use std::os::unix::fs::PermissionsExt as _;
         let mode = std::fs::metadata(&path).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o666, "mode {mode:o}");
         // An unbindable path (parent is a regular file) is a clear

@@ -258,7 +258,7 @@ fn probe_from_section(section: &Map<String, Value>, kind: ProbeKind) -> ProbeCon
 ///
 /// Total by design: missing cross-check data becomes the
 /// `MachineConfig` shape that *fails validation* (empty probe list,
-/// `None` position_min, ...) rather than an error here — so the
+/// `None` `position_min`, ...) rather than an error here — so the
 /// operator sees every problem in one `validate_machine` report.
 pub fn machine_from_settings(
     settings: &Map<String, Value>,
@@ -325,20 +325,16 @@ pub fn machine_from_settings(
             // probes[0]); the other traditional section, if ALSO
             // present, is appended so the single-probe check reports
             // the inconsistency.
-            let ordered: [(&str, fn() -> ProbeKind); 2] = if method == "load_cell" {
-                [
-                    ("load_cell_probe", || ProbeKind::LoadCell),
-                    ("probe", || ProbeKind::Tap),
-                ]
+            let tap = ("probe", ProbeKind::Tap);
+            let load_cell = ("load_cell_probe", ProbeKind::LoadCell);
+            let ordered = if method == "load_cell" {
+                [load_cell, tap]
             } else {
-                [
-                    ("probe", || ProbeKind::Tap),
-                    ("load_cell_probe", || ProbeKind::LoadCell),
-                ]
+                [tap, load_cell]
             };
             ordered
-                .iter()
-                .filter_map(|(name, kind)| section(name).map(|s| probe_from_section(s, kind())))
+                .into_iter()
+                .filter_map(|(name, kind)| section(name).map(|s| probe_from_section(s, kind)))
                 .collect()
         }
     };
@@ -460,7 +456,7 @@ pub fn query_klippy_snapshot(
 
     let deadline = std::time::Instant::now() + timeout;
     let mut splitter = FrameSplitter::new();
-    let mut buf = [0_u8; 64 * 1024];
+    let mut buf = vec![0_u8; 64 * 1024];
     loop {
         if std::time::Instant::now() >= deadline {
             return Err(format!(
@@ -573,6 +569,8 @@ pub(crate) mod tests {
         })
     }
 
+    // Test-helper ergonomics: callers hand over the fixture values.
+    #[allow(clippy::needless_pass_by_value)]
     pub(crate) fn query_result(configfile: Value, plr_object: Value) -> Value {
         json!({
             "eventtime": 100.5,
