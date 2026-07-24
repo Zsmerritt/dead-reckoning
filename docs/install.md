@@ -8,12 +8,60 @@ prerequisites through first-run verification. Companion documents:
 
 Contents:
 
-1. [Commissioning checklist](#commissioning-checklist) — is this machine a
+1. [Quick install (one command)](#quick-install-one-command)
+2. [Commissioning checklist](#commissioning-checklist) — is this machine a
    candidate for recovery at all?
-2. [Where each prerequisite lives in the Klipper config](#where-each-prerequisite-lives)
-3. [Building plrd](#building-plrd)
-4. [Installing binary, config, and systemd unit](#installing)
-5. [First-run verification](#first-run-verification)
+3. [Where each prerequisite lives in the Klipper config](#where-each-prerequisite-lives)
+4. [Building plrd manually](#building-plrd-manually)
+5. [Installing manually](#installing-manually)
+6. [Commissioning the machine section](#commissioning-the-machine-section)
+   — required before `plrd recover` will execute anything
+7. [Moonraker update manager integration](#moonraker-update-manager-integration)
+8. [First-run verification](#first-run-verification)
+
+## Quick install (one command)
+
+On the printer host, as your normal printer user (not root; sudo is used
+only where needed):
+
+```sh
+curl -sSL https://raw.githubusercontent.com/Zsmerritt/dead-reckoning/main/scripts/install.sh | bash
+```
+
+Prefer to read what you run? [`scripts/install.sh`](../scripts/install.sh)
+is short and commented — download it, read it, run
+`bash install.sh`. It is equally runnable from a clone
+(`bash scripts/install.sh`). What it does:
+
+1. checks/installs build prerequisites (and rustup if missing — the pinned
+   toolchain from `rust-toolchain.toml` installs itself on first build);
+2. clones the repo to `~/dead-reckoning` (or updates/uses an existing
+   checkout) and builds `plrd` in release mode;
+3. detects your `printer_data` directory, the Klipper API socket
+   (`comms/klippy.sock`), and your `[stepper_z*]` sections from
+   `printer.cfg`, and generates `/etc/plrd.conf` from them (an existing
+   config is left untouched unless you pass `--force-config`; backups are
+   timestamped);
+4. installs the binary, config, and systemd unit, then enables and starts
+   the service.
+
+Safety properties of the script itself: it **never** talks to the Klipper
+socket and **never** stops, starts, or restarts the klipper or moonraker
+services; Moonraker-file edits happen only with `--moonraker` and are
+backed up first.
+
+Flags: `--yes` (non-interactive, take defaults), `--moonraker` (register
+with Moonraker's update manager — see
+[below](#moonraker-update-manager-integration)), `--no-service` (build and
+stage only; no sudo, nothing installed), `--force-config`, `--dir <path>`
+(checkout location), `--printer-data <path>`. To remove everything later:
+[`scripts/uninstall.sh`](../scripts/uninstall.sh) (keeps the config and the
+WAL — which holds recovery data — unless you explicitly ask for purge).
+
+After installing, continue with
+[first-run verification](#first-run-verification) and — before ever
+executing a recovery —
+[commissioning](#commissioning-the-machine-section).
 
 ## Commissioning checklist
 
@@ -80,10 +128,12 @@ How to check each item against a stock Klipper/Moonraker install:
 | Klipper API socket | the klippy service file (usually `/etc/systemd/system/klipper.service` or `~/printer_data/systemd/klipper.env`): the `-a <path>` argument of `klippy.py`. Moonraker installs use `~/printer_data/comms/klippy.sock`. This is the value for `klipper_socket` in `plrd.conf` |
 | `;TYPE:` annotations | open a sliced file and search for `;TYPE:`; if absent, enable the feature-comment option in your slicer profile |
 
-## Building plrd
+## Building plrd manually
 
-Rust is pinned by `rust-toolchain.toml` (currently 1.97.x); rustup fetches
-the right toolchain automatically on first build.
+(Skip this and the next section if you used the
+[install script](#quick-install-one-command).) Rust is pinned by
+`rust-toolchain.toml` (currently 1.97.x); rustup fetches the right
+toolchain automatically on first build.
 
 ### On the printer host (tested path)
 
@@ -115,7 +165,7 @@ filesystem (e.g. `~/src/dead-reckoning`), not under `/mnt/c` — the 9p mount
 does not give real fsync semantics, and durability code is never tested
 against fakes.
 
-## Installing
+## Installing manually
 
 These are the same steps the header of `deploy/plrd.service` documents:
 
@@ -129,10 +179,11 @@ sudo systemctl enable --now plrd
 
 ### Editing `/etc/plrd.conf`
 
-The format is flat `key = value` with `#` comments — the same family as
-`printer.cfg`. **Unknown and duplicate keys are hard errors** (a misspelled
-durability knob silently falling back to a default is exactly the kind of
-quiet failure this project exists to prevent). Every key and its default:
+The format is `key = value` with `#` comments and one optional `[machine]`
+section — the same family as `printer.cfg`. **Unknown and duplicate keys
+are hard errors** (a misspelled durability knob silently falling back to a
+default is exactly the kind of quiet failure this project exists to
+prevent). Every top-level key and its default:
 
 | Key | Default | Meaning |
 | --- | --- | --- |
@@ -146,9 +197,14 @@ quiet failure this project exists to prevent). Every key and its default:
 | `heartbeat_o_dsync` | `false` | Open the heartbeat file `O_DSYNC` instead of `fdatasync` per rewrite (same durability, one syscall instead of two) |
 | `segment_rotate_bytes` | `16777216` | Rotate to a new WAL segment at this size. Minimum 4096 |
 | `channel_capacity` | `1024` | Bounded queue between socket reader and WAL thread; on overflow motion records are dropped and the gap is journaled. Minimum 8 |
+| `moonraker_url` | `ws://127.0.0.1:7125/websocket` | Moonraker WebSocket endpoint, used for the boot-time pending-recovery announcement and by `plrd recover --execute` |
 
-The two values almost everyone must change are `klipper_socket` (point it at
-the real klippy socket) and, on multi-Z machines, `z_steppers`. A fully
+Plus the `[machine]` section — the recovery-commissioning snapshot,
+documented in [the next section](#commissioning-the-machine-section).
+
+For *recording*, the two values almost everyone must change are
+`klipper_socket` (the install script detects it; point it at the real
+klippy socket otherwise) and, on multi-Z machines, `z_steppers`. A fully
 commented example for a Voron 2.4-style machine is at
 [examples/plrd.conf](../examples/plrd.conf).
 
@@ -166,6 +222,103 @@ If you change `wal_dir` away from `/var/lib/plrd`, you must also grant the
 service write access to the new location — see
 [examples/plrd.service.override.conf](../examples/plrd.service.override.conf)
 for a drop-in override that does this.
+
+## Commissioning the machine section
+
+Recording needs none of this. **Executing a recovery does**: `plrd recover`
+assembles a machine snapshot from the `[machine]` section of
+`/etc/plrd.conf` and refuses — listing every failed check — until all
+prerequisites validate. Every attestation defaults to `false`, so a fresh
+install is deliberately not commissioned.
+
+The keys (each maps 1:1 onto a `plr-recovery` prerequisite; the
+[commissioning checklist](#commissioning-checklist) is the physical truth
+you are attesting to):
+
+| `[machine]` key | Default | Set it to |
+| --- | --- | --- |
+| `force_move_enabled` | `false` | `true` only after confirming `[force_move]` with `enable_force_move: True` in printer.cfg |
+| `z_self_locking_attested` | `false` | `true` only if your Z leadscrews are self-locking (bed holds position unpowered) |
+| `z_steppers` | `stepper_z` | every Z stepper, as `name` or `name:mcu` (bare names assume `primary_mcu`; any Z stepper on a secondary MCU is refused) |
+| `primary_mcu` | `mcu` | your primary MCU's name |
+| `probe_kind` | unset | `tap` (`[probe]`) or `load_cell` (`[load_cell_probe]`) |
+| `probe_z_offset` | unset | the probe's configured `z_offset`, mm |
+| `probe_activate_gcode_no_move` | `false` | `true` only after checking `activate_gcode` is empty or commands no motion |
+| `probe_deactivate_gcode_no_move` | `false` | ditto for `deactivate_gcode` |
+| `z_position_min` | unset | the Z rail's `position_min` (or `[printer] minimum_z_position`), mm |
+| `klipper_config_path` | unset | your `printer.cfg` path — plrd checksums it at recover time |
+| `validated_config_hash` | unset | the blessing — see below |
+| `virtual_sdcard_root` | unset | the `[virtual_sdcard] path` value |
+
+Two values are *not* configurable, on purpose: `;TYPE:` annotation presence
+is observed from the actual print file, and the running config hash is
+computed from `klipper_config_path` at recover time.
+
+**The blessing flow** (change detection): after filling in the section, run
+
+```sh
+plrd recover --config /etc/plrd.conf
+```
+
+On a never-blessed config it refuses and prints the computed checksum:
+
+```text
+pipeline: machine hash computed: crc32c:658a94bb
+recover: REFUSED — machine prerequisites failed:
+  - machine prerequisites have never been validated
+```
+
+Re-walk the checklist against your printer.cfg, then paste the printed
+value into the config:
+
+```ini
+validated_config_hash = crc32c:658a94bb
+```
+
+From then on, any edit to printer.cfg changes the computed hash and
+recovery refuses until you deliberately re-validate and re-bless. (It is a
+crc32c change-detection checksum — an operator gate against forgotten
+edits, not a security boundary.)
+
+Finally, commission empirically: the first `--execute` should be a
+supervised run on a scrap print, with `--step`, after a deliberate
+power-cut drill — see
+[operations → After a real power loss](operations.md#after-a-real-power-loss)
+and the [dry-run walkthrough](../examples/recovery-walkthrough.md).
+
+## Moonraker update manager integration
+
+`scripts/install.sh --moonraker` registers plrd in Moonraker's update
+manager so Mainsail/Fluidd's update panel shows and updates it like
+Klipper itself. [`deploy/moonraker-update-manager.conf`](../deploy/moonraker-update-manager.conf)
+is the canonical hand-edit reference; the automated steps are:
+
+1. append an `[update_manager plrd]` `git_repo` section to
+   `moonraker.conf` — the section name **must** equal the systemd unit
+   name (`plrd`), because Moonraker's `managed_services` only accepts the
+   section-header name (its `svc_choices`), case-sensitively;
+2. allow-list the service: a line reading exactly `plrd` in
+   `<printer_data>/moonraker.asvc`;
+3. install a systemd drop-in
+   (`/etc/systemd/system/plrd.service.d/50-plrd-refresh.conf`) with an
+   `ExecStartPre` that runs `install.sh --refresh`.
+
+What an update then actually does: Moonraker performs `git pull` and
+restarts the `plrd` service — it runs **no build steps** for `git_repo`
+entries. The drop-in turns that restart into "rebuild if HEAD changed,
+then start": `--refresh` compares the installed binary's build stamp to
+the repo HEAD, rebuilds as the repo's owner (never root-in-checkout) when
+they differ, and swaps only `/usr/local/bin/plrd`. A failed build is
+stamped and **not** retried automatically, and never blocks startup — the
+old binary keeps running until you fix the build and clear the stamp
+(`sudo rm /var/lib/plrd/build-failed-head`).
+
+Restarting plrd is always safe: it observes Klipper read-only and never
+touches a running print. Nothing in the repo ever restarts Moonraker or
+Klipper — after registering, restart Moonraker yourself.
+
+Both companion edits are backed up first, and `uninstall.sh --moonraker`
+reverses them.
 
 ## First-run verification
 

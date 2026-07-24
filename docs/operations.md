@@ -18,6 +18,16 @@ journalctl -u plrd -b -1     # the boot before this one (post-mortems)
 Every line is prefixed `plrd:`. The complete catalog of messages the daemon
 emits, what each means, and what (if anything) to do:
 
+**Boot-time detection** (runs at every daemon start, before anything
+else; it only writes a state file and announces — recovery starts only
+when *you* run `plrd recover`):
+
+| Message | Meaning / action |
+| --- | --- |
+| `unfinished print detected: <file> at byte <n> (~NN%) (<class>); run 'plrd recover'` | The previous session's WAL ends uncleanly with a print in progress. `pending_recovery.json` is (re)written in the WAL dir; the same message is announced on the printer console |
+| `pending-recovery announcement delivered` | The console message landed via Moonraker (`RESPOND`, falling back to `M117`; retried for ~5 minutes while klippy comes up) |
+| `could not deliver the pending-recovery announcement (gave up)` | Moonraker unreachable or both commands rejected (no `[respond]`/`[display_status]` in printer.cfg). Cosmetic only — `plrd recover` works regardless |
+
 **Connection lifecycle** (normal operation — plrd is designed to wait for
 and outlive Klipper):
 
@@ -200,52 +210,118 @@ its own.
 
 ## After a real power loss
 
-The v1 flow. Remember what v1 is: reconstruction and plan generation are
-implemented and tested; **plan execution via Moonraker is a scaffold that
-refuses to run**. Executing the recovery is a human job, guided by the
-tooling.
-
 1. **Do not home anything yet.** Do not run `G28`. On a moving-bed-Z
    machine, homing Z (or letting the idle timeout's `M84` clear state and
    then homing) can drive the bed into the nozzle or the nozzle through the
    part. Leave the printer as it is; the bed holds position because the Z
    leadscrews are self-locking (a commissioning prerequisite).
-2. **Scan.** Power the host (or pull the WAL medium) and run
-   `plrd scan --wal <wal_dir>` — on the printer host if possible, so the
-   printed G-code file is readable and the forward extension can run. Read
-   the report against the [section above](#reading-plrd-scan-reports).
+2. **Power the host and let plrd tell you.** At startup the daemon
+   classifies the previous session's WAL: an unclean end with a print in
+   progress writes `pending_recovery.json` into the WAL directory and
+   announces on the printer console (via `RESPOND`/`M117`):
+   `unfinished print detected: <file> at byte <n> (~NN%); run 'plrd
+   recover'`. Detection never executes anything.
+3. **Scan for the evidence** (optional but recommended before executing):
+   `plrd scan --wal <wal_dir>` — on the printer host, so the printed
+   G-code file is readable and the forward extension can run. Read the
+   report against the [section above](#reading-plrd-scan-reports).
    - `CLEAN SHUTDOWN` → nothing to recover, you are done.
    - `not possible` or `extension_unavailable` → fix the missing input
-     (usually the print file path) and re-scan before trusting anything.
-3. **Generate and inspect the plan.** Plan generation is a library API in
-   v1 (`plr_recovery::plan_recovery`); there is no `plrd` subcommand that
-   emits a plan yet. The rendered plan format — and a complete example of
-   one — is in the [walkthrough](../examples/recovery-walkthrough.md#the-recovery-plan);
-   the checked-in golden output
-   (`crates/plr-recovery/tests/golden/normal_tap.txt`) is the source of
-   truth for what a plan contains. A plan may also come back as a typed
-   **manual fallback** (vase mode, single-wall part, layer-only match, no
-   safe contact zone): that is the system telling you automatic-style
-   recovery is not safe for this part, not a bug.
-4. **Execute manually, step by step, in plan order.** The phase order and
-   its verifications exist for physical reasons
-   ([architecture](architecture.md#the-plan-is-data-the-trust-model));
-   respect them even when working by hand, and verify each step's outcome
-   before the next (the plan's `ok?:` lines tell you exactly which Klipper
-   status fields to check). The non-negotiables:
-   - `SET_IDLE_TIMEOUT TIMEOUT=86400` **first** — the default idle timeout
-     runs `M84`, and any motor-off clears ALL homed state.
-   - Never `G28` after declaring the shifted frame. Home **XY only**, ever.
-   - Probe at 1–2 mm/s, `SAMPLES=1`, only after declaring the shifted frame
-     (`SET_KINEMATIC_POSITION Z = position_min + envelope`), with the
-     nozzle in the 140–160 °C band (warm enough not to plough cold plastic,
-     cool enough not to ooze).
-   - If the probe reports **no trigger over the full envelope**, stop: the
-     part was never touched and is beyond the envelope — the reconstruction
-     and reality disagree, and continuing means guessing.
-   - If any verification fails, **abort** (heaters to safe state, motion
-     stopped). The plan format has no "continue past a failure" action, and
-     neither should you.
+     (usually the print file path) before trusting anything.
+4. **Dry-run the recovery**: `plrd recover --config /etc/plrd.conf`. This
+   runs the whole pipeline and prints the full plan and every command
+   that would be sent — and sends nothing. See
+   [the next section](#recovering-with-plrd-recover) for reading it.
+   Typed declines (vase mode, single wall, layer-only match, no safe
+   contact zone…) mean automation refuses for this part — that is the
+   system being honest, not a bug; recover manually using the rendered
+   plan phases as the checklist (below).
+5. **Execute**: `plrd recover --config /etc/plrd.conf --execute --confirm`
+   (add `--step` for your first recoveries — it asks before every step).
+   Supervise it: the printer must already be ready and idle, the nozzle
+   will approach the part at probing temperature, and any failed
+   verification aborts and leaves the printer as-is with a transcript to
+   review.
+
+### Manual fallback
+
+When the pipeline declines — or the machine is not
+[commissioned](install.md#commissioning-the-machine-section) — execution
+is a human job, guided by the same plan structure
+([architecture](architecture.md#the-plan-is-data-the-trust-model)).
+Respect the phase order and verify each step's outcome before the next
+(the plan's `ok?:` lines name the exact Klipper status fields). The
+non-negotiables:
+
+- `SET_IDLE_TIMEOUT TIMEOUT=86400` **first** — the default idle timeout
+  runs `M84`, and any motor-off clears ALL homed state.
+- Never `G28` after declaring the shifted frame. Home **XY only**, ever.
+- Probe at 1–2 mm/s, `SAMPLES=1`, only after declaring the shifted frame
+  (`SET_KINEMATIC_POSITION Z = position_min + envelope`), with the
+  nozzle in the 140–160 °C band (warm enough not to plough cold plastic,
+  cool enough not to ooze).
+- If the probe reports **no trigger over the full envelope**, stop: the
+  part was never touched and is beyond the envelope — the reconstruction
+  and reality disagree, and continuing means guessing.
+- If any verification fails, **abort** (heaters to safe state, motion
+  stopped). The plan format has no "continue past a failure" action, and
+  neither should you.
+
+## Recovering with `plrd recover`
+
+`plrd recover --config <path>` runs WAL → reconstruction → stop-point
+match → contact selection → validated plan, then a gate stack. A complete
+real transcript of everything below is in the
+[walkthrough](../examples/recovery-walkthrough.md#from-evidence-to-a-plan-plrd-recover).
+
+**Reading a dry run.** The default invocation prints, in order: pipeline
+progress lines (`pipeline: stop window …`, `pipeline: match confidence …`,
+`pipeline: N probe candidate(s); best at (x, y)`), the fully rendered plan
+(same format as the golden fixture — envelope header, numbered steps with
+`send:`/`pre:`/`ok?:`/`fail:` lines), a summary
+(`recover: plan has N steps, M commands; resume <file> @ byte <n>`), and
+the banner:
+
+```text
+recover: DRY RUN — nothing was sent. Re-run with --execute --confirm
+         to execute after review.
+```
+
+The dry path provably cannot send anything: no network client is
+constructed on it. Review at minimum: the envelope header (does the gap
+match the scan's Z span?), the probe point (step 6 — is it on printed
+part, away from the crash?), the resume byte offset, and any
+`# warning:` lines.
+
+**The execution gates**, in order (each verified by tests; no connection
+to Moonraker exists until gate 4, and no G-code is sent until every gate
+has passed):
+
+1. dry run by default;
+2. `--execute` without `--confirm` → refused (usage error);
+3. interactive consent — the plan is shown, you must answer `y`;
+4. Moonraker must be reachable and the printer **ready and idle**
+   (`webhooks.state == ready`, `print_stats.state` ∈ standby / complete /
+   cancelled / error, `virtual_sdcard.is_active == false`);
+5. machine prerequisites already validated (else no plan exists at all);
+6. with `--step`: a prompt before every step.
+
+**The transcript.** Execution refuses to start unless it can create
+`recovery-transcript-<unix-seconds>.jsonl` in the WAL directory. Every
+command sent, every Moonraker response, every verification evaluation,
+every runtime computation (the `{true_z}` substitution), every prompt,
+and the final outcome is appended as one JSON line each — it is the
+authoritative record of what the recovery actually did. After an abort
+(`recover: ABORTED at step N [phase]: <reason>`), the printer is left
+as-is; read the transcript bottom-up to see exactly which predicate
+failed on which field before retrying. After
+`recover: COMPLETED — N steps executed and verified.` the stale
+`pending_recovery.json` is removed.
+
+`pending_recovery.json` itself is operator UX state (file, byte offset,
+rough %, crash class, detection time) — safe to read, never required by
+the pipeline, cleared automatically on a clean shutdown or completed
+recovery.
 
 ## Troubleshooting
 
@@ -292,6 +368,33 @@ without the mesh (first layers of the resumed region rely on the true-Z
 probe datum instead). If you want meshes restored after recovery, print
 with a named, saved mesh profile. Similarly, `SkewProfileUnknown` means
 skew was active but unnamed and is not restored.
+
+**`recover: REFUSED — machine prerequisites failed` (list of checks).**
+Working as designed: the `[machine]` section is not (fully) commissioned,
+or printer.cfg changed since the last blessing
+(`config changed since validation`). Fix the listed items per the
+[commissioning guide](install.md#commissioning-the-machine-section); on a
+hash mismatch, re-verify the checklist against the *current* printer.cfg,
+then paste the printed `crc32c:` value into `validated_config_hash`.
+
+**`recover: cannot reach Moonraker: …` (after answering yes).**
+The `moonraker_url` in `/etc/plrd.conf` is wrong or Moonraker is down.
+Default is `ws://127.0.0.1:7125/websocket`. Note the gate order: this
+connection is only attempted *after* your interactive consent — a dry run
+never connects at all.
+
+**`recover: REFUSED — klippy state is … / printer is not idle`.**
+The ready-and-idle gate: klippy must report `ready`, `print_stats.state`
+must be standby/complete/cancelled/error, and `virtual_sdcard` must not be
+active. Clear the printer state (e.g. firmware-restart after the outage)
+and retry; nothing was sent.
+
+**No console announcement after a power loss.**
+The boot announcement needs `[respond]` (primary) or `[display_status]`
+(fallback) in printer.cfg, Moonraker reachable, and klippy up within the
+retry window (~5 minutes). Check `journalctl -u plrd` for the
+`unfinished print detected` line — detection and `plrd recover` work
+regardless of announcement delivery; the console message is convenience.
 
 **Scan (or reconstruction) from an older build rejects records from a
 newer recorder's WAL.**

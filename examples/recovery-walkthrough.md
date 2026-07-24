@@ -1,19 +1,17 @@
-# Recovery walkthrough: record → power cut → scan → plan
+# Recovery walkthrough: record → power cut → scan → recover
 
 A synthetic but end-to-end honest tour of the pipeline. Everything below
 was produced by the real tools in this repository:
 
-- the WAL directory was written with `plr-wal`'s actual writer APIs (the
-  same encoder the daemon uses), shaped exactly like a mid-print power
-  loss — including the torn trailing frame, the dual-slot heartbeat file
-  with correct slot parity, and the receive-seq sidecar — by a small
-  throwaway program (not part of the repo; ~150 lines against the public
-  `plr_wal` API);
-- the scan output is verbatim `plrd scan` from a `plrd` binary built from
-  this repo;
-- the recovery plan is the checked-in golden output of `plr-recovery`'s
-  plan builder (`crates/plr-recovery/tests/golden/normal_tap.txt`), the
-  source of truth for the rendered plan format.
+- the WAL directories were written with `plr-wal`'s actual writer APIs
+  (the same encoder the daemon uses), shaped exactly like a mid-print
+  power loss — including the torn trailing frame, the dual-slot heartbeat
+  file with correct slot parity, and the receive-seq sidecar — by small
+  throwaway programs (not part of the repo; ~150 lines each against the
+  public `plr_wal` API);
+- every console block is verbatim output of a `plrd` binary built from
+  this repo: `plrd scan`, the boot-time detection, and the full
+  `plrd recover` flow including its refusals.
 
 Background reading: [architecture](../docs/architecture.md) explains every
 concept used here; [operations](../docs/operations.md#reading-plrd-scan-reports)
@@ -133,34 +131,96 @@ loudly (`extension_unavailable: true`, confidence drops to `PerLayer`).
 copy the print file alongside the WAL (or scan on the printer) before
 trusting the set.
 
-## The recovery plan
+## From evidence to a plan: `plrd recover`
 
-Plan generation is a library API in v1 (`plr_recovery::plan_recovery`; no
-`plrd` subcommand emits plans yet), and execution is a scaffold that
-refuses — plans are rendered for human review and manual execution. Below
-is the repository's golden rendered plan, verbatim
-(`crates/plr-recovery/tests/golden/normal_tap.txt`). Its scenario is the
-same *shape* as the scan above — a stop with a single trusted Z plateau
-(`z_prev_top` = 0.4 mm) — but it is the golden test's own fixture: a
-two-Z-stepper Tap machine with `position_min = -2`, resuming `part.gcode`
-at byte 128, bed 60 °C / nozzle 210 °C. The envelope arithmetic is visible
-in the header: Z span 0 + sag allowance 0.2 = gap 0.2; + 0.15 × 1 mm/s +
-margin 0.5 = **0.85 mm**; shifted declare −2 + 0.85 = **−1.15**.
+Running `plrd recover` on the scenario above ends in a **typed decline**:
+the tiny fixture's lines are so short (0.28–0.66 mm of filament each) that
+the E evidence window spans more than eight candidate lines, and the match
+degrades to layer granularity — which the planner refuses to auto-resume:
 
 ```text
+pipeline: match confidence LayerOnly { layer: 0 } (11 candidates)
+recover: automation declined — no safe resume point: MatchTooCoarse { layer: 0 }
+  Manual recovery is required; the report above is the evidence.
+```
+
+That refusal is the design working ([honest degradation](../docs/architecture.md#the-guarantee-and-its-honest-caveats)):
+ambiguity never silently collapses into a guess. So the rest of this
+walkthrough uses a second synthetic scenario with realistic part geometry
+— `hatch_xl.gcode`, the same two-layer crossing-hatch design scaled to an
+80 mm square (2–5 mm of filament per line), crashed mid-way through
+layer 2's big sparse-infill diagonal. Same generator approach, same torn
+tail, heartbeat at `t_a = 21.2 s`, committed boundary `t_b = 21.95 s`.
+
+### Boot detection
+
+The daemon notices at its next start, before connecting to anything:
+
+```text
+plrd: unfinished print detected: /home/pi/printer_data/gcodes/hatch_xl.gcode at byte 943 (~83%) (HostDeathOrPowerLoss { torn_tail: true }); run `plrd recover`
+```
+
+The same message is announced on the printer console (via `RESPOND`,
+falling back to `M117`), and `pending_recovery.json` appears in the WAL
+directory:
+
+```json
+{
+  "detected_wall_ns": 1784867018379782816,
+  "file": "/home/pi/printer_data/gcodes/hatch_xl.gcode",
+  "file_position": 943,
+  "file_size": 1141,
+  "percent": 82.64680105170903,
+  "crash_class": "HostDeathOrPowerLoss { torn_tail: true }"
+}
+```
+
+### The commissioning gate, first
+
+With a filled-in `[machine]` section but no blessing yet, recovery
+refuses and prints the computed printer.cfg checksum:
+
+```text
+pipeline: stop window t_a 21.200s .. t_b 21.950s, class HostDeathOrPowerLoss { torn_tail: true }
+pipeline: machine hash computed: crc32c:658a94bb
+recover: REFUSED — machine prerequisites failed:
+  - machine prerequisites have never been validated
+  Fix the machine/config, set machine.validated_config_hash to the
+  computed hash printed above once re-validated, and retry.
+```
+
+After re-walking the [commissioning checklist](../docs/install.md#commissioning-checklist)
+and pasting `validated_config_hash = crc32c:658a94bb` into the config
+(the [blessing flow](../docs/install.md#commissioning-the-machine-section)),
+recovery proceeds.
+
+### The dry run
+
+`plrd recover --config /etc/plrd.conf` — dry run is the default, and the
+dry path never constructs a network client (the `moonraker_url` in this
+test config points at a port with nothing listening, on purpose):
+
+```console
+$ plrd recover --config /tmp/plrd-recover2.conf
+pipeline: 21 WAL records, tail: torn frame payload at end of log
+pipeline: print file /home/pi/printer_data/gcodes/hatch_xl.gcode (1141 bytes)
+pipeline: stop window t_a 21.200s .. t_b 21.950s, class HostDeathOrPowerLoss { torn_tail: true }
+pipeline: machine prerequisites validated
+pipeline: layer model from byte 0: 2 layers
+pipeline: match confidence AmbiguousWindow { offsets: [918, 943, 961, 986, 1004, 1046, 1063, 1087] } (8 candidates)
+pipeline: 5 probe candidate(s); best at (108.00, 132.00)
 # dead-reckoning recovery plan
-# resume: part.gcode @ byte 128
+# resume: hatch_xl.gcode @ byte 1087
 # envelope: gap 0.2 + 0.15 x speed 1 + margin 0.5 = 0.85 mm
 # shifted frame: Z declared 0.85 above position_min -2
+# warning: ResumeNotOnInfill
  1. [idle-timeout] disarm the idle timeout FIRST (its default M84 would clear all homed state)
       send: SET_IDLE_TIMEOUT TIMEOUT=86400
       ok?:  idle_timeout.idle_timeout within 0.5 of 86400
       fail: abort (idle-timeout-not-applied)
  2. [stepper-enable] energize the Z steppers (enabling never touches homed state; there is no M17)
       send: SET_STEPPER_ENABLE STEPPER=stepper_z ENABLE=1
-      send: SET_STEPPER_ENABLE STEPPER=stepper_z1 ENABLE=1
       ok?:  stepper_enable.steppers.stepper_z is true
-      ok?:  stepper_enable.steppers.stepper_z1 is true
       fail: abort (stepper-enable-failed)
  3. [preheat] bed to target; nozzle to the warm-but-below-ooze probing band
       send: M140 S60
@@ -180,9 +240,9 @@ margin 0.5 = **0.85 mm**; shifted declare −2 + 0.85 = **−1.15**.
       fail: abort (shifted-frame-not-declared)
  6. [probe-approach] XY travel to the selected contact point (no Z motion)
       send: G90
-      send: G0 X20 Y10 F6000
-      ok?:  toolhead.position.0 within 0.25 of 20
-      ok?:  toolhead.position.1 within 0.25 of 10
+      send: G0 X108 Y132 F6000
+      ok?:  toolhead.position.0 within 0.25 of 108
+      ok?:  toolhead.position.1 within 0.25 of 132
       fail: abort (approach-failed)
  7. [probe] single-sample probe (SAMPLES=1: the toolhead rests exactly at the halt position)
       pre:  extruder.temperature in [140, 160] C
@@ -205,13 +265,13 @@ margin 0.5 = **0.85 mm**; shifted declare −2 + 0.85 = **−1.15**.
       send: G91
       send: G1 Z1 F1200
       send: G90
-      send: SET_GCODE_OFFSET X=0 Y=0 Z=0.05
+      send: SET_GCODE_OFFSET X=0 Y=0 Z=0
       send: M220 S100
       send: M221 S100
       send: M104 S210
       send: M140 S60
       send: M106 S128
-      send: G1 F1800
+      send: G1 F3000
       ok?:  gcode_move.speed_factor within 0.01 of 1
       ok?:  gcode_move.extrude_factor within 0.01 of 1
       ok?:  extruder.temperature in [207, 213] C
@@ -220,65 +280,104 @@ margin 0.5 = **0.85 mm**; shifted declare −2 + 0.85 = **−1.15**.
 11. [entry] enter from above the part interior, speed-limited; prime; final E frame and modes
       send: G90
       send: M83
-      send: G0 Z1.35 F1200
-      send: G0 X30 Y30 F1200
-      send: G1 Z0.35 F1200
+      send: G0 Z1.4 F1200
+      send: G0 X160 Y80 F1200
+      send: G1 Z0.4 F1200
       send: G1 E0.4 F1800
-      send: G92 E3
+      send: G92 E81.44
       send: M83
       send: G90
-      send: G1 F1800
-      ok?:  toolhead.position.0 within 0.25 of 30
-      ok?:  toolhead.position.1 within 0.25 of 30
+      send: G1 F3000
+      ok?:  toolhead.position.0 within 0.25 of 160
+      ok?:  toolhead.position.1 within 0.25 of 80
       fail: abort (entry-failed)
 12. [file-select] select the file (top level only), restore exclude-object state, seek to the line boundary
-      send: M23 part.gcode
-      send: M26 S128
-      ok?:  virtual_sdcard.file_path equals "/tmp/part.gcode"
-      ok?:  virtual_sdcard.file_position within 0.5 of 128
+      send: M23 hatch_xl.gcode
+      send: M26 S1087
+      ok?:  virtual_sdcard.file_path equals "/home/pi/printer_data/gcodes/hatch_xl.gcode"
+      ok?:  virtual_sdcard.file_position within 0.5 of 1087
       fail: abort (file-select-failed)
 13. [resume-start] start playback
       send: M24
       ok?:  virtual_sdcard.is_active is true
       ok?:  idle_timeout.state equals "Printing"
       fail: abort (resume-start-failed)
+
+recover: plan has 13 steps, 34 commands; resume hatch_xl.gcode @ byte 1087
+recover: DRY RUN — nothing was sent. Re-run with --execute --confirm
+         to execute after review.
 ```
 
 What to notice, mapped to the [trust model](../docs/architecture.md#the-plan-is-data-the-trust-model):
 
+- **The ambiguity resolved honestly.** Eight candidate lines fit the
+  evidence; skip-forward is the conservative direction (resuming earlier
+  would double-extrude over printed geometry), so the resume target is
+  the **latest** offset (1087 — the start of layer-2's outer wall), and
+  the plan says so in a warning: `ResumeNotOnInfill` (the seam of the
+  resume will land on a wall, not hidden in infill).
+- **The probe point (108, 132)** is the midpoint of a layer-1 sparse
+  infill diagonal — plastic that exists, that layer 2 will rebury, well
+  away from the crash region. Five ranked candidates were found.
 - **Step 1 before everything**: the idle timeout's default `M84` would
-  clear all homed state; a later naive `G28` would crash the bed into the
-  nozzle. Disarming it is the very first command, and the plan's
-  invariants (`idle_timeout_first`, `no_g28_after_shifted_declare`, …) are
-  machine-checked in tests.
-- **Every step verifies, every failure aborts.** `pre:` lines are checked
-  before the commands are sent, `ok?:` lines after; a timeout while
-  polling a temperature is a failure. There is no continue-on-failure
-  action in the format.
+  clear all homed state; a later naive `G28` would crash the bed into
+  the nozzle. Machine-checked plan invariants (`idle_timeout_first`,
+  `no_g28_after_shifted_declare`, …) enforce the ordering.
 - **Step 5 is the safety centerpiece**: after
   `SET_KINEMATIC_POSITION Z=-1.15`, the probe descent toward
   `position_min = -2` is bounded by Klipper's own rail-limit checking —
-  0.85 mm of travel, envelope-sized, probe trusted for measurement only.
-- **`{true_z}`** is the only placeholder in the format: the executor (or
-  the human, in v1) computes `true_Z = z_prev_top + (halt − trigger)` from
-  the probe result and substitutes it. Non-finite → abort, never
-  substitute.
-- **Step 10 lifts off the part before heating to print temperature** — the
-  nozzle would otherwise dwell pressed into layer N−1 plastic while the
+  0.85 mm of envelope-sized travel, probe trusted for measurement only.
+  The envelope header shows the arithmetic: Z span 0 (single trusted
+  plateau) + sag 0.2 + 0.15 × 1 mm/s + margin 0.5.
+- **`{true_z}` is the only placeholder**: the executor computes
+  `true_Z = z_prev_top + (halt − trigger)` from the live probe result and
+  substitutes it; a non-finite result aborts, never substitutes. This
+  Tap-probe plan reads the raw trigger from `probe.last_z_result`; a
+  `[load_cell_probe]` plan differs in exactly one principled way — it
+  reads `probe.last_probe_position[2]` (`bed_z`) and adds the configured
+  `z_offset` back.
+- **Step 10 lifts off the part before heating to print temperature** —
+  the nozzle must not dwell pressed into layer-1 plastic while the
   temperature verification polls.
-- This scenario used a Tap probe (`probe.last_z_result` is the raw trigger
-  Z). A `[load_cell_probe]` plan differs in exactly one principled way:
-  the trigger is read from `probe.last_probe_position[2]` (`bed_z`) and
-  the configured `z_offset` is added back to recover the raw trigger Z.
+- The rendered format's source of truth is the golden test output,
+  `crates/plr-recovery/tests/golden/normal_tap.txt`.
+
+### The execution gates
+
+Each gate refuses loudly, and nothing is sent until all of them pass:
+
+```console
+$ plrd recover --config ... --execute
+recover: REFUSED — --execute requires --confirm.
+
+$ plrd recover --config ... --execute --confirm     # then answer: n
+recover: about to EXECUTE the plan above on the printer.
+Execute this recovery on the printer? [y/N] recover: declined by operator; nothing was sent.
+
+$ plrd recover --config ... --execute --confirm     # then answer: y
+recover: about to EXECUTE the plan above on the printer.
+Execute this recovery on the printer? [y/N] recover: cannot reach Moonraker: moonraker connection: IO error: Connection refused (os error 111)
+```
+
+(The last line is this walkthrough's deliberately dead `moonraker_url`
+being contacted **only after** consent — on a real printer the connection
+succeeds, the ready-and-idle gate runs, execution writes its JSONL
+transcript into the WAL directory, and any failed verification aborts
+with a typed reason. See
+[operations](../docs/operations.md#recovering-with-plrd-recover).)
 
 ## Reproducing
 
-- The WAL generator is intentionally not in the repo (it fakes daemon
+- The WAL generators are intentionally not in the repo (they fake daemon
   output; the daemon's own output is covered by the crash-consistency
   test). Any ~150-line program against `plr_wal`'s public API —
   `WalWriter`, `encode_slot`, the documented 24-byte sidecar layout — can
   produce an equivalent directory; truncate the final frame to simulate
   the torn tail.
-- The rendered plan regenerates via the golden test:
-  `cargo test -p plr-recovery --test golden` (set `PLR_BLESS=1` to re-bless
-  after intentional changes).
+- The `plrd recover` outputs used a config whose `[machine]` section was
+  commissioned exactly as
+  [install.md](../docs/install.md#commissioning-the-machine-section)
+  describes, against a minimal fake printer.cfg.
+- The rendered-plan format regenerates via the golden test:
+  `cargo test -p plr-recovery --test golden` (set `PLR_BLESS=1` to
+  re-bless after intentional changes).
