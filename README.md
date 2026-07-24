@@ -15,16 +15,39 @@ not depend on motors that lost their reference), re-heat, and resume from
 the right line of G-code. No Klipper patches, no custom firmware — it talks
 to Klipper's existing API socket.
 
-**Honest status (v1):** the recorder, the reconstruction, and the plan
-generator are implemented and tested. Automatic *execution* of a plan is
-deliberately not enabled yet — you inspect the generated plan and drive the
-recovery yourself. See [Project status](#project-status-v1).
+**Honest status (v1):** the whole chain is implemented and tested —
+recording, reconstruction, plan generation, and gated execution via
+Moonraker (`plrd recover`). Execution sits behind a deliberate stack of
+safety gates: per-machine commissioning attestations that default to
+"not commissioned", a printer.cfg change-detection hash, dry-run by
+default, a double consent flag plus an interactive prompt, and
+abort-on-any-failed-verification. Treat your first execution as a
+supervised commissioning run on a scrap print — the empirical hardware
+validation tasks (E1–E5) are still open. See
+[Project status](#project-status-v1).
 
 ## Quick install
 
 Prerequisites: a moving-bed-Z printer that meets the
 [project requirements](#project-requirements), and a Linux host (e.g.
-Raspberry Pi) running Klipper.
+Raspberry Pi) running Klipper. One command on the printer host (run as your
+normal printer user, not root):
+
+```sh
+curl -sSL https://raw.githubusercontent.com/Zsmerritt/dead-reckoning/main/scripts/install.sh | bash
+```
+
+Prefer to read before you pipe? So do we —
+[scripts/install.sh](scripts/install.sh) is short and commented; download
+it, read it, then run it. It installs build prerequisites, clones the repo,
+builds `plrd`, generates `/etc/plrd.conf` from your detected `printer_data`
+(socket path, Z steppers), and installs + starts the systemd service. It
+never talks to Klipper and never restarts the klipper or moonraker
+services. Add `--moonraker` to also register plrd in Moonraker's update
+manager, so Mainsail/Fluidd's update panel shows and updates it. There is a
+matching [scripts/uninstall.sh](scripts/uninstall.sh).
+
+Manual alternative (what the script automates):
 
 ```sh
 git clone https://github.com/Zsmerritt/dead-reckoning.git
@@ -41,12 +64,14 @@ under `/var/lib/plrd/wal`) and, after any unclean stop, inspect what the
 journal knows:
 
 ```sh
-plrd scan --wal /var/lib/plrd/wal
+plrd scan --wal /var/lib/plrd/wal      # evidence report
+plrd recover --config /etc/plrd.conf   # recovery plan (dry run by default)
 ```
 
 **The full guide — commissioning checklist, config editing, first-run
 verification, cross-compiling — is [docs/install.md](docs/install.md).**
-A complete worked example (record → power cut → scan → recovery plan) is
+A complete worked example (record → power cut → scan → `plrd recover`,
+with real tool output at every step) is
 [examples/recovery-walkthrough.md](examples/recovery-walkthrough.md).
 
 ## Project requirements
@@ -81,12 +106,16 @@ Out of scope in v1: multi-extruder machines.
 
 Two configs matter — the daemon's and Klipper's:
 
-- **`/etc/plrd.conf`** (flat `key = value`): every key, default, and valid
-  range is tabulated in
+- **`/etc/plrd.conf`** (flat `key = value` plus a `[machine]` section):
+  every key, default, and valid range is tabulated in
   [docs/install.md → Editing /etc/plrd.conf](docs/install.md#editing-etcplrdconf).
   A fully commented example for a Voron-style multi-Z machine:
-  [examples/plrd.conf](examples/plrd.conf). Most installs change only
-  `klipper_socket` and (multi-Z) `z_steppers`.
+  [examples/plrd.conf](examples/plrd.conf). Recording works with only
+  `klipper_socket` (and, multi-Z, `z_steppers`) changed; **recovery
+  execution additionally requires commissioning the `[machine]` section**
+  — its attestations default to false and `plrd recover` refuses until
+  every prerequisite validates
+  ([docs/install.md → Commissioning the machine section](docs/install.md#commissioning-the-machine-section)).
 - **`printer.cfg` prerequisites**: what each requirement above looks like in
   your Klipper config, and where to find it —
   [docs/install.md → Where each prerequisite lives](docs/install.md#where-each-prerequisite-lives).
@@ -133,7 +162,7 @@ flowchart LR
         SCAN --> R["plr-reconstruct<br/>possible-stop set"]
         R --> A["plr-analyzer<br/>stop match + contact zone"]
         A --> P["plr-recovery<br/>typed, verifiable plan"]
-        P --> X["execution<br/>(v1: scaffold — refuses;<br/>plans are for inspection)"]
+        P --> X["plrd recover<br/>(dry run by default;<br/>gated execution via Moonraker)"]
     end
 ```
 
@@ -174,8 +203,15 @@ summary, stated as honestly as the code states it:
   declaration, and a guard scan strips `G28` / `Z_TILT_ADJUST` /
   `QUAD_GANTRY_LEVEL` from any user macro text recovery would execute.
 - **Abort-only failure policy.** Every plan step carries machine-readable
-  verification predicates; the executor contract is to never continue past a
-  failed verification. There is no "retry and hope" path in v1.
+  verification predicates; the executor never continues past a failed
+  verification (there is no code path that does — any predicate failure,
+  poll timeout, or non-finite computation aborts with a typed reason).
+  There is no "retry and hope" path in v1, and everything sent and checked
+  is transcribed to a JSONL file.
+- **Consent-gated execution.** `plrd recover` is a dry run unless you pass
+  `--execute --confirm` *and* answer an interactive prompt; the machine
+  must be commissioned (attestations + config-hash blessing) and the
+  printer ready and idle before a single command is sent.
 - **Honest degradation.** Subscription gaps, missing file tails, adaptive
   (non-restorable) bed meshes, unparseable lines — all surface as typed flags
   or plan warnings, and several degrade to a **typed manual-recovery
@@ -214,22 +250,36 @@ Implemented and tested:
 - Offline scan + reconstruction (`plrd scan`), cross-platform.
 - The full planning pipeline (reconstruct → analyze → plan), property-tested
   and golden-tested, producing rendered, human-reviewable plans.
+- Boot-time unfinished-print detection: on startup the daemon classifies
+  the previous session's WAL, writes `pending_recovery.json`, and announces
+  the pending recovery on the printer console (`RESPOND`, falling back to
+  `M117`).
+- **Recovery execution** (`plrd recover`): the full pipeline from WAL to a
+  validated plan, then gated execution via Moonraker. The gate stack, in
+  order: machine prerequisites must validate (the `[machine]` attestations
+  **default to not-commissioned**, and the printer.cfg checksum must match
+  the blessed `validated_config_hash`); **dry run is the default** — the
+  dry path provably cannot send (no network client is ever constructed);
+  `--execute` requires `--confirm` *and* an interactive yes; the printer
+  must be ready and idle; `--step` asks again before every step. During
+  execution every step's verifications must pass — any failure aborts with
+  a typed reason — and everything sent, received, and evaluated is written
+  to a JSONL transcript in the WAL directory.
 
-Deliberately **not** in v1:
+Known limits, stated plainly:
 
-- **Plan execution is a scaffold that refuses to run.** The Moonraker
-  executor (`crates/plrd/src/executor.rs`) pins down the shape but returns
-  `NotImplemented` unconditionally; executing a recovery moves a hot nozzle
-  around a solidified print and ships only together with its own safety
-  review. In v1 you generate and inspect plans; execution is manual (see
-  [docs/operations.md](docs/operations.md#after-a-real-power-loss)).
+- **First execution = supervised commissioning.** The empirical validation
+  tasks **E1–E5** — real-hardware fault injection, probe repeatability on
+  infill, WAL write-load measurement — are open. Commission on a scrap
+  print with your hand near the power switch, using `--step`:
+  [docs/install.md](docs/install.md#commissioning-checklist).
 - ADXL drag probing is deferred; multi-extruder machines are out of scope.
 - The MCU `CLOCK_FREQ` is not journaled yet, so reconstruction falls back to
   Klipper-converted step times (reported as a `NoMcuFrequency` anomaly).
-- Empirical validation tasks **E1–E5** — real-hardware fault injection, probe
-  repeatability on infill, WAL write-load measurement — are open. They are
-  the recommended commissioning steps for any machine that intends to trust
-  a recovery: see [docs/install.md](docs/install.md#commissioning-checklist).
+- Automation declines rather than guesses: vase mode, single-wall parts,
+  layer-only matches, and mid-file exclude-object state all degrade to a
+  typed manual fallback (exclude-object state is not journaled by the WAL
+  format yet, so restoring exclusions after `M23` is out of scope).
 
 ## Local development setup
 

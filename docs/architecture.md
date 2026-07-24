@@ -1,10 +1,11 @@
 # Architecture
 
-dead-reckoning is a pipeline of four stages — **record**, **reconstruct**,
-**analyze**, **plan** — plus an execution stage that in v1 is deliberately a
-refusing scaffold. This document describes each stage as the code implements
-it, including the on-disk formats, the containment guarantee and its honest
-caveats, the probe-envelope math, and the trust model of recovery plans.
+dead-reckoning is a pipeline of five stages — **record**, **reconstruct**,
+**analyze**, **plan**, **execute** — with execution deliberately parked
+behind a stack of consent and commissioning gates. This document describes
+each stage as the code implements it, including the on-disk formats, the
+containment guarantee and its honest caveats, the probe-envelope math, and
+the trust model of recovery plans.
 
 Related: [install guide](install.md) · [operations](operations.md) ·
 [worked example](../examples/recovery-walkthrough.md).
@@ -27,7 +28,7 @@ flowchart TD
         RC --> AN["plr-analyzer:<br/>layer model, stop match, contact zone"]
         FILE --> AN
         AN --> PL["plr-recovery:<br/>validated machine + typed plan"]
-        PL --> EX["executor (v1: scaffold, refuses)"]
+        PL --> EX["plrd recover:<br/>dry run by default,<br/>gated execution via Moonraker"]
     end
 ```
 
@@ -396,7 +397,7 @@ convention — it is checked by invariant accessors used in tests
 15. `resume-start` — `M24`
 
 A rendered plan (from the checked-in golden test output) is shown in the
-[walkthrough](../examples/recovery-walkthrough.md#the-recovery-plan).
+[walkthrough](../examples/recovery-walkthrough.md#from-evidence-to-a-plan-plrd-recover).
 
 Planning outcomes are typed: `NoRecoveryNeeded` (clean shutdown),
 `Plan(...)`, or `ManualFallback { reason }` — contact zone declined, match
@@ -412,15 +413,77 @@ lethal-command guard scan first: `G28`, `Z_TILT_ADJUST` and
 `QUAD_GANTRY_LEVEL` are stripped (commented occurrences are reported but
 inert; Jinja-templated occurrences are conservatively treated as live).
 
-## Stage 5 — Execute (v1: scaffold that refuses)
+## Stage 5 — Execute (`plrd recover`)
 
-`crates/plrd/src/executor.rs` pins down the executor's shape (a Moonraker
-WebSocket JSON-RPC client walking the plan) but its `execute` returns
-`ExecutorError::NotImplemented` unconditionally. This is deliberate:
-executing a recovery moves a hot nozzle around a solidified print, so the
-implementation ships only together with its own safety review. In v1,
-recovery execution is a human activity guided by a rendered plan — see
-[operations](operations.md#after-a-real-power-loss).
+Execution lives in the daemon crate (`pipeline.rs`, `recover.rs`,
+`executor.rs`, `moonraker.rs`, `detect.rs`) and is built as a chain of
+refusals — every path to a sent G-code command passes an explicit gate.
+
+**Detect.** At every daemon start, before subscribing to Klipper, the
+previous session's WAL tail (newest three segments) is classified with the
+same reconstruction pipeline `plrd scan` uses. An unclean end with a print
+in progress writes `pending_recovery.json` (file, byte offset, rough
+percent, crash class) into the WAL directory and announces on the printer
+console via Moonraker's `printer.gcode.script` — `RESPOND` first (needs
+`[respond]`), `M117` as fallback — retried while klippy comes up, and
+never affecting recording. Detection *never* executes anything. (Moonraker
+has no client-postable announcement API; the console message is the
+supported channel.)
+
+**Pipeline** (`pipeline.rs`): WAL dir → reconstruction → layer model
+seeded from the anchor context → stop-point match → contact selection →
+`plr_recovery::plan_recovery`. Machine prerequisites validate **first**
+and refusal is fatal — the `[machine]` config section supplies the
+operator attestations (all defaulting to not-commissioned), while
+`;TYPE:` presence is observed from the actual print file and the running
+printer.cfg is checksummed (crc32c) and compared against the
+operator-blessed `validated_config_hash` — an operator gate against
+forgotten config edits, not a security boundary. The pipeline reads local
+files only and produces data; it never talks to the printer. Every
+non-plan outcome is typed: clean shutdown, machine rejection (every
+failure listed), manual fallback, not possible.
+
+**Gate stack** (`recover.rs`, each gate tested):
+
+1. **Dry run is the default** — and provably cannot send: the dry path
+   never constructs a network client (the proof is type-level; there is
+   no I/O handle in scope).
+2. `--execute` requires `--confirm`, else a usage error.
+3. **Interactive consent** — the rendered plan is shown; only `y`/`yes`
+   proceeds.
+4. **Printer ready and idle**, queried via Moonraker: `webhooks.state ==
+   "ready"`, `print_stats.state` ∈ {standby, complete, cancelled, error},
+   `virtual_sdcard.is_active == false`.
+5. Machine prerequisites (already fatal in the pipeline — no plan exists
+   to execute if they failed).
+6. With `--step`, a fresh prompt before every step.
+
+**Executor invariants** (`executor.rs`, tested in-module):
+
+1. dry run cannot send (no client parameter exists);
+2. **only plan commands are ever sent** — the single G-code call site
+   iterates a validated plan's step commands; no ad-hoc G-code exists in
+   the execution path, and the only substitution is the typed `{true_z}`
+   computation defined by the plan (non-finite ⇒ abort, never
+   substitute);
+3. **any verification failure aborts** with the step's typed reason —
+   predicate failure, poll timeout, query error, or bad computation;
+   there is no code path that continues past a failed verification;
+4. **everything is transcribed**: commands, responses, verification
+   evaluations, computations, prompts, and the outcome, as JSON lines in
+   `recovery-transcript-<unix-seconds>.jsonl` in the WAL directory —
+   refusing to create the transcript refuses to execute.
+
+The Moonraker client (`moonraker.rs`) is a minimal WebSocket JSON-RPC 2.0
+client doing read-only queries plus `printer.gcode.script`, leaning on the
+documented semantic that a gcode script call resolves only when the script
+completes, so post-verifications read settled state. Temperature
+predicates poll up to 15 minutes; everything else up to 10 seconds.
+
+Operationally: dry-run reading, gate order, and transcript forensics are
+covered in [operations](operations.md#recovering-with-plrd-recover); the
+commissioning flow in
+[install](install.md#commissioning-the-machine-section).
 
 ## Time correlation (`plr-klipper`)
 
