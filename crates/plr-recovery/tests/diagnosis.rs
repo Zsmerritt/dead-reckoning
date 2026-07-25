@@ -715,36 +715,51 @@ fn the_confirm_timeout_is_bounded_on_both_sides() {
     assert_eq!(PlanConfig::default().confirm_timeout_s, None);
 }
 
-/// The default that applies when the key is absent must be a value the key
-/// itself would have accepted, strictly inside the band.
+/// The out-of-range advice quotes a default the same validator accepts.
 ///
-/// Two reasons this lives here and not only in `plrd`. It is `plr-recovery`
-/// that *quotes* the default back at the operator in the
-/// `confirm_timeout_out_of_range` fix text, so a default outside the band
-/// would print advice the same validator rejects. And `plrd` is excluded
-/// from the Windows gate entirely (`--exclude plrd`), so a divergence
-/// introduced on a Windows machine would be structurally invisible until
-/// the Linux run; this test is in the default members and always runs.
+/// Not a restatement of the band. `confirm_timeout_out_of_range` tells the
+/// operator "remove the key to use the N s default", where N is
+/// [`CONFIRM_TIMEOUT_DEFAULT_S`] — which is also the deadline `plrd`
+/// enforces. This reads N back out of the rendered advice and hands it to
+/// the same validator that produced the refusal, so advice that a printer
+/// would reject fails here instead of in front of an operator mid-recovery.
+///
+/// It lives in this crate on purpose: `plrd` is excluded from the Windows
+/// gate (`--exclude plrd`), so the plrd-side equivalent is structurally
+/// invisible to a Windows-only run, while this file is a default member and
+/// always runs.
 #[test]
-fn the_confirm_timeout_default_sits_strictly_inside_its_own_band() {
-    assert!(
-        CONFIRM_TIMEOUT_DEFAULT_S > CONFIRM_TIMEOUT_MIN_S,
-        "the default must leave room below it: {CONFIRM_TIMEOUT_DEFAULT_S} vs \
-         {CONFIRM_TIMEOUT_MIN_S}"
-    );
-    assert!(
-        CONFIRM_TIMEOUT_DEFAULT_S < CONFIRM_TIMEOUT_MAX_S,
-        "the default must leave room above it: {CONFIRM_TIMEOUT_DEFAULT_S} vs \
-         {CONFIRM_TIMEOUT_MAX_S}"
-    );
-    // And it must be a legal setting, not merely a number in range: the
-    // validator is the authority on that, so ask it.
-    PlanConfig {
-        confirm_timeout_s: Some(CONFIRM_TIMEOUT_DEFAULT_S),
+fn the_out_of_range_advice_quotes_a_default_the_validator_accepts() {
+    let error = PlanConfig {
+        confirm_timeout_s: Some(CONFIRM_TIMEOUT_MAX_S + 1.0),
         ..PlanConfig::default()
     }
     .validate()
-    .unwrap_or_else(|e| panic!("the default must be a settable value: {e:?}"));
+    .unwrap_err_or_panic("an out-of-band confirm_timeout_s must refuse");
+    let fix = error.diagnosis().suggested_fix;
+    // "… or remove the key to use the <N> s default."
+    let quoted: f64 = fix
+        .split("to use the ")
+        .nth(1)
+        .and_then(|rest| rest.split(" s default").next())
+        .unwrap_or_else(|| panic!("the advice must name the default: {fix}"))
+        .parse()
+        .unwrap_or_else(|e| panic!("the advice's default must be a number ({e}): {fix}"));
+    // Compared as `Duration`s — exact, and it ties the rendered advice to
+    // the one `Duration` constant that `plrd` also enforces.
+    assert_eq!(
+        std::time::Duration::from_secs_f64(quoted),
+        plr_recovery::CONFIRM_TIMEOUT_DEFAULT,
+        "the advice must quote the real default: {fix}"
+    );
+    PlanConfig {
+        confirm_timeout_s: Some(quoted),
+        ..PlanConfig::default()
+    }
+    .validate()
+    .unwrap_or_else(|e| {
+        panic!("the advice names {quoted} s, which the same validator rejects: {e:?}")
+    });
 }
 
 /// A Hard refusal with `override_key: None` is refused no matter what
