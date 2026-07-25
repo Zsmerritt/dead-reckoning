@@ -12,7 +12,11 @@ THE NUMBERS IT IS MEASURED AGAINST, from klippy's own sources:
   MCU for every heater pin (``setup_max_duration``, heaters.py:62).  An
   MCU pwm pin left at a non-default value with no further update inside
   that window SHUTS THE MCU DOWN (src/pwmcmds.c:45-53 arms
-  ``pwm_end_event``).
+  ``pwm_end_event``).  A stalled reactor does not reach that bound on its
+  own — heater PWM is refreshed from the serial background thread
+  (klippy/serialhdl.py:41-65, klippy/mcu.py:628-630) — so this number is
+  used here as the strictest published bound on how long klippy's thread
+  may be unavailable, not as a claim about what a stall triggers.
 * ``MAX_MAINTHREAD_TIME = 5.0`` (heaters.py:17) is the deadline
   ``Heater.set_pwm`` compares against before it forces the PWM value to
   zero (heaters.py:72-74), and it is refreshed ONLY from ``Heater.stats``

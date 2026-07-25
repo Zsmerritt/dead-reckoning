@@ -277,13 +277,21 @@ against a deadline refreshed only from the reactor
 (`MAX_MAINTHREAD_TIME = 5.0`, `klippy/extras/heaters.py:17`, :72-74,
 :138-141): a reactor stalled past it silently drops every heater to 0 %
 with its target still set, which `verify_heater` can escalate to a
-printer shutdown (`klippy/extras/verify_heater.py:86-91`). The MCU-side
-bound is tighter still — heater pins are armed with
+printer shutdown (`klippy/extras/verify_heater.py:86-91`). A recovery is
+exactly the window where this bites: the plan sets the bed temperature
+first and holds for the probe temperature before any motion.
+
+The MCU-side bound is tighter still: heater pins are armed with
 `MAX_HEAT_TIME = 3.0` (`heaters.py:14`, :62) and a pin left at a
 non-default value with no further update inside that window shuts the MCU
-down (`src/pwmcmds.c:45-53`). A recovery is exactly the window where this
-bites: the plan sets the bed temperature first and holds for the probe
-temperature before any motion.
+down (`src/pwmcmds.c:45-53`). The host stays clear of *that* only because
+heater PWM is refreshed from the serial background thread rather than the
+reactor (`klippy/serialhdl.py:41-65` dispatches registered responses;
+`klippy/mcu.py:628-630` registers the ADC callback) — so a stalled
+reactor turns the heaters off rather than shutting the MCU down. Mid-print
+there is a further hazard in the same class: a reactor that stops flushing
+the motion queue and then resumes is the classic source of Klipper's
+`Timer too close`.
 
 And it deadlocks: plrd drives the machine through Moonraker's
 `printer.gcode.script`, which Moonraker forwards to klippy's API socket

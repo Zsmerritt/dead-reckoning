@@ -35,10 +35,14 @@ AND holds the g-code mutex.  Two independent things then break:
    SERIAL background thread (klippy/serialhdl.py:41-65 dispatches
    registered responses; ``MCU_adc`` registers its ADC callback at
    klippy/mcu.py:628-630) — the refresh keeps happening, but from
-   heaters.py:72-74 it happens with the value clamped to zero.
-   Either way: recovery sets the bed temperature first and holds for the
-   probe temperature before any motion, so a recovery is exactly the
-   window in which heaters are active.
+   heaters.py:72-74 it happens with the value clamped to zero.  So the
+   honest chain for a stalled reactor is *heaters off, then possibly a
+   verify_heater shutdown*, not an immediate MCU fault; mid-print there is
+   a second hazard in the same class, since a reactor that stops flushing
+   the motion queue and then resumes is the classic source of Klipper's
+   "Timer too close".  Either way: recovery sets the bed temperature first
+   and holds for the probe temperature before any motion, so a recovery is
+   exactly the window in which heaters are active.
 
 2. **plrd cannot drive the machine while its own client blocks.**
    plrd executes a plan by calling Moonraker's ``printer.gcode.script``

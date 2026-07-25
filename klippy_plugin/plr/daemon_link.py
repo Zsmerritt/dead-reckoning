@@ -22,16 +22,15 @@ THREAD (plr/daemon_worker.py) — NEVER INSIDE A G-CODE HANDLER.
 ``call`` does a blocking ``connect``/``sendall``/``recv``.  Klippy's
 reactor is one thread that dispatches g-code handlers inline
 (klippy/reactor.py:314-327), so a blocking call in a handler stalls
-every timer and fd in klippy — which switches the heaters off within
-``MAX_MAINTHREAD_TIME`` = 5 s (klippy/extras/heaters.py:17, :72-74,
-:138-141) and can fault the printer into shutdown
-(klippy/extras/verify_heater.py:86-91), while a heater PWM pin left
-un-refreshed past ``MAX_HEAT_TIME`` = 3 s is an MCU-side shutdown by
-construction (heaters.py:14, :62; src/pwmcmds.c:45-53).  The full
-argument, including why plrd cannot make progress either, is in
-plr/daemon_worker.py's module docstring.  Consequence for this file: no
-timeout here is "short enough" to be safe on the reactor, and none of
-these functions may be called from one.
+every timer and fd in klippy.  Past ``MAX_MAINTHREAD_TIME`` = 5 s that
+switches every heater off while its target stays set
+(klippy/extras/heaters.py:17, :72-74, :138-141) and can fault the printer
+into shutdown (klippy/extras/verify_heater.py:86-91).  The full argument
+— including the MCU-side ``MAX_HEAT_TIME`` = 3 s bound, why the serial
+background thread is what keeps the host clear of it, and why plrd cannot
+make progress either — is in plr/daemon_worker.py's module docstring.
+Consequence for this file: no timeout here is "short enough" to be safe
+on the reactor, and none of these functions may be called from one.
 
 The client's errors are human: plrd is Linux-only and may simply not be
 running, and every failure surfaces as a clear console message instead of
