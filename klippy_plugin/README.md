@@ -434,14 +434,20 @@ If a question is still answerable in one of those rows,
 recovery instead **abandons** it, says so, and sends `abort` to plrd for it
 so it is not left waiting out its own deadline.
 
-**"Sent" is never reported as "landed".** Wherever the plugin sends an abort
-without waiting for the reply — a klippy shutdown, or abandoning a question —
-it says the abort was *sent*, publishes `unknown`, and reports success only
-once plrd has actually confirmed it (which is also the only thing that
-publishes anything calmer). An abort that never arrived leaves plrd paused,
-and it will run that step's cleanup commands when its own deadline expires;
-a console that had already said "aborted, idle" is a machine that moves after
-the operator was told it was over.
+**"Sent" is never reported as "landed", and nothing can upgrade it.**
+Wherever the plugin sends an abort without owning the conversation — a klippy
+shutdown, or abandoning a question — it says the abort was *sent*, publishes
+`unknown`, and **stays there**. plrd's reply is read and reported (it may say
+"I am still paused at a confirm point", which you want to know) but it is
+never treated as confirmation, because `recover_confirm` only answers once
+plrd has FINISHED aborting — which includes pushing that step's cleanup
+commands through Moonraker. So on the intended success path the reply does
+not arrive inside the send window at all, and "no reply" is the rule rather
+than a failure. Only `journalctl -u plrd` showing plrd idle tells you the
+machine is free. An abort that never arrived leaves plrd paused, and it will
+run that cleanup when its own deadline expires; a console that had said
+"aborted, idle" is a machine that moves after the operator was told it was
+over.
 
 **Deadlines — two of them, and they end at different times.** plrd bounds
 an unanswered question itself and **aborts cleanly** when it expires: that
@@ -469,8 +475,8 @@ If klippy shuts down (M112, an MCU fault) while a question is open — or if
 one **arrives** after the shutdown, which is the likelier order — the plugin
 sends `abort` for you so plrd stops immediately rather than at its deadline,
 says it has been *sent*, and clears the dialog. It never leaves a live dialog
-on screen whose Continue button could not work. Until plrd confirms that
-abort the state is `unknown`, not `idle` (above). A shutdown *during*
+on screen whose Continue button could not work. The state is then `unknown`
+and stays `unknown` (above) — no reply to that abort can make it calmer. A shutdown *during*
 execution cannot interrupt plrd: if the recovery is this session's, the
 plugin says so and its report still arrives; if plrd is executing one this
 plugin is not connected to (`plrd_busy`) it says that instead — **no report

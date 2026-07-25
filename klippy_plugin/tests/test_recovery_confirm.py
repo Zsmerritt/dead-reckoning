@@ -17,6 +17,7 @@ thread and comes back through ``reactor.register_async_callback`` — the
 blocked would have delivered its answer before returning.
 """
 
+import threading
 import time
 
 import confirm_fixtures as fx
@@ -337,7 +338,7 @@ def test_a_malformed_token_is_treated_the_same_way(plugin, run, fake_printer, to
     assert "no usable resume token" in "\n".join(since())
 
 
-def test_only_the_timed_out_unknown_token_is_rendered_as_an_abort(
+def test_the_timed_out_unknown_token_says_plrd_is_still_aborting(
     plugin, run, fake_printer
 ):
     # plrd's confirm deadline expired between the question and the answer,
@@ -353,10 +354,14 @@ def test_only_the_timed_out_unknown_token_is_rendered_as_an_abort(
     run("PLR_RECOVER_CONTINUE")
     body = "\n".join(since())
     assert "no longer waiting for that answer" in body
-    assert "aborted" in body
+    assert "ABORTING the recovery now" in body
     assert "invalidates the Z frame" in body
-    assert "PLR_WIZARD_START" in body
-    assert plugin.recovery.state() == "idle"
+    # NOT idle: plrd is inside finish_abort, pushing that step's cleanup
+    # commands through Moonraker, so the machine is not yet still — and the
+    # old advice to re-run the wizard would have answered `busy`.
+    assert plugin.recovery.state() == "unknown"
+    assert "still sending that step's cleanup commands" in body
+    assert "Wait for plrd to go quiet" in body
 
 
 def test_busy_is_treated_as_PROOF_that_plrd_is_executing(plugin, run, fake_printer):
@@ -419,7 +424,7 @@ def test_a_response_with_no_data_map_is_not_classified_as_success(
     since = responses_since(gcode)
     execute(plugin, run)
     body = "\n".join(since())
-    assert "no data" in body
+    assert "cannot classify" in body
     assert "PLR recovery complete" not in body
     # Unclassifiable says nothing about whether plrd is still executing, so
     # it is UNKNOWN — never idle.
@@ -433,9 +438,9 @@ def test_a_response_with_no_data_map_is_not_classified_as_success(
         pytest.param(
             "the confirmation timed out before the answer arrived; the "
             "recovery aborted",
-            "idle",
+            "unknown",
             True,
-            id="timed-out-aborted",
+            id="timed-out-aborting",
         ),
         # :755-760 — no execution at all: plrd is not saying what happened.
         pytest.param(
@@ -480,7 +485,7 @@ def test_unknown_token_tells_the_truth_for_each_of_its_four_causes(
     body = "\n".join(since())
     assert plugin.recovery.state() == expected_state
     if claims_abort:
-        assert "the recovery aborted" in body
+        assert "ABORTING the recovery now" in body
     else:
         assert "aborted" not in body
         assert "may still be executing, or still paused" in body
@@ -609,20 +614,22 @@ def test_a_shutdown_at_a_confirm_point_aborts_the_recovery_and_clears_the_dialog
     assert plugin.daemon.answers() == ["abort"]
     body = "\n".join(since())
     assert "klippy stopped while plrd was waiting" in body
-    # SENT is not LANDED.  The reply is deliberately not waited for, so until
-    # plrd confirms, the state must stay unknown: an abort that never arrived
-    # leaves plrd paused, and it will run that step's cleanup commands when
-    # its own deadline expires — into a klippy the operator has since
-    # restarted.
+    # SENT is not APPLIED, and no reply can make it so: recover_confirm only
+    # returns once plrd has FINISHED aborting, so the send window closing is
+    # the normal case on the success path.
     assert "has been SENT" in body
-    assert "does NOT mean it landed" in body
+    assert "does NOT mean it was applied" in body
     assert "action:prompt_end" in since()
     assert plugin.recovery.state() == "unknown"
     assert plugin.recovery.can_answer() is False
-    # ...and once plrd confirms, and only then, it goes quiet.
+    # plrd's reply is READ and reported — and changes nothing about the
+    # published state.
     assert fake_printer.reactor.pump_async(1, timeout=2.0) == 1
-    assert "plrd accepted the abort" in "\n".join(since())
-    assert plugin.recovery.state() == "idle"
+    after = "\n".join(since())
+    assert "plrd replied to the abort" in after
+    assert "does NOT treat any reply as confirmation" in after
+    assert "accepted the abort" not in after
+    assert plugin.recovery.state() == "unknown"
 
 
 def test_a_shutdown_during_a_running_recovery_says_so_and_still_reports(
@@ -917,10 +924,11 @@ def test_a_shutdown_disarms_the_local_deadline(fake_printer, plr_config, run_cmd
     fake_printer.invoke_shutdown("Manual stop (M112)")
     reactor.advance(10000.0)
     assert reactor.run_due_timers() == 0
-    # Unknown until plrd confirms the abort; idle only after.
+    # Unknown, and it stays unknown: nothing plrd can say inside the send
+    # window proves the abort was applied.
     assert plugin.recovery.state() == "unknown"
     assert reactor.pump_async(1, timeout=2.0) == 1
-    assert plugin.recovery.state() == "idle"
+    assert plugin.recovery.state() == "unknown"
 
 
 def test_an_exception_in_the_expiry_handler_never_escapes(
@@ -1005,7 +1013,7 @@ def test_an_abort_that_could_not_be_delivered_is_reported_and_stays_unknown(
     # The failure is marshalled back to the reactor and reported.
     assert fake_printer.reactor.pump_async(1, timeout=2.0) == 1
     body = "\n".join(since())
-    assert "could NOT be delivered" in body
+    assert "could NOT be sent to plrd" in body
     assert "Assume plrd is STILL PAUSED" in body
     assert "DO NOT touch the printer" in body
     # And the state never got calmer on the strength of a send.
@@ -1125,9 +1133,9 @@ def test_a_fresh_recovery_after_the_downgrade_abandons_the_question_out_loud(
     run_cmd("PLR_RECOVER", EXECUTE=1, CONFIRM="YES")
     body = "\n".join(since())
     assert "abandoning the confirmation that was still open" in body
-    # SENT, not landed — the same honesty as every other detached abort.
+    # SENT, and no reply can confirm it was applied.
     assert "has been SENT to plrd" in body
-    assert "not confirmed" in body
+    assert "cannot confirm it was applied" in body
     assert plugin.recovery.can_answer() is False
     for _ in range(400):
         if "recover_confirm" in [c[0] for c in plugin.daemon.calls]:
@@ -1146,7 +1154,8 @@ def test_a_fresh_recovery_after_the_downgrade_abandons_the_question_out_loud(
         "recover_execute",
     ]
     joined = "\n".join(plugin.printer.lookup_object("gcode").responses)
-    assert "plrd accepted the abort for the abandoned question" in joined
+    assert "plrd replied to the abort for the abandoned question" in joined
+    assert "accepted the abort" not in joined
 
 
 def test_a_known_deadline_asserts_liveness_right_up_to_it(
@@ -1750,10 +1759,41 @@ def test_a_protocol_refusal_says_the_daemon_is_too_old(
     since = responses_since(gcode)
     execute(plugin, run)
     body = "\n".join(since())
+    # From idle, a rejected REQUEST leaves idle standing...
     assert plugin.recovery.state() == "idle"
-    assert "nothing was started and the printer was not touched" in body
+    assert "nothing was started by it" in body
     assert "NEWER than the plrd" in body
     assert "DO NOT touch" not in body
+
+
+@pytest.mark.parametrize("outcome", ["unknown-cmd", "oversized"])
+def test_a_protocol_refusal_never_discards_evidence_about_the_machine(
+    plugin, run, fake_printer, outcome
+):
+    # "plrd rejected the request" is a fact about the REQUEST.  Publishing
+    # idle over a prior `plrd_busy` would discard positive proof that plrd is
+    # executing — the same class of error as every other calming claim.
+    plugin.daemon = ScriptedDaemon(
+        {
+            "recover_execute": [
+                fx.busy(),
+                {
+                    "ok": False,
+                    "text": "unknown cmd recover_execute",
+                    "data": {"outcome": outcome},
+                },
+            ]
+        }
+    )
+    execute(plugin, run)
+    assert plugin.recovery.state() == "plrd_busy"
+    gcode = fake_printer.lookup_object("gcode")
+    since = responses_since(gcode)
+    execute(plugin, run)
+    body = "\n".join(since())
+    assert plugin.recovery.state() == "plrd_busy"
+    assert "the recovery state is unchanged" in body
+    assert "plrd IS EXECUTING A RECOVERY" in body
 
 
 def test_the_agreement_matrix_covers_running_too(plugin, run_cmd, pump):
@@ -1787,3 +1827,432 @@ def test_can_answer_is_published_on_both_surfaces(plugin, run, fake_printer):
     reactor.advance(recovery.DAEMON_CONFIRM_CEILING_S)
     reactor.run_due_timers()
     assert plugin.get_status(100.0)["recovery_can_answer"] is False
+
+
+# --- THE ABORT PATH CANNOT PUBLISH A CALMER STATE ---------------------
+#
+# The fifth instance of the calmer-state defect lived inside the machinery
+# built to prevent the first four: `_transition` forced a REASON to exist but
+# could not tell whether the sentence was true, and the detached abort's
+# reason ("plrd accepted the abort") rested on a send with no reply.  So the
+# abort path no longer has access to a calming transition at all.
+
+
+def _function_calls(source, function_name):
+    """Every ``self.<name>(...)`` called inside ``function_name``.
+
+    Nested functions count as part of their parent: the abort's worker thread
+    body is a closure inside `_abort_detached`, and it must be covered by the
+    same rule.
+    """
+    import ast
+
+    tree = ast.parse(source)
+    target = None
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef) and node.name == function_name:
+            target = node
+            break
+    assert target is not None, function_name
+    calls = set()
+    for node in ast.walk(target):
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+            if isinstance(node.func.value, ast.Name) and node.func.value.id == "self":
+                calls.add(node.func.attr)
+    return calls
+
+
+@pytest.mark.parametrize(
+    "function_name",
+    ["_abort_detached", "_abort_reported", "_abort_shutdown_pause"],
+)
+def test_the_abort_path_cannot_call_the_calming_transition(function_name):
+    # THE STRUCTURAL RULE.  `_raise_alarm` is allowed (it cannot lower);
+    # `_transition` is not, because it can.  Reintroducing the acceptance
+    # claim requires calling `_transition` here, which fails this test.
+    source, _name = _recovery_source()
+    calls = _function_calls(source, function_name)
+    assert "_transition" not in calls, sorted(calls)
+
+
+def test_raise_alarm_cannot_lower_the_state(plugin):
+    session = plugin.recovery
+    session._transition(recovery.STATE_UNKNOWN)
+    session._raise_alarm(recovery.STATE_IDLE)
+    assert session.state() == "unknown"
+    session._raise_alarm(recovery.STATE_PLRD_BUSY)
+    assert session.state() == "unknown"
+    # Equal or more alarming is fine.
+    session._transition(recovery.STATE_IDLE, reason="test")
+    session._raise_alarm(recovery.STATE_PLRD_BUSY)
+    assert session.state() == "plrd_busy"
+
+
+def _shutdown_with_abort_reply(plugin, run, fake_printer, reply):
+    """Drive M112 at a confirm point with plrd's abort reply scripted."""
+    plugin.daemon = ScriptedDaemon(
+        {"recover_execute": [fx.pause()], "recover_confirm": [reply]}
+    )
+    execute(plugin, run)
+    gcode = fake_printer.lookup_object("gcode")
+    since = responses_since(gcode)
+    fake_printer.invoke_shutdown("Manual stop (M112)")
+    for _ in range(400):
+        if plugin.daemon.tokens():
+            break
+        time.sleep(0.005)
+    assert fake_printer.reactor.pump_async(1, timeout=2.0) == 1
+    return since
+
+
+@pytest.mark.parametrize(
+    "reply,expected",
+    [
+        # THE CASE THAT RETRACTED A WARNING: plrd is still standing at the
+        # confirm point (ctrlsock.rs:740-751 answers before it takes the
+        # outstanding question), and this used to read as acceptance.
+        pytest.param(
+            {
+                "ok": False,
+                "text": "recover_confirm requires a string token",
+                "data": {"outcome": "malformed"},
+            },
+            "says nothing about whether it applied the abort",
+            id="malformed",
+        ),
+        pytest.param(
+            fx.busy(),
+            "still executing a recovery",
+            id="busy",
+        ),
+        pytest.param(
+            fx.unknown_token(text="no execution is awaiting confirmation"),
+            "not waiting for that question any more",
+            id="unknown-token",
+        ),
+        pytest.param(
+            {
+                "ok": False,
+                "text": "unknown cmd recover_confirm",
+                "data": {"outcome": "unknown-cmd"},
+            },
+            "says nothing about whether it applied the abort",
+            id="unknown-cmd",
+        ),
+        pytest.param(
+            fx.pause(token="plrc-other"),
+            "is PAUSED at a confirm-point",
+            id="still-paused",
+        ),
+        pytest.param(
+            fx.aborted(),
+            "reported the recovery as over",
+            id="terminal",
+        ),
+    ],
+)
+def test_no_plrd_reply_to_an_abort_is_read_as_acceptance(
+    plugin, run, fake_printer, reply, expected
+):
+    since = _shutdown_with_abort_reply(plugin, run, fake_printer, reply)
+    body = "\n".join(since())
+    assert "plrd replied to the abort" in body
+    assert expected in body
+    assert "does NOT treat any reply as confirmation" in body
+    # THE INVARIANT: whatever plrd said, nothing got calmer.
+    assert plugin.recovery.state() == "unknown"
+    assert plugin.get_status(100.0)["recovery_state"] == "unknown"
+    assert "DO NOT touch the printer" in "\n".join(plugin.recovery.status_lines())
+
+
+def test_no_reply_at_all_is_not_acceptance(plugin, run, fake_printer):
+    # THE NORMAL SUCCESS PATH: recover_confirm only returns once plrd has
+    # finished aborting, which includes pushing cleanup g-code through
+    # Moonraker — so the send window closing is the RULE, not a failure, and
+    # it proves nothing either way.
+    since = _shutdown_with_abort_reply(
+        plugin,
+        run,
+        fake_printer,
+        daemon_link.DaemonError(
+            "plrd did not answer 'recover_confirm' within 5s at /x"
+        ),
+    )
+    body = "\n".join(since())
+    assert "did not reply inside the send window" in body
+    assert "NOT confirmation that the abort was applied" in body
+    assert "accepted" not in body
+    assert plugin.recovery.state() == "unknown"
+
+
+def test_an_abort_outcome_cannot_land_on_a_later_conversation(
+    plugin, run, run_cmd, fake_printer
+):
+    # The old gate was `if self._token is None`, which tests for "no NEW
+    # question" rather than identity — so an abandoned question's outcome
+    # could take a fresh recover_execute from running to idle while that
+    # request was still in flight.  The epoch makes it impossible.
+    plugin.daemon = ScriptedDaemon(
+        {
+            "recover_execute": [fx.pause(), fx.completed()],
+            "recover_confirm": [fx.aborted()],
+        }
+    )
+    reactor = fake_printer.reactor
+    execute(plugin, run)
+    reactor.advance(recovery.DAEMON_CONFIRM_DEFAULT_S + recovery.CONFIRM_HEADROOM_S)
+    reactor.run_due_timers()
+    # Start a fresh recovery, abandoning the (still answerable) question.
+    run_cmd("PLR_RECOVER", EXECUTE=1, CONFIRM="YES")
+    assert plugin.recovery.state() == "running"
+    for _ in range(400):
+        if any(c[0] == "recover_confirm" for c in plugin.daemon.calls):
+            break
+        time.sleep(0.005)
+    gcode = fake_printer.lookup_object("gcode")
+    since = responses_since(gcode)
+    # Deliver the abandoned abort's outcome FIRST, while the new execute is
+    # still outstanding.
+    assert reactor.pump_async(1, timeout=2.0) >= 1
+    body = "\n".join(since())
+    # The outcome IS reported — what plrd said can matter — but it is labelled
+    # as belonging to the earlier conversation, and it moved nothing: the new
+    # request's own state stands.
+    assert "about an earlier conversation" in body
+    assert "does NOT treat any reply as confirmation" in body
+    assert plugin.recovery.state() in ("running", "idle")
+
+
+# --- one reading of plrd's tags ---------------------------------------
+
+
+@pytest.mark.parametrize(
+    "response,kind",
+    [
+        pytest.param(fx.pause(), recovery.ANSWER_PAUSE, id="pause"),
+        pytest.param(fx.busy(), recovery.ANSWER_BUSY, id="busy"),
+        pytest.param(fx.unknown_token(), recovery.ANSWER_STALE_TOKEN, id="stale"),
+        pytest.param(fx.completed(), recovery.ANSWER_TERMINAL, id="completed"),
+        pytest.param(fx.aborted(), recovery.ANSWER_TERMINAL, id="aborted"),
+        pytest.param(
+            {"ok": False, "text": "", "data": {"outcome": "unknown-cmd"}},
+            recovery.ANSWER_PROTOCOL_REFUSAL,
+            id="unknown-cmd",
+        ),
+        pytest.param(
+            {"ok": False, "text": "", "data": {"outcome": "oversized"}},
+            recovery.ANSWER_PROTOCOL_REFUSAL,
+            id="oversized",
+        ),
+        # The two excluded tags: one tag, two opposite machine states.
+        pytest.param(
+            {"ok": False, "text": "", "data": {"outcome": "error"}},
+            recovery.ANSWER_UNCLASSIFIABLE,
+            id="error",
+        ),
+        pytest.param(
+            {"ok": False, "text": "", "data": {"outcome": "malformed"}},
+            recovery.ANSWER_UNCLASSIFIABLE,
+            id="malformed",
+        ),
+        pytest.param(
+            {"ok": False, "text": "", "data": {"outcome": "brand-new"}},
+            recovery.ANSWER_UNCLASSIFIABLE,
+            id="future-tag",
+        ),
+        # ok:true under an unknown tag rests on plrd's own `ok` invariant.
+        pytest.param(
+            {"ok": True, "text": "", "data": {"outcome": "brand-new"}},
+            recovery.ANSWER_TERMINAL,
+            id="ok-true-unknown-tag",
+        ),
+        pytest.param(
+            {"ok": True, "text": "", "data": None},
+            recovery.ANSWER_UNCLASSIFIABLE,
+            id="no-data",
+        ),
+        pytest.param(None, recovery.ANSWER_UNCLASSIFIABLE, id="not-a-dict"),
+    ],
+)
+def test_classify_is_the_single_reading_of_plrds_tags(response, kind):
+    # Both the confirm loop and the detached abort's report go through this
+    # one function: a second bespoke reading is how the abort came to treat
+    # six typed refusals as acceptance.
+    assert recovery.classify(response)[0] == kind
+
+
+def test_classify_is_pure():
+    # No state, no side effects — the property that lets two very different
+    # callers share it.
+    response = fx.busy()
+    before = dict(response)
+    recovery.classify(response)
+    recovery.classify(response)
+    assert response == before
+
+
+# --- busy on the CONFIRM path keeps the question answerable ------------
+
+
+def test_busy_in_reply_to_an_answer_keeps_the_question_answerable(
+    plugin, run, run_cmd, fake_printer
+):
+    # ctrlsock.rs:752-754 answers `busy` when the session lock is contended,
+    # which means the ANSWER never landed — so the question may well still be
+    # outstanding at plrd, and destroying the token would strand the operator
+    # with a live question they can no longer answer.
+    plugin.daemon = ScriptedDaemon(
+        {
+            "recover_execute": [fx.pause()],
+            "recover_confirm": [fx.busy(), fx.completed()],
+        }
+    )
+    execute(plugin, run)
+    token_before = plugin.recovery._token
+    run("PLR_RECOVER_CONTINUE")
+    assert plugin.recovery.state() == "plrd_busy"
+    # The token came back, so a retry is possible...
+    assert plugin.recovery.can_answer() is True
+    assert plugin.recovery._token == token_before
+    assert plugin.get_status(100.0)["recovery_can_answer"] is True
+    assert "a question can still be answered" in "\n".join(
+        plugin.recovery.status_lines()
+    )
+    # ...and it works.
+    run("PLR_RECOVER_CONTINUE")
+    assert plugin.daemon.answers() == ["continue", "continue"]
+    assert plugin.recovery.state() == "idle"
+
+
+def test_busy_in_reply_to_an_execute_has_no_question_to_keep(plugin, run):
+    plugin.daemon = ScriptedDaemon({"recover_execute": [fx.busy()]})
+    execute(plugin, run)
+    assert plugin.recovery.state() == "plrd_busy"
+    assert plugin.recovery.can_answer() is False
+
+
+# --- the plrd_busy shutdown branch ------------------------------------
+
+
+def test_a_shutdown_while_plrd_is_busy_elsewhere_promises_no_report(
+    plugin, run, fake_printer
+):
+    # `was_running` used to conflate `running` with `plrd_busy`, but in
+    # plrd_busy no call of ours is in flight, so "its report still appears
+    # here" told the operator to wait forever.
+    plugin.daemon = ScriptedDaemon({"recover_execute": [fx.busy()]})
+    execute(plugin, run)
+    assert plugin.recovery.state() == "plrd_busy"
+    gcode = fake_printer.lookup_object("gcode")
+    since = responses_since(gcode)
+    fake_printer.invoke_shutdown("Manual stop (M112)")
+    body = "\n".join(since())
+    assert "NO report for it will appear here" in body
+    assert "journalctl -u plrd" in body
+    assert "still appears here" not in body
+    # No abort is sent: there is no question, and this plugin cannot stop
+    # what it is not connected to.
+    assert plugin.daemon.answers() == []
+    assert plugin.recovery.state() == "plrd_busy"
+
+
+# --- the rollback restores deadlines, it does not extend them ----------
+
+
+def test_a_failed_answer_restores_the_deadlines_it_found(
+    fake_printer, plr_config, run_cmd, pump
+):
+    # Re-arming from `now` would let the plugin assert a live question up to a
+    # full wait past plrd's real deadline.
+    plugin = confirm_timeout_plugin(fake_printer, plr_config, "120")
+    plugin.daemon = ScriptedDaemon({"recover_execute": [fx.pause()]})
+    reactor = fake_printer.reactor
+    run_cmd("PLR_RECOVER", EXECUTE=1, CONFIRM="YES")
+    assert pump() == 1
+    waketimes = [t.waketime for t in reactor.timers]
+    # Time passes, then an answer that cannot start (the channel is busy).
+    reactor.advance(60.0)
+    release = threading.Event()
+
+    class Hanging:
+        calls = []
+
+        def call(self, cmd, args=None, timeout=None):
+            self.calls.append((cmd, args, timeout))
+            release.wait(5.0)
+            return fx.completed()
+
+    plugin.daemon = Hanging()
+    plugin.recovery._async.call("status", None, 1.0, lambda r: None, lambda e: None)
+    try:
+        with pytest.raises(fake_klippy.FakeCommandError, match="still waiting"):
+            run_cmd("PLR_RECOVER_CONTINUE")
+    finally:
+        release.set()
+    # The question is back, and its deadlines are where they were — NOT
+    # 60 seconds later.
+    assert plugin.recovery.can_answer() is True
+    assert [t.waketime for t in reactor.timers] == waketimes
+    fake_printer.reactor.pump_async(1, timeout=2.0)
+
+
+def test_an_unexpected_error_in_the_abort_thread_is_reported_as_a_send_failure(
+    plugin, run, fake_printer
+):
+    class Exploding:
+        calls = []
+
+        def call(self, cmd, args=None, timeout=None):
+            self.calls.append((cmd, args, timeout))
+            if cmd == "recover_confirm":
+                raise ValueError("something we never classified")
+            return fx.pause()
+
+    plugin.daemon = Exploding()
+    execute(plugin, run)
+    gcode = fake_printer.lookup_object("gcode")
+    since = responses_since(gcode)
+    fake_printer.invoke_shutdown("Manual stop (M112)")
+    assert fake_printer.reactor.pump_async(1, timeout=2.0) == 1
+    body = "\n".join(since())
+    assert "could NOT be sent to plrd" in body
+    assert "ValueError" in body
+    assert "Assume plrd is STILL PAUSED" in body
+    assert plugin.recovery.state() == "unknown"
+
+
+def test_an_abort_outcome_after_teardown_is_dropped(plugin, run, fake_printer):
+    plugin.daemon = ScriptedDaemon(
+        {"recover_execute": [fx.pause()], "recover_confirm": [fx.aborted()]}
+    )
+    execute(plugin, run)
+    fake_printer.invoke_shutdown("Manual stop (M112)")
+    for _ in range(400):
+        if plugin.daemon.tokens():
+            break
+        time.sleep(0.005)
+    # Teardown lands before the outcome is delivered: nothing may be said to
+    # a printer that has gone away.
+    fake_printer.send_event("klippy:disconnect")
+    gcode = fake_printer.lookup_object("gcode")
+    since = responses_since(gcode)
+    assert fake_printer.reactor.pump_async(1, timeout=2.0) == 1
+    assert since() == []
+
+
+def test_a_broken_console_cannot_take_klippy_down_from_the_abort_report(
+    plugin, run, fake_printer, monkeypatch
+):
+    plugin.daemon = ScriptedDaemon(
+        {"recover_execute": [fx.pause()], "recover_confirm": [fx.aborted()]}
+    )
+    execute(plugin, run)
+    fake_printer.invoke_shutdown("Manual stop (M112)")
+
+    def boom(_msg):
+        raise RuntimeError("respond exploded")
+
+    monkeypatch.setattr(plugin.recovery, "_respond", boom)
+    # A raise here would reach klippy's reactor loop, which turns it into a
+    # printer shutdown (klippy/klippy.py:170-186).
+    assert fake_printer.reactor.pump_async(1, timeout=2.0) == 1

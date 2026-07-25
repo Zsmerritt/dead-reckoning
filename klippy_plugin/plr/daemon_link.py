@@ -68,6 +68,15 @@ import time
 #   against any plrd limit.
 PING_TIMEOUT = 1.0
 STATUS_TIMEOUT = 5.0
+# How long a DETACHED abort waits before giving up on a reply
+# (plr/recovery.py `_abort_detached`).  Its own constant, not borrowed from
+# STATUS_TIMEOUT: retuning PLR_STATUS latency must not silently retune how
+# long the plugin waits before reporting on an abort.  Short on purpose —
+# `recover_confirm` only returns once plrd has FINISHED aborting (which
+# includes pushing that step's cleanup commands through Moonraker), so a
+# reply inside this window is the exception, no reply is the rule, and
+# neither is treated as confirmation.
+ABORT_SEND_TIMEOUT = 5.0
 DRYRUN_TIMEOUT = 300.0
 EXECUTE_TIMEOUT = 3600.0
 
