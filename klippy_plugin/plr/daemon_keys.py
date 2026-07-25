@@ -156,6 +156,8 @@ DAEMON_KEYS = collections.OrderedDict(
         ("confirm_z_before_resume", BOOLEAN),
         ("debug_confirm_each_step", BOOLEAN),
         ("confirm_timeout_s", FLOAT),
+        # --- exclusive g-code access (plrd band [5, 600]) ---
+        ("gcode_barrier_timeout_s", FLOAT),
         # The system's ONE hard-refusal escape hatch.  Spelled exactly as
         # the documentation spells it: klippy's config parser is a
         # configparser.RawConfigParser (klippy/configfile.py:170-176) with
