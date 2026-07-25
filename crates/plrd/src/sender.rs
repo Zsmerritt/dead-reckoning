@@ -531,6 +531,8 @@ mod tests {
     /// A `Context` record carrying the given excluded-name set.
     fn exclusion_context(mono_ns: u64, excluded: &[&str], redefine: bool) -> WalRecord {
         WalRecord::Context(plr_wal::Context {
+            // Channel-policy tests: only the exclude payload matters.
+            print_time: None,
             mono_ns,
             print_state: None,
             virtual_sdcard: None,

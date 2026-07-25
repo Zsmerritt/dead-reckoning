@@ -442,6 +442,13 @@ fn wal_gcode_state(state: &GcodeState) -> WalGcodeState {
 fn context_record(pt: f64, file_position: u64, state: &GcodeState) -> WalRecord {
     WalRecord::Context(Context {
         mono_ns: pt_to_mono_ns(pt),
+        // Faithful to the real recorder: Klipper samples
+        // `toolhead.print_time` and `virtual_sdcard.file_position` in one
+        // `_do_query` pass, so a context at print time `pt` reports `pt` as
+        // its trapq append frontier. Setting it here is what makes this
+        // containment suite exercise the coverage-certified band path
+        // rather than the pre-change `Uncertifiable` fallback.
+        print_time: Some(pt),
         virtual_sdcard: Some(VirtualSdState {
             file_path: FILE_PATH.to_owned(),
             file_position,

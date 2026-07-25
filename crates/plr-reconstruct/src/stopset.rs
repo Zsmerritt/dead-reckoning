@@ -72,42 +72,57 @@
 //! unioning the WAL-internal interval converted under recent context
 //! frames, flagged [`Degradation::e_file_frames_incomplete`].
 //!
-//! **Known limit in `e_internal`, open and unfixed.** `e_internal` comes
-//! from the trapq evaluation plus the extension. If the durable WAL is
-//! missing extruder rows for lines the anchor context already counts as
-//! processed — possible in production because `dump_trapq` batches at
-//! ~0.5 s, so a row can land in the batch *after* the flush that wrote
-//! the context — then an E excursion confined to those lines (a retract,
-//! say) is bounded by no evidence this crate holds, while `PerLine`
-//! confidence lets a resume proceed on it. This is net-neutral against
-//! the behaviour before the extension-horizon fix; it is recorded here,
-//! not worked around, and it is being scheduled separately because
-//! changing it once broke 18 daemon end-to-end tests and each option
-//! needs its own measurement. `e_file` is unaffected: on the exact path
-//! (`reached_end` and a certain floor) the replay covers those lines, so
-//! the interval does contain the truth — but `plr-analyzer`'s
-//! `StopEvidence` (fed by `plrd`) carries only `e_internal` and discards
-//! `e_file`.
+//! # Durable extruder coverage, and the `e_internal` band
 //!
-//! Options, with what each costs — no verdict here:
+//! `e_internal` comes from the trapq evaluation plus the extension. The
+//! durable WAL can be missing extruder rows for lines the anchor context
+//! already counts as processed, for two independent reasons (both proved
+//! from Klipper's source in [`Context::print_time`]'s docs): the move
+//! waits in a `LookAheadQueue` invisible to `dump_trapq`, and then waits
+//! up to one ~0.5 s dump batch. Measured against real `OrcaSlicer` output
+//! at real print settings, the frontier runs **17–119 lines** ahead over
+//! 0.5 s and **22–147 lines** over 0.65 s (median–max).
 //!
-//! * **Union the replay's internal E over only the un-evidenced tail
-//!   band** — from the newest durable extruder-trapq coverage to the
-//!   anchor frontier, rather than the whole loose-floored window. Costs
-//!   no granularity (the band is the ~0.5 s of lines that lack rows, not
-//!   everything since the floor) but needs a way to map "newest durable
-//!   extruder coverage" onto a file offset.
-//! * **Start the forward extension at the last file offset covered by
-//!   durable trapq** instead of the anchor frontier. A monotone widening
-//!   by a few lines, reusing machinery that already exists here; costs
-//!   some simulated-motion budget on every recovery, and the offset needs
-//!   the same context/offset mapping as the option above.
-//! * **Write-side ordering in the daemon**: never journal a `Context`
-//!   whose processing frontier runs ahead of durable trapq coverage,
-//!   making the invariant hold by construction. Costs precision on
-//!   *every* print and every recovery — each `Context` then reports a
-//!   staler frontier, widening the offset window permanently — to close a
-//!   ~0.5 s band.
+//! ## What is actually missing is an *interior extremum*, not an endpoint
+//!
+//! This is the trap, and it is worth being explicit because the obvious
+//! reading of the hazard suggests a fix that does not work. Both
+//! **endpoints** of the un-evidenced band are already known exactly:
+//!
+//! * the low end from the newest durable extruder row, and
+//! * the high end from `anchor.gcode.position[3]`, which is Klipper's
+//!   `gcode_move.last_position` — internal accumulated E at the
+//!   *processing* frontier, updated inside `cmd_G1` ahead of the
+//!   lookahead and the trapq — and which already seeds the extension via
+//!   [`anchor_state_from_context`].
+//!
+//! So "bound E by the value at the frontier" looks sufficient and is
+//! **not**. The hazard is a *non-monotone excursion* strictly inside the
+//! band: a retract to `E−5` and back leaves both endpoints at `E₀`, and
+//! neither the trapq evaluation nor the extension (which starts at `F`,
+//! after the excursion) ever sees `E−5`. Only a replay of the band's
+//! lines recovers it.
+//!
+//! ## The fix: union the replay's internal E over the certified band
+//!
+//! [`replay_file_e`] already computes exact cumulative E after **every**
+//! line from the floor forward, so the excursion is already in reach; the
+//! only missing ingredient was a *safe* band start. `Context::print_time`
+//! supplies it. See [`coverage_certified_context`] for the certificate
+//! and the one premise it rests on, and [`Degradation::e_internal_band`]
+//! for what each outcome costs.
+//!
+//! Unioning over the **whole** loose-floored window instead was tried and
+//! reverted: it broke 18 daemon end-to-end tests with "below layer
+//! granularity", i.e. manual fallback or a wrong line on every real
+//! recovery. The certified band is bounded by the *coverage lag*
+//! (sub-second, tens of lines) rather than by `max_processing_lead`
+//! (3 s, hundreds of lines), which is why it does not reproduce that.
+//!
+//! `e_file` was never affected: on the exact path (`reached_end` and a
+//! certain floor) the replay already covers those lines. But
+//! `plr-analyzer`'s `StopEvidence` (fed by `plrd`) carries only
+//! `e_internal` and discards `e_file`, so the hole was reachable.
 //!
 //! # File-offset window
 //!
@@ -280,6 +295,24 @@ pub struct ExtensionSummary {
 }
 
 /// How much confidence downstream matching can place in the result.
+///
+/// # This value currently decides nothing
+///
+/// It is computed in [`compute_stop_set`] and it reads like a control
+/// signal, but **no consumer anywhere in the workspace acts on it**. Its
+/// only use outside this crate is a forensic `eprintln!` in `plrd::scan`.
+/// `plr-analyzer`'s matcher derives its own `MatchConfidence` from the
+/// candidate count and never receives this field, and nothing in the
+/// `plrd` pipeline consults it before offering a plan.
+///
+/// That matters because several flags on [`Degradation`] are documented as
+/// forcing [`Confidence::PerLayer`] "so automation refuses rather than
+/// resuming" — see [`Degradation::extension_truncated`]. **That claim is
+/// not true today.** Setting this field is a confession, not a guarantee.
+/// Any new flag that needs to be consequential must reach the code that
+/// decides whether to offer a recovery; wiring it here is a no-op, which
+/// was verified by experiment (forcing `PerLayer` from a new flag changed
+/// the behaviour of zero tests).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Confidence {
     /// Evidence covers the window without known holes: candidates are
@@ -321,9 +354,9 @@ pub struct Degradation {
     ///   cannot be computed cannot be claimed to bound anything — see
     ///   [`run_extension`].
     ///
-    /// Either way this forces [`Confidence::PerLayer`], so automation
-    /// refuses rather than resuming on an answer whose far end is
-    /// unverified.
+    /// Either way this sets [`Confidence::PerLayer`] — which, despite how
+    /// this comment used to read, does **not** make automation refuse:
+    /// nothing consumes that field. See [`Confidence`].
     pub extension_truncated: bool,
     /// The extension stopped at an unparseable/unsupported line;
     /// candidates beyond it are missing.
@@ -362,6 +395,69 @@ pub struct Degradation {
     /// The anchor context could not be placed on the print-time axis;
     /// the extension horizon used a conservative fallback catch-up.
     pub anchor_time_unknown: bool,
+    /// How `e_internal` handled the un-evidenced extruder band — see the
+    /// module-level "Durable extruder coverage".
+    pub e_internal_band: BandOutcome,
+}
+
+/// What became of the `e_internal` un-evidenced-band union.
+///
+/// The band exists because durable extruder trapq rows can be missing for
+/// lines the anchor already counts as processed; an E excursion confined
+/// to those lines (a retract) is otherwise bounded by nothing. This says
+/// which of three situations the log presented, because they have
+/// genuinely different consequences and collapsing them into one boolean
+/// would hide the one that matters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BandOutcome {
+    /// No context carries `toolhead.print_time`, so no coverage
+    /// certificate is computable: a **pre-change WAL**, or a printer whose
+    /// status never carried `toolhead.print_time`.
+    ///
+    /// `e_internal` is left exactly as older readers computed it, and
+    /// confidence is **not** forced down. That is deliberate and it is the
+    /// only honest choice: the hazard on such a log is precisely what it
+    /// has always been, and forcing per-layer here would turn every
+    /// recovery from an existing log into a manual fallback — a large
+    /// regression to mitigate nothing, since no new information is
+    /// available to act on. The limit is real and unmitigated in this
+    /// state; that is what this variant records.
+    #[default]
+    Uncertifiable,
+    /// A certificate was found: every move from lines at or before the
+    /// certified context's frontier is durable, and `e_internal` was
+    /// widened by the replayed internal-E excursion over
+    /// `(certified frontier, anchor frontier]`.
+    ///
+    /// The normal outcome during a print. Informational: it records that
+    /// the band rests on the [`max_lookahead_lead`] premise
+    /// ([`crate::config::ReconstructConfig::max_lookahead_lead`]) rather
+    /// than on direct evidence of queue depth, which cannot be observed.
+    Certified,
+    /// `toolhead.print_time` **is** present but no context could be
+    /// certified — durable extruder coverage never reached any context's
+    /// append frontier plus the lookahead premise. Typical very early in a
+    /// print, and after a drop storm that ate extruder rows.
+    ///
+    /// `e_internal` is **not** widened, and the reason is a measurement,
+    /// not a preference: widening to the floor-wide band here reproduces
+    /// the reverted whole-window union and regresses two `plrd` end-to-end
+    /// tests to `ManualFallback` (see [`band_e_internal`]). So this variant
+    /// currently *reports* an unmitigated exposure rather than trading it
+    /// for a useless answer.
+    ///
+    /// **This flag has no decision consumer yet, and saying so is the
+    /// point.** [`Degradation::confidence`] is not the lever it appears to
+    /// be: nothing outside this crate reads it. Its only consumer in the
+    /// whole workspace is a forensic `eprintln!` in `plrd::scan`; the
+    /// matcher computes its own `MatchConfidence` from candidate count and
+    /// never sees it. Wiring this variant to [`Confidence::PerLayer`] was
+    /// tried and changed the behaviour of exactly zero tests, which is the
+    /// definition of a vacuous guard. A real consumer has to live at the
+    /// point that decides whether to offer a plan, and choosing it is a
+    /// deliberate design decision rather than something to smuggle in
+    /// here — see this crate's module docs.
+    Uncertified,
 }
 
 /// The possible-stop set: everything downstream recovery needs to
@@ -487,6 +583,22 @@ pub fn compute_stop_set(
         e_file = union_opt(e_file, ext.e_file);
     }
 
+    // Close the un-evidenced extruder band: durable extruder rows can be
+    // missing for lines the anchor already counts as processed, and an E
+    // excursion confined to them (a retract) is bounded by nothing else
+    // this crate holds. See the module-level "Durable extruder coverage".
+    e_internal = union_opt(
+        e_internal,
+        band_e_internal(
+            timeline,
+            anchor,
+            floor.as_ref(),
+            file_tail,
+            config,
+            &mut degradation,
+        ),
+    );
+
     let file_window = offset_window(anchor, floor.as_ref(), extension.as_ref());
 
     degradation.confidence = if degradation.observation_gap
@@ -512,6 +624,243 @@ pub fn compute_stop_set(
         extension: extension.map(|e| e.summary),
         degradation,
     })
+}
+
+/// The internal-frame E interval over the un-evidenced extruder band, and
+/// the [`BandOutcome`] that says how much the answer can be trusted.
+///
+/// Three outcomes, in the order they are decided:
+///
+/// 1. **No `toolhead.print_time` anywhere** → [`BandOutcome::Uncertifiable`],
+///    `None`. A pre-change WAL. Behaviour is left exactly as it was, which
+///    is the only non-regressive choice: no new information exists to act
+///    on, and forcing per-layer would make every recovery from an existing
+///    log a manual fallback.
+/// 2. **Certified** → band `(certified frontier, anchor frontier]`.
+/// 3. **Present but uncertified** → band `(floor, anchor frontier]`, the
+///    maximally conservative choice, and confidence drops to per-layer in
+///    [`compute_stop_set`].
+///
+/// The replay always seeds from the **floor** context (the oldest state
+/// this crate trusts) regardless of where the band starts, because only a
+/// floor-seeded replay reconstructs the `(base_e, extrude_factor)` frames
+/// in force inside the band — the same reason [`file_frame_e`]'s replay
+/// starts there.
+fn band_e_internal(
+    timeline: &WalTimeline,
+    anchor: &Context,
+    floor: Option<&FloorContext<'_>>,
+    file_tail: Option<&FileTail<'_>>,
+    config: &ReconstructConfig,
+    degradation: &mut Degradation,
+) -> Option<Interval> {
+    if !any_print_time(&timeline.contexts) {
+        degradation.e_internal_band = BandOutcome::Uncertifiable;
+        return None;
+    }
+    let cov_end = extruder_coverage_end(&timeline.extruder_segments);
+    let certified = coverage_certified_context(&timeline.contexts, cov_end, config);
+    let (floor, tail, anchor_vsd) = (floor?, file_tail?, anchor.virtual_sdcard.as_ref()?);
+    let band_end = anchor_vsd.file_position;
+
+    let Some(vsd) = certified.and_then(|c| c.virtual_sdcard.as_ref()) else {
+        degradation.e_internal_band = BandOutcome::Uncertified;
+        // Deliberately does NOT widen. Widening to the floor here was
+        // implemented and measured: it regresses
+        // `full_pipeline_reaches_a_validated_plan` and
+        // `a_recoverable_print_is_not_denied_by_the_identity_check` to
+        // `ManualFallback("... 12 candidate lines across layers [0, 1];
+        // below layer granularity")` — i.e. it reproduces exactly the
+        // whole-window union that was reverted before. Isolated by
+        // experiment: with the widening removed and the flag still set, all
+        // 19 pipeline tests pass, so the widening is the sole cause.
+        //
+        // So this state reports the honest flag and leaves `e_internal` as
+        // older readers computed it. The containment exposure is unchanged
+        // from before this change — it is now *labelled* rather than
+        // silent, which is strictly more than the log carried before, and
+        // less than a guarantee.
+        return None;
+    };
+    degradation.e_internal_band = BandOutcome::Certified;
+    // A certified frontier ahead of the anchor's would invert the band;
+    // clamp rather than trust it. Contexts are journaled in order so this
+    // needs a reordered log to happen, but an inverted band would silently
+    // collect nothing.
+    let band_start = vsd.file_position.min(band_end);
+    replay_band_internal_e(floor, band_start, band_end, tail, config)
+}
+
+/// End of durable extruder-queue coverage in print time: the newest
+/// `print_time + duration` across journaled extruder rows.
+///
+/// Computed **per queue** (extruder rows only). A max that also folded in
+/// toolhead rows would let travel moves certify coverage of extrusion that
+/// was never journaled — and a pure retract produces an extruder row with
+/// *no* toolhead row at all, because `Move.is_kinematic_move` is false for
+/// extrude-only moves (`klippy/toolhead.py`), so the two queues genuinely
+/// do not track each other.
+fn extruder_coverage_end(segments: &[TrapqSegment]) -> Option<f64> {
+    segments
+        .iter()
+        .map(TrapqSegment::end_time)
+        .filter(|t| t.is_finite())
+        .fold(None, |acc: Option<f64>, t| {
+            Some(acc.map_or(t, |a: f64| a.max(t)))
+        })
+}
+
+/// The newest context whose processing frontier is **certified** to be
+/// fully covered by durable extruder trapq rows, with the file offset that
+/// certifies.
+///
+/// # The certificate
+///
+/// Let `C_E` be the end of durable extruder coverage (`cov_end`) and let a
+/// context report the atomic pair `(F, P)` — processing frontier and trapq
+/// append frontier ([`Context::print_time`]). The context is certified
+/// when
+///
+/// ```text
+/// C_E >= P + max_lookahead_lead
+/// ```
+///
+/// **Why that implies every move from lines `<= F` is durable**, in three
+/// steps, each resting on a cited Klipper property:
+///
+/// 1. *Everything already appended at the snapshot is durable.* Appended
+///    moves end at print time `<= P` (that is what `self.print_time`
+///    means: `_advance_move_time` sets it to the end of the last appended
+///    move). Batches deliver **contiguous** print-time coverage —
+///    `DumpTrapQ._process_batch` resumes at
+///    `last_batch_msg.print_time + min(move_t, 0.1)` and extracts to
+///    `NEVER_TIME` (`klippy/extras/motion_report.py`) — so every row
+///    ending `<= C_E` has been delivered. With `P <= C_E`, all of them
+///    have.
+/// 2. *The residue is bounded, by premise.* Lines `<= F` whose moves are
+///    still in the `LookAheadQueue` get appended later, starting at print
+///    time `P` (`_process_lookahead` seeds `next_move_time =
+///    self.print_time`) and in FIFO file order. By
+///    [`max_lookahead_lead`](crate::config::ReconstructConfig::max_lookahead_lead)
+///    the queue holds at most that much move time, so the residue ends by
+///    `P + max_lookahead_lead <= C_E` — hence it too is delivered.
+/// 3. *Nothing from lines `<= F` is left.* Steps 1 and 2 exhaust them:
+///    every such move is either appended-by-snapshot or residue.
+///
+/// Step 2 is the premise; steps 1 and 3 are proved. See the config field
+/// for the violation mode and its cost.
+///
+/// # Direction of every approximation
+///
+/// * `cov_end` is computed from rows actually in the durable log, so drops
+///   and batching **lower** it → certificate harder to satisfy → band
+///   wider. Safe.
+/// * `P` errs **high** under the one-line sampling skew
+///   ([`Context::print_time`]), which demands *more* coverage. Safe.
+/// * Scanning newest-first and taking the first certified context makes
+///   the band as narrow as the certificate allows; taking any older
+///   context would only widen it. Safe either way, so precision wins.
+fn coverage_certified_context<'a>(
+    contexts: &'a [Context],
+    cov_end: Option<f64>,
+    config: &ReconstructConfig,
+) -> Option<&'a Context> {
+    let cov_end = cov_end?;
+    if !cov_end.is_finite() {
+        return None;
+    }
+    // A non-finite or negative premise would make the comparison
+    // meaningless; fall back to "no certificate" (widest band).
+    let lead = config.max_lookahead_lead;
+    if !lead.is_finite() || lead < 0.0 {
+        return None;
+    }
+    contexts.iter().rev().find(|ctx| {
+        ctx.print_time
+            .is_some_and(|p| p.is_finite() && cov_end >= p + lead)
+    })
+}
+
+/// `true` when any context carries `toolhead.print_time` — i.e. the log is
+/// new enough for a coverage certificate to be *computable* at all.
+/// Distinguishes [`BandOutcome::Uncertifiable`] from
+/// [`BandOutcome::Uncertified`].
+fn any_print_time(contexts: &[Context]) -> bool {
+    contexts
+        .iter()
+        .any(|c| c.print_time.is_some_and(f64::is_finite))
+}
+
+/// Replays the un-evidenced band and returns the **internal**-frame E
+/// interval across it, which is what `e_internal` is missing.
+///
+/// `band_start` is the certified frontier (or the floor, uncertified);
+/// `band_end` the anchor frontier. Both are widened by one line before
+/// replaying — see "one-line sampling skew" on
+/// [`plr_wal::GcodeState::position`]: the seed state can already include
+/// the line after the recorded frontier, and under relative extrusion
+/// (`M83`, the slicer default) re-applying it shifts the replayed E by one
+/// line's delta in the *unsafe* direction. Starting one line earlier and
+/// ending one line later makes the reported interval a superset of the
+/// truth either way, at a cost of two lines of width.
+fn replay_band_internal_e(
+    seed: &FloorContext<'_>,
+    band_start: u64,
+    band_end: u64,
+    tail: &FileTail<'_>,
+    config: &ReconstructConfig,
+) -> Option<Interval> {
+    let tail_end = tail.base_offset.saturating_add(tail.bytes.len() as u64);
+    if seed.file_position < tail.base_offset || seed.file_position > tail_end {
+        return None;
+    }
+    let mut state = anchor_state_from_context(&seed.ctx.gcode).ok()?;
+    // Fits: file_position - base_offset <= bytes.len().
+    #[allow(clippy::cast_possible_truncation)]
+    let skip = (seed.file_position - tail.base_offset) as usize;
+    let bytes = tail.bytes.get(skip..).unwrap_or(&[]);
+    let mut budget = config.sim.max_lines.unwrap_or(usize::MAX);
+    let mut out: Option<Interval> = None;
+    // `prev_e` carries the E value from one line back so the band can be
+    // widened by a leading line without a second pass; `past_end` grants
+    // exactly one trailing line.
+    let mut prev_e: Option<f64> = None;
+    let mut past_end = false;
+    for line in LineIter::new(bytes, seed.file_position) {
+        if budget == 0 || state.apply(&line).is_err() {
+            break;
+        }
+        budget -= 1;
+        // Internal (trapq-frame) accumulated E — the frame `e_internal` is
+        // expressed in. NOT `gcode_position()[3]`, which is the file frame
+        // that `replay_file_e` collects.
+        let e = state.last_position[3];
+        if line.span.end >= band_start {
+            // Leading slack: on first entry, seed from the line *before*
+            // the band so a one-line-late seed cannot shift the interval
+            // off the truth.
+            if out.is_none() {
+                if let Some(p) = prev_e.filter(|v| v.is_finite()) {
+                    out = Some(Interval::point(p));
+                }
+            }
+            if e.is_finite() {
+                match &mut out {
+                    Some(iv) => iv.expand(e),
+                    None => out = Some(Interval::point(e)),
+                }
+            }
+        }
+        if line.span.end >= band_end {
+            // One trailing line, then stop.
+            if past_end {
+                break;
+            }
+            past_end = true;
+        }
+        prev_e = Some(e);
+    }
+    out
 }
 
 /// Union of two optional intervals.
@@ -762,14 +1111,30 @@ struct ExtensionResult {
 /// Bounds used, smallest wins:
 ///
 /// * **`trapq_end_time_journaled_by(anchor.mono_ns)` — motion evidence,
-///   the anchored branch.** Every line up to `F` was processed by the
-///   anchor's capture time, so its trapq row was journaled by then; the
-///   newest such row's end time is when motion preceding `F` completes.
-///   Batching delay can only drop rows from this set, which lowers the
-///   value — conservative. Whether the daemon journals rows at planning
-///   time (the reader running ahead, so the value exceeds the capture
-///   time) or later, the quantity is the same: the end of motion for
-///   lines before `F`.
+///   the anchored branch.** The newest trapq row journaled by the
+///   anchor's capture time; its end is a lower bound on when motion
+///   preceding `F` completes.
+///
+///   **This is a lower bound, not the quantity itself, and the
+///   distinction is load-bearing.** An earlier version of this comment
+///   claimed "every line up to `F` was processed by the anchor's capture
+///   time, so its trapq row was journaled by then". That is **false**, in
+///   two independent ways. Klipper's reader advances `file_position`
+///   *after* running a line (`klippy/extras/virtual_sdcard.py`,
+///   `work_handler`), but the move that line produced first sits in a
+///   Python-side `LookAheadQueue` that `dump_trapq` cannot see at all —
+///   `trapq_extract_old` (`klippy/chelper/trapq.c`) walks only
+///   `tq->moves` and `tq->history` — and is appended to the trapq only on
+///   a later flush (`ToolHead._process_lookahead`); *then* it waits up to
+///   one ~0.5 s dump batch (`klippy/extras/bulk_sensor.py`,
+///   `BATCH_INTERVAL`). So rows for lines before `F` are routinely
+///   missing from this set.
+///
+///   It remains safe **here** precisely because a lower bound is what
+///   this function wants: missing rows can only lower the value, and only
+///   the smallest term shortens the horizon. It is **not** safe wherever
+///   the same premise would license treating trapq evidence as *complete*
+///   — see the module-level "Durable extruder coverage".
 /// * **`t_a - max_processing_lead` — the degenerate branch**, taken when
 ///   no durable trapq row precedes the anchor and reported as
 ///   [`Degradation::extension_start_unanchored`]. It rests on the same
@@ -1340,14 +1705,15 @@ mod tests {
     use plr_wal::{GcodeState as WalGcodeState, Marker, MarkerKind, WalRecord};
 
     use super::{
-        anchor_state_from_context, compute_stop_set, Confidence, FileTail, Interval, Provenance,
-        ZKind,
+        anchor_state_from_context, compute_stop_set, coverage_certified_context,
+        extruder_coverage_end, BandOutcome, Confidence, FileTail, Interval, PossibleStopSet,
+        Provenance, ZKind,
     };
     use crate::config::ReconstructConfig;
     use crate::error::{ContextDefect, ReconstructError};
     use crate::testutil::{
-        context_at, context_with_gcode, heartbeat_at, ingest_records, stepper_range,
-        stepper_range_with_clock, trapq_segment_xyz,
+        context_at, context_with_gcode, context_with_print_time, heartbeat_at, ingest_records,
+        stepper_range, stepper_range_with_clock, trapq_segment_xyz,
     };
     use crate::window::compute_stop_window;
 
@@ -1466,6 +1832,197 @@ mod tests {
             "e_internal {e:?} misses motion the machine had time to execute"
         );
         assert!(!set.degradation.extension_start_unanchored);
+    }
+
+    // --- the un-evidenced extruder band -------------------------------
+    //
+    // These build the real product of the system the hazard describes: a
+    // retract *and* its unretract sit strictly between the newest durable
+    // extruder row and the anchor frontier, so both endpoints look normal
+    // and only the interior excursion is missing. Every one of them fails
+    // on the pre-change code path (`BandOutcome::Uncertifiable`), which is
+    // what stops them being green tautologies.
+
+    /// File whose lines up to offset `F` contain a retract to E−4 and back.
+    /// Absolute E so the values are readable; the trailing lines give the
+    /// extension something to consume.
+    const RETRACT_TEXT: &str = concat!(
+        "G1 X60 Y50 E10 F3000\n", //  0..21  E=10
+        "G1 E6\n",                // 21..28  retract to 6  <-- the excursion
+        "G1 E10\n",               // 28..36  back to 10
+        "G1 X70 Y50 E11\n",       // 36..52  E=11
+        "G1 X80 Y50 E12\n",       // 52..68
+        "G1 X90 Y50 E13\n",
+    );
+
+    /// Offset just past `G1 E10` (the unretract): the anchor frontier, so
+    /// the excursion is strictly *inside* the processed-but-un-evidenced
+    /// region and invisible to both trapq rows and the extension.
+    const RETRACT_FRONTIER: u64 = 36;
+
+    fn e10_gcode(e: f64) -> WalGcodeState {
+        WalGcodeState {
+            speed_factor: 1.0,
+            speed: 3000.0,
+            extrude_factor: 1.0,
+            absolute_coordinates: true,
+            absolute_extrude: true,
+            homing_origin: vec![0.0; 4],
+            position: vec![60.0, 50.0, 0.2, e],
+            gcode_position: vec![60.0, 50.0, 0.2, e],
+        }
+    }
+
+    /// Builds the retract scenario. `extruder_cov_end` is where durable
+    /// extruder-queue coverage ends in print time; `anchor_print_time` is
+    /// the anchor's journaled append frontier.
+    fn retract_set(
+        extruder_cov_end: f64,
+        floor_print_time: Option<f64>,
+        anchor_print_time: Option<f64>,
+    ) -> PossibleStopSet {
+        // Extruder row covering only up to `extruder_cov_end`: the
+        // excursion's own rows never made it to the log.
+        let e_row = trapq_segment_xyz(
+            "extruder",
+            8.0,
+            extruder_cov_end - 8.0,
+            [10.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            1.0,
+            8_000_000_000,
+        );
+        // A floor context old enough to seed the replay, and the anchor.
+        let mut floor = context_with_gcode(9_000_000_000, 0, e10_gcode(10.0));
+        floor.print_time = floor_print_time;
+        let mut anchor = context_with_gcode(20_000_000_000, RETRACT_FRONTIER, e10_gcode(10.0));
+        anchor.print_time = anchor_print_time;
+        let records = base_records(
+            20.0,
+            20.1,
+            vec![
+                WalRecord::TrapqSegment(e_row),
+                WalRecord::Context(floor),
+                WalRecord::Context(anchor),
+            ],
+        );
+        let timeline = ingest_records(records);
+        let window = compute_stop_window(&timeline, None, &cfg()).unwrap();
+        let tail = FileTail {
+            base_offset: 0,
+            bytes: RETRACT_TEXT.as_bytes(),
+        };
+        compute_stop_set(&timeline, &window, Some(&tail), &cfg()).unwrap()
+    }
+
+    /// The hazard, and the fix. Durable extruder coverage ends at 10.0; the
+    /// floor context's append frontier is 9.0, so with the 0.5 s lookahead
+    /// premise `10.0 >= 9.0 + 0.5` certifies it. The band then runs from
+    /// the floor frontier to the anchor frontier and the replay recovers
+    /// E = 6 — a value neither the trapq evaluation nor the extension can
+    /// see, because it is bracketed by E = 10 on both sides.
+    #[test]
+    fn band_recovers_a_retract_excursion_no_other_evidence_bounds() {
+        let set = retract_set(10.0, Some(9.0), Some(19.5));
+        assert_eq!(set.degradation.e_internal_band, BandOutcome::Certified);
+        let e = set.e_internal.expect("internal E interval");
+        assert!(
+            e.contains(6.0, 1e-9),
+            "e_internal {e:?} must contain the retract low point E=6"
+        );
+    }
+
+    /// The guard is not vacuous: the *same* scenario on a pre-change WAL
+    /// (no context carries `toolhead.print_time`) leaves the excursion
+    /// unbounded. This is the containment hole as it exists today, pinned
+    /// so that the fix above is demonstrably doing the work.
+    #[test]
+    fn without_print_time_the_retract_excursion_is_unbounded() {
+        let set = retract_set(10.0, None, None);
+        assert_eq!(set.degradation.e_internal_band, BandOutcome::Uncertifiable);
+        let e = set.e_internal.expect("internal E interval");
+        assert!(
+            !e.contains(6.0, 1e-9),
+            "pre-change path unexpectedly bounded E=6 ({e:?}); if this now \
+             holds, the band test above proves nothing"
+        );
+    }
+
+    /// Coverage that never reaches any context's append frontier plus the
+    /// premise yields `Uncertified` — and, by the measured decision in
+    /// [`band_e_internal`], no widening.
+    #[test]
+    fn coverage_behind_every_append_frontier_is_uncertified() {
+        // cov_end 10.0 but the floor claims an append frontier of 9.8, so
+        // 10.0 >= 9.8 + 0.5 is false; likewise for the anchor.
+        let set = retract_set(10.0, Some(9.8), Some(19.5));
+        assert_eq!(set.degradation.e_internal_band, BandOutcome::Uncertified);
+    }
+
+    /// The certificate must reject a non-finite premise and a non-finite
+    /// `print_time` rather than certifying on them — `NaN >= x` is false,
+    /// but relying on that silently is how a guard rots.
+    #[test]
+    fn non_finite_inputs_never_certify() {
+        let contexts = vec![context_with_print_time(1_000_000_000, 10, 5.0)];
+        let sane = cfg();
+        assert!(coverage_certified_context(&contexts, Some(f64::NAN), &sane).is_none());
+        // Infinity would certify *every* context — the unsafe direction —
+        // so it is rejected rather than trusted. `extruder_coverage_end`
+        // already filters non-finite row ends, so this is defence in depth.
+        assert!(coverage_certified_context(&contexts, Some(f64::INFINITY), &sane).is_none());
+        assert!(coverage_certified_context(&contexts, None, &sane).is_none());
+        let bad_premise = ReconstructConfig {
+            max_lookahead_lead: f64::NAN,
+            ..cfg()
+        };
+        assert!(coverage_certified_context(&contexts, Some(100.0), &bad_premise).is_none());
+        let negative = ReconstructConfig {
+            max_lookahead_lead: -1.0,
+            ..cfg()
+        };
+        assert!(coverage_certified_context(&contexts, Some(100.0), &negative).is_none());
+        // A context whose own print_time is non-finite must not certify.
+        let nan_ctx = vec![context_with_print_time(1_000_000_000, 10, f64::NAN)];
+        assert!(coverage_certified_context(&nan_ctx, Some(100.0), &sane).is_none());
+    }
+
+    /// `extruder_coverage_end` must ignore the toolhead queue. A pure
+    /// retract produces an extruder row and **no** toolhead row
+    /// (`Move.is_kinematic_move` is false for extrude-only moves), so
+    /// letting toolhead rows raise the coverage end would certify
+    /// extrusion that was never journaled.
+    #[test]
+    fn coverage_end_is_per_queue_and_ignores_the_toolhead() {
+        let th = trapq_segment_xyz(
+            "toolhead",
+            10.0,
+            5.0, // ends at 15.0, far ahead
+            [0.0, 0.0, 0.2],
+            [1.0, 0.0, 0.0],
+            20.0,
+            10_000_000_000,
+        );
+        let ex = trapq_segment_xyz(
+            "extruder",
+            8.0,
+            1.0, // ends at 9.0
+            [1.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            1.0,
+            8_000_000_000,
+        );
+        let timeline = ingest_records(base_records(
+            20.0,
+            20.1,
+            vec![
+                WalRecord::TrapqSegment(th),
+                WalRecord::TrapqSegment(ex),
+                WalRecord::Context(context_with_print_time(20_000_000_000, 0, 19.0)),
+            ],
+        ));
+        let cov = extruder_coverage_end(&timeline.extruder_segments);
+        assert_eq!(cov, Some(9.0), "toolhead rows must not raise coverage");
     }
 
     /// A long file of 10 mm extruding moves (0.2 s each at F3000), so a

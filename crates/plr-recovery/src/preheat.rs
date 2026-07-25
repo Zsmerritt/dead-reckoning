@@ -116,6 +116,9 @@ mod tests {
     fn context(heaters: Vec<HeaterTarget>, fans: Vec<FanTarget>) -> Context {
         Context {
             mono_ns: 0,
+            // Irrelevant to preheat derivation, which reads only heaters
+            // and fans.
+            print_time: None,
             virtual_sdcard: None,
             gcode: GcodeState {
                 speed_factor: 1.0,

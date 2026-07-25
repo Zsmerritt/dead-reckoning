@@ -1315,6 +1315,11 @@ G1 X60 Y60 E0.02
     fn crash_context(file_path: &str) -> Context {
         Context {
             mono_ns: 5_000_000_000,
+            // Faithful to the recorder: Klipper reports
+            // `toolhead.print_time` (the trapq append frontier) in the same
+            // status pass as `file_position`. 10.0 matches this fixture's
+            // heartbeat and the end of `preceding_motion`.
+            print_time: Some(10.0),
             virtual_sdcard: Some(VirtualSdState {
                 file_path: file_path.to_owned(),
                 file_position: crash_offset(),
@@ -1427,6 +1432,11 @@ G1 X60 Y60 E0.02
         // N−1, which must exist in the modeled window.
         let mut early = crash_context(gcode_path.to_str().unwrap());
         early.mono_ns = 1_000_000_000;
+        // The append frontier must move with the clock: an earlier context
+        // claiming the later context's print_time is a shape the recorder
+        // cannot produce (Klipper's `print_time` is monotone within a
+        // klippy instance) and would hand the coverage certificate a lie.
+        early.print_time = Some(6.0);
         if let Some(vsd) = &mut early.virtual_sdcard {
             vsd.file_position = 8; // after G90/M83, before layer 0
         }

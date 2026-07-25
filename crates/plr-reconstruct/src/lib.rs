@@ -289,6 +289,24 @@ pub(crate) mod testutil {
             fans: Vec::new(),
             exclude: None,
             print_state: None,
+            // Default `None` = the pre-change WAL shape, so every existing
+            // test keeps exercising the unmitigated path. Tests that
+            // exercise coverage certification set it explicitly via
+            // `context_with_print_time`.
+            print_time: None,
+        }
+    }
+
+    /// [`context_at`] with an explicit `toolhead.print_time` — the trapq
+    /// append frontier the coverage certificate is computed against.
+    pub(crate) fn context_with_print_time(
+        mono_ns: u64,
+        file_position: u64,
+        print_time: f64,
+    ) -> Context {
+        Context {
+            print_time: Some(print_time),
+            ..context_at(mono_ns, file_position)
         }
     }
 }

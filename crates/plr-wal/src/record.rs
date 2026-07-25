@@ -273,7 +273,42 @@ pub struct GcodeState {
     pub absolute_extrude: bool,
     /// `SET_GCODE_OFFSET` / `G92`-derived homing origin, per axis (mm).
     pub homing_origin: Vec<f64>,
-    /// Internal (post-transform) position, per axis (mm).
+    /// Internal (post-transform) position, per axis (mm) — Klipper's
+    /// `gcode_move.last_position`.
+    ///
+    /// # One-line sampling skew (a real, narrow hazard)
+    ///
+    /// This is **not** guaranteed to be the state after exactly the lines
+    /// that [`VirtualSdState::file_position`] claims were processed. It
+    /// can be the state after **one line more**.
+    ///
+    /// `gcode_move` updates `last_position` inside `cmd_G1`
+    /// (`klippy/extras/gcode_move.py`) *before* handing the move to the
+    /// toolhead, whereas `virtual_sdcard.work_handler` advances
+    /// `file_position` only *after* `gcode.run_script(line)` returns
+    /// (`klippy/extras/virtual_sdcard.py`). If a reactor pause lands
+    /// between those two points — reachable through
+    /// `ToolHead._check_pause`'s `reactor.pause` (`klippy/toolhead.py`),
+    /// which yields while the move buffer is full — the subscription's
+    /// `_do_query` timer can sample exactly there. The context then pairs
+    /// a frontier that excludes line `L` with a position that includes
+    /// it.
+    ///
+    /// **Why it matters, and for whom.** A consumer that seeds a forward
+    /// replay at `file_position` with this state re-applies line `L`.
+    /// Under `G90`/`M82` (absolute) that is idempotent — `last_position`
+    /// is *assigned*, not accumulated — so there is no error at all.
+    /// Under `G91`/`M83` (relative; `M83` relative-E is the default for
+    /// `PrusaSlicer` and `OrcaSlicer`) the delta is applied **twice**, so the
+    /// replayed E and XYZ run one line's displacement ahead of the truth.
+    /// The error direction is toward *more* extrusion than the frontier
+    /// accounts for, so an interval built only forward from here can miss
+    /// the true value at its low end. That is the unsafe direction, which
+    /// is why `plr_reconstruct::stopset` widens its replayed E band by one
+    /// line at each end rather than trusting the seed exactly.
+    ///
+    /// The skew is bounded at exactly one line and cannot compound: the
+    /// next status update observes a consistent pair.
     pub position: Vec<f64>,
     /// G-code space position (what the file's coordinates refer to), per
     /// axis (mm).
@@ -718,6 +753,75 @@ pub struct Context {
     /// the two contracts.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub print_state: Option<String>,
+    /// `toolhead.print_time` at capture time — the **trapq append
+    /// frontier**: the print time through which motion has been queued
+    /// into the trapezoid motion queues.
+    ///
+    /// # Why this is journaled
+    ///
+    /// It is the other half of a correspondence the recorder was
+    /// otherwise throwing away. Klipper samples this and
+    /// `virtual_sdcard.file_position` in the *same* `_do_query` pass
+    /// under `reactor.assert_no_pause()` (`klippy/webhooks.py`,
+    /// `QueryStatusHelper._do_query`), so the pair
+    /// `(file_position, print_time)` is an atomic, exact statement
+    /// relating a **file offset** to the **print-time axis**. Without it a
+    /// reader must push the host `mono_ns` through a clock correlation to
+    /// guess where a context sits on that axis.
+    ///
+    /// `self.print_time` advances only in `ToolHead._process_lookahead`
+    /// (`klippy/toolhead.py`, via `_advance_move_time`), i.e. only when
+    /// moves are appended to a trapq. So it is precisely the append
+    /// frontier, and **not** the execution frontier and **not** the
+    /// g-code processing frontier.
+    ///
+    /// # The invariant it establishes
+    ///
+    /// For a snapshot `(F, P)`, because `_process_lookahead` appends in
+    /// FIFO file order starting at `next_move_time = self.print_time`:
+    ///
+    /// > every move produced by lines at or before `F` either **ends** at
+    /// > print time `<= P`, or **begins** at print time `>= P`.
+    ///
+    /// That is what lets a reader certify durable trapq coverage of a
+    /// file offset — see `plr_reconstruct::stopset`'s
+    /// `coverage_certified_context`. The gap it closes is real: Klipper's
+    /// reader advances `file_position` *after* running each line
+    /// (`klippy/extras/virtual_sdcard.py`, `work_handler`), while the
+    /// move that line produced sits in a Python-side `LookAheadQueue`
+    /// that `dump_trapq` **cannot see at all**
+    /// (`trapq_extract_old` in `klippy/chelper/trapq.c` walks only
+    /// `tq->moves` and `tq->history`), and is only later appended and
+    /// only later batched out at ~0.5 s.
+    ///
+    /// # Sampling skew (one line, and it is not symmetric)
+    ///
+    /// `P` shares one hazard with [`GcodeState::position`]: if a reactor
+    /// pause lands *inside* `gcode.run_script(line)` — reachable via
+    /// `ToolHead._check_pause`'s `reactor.pause` — then a status update
+    /// can observe state that already includes the in-flight line while
+    /// `file_position` still excludes it. `P` errs **high** (motion for a
+    /// line the frontier does not yet claim), which is the direction that
+    /// makes a coverage certificate *stricter*, not looser: a high `P`
+    /// demands more coverage before certifying. So the skew is safe for
+    /// this field's purpose. It is **not** safe for
+    /// [`GcodeState::position`] — see the note there.
+    ///
+    /// `None` means **not observed**: a pre-change WAL, or a status
+    /// update that carried no `toolhead.print_time`.
+    ///
+    /// # WAL format compatibility
+    ///
+    /// Added after [`print_state`](Self::print_state), with the same
+    /// `#[serde(default)]` / `skip_serializing_if` treatment and for the
+    /// same reasons: every payload written before this field existed
+    /// still decodes (yielding `None`), and a `Context` that never
+    /// observed `toolhead.print_time` serializes byte-identically to what
+    /// the recorder wrote before it, so a pre-change reader is
+    /// unaffected. `Context` does not use `deny_unknown_fields`, so a
+    /// pre-change decoder also ignores the key when it *is* present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub print_time: Option<f64>,
 }
 
 impl Context {
@@ -732,6 +836,10 @@ impl Context {
                 .exclude
                 .as_deref()
                 .is_none_or(ExcludeState::values_are_finite)
+            // A non-finite print_time would poison every coverage
+            // comparison a reader makes against it, so it is rejected
+            // here rather than defended against at each use site.
+            && self.print_time.is_none_or(f64::is_finite)
     }
 }
 
@@ -901,6 +1009,19 @@ impl RecordKind {
 /// naming the variant, duplicated (deliberately) by the one-byte kind tag
 /// in the binary frame header so frames can be classified without parsing
 /// JSON.
+// `Context` (~328 bytes) dwarfs `TrapqSegment` (~112), and adding
+// `Context::print_time` is what pushed the ratio past this lint's
+// threshold — it did not fire before. Boxing the `Context` variant would
+// silence it and would genuinely shrink the enum, but it changes a public
+// type of this crate and every construction and `match` site across the
+// workspace, including files another agent owns. The project has already
+// ruled on this exact tradeoff for the same data one layer up:
+// `plrd::sender::WalCmd` carries the identical `#[allow]` with the
+// reasoning that trapq segments are >99% of the traffic and the rare large
+// variant is not worth a hot-path allocation. Same data, same conclusion,
+// kept consistent deliberately. Boxing remains the right cleanup if the
+// enum grows again; it belongs in its own change.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum WalRecord {
@@ -1040,6 +1161,7 @@ pub(crate) mod samples {
     pub(crate) fn sample_context() -> Context {
         Context {
             print_state: Some("printing".to_owned()),
+            print_time: Some(1_234.5),
             mono_ns: 3_333,
             virtual_sdcard: Some(VirtualSdState {
                 file_path: "/home/pi/gcodes/benchy.gcode".into(),
@@ -1084,10 +1206,18 @@ pub(crate) mod samples {
 
     /// A context with no exclude-object observation — the shape every
     /// pre-change WAL carries.
+    /// The `Context` shape as it was **before any of the optional fields
+    /// existed** — the payload [`PRE_EXCLUDE_CONTEXT_JSON`] is pinned to.
+    ///
+    /// Every `#[serde(default, skip_serializing_if)]` field must be
+    /// cleared here, not just `exclude`: the fixture's whole job is to be
+    /// the oldest shape, so each field added later has to be added to this
+    /// list or the byte-identity tests below stop testing anything.
     pub(crate) fn sample_context_without_exclude() -> Context {
         Context {
             exclude: None,
             print_state: None,
+            print_time: None,
             ..sample_context()
         }
     }
@@ -1243,6 +1373,66 @@ mod tests {
             serde_json::to_string(&WalRecord::Context(sample_context_without_exclude())).unwrap();
         assert_eq!(json, PRE_EXCLUDE_CONTEXT_JSON);
         assert!(!json.contains("print_state"), "{json}");
+    }
+
+    /// A pre-change payload decodes with `print_time == None` — "not
+    /// observed", never a print time of zero (which would be a real point
+    /// on Klipper's axis and would let a reader certify trapq coverage it
+    /// does not have).
+    #[test]
+    fn a_pre_print_time_context_still_decodes() {
+        let record: WalRecord = serde_json::from_str(PRE_EXCLUDE_CONTEXT_JSON).unwrap();
+        let WalRecord::Context(ctx) = &record else {
+            panic!("variant changed");
+        };
+        assert_eq!(ctx.print_time, None);
+        assert!(record.values_are_finite());
+    }
+
+    /// And a `Context` that never observed `toolhead.print_time` serializes
+    /// byte-identically to the pre-change format, so a pre-change reader
+    /// sees exactly the bytes it used to.
+    #[test]
+    fn context_without_print_time_serializes_byte_identically() {
+        let json =
+            serde_json::to_string(&WalRecord::Context(sample_context_without_exclude())).unwrap();
+        assert_eq!(json, PRE_EXCLUDE_CONTEXT_JSON);
+        assert!(!json.contains("print_time"), "{json}");
+    }
+
+    /// When it *is* observed the key appears and the value survives a round
+    /// trip bit-exactly — the `float_roundtrip` contract this crate relies
+    /// on, applied to the new field.
+    #[test]
+    fn print_time_roundtrips_bit_exactly_when_present() {
+        let pt = 1_234.567_890_123_456_7_f64;
+        let record = WalRecord::Context(Context {
+            print_time: Some(pt),
+            ..sample_context_without_exclude()
+        });
+        let json = serde_json::to_string(&record).unwrap();
+        assert!(json.contains("print_time"), "{json}");
+        let WalRecord::Context(back) = roundtrip(&record) else {
+            panic!("variant changed");
+        };
+        assert_eq!(back.print_time.unwrap().to_bits(), pt.to_bits());
+    }
+
+    /// A non-finite `print_time` must fail the finiteness gate, so the
+    /// writer skips the record rather than journaling a value that would
+    /// poison every coverage comparison a reader makes against it.
+    #[test]
+    fn non_finite_print_time_is_rejected_as_non_finite() {
+        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let record = WalRecord::Context(Context {
+                print_time: Some(bad),
+                ..sample_context_without_exclude()
+            });
+            assert!(
+                !record.values_are_finite(),
+                "print_time {bad} must be rejected"
+            );
+        }
     }
 
     /// The field is stored verbatim, so any state string — including one

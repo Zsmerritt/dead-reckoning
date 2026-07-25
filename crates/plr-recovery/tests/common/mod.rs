@@ -102,6 +102,10 @@ pub fn plain_transforms() -> TransformObservations {
 pub fn wal_context(transforms: TransformObservations) -> Context {
     Context {
         mono_ns: 5_000_000_000,
+        // These fixtures exercise plan building from a given stop set, not
+        // trapq coverage certification, so the append frontier is not
+        // observed here.
+        print_time: None,
         virtual_sdcard: Some(VirtualSdState {
             file_path: "/tmp/part.gcode".to_owned(),
             file_position: 60,

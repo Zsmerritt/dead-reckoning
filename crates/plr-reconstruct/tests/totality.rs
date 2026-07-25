@@ -166,11 +166,15 @@ fn any_context() -> impl Strategy<Value = Context> {
         proptest::option::of(any_exclude_state().prop_map(Box::new)),
         // Verbatim field: totality must hold for any reported state.
         proptest::option::of(".{0,12}"),
+        // Includes NaN/infinity: the coverage certificate compares against
+        // this, and a non-finite value must not panic or certify.
+        proptest::option::of(any_f64()),
     )
         .prop_map(
-            |(mono_ns, vsd, gcode, target, exclude, print_state)| Context {
+            |(mono_ns, vsd, gcode, target, exclude, print_state, print_time)| Context {
                 mono_ns,
                 print_state,
+                print_time,
                 virtual_sdcard: vsd.map(|(file_position, file_path)| VirtualSdState {
                     file_path,
                     file_position,
@@ -271,6 +275,10 @@ fn any_config() -> impl Strategy<Value = ReconstructConfig> {
             step_gen_lead: lead,
             quiet_tail_ns: 2_000_000_000,
             max_processing_lead: lead,
+            // Deliberately fed the same unconstrained f64 (NaN, infinity,
+            // negatives included): the premise knob must never panic or
+            // silently certify on a nonsense value.
+            max_lookahead_lead: lead,
             extension_horizon: horizon,
             exclusion_freshness_horizon: horizon,
             // Hostile but in-domain: 0 would fail validation, so the

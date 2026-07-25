@@ -161,9 +161,11 @@ prop_compose! {
         // stored verbatim, so the round trip must survive anything the
         // printer might report.
         print_state in prop::option::of(".{0,12}"),
+        print_time in prop::option::of(finite_f64()),
     ) -> Context {
         Context {
             mono_ns, virtual_sdcard, gcode, transforms, heaters, fans, exclude, print_state,
+            print_time,
         }
     }
 }

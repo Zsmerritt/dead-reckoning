@@ -378,6 +378,22 @@ pub struct Recorder {
     heaters: BTreeMap<String, f64>,
     fans: BTreeMap<String, f64>,
     latest_print_time: f64,
+    /// Newest `toolhead.print_time` verbatim — the **trapq append
+    /// frontier** — for [`plr_wal::Context::print_time`].
+    ///
+    /// Deliberately **not** [`Self::latest_print_time`], which is a `max`
+    /// across `toolhead.print_time`, *both* trapq queues' row end times
+    /// and every stepper batch's `last_step_time`. That conflation is
+    /// correct for the heartbeat's "newest motion we know of" but wrong
+    /// here: a reader compares this value against *per-queue* durable
+    /// coverage to certify that coverage, and a max polluted by the
+    /// extruder queue's own rows would let the certificate pass using the
+    /// very rows it is supposed to be testing. Over-claiming coverage is
+    /// the containment-unsafe direction, so this stays separate and
+    /// verbatim.
+    ///
+    /// `None` until a status update carries `toolhead.print_time`.
+    toolhead_print_time: Option<f64>,
     est_sample: Option<(u64, f64)>,
     last_context_mono_ns: Option<u64>,
     last_context_file_position: u64,
@@ -425,6 +441,7 @@ impl Recorder {
             heaters: BTreeMap::new(),
             fans: BTreeMap::new(),
             latest_print_time: 0.0,
+            toolhead_print_time: None,
             est_sample: None,
             last_context_mono_ns: None,
             last_context_file_position: 0,
@@ -474,6 +491,12 @@ impl Recorder {
         self.print_in_progress = false;
         self.est_sample = None;
         self.latest_print_time = 0.0;
+        // Same reason as `latest_print_time`: a RESTART resets Klipper's
+        // print-time axis, so the old instance's append frontier must not
+        // be journaled against the new instance's trapq rows. A stale-high
+        // value would certify durable coverage that does not exist —
+        // the containment-unsafe direction.
+        self.toolhead_print_time = None;
         self.exclude = ExcludeObjectSnapshot::new();
         self.exclude_seen = false;
         self.exclude_definitions_dirty = false;
@@ -654,6 +677,14 @@ impl Recorder {
         if let Some(pt) = th.print_time {
             if pt.is_finite() {
                 self.latest_print_time = self.latest_print_time.max(pt);
+                // Verbatim, and NOT a running max: a klippy restart resets
+                // the print-time axis, and a stale-high value would let a
+                // reader certify coverage it does not have. Klipper's own
+                // `self.print_time` is monotone within one klippy
+                // instance, so tracking the newest observation is faithful
+                // to the source; `reset_session` clears it at the
+                // instance boundary.
+                self.toolhead_print_time = Some(pt);
             }
         }
     }
@@ -902,6 +933,13 @@ impl Recorder {
             // first `print_stats` observation of the session, which is
             // exactly "not observed".
             print_state: self.print_state.clone(),
+            // The trapq append frontier, paired atomically with
+            // `virtual_sdcard.file_position` below because Klipper
+            // produced both in one `_do_query` pass under
+            // `assert_no_pause`. Journaling the pair is what lets recovery
+            // certify durable trapq coverage of a file offset; see
+            // `plr_wal::Context::print_time`.
+            print_time: self.toolhead_print_time,
             virtual_sdcard: self.file_path.clone().map(|file_path| VirtualSdState {
                 file_path,
                 file_position: self.file_position,
