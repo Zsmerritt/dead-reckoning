@@ -498,8 +498,11 @@ def test_recover_dryrun_daemon_down_is_reported_from_the_worker(plugin, run_cmd,
 
 
 def test_report_where_socket_tests_ran():
-    # Documents (in the test log) which transport the suite exercised;
-    # the WSL parity run covers the AF_UNIX leg on Windows dev machines.
+    # Documents (in the test log) which transport the suite exercised.  The
+    # AF_UNIX leg is NOT allowed to stay permanently skipped: on a Windows
+    # dev box it is covered by running the same suite under WSL, which is
+    # part of this branch's gate record (955 passed / 1 skipped on Linux,
+    # where the one skip is the inverse no-AF_UNIX guard below).
     assert isinstance(HAS_AF_UNIX, bool)
     if not HAS_AF_UNIX and os.name != "nt":
         pytest.fail("AF_UNIX missing on a POSIX host — unexpected")

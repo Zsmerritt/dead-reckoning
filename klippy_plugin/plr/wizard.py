@@ -364,14 +364,24 @@ class RecoveryWizard:
         prompt (idempotent), never a second parallel flow.  Returns as
         soon as the ``status`` query is handed to a worker.
         """
-        if self._state == STATE_RUNNING or self.plugin.recovery.is_active():
+        recovery_session = self.plugin.recovery
+        # QUESTION ASKED: is there anything the operator must attend to?  A
+        # question they can still answer is the reason they ran this, so it
+        # is re-shown even when the plugin can no longer vouch for it —
+        # offering a fresh "Attempt recovery" dialog instead would bury it.
+        if recovery_session.can_answer():
             gcmd.respond_info(
-                "PLR wizard: a recovery is already in flight.\n%s"
-                % ("\n".join(self.plugin.recovery.status_lines()),)
+                "PLR wizard: a recovery confirmation is still open.\n%s"
+                % ("\n".join(recovery_session.status_lines()),)
             )
-            # If plrd is waiting on an answer, put the question back on
-            # screen: that is what the operator came here for.
-            self.plugin.recovery.reshow(gcmd.respond_info)
+            recovery_session.reshow(gcmd.respond_info)
+            return
+        if self._state == STATE_RUNNING or recovery_session.needs_attention():
+            gcmd.respond_info(
+                "PLR wizard: plrd may still be working — not offering a new "
+                "recovery until that is resolved.\n%s"
+                % ("\n".join(recovery_session.status_lines()),)
+            )
             return
         if self._state == STATE_QUERY:
             # There is nothing to re-show yet: the answer that decides what
@@ -582,10 +592,11 @@ class RecoveryWizard:
         resetting the plugin's own view while plrd still drives the machine
         is precisely the outcome nobody can act on.
         """
-        if self.plugin.recovery.is_awaiting() or self.plugin.recovery.is_active():
-            # Raises for a running (unanswerable) recovery; answers abort for
-            # an outstanding confirm-point — including one the plugin can no
-            # longer show is live, where plrd's own reply adjudicates.
+        # QUESTION ASKED: is there anything the operator must attend to?  If
+        # so the session decides what cancelling can mean — answering abort
+        # for a question (even one it can no longer vouch for), and refusing
+        # for anything it cannot stop.
+        if self.plugin.recovery.needs_attention():
             self.plugin.recovery.cancel(gcmd, "PLR_WIZARD_CANCEL")
             self._reset()
             gcmd.respond_info(
@@ -696,10 +707,14 @@ class RecoveryWizard:
         works after the dialog is closed.
         """
         gcmd.respond_info(action_prompt_end())
-        if self.plugin.recovery.is_active():
+        # QUESTION ASKED: is there anything the operator must attend to?
+        # Closing a dialog must not drop the machine-state warning that goes
+        # with it — including in the two unknowable states, whose whole point
+        # is "do not touch the printer".
+        if self.plugin.recovery.needs_attention():
             gcmd.respond_info(
-                "PLR: dialog closed. %s"
-                % (" ".join(self.plugin.recovery.status_lines()),)
+                "PLR: dialog closed.\n%s"
+                % ("\n".join(self.plugin.recovery.status_lines()),)
             )
         elif self.is_active():
             gcmd.respond_info(

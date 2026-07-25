@@ -300,7 +300,7 @@ def test_the_whole_confirm_point_conversation_never_holds_the_reactor(harness):
     try:
         h.operator("PLR_RECOVER EXECUTE=1 CONFIRM=YES")
         assert h.reactor.run_until(
-            lambda: h.plugin.recovery.is_awaiting(), timeout=DAEMON_LATENCY * 4
+            lambda: h.plugin.recovery.can_answer(), timeout=DAEMON_LATENCY * 4
         ), "the confirm-point never reached the reactor"
         # The prompt really was rendered, on a real reactor, from a worker
         # callback.

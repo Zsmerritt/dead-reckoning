@@ -187,6 +187,12 @@ class DaemonLink:
         while True:
             if deadline is not None:
                 remaining = deadline - time.monotonic()
+                # This branch is also what keeps a NEGATIVE value out of
+                # `settimeout`, which would raise ValueError and leave `call`
+                # (which handles socket.timeout and OSError) reporting an
+                # internal error instead of a timeout.  It is reachable
+                # whenever connect plus sendall have already consumed the
+                # whole budget.
                 if remaining <= 0.0:
                     raise DaemonError(
                         "plrd did not finish answering '%s' within %.0fs at "
@@ -318,7 +324,10 @@ def cmd_PLR_STATUS(plugin, gcmd):
             )
         )
     gcmd.respond_info("\n".join(lines))
-    if plugin.recovery.is_awaiting():
+    # QUESTION ASKED: can an answer still be sent?  If so, the operator who
+    # ran PLR_STATUS is the operator who needs the question back in front of
+    # them, whether or not the plugin can still vouch for it.
+    if plugin.recovery.can_answer():
         # The operator asked what is going on and there is an unanswered
         # question: show it again rather than leaving them to scroll for it.
         gcmd.respond_info("The outstanding recovery question, again:")

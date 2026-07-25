@@ -391,25 +391,71 @@ question for each:
 - **`debug_confirm_each_step`** (a `[plr]` key) — "run the next step?"
   before every step, listing that step's exact commands.
 
-Only one question is ever outstanding, and only one recovery can be in
-flight: a second attempt from either entry point is refused, and
-`PLR_STATUS` re-states the outstanding question and how to answer it.
-`get_status` exposes `recovery_state`
-(`idle` / `running` / `awaiting_confirmation`) and
-`recovery_awaiting_confirmation` for UIs.
+Only one question is ever outstanding, and plrd runs exactly one recovery
+at a time. `PLR_STATUS` re-states the outstanding question in full —
+prompt included — and `PLR_WIZARD_START` does too rather than offering a
+new recovery over the top of it.
 
-**Deadlines.** plrd bounds an unanswered question itself and **aborts
-cleanly** when it expires — that is the safe direction, and it is what you
-will see: `confirm_timeout_s` in `[plr]` if you set it, otherwise plrd's
-own default. The plugin's local dialog deadline is deliberately longer
-than plrd's (derived from the same `[plr]` value, plus named headroom), so
-plrd's own abort always wins the race and is always what gets reported. If
-your answer arrives after plrd gave up, plrd says so and the plugin
-reports it as the abort it is — never as a transport error.
+#### What the plugin will and will not claim about the machine
 
-If klippy shuts down (M112, an MCU fault) while a question is open, the
+This is the operator contract, and it is deliberately asymmetric: the
+plugin will tell you it does not know, but it will never tell you nothing
+is happening unless it can show that. `get_status` publishes
+`recovery_state`, and the console prints the same thing from the same
+source, so the two can never disagree:
+
+| `recovery_state` | meaning | starting a new recovery |
+| --- | --- | --- |
+| `idle` | nothing known to be happening | allowed |
+| `running` | plrd is executing **this** session's recovery; its report comes to this console | refused locally |
+| `awaiting_confirmation` | plrd is paused on a question, and the plugin can still show it is live | refused locally |
+| `plrd_busy` | plrd **told us** it is executing a recovery (`busy`) that this session cannot report on or answer — positive proof the machine is under its control | allowed: plrd re-answers `busy` while it is still working |
+| `unknown` | plrd answered something that does not say what it is doing, or the plugin can no longer show a pause is live | allowed: it is the only way to find out |
+
+`recovery_awaiting_confirmation` is true only in the
+`awaiting_confirmation` row — never on the strength of a guess. In the two
+right-hand "allowed" rows the console says **do not touch the printer**,
+and the way to learn more is to run `PLR_RECOVER EXECUTE=1 CONFIRM=YES`
+again: plrd refuses it with `busy` if it is still working, and there is no
+path in the daemon to two concurrent recoveries. If a question is still
+answerable in one of those rows, `PLR_RECOVER_CONTINUE` /
+`PLR_RECOVER_ABORT` still work — and starting a new recovery instead
+**abandons** it, says so, and sends `abort` to plrd for it so it is not
+left waiting out its own deadline.
+
+**Deadlines — two of them, and they end at different times.** plrd bounds
+an unanswered question itself and **aborts cleanly** when it expires: that
+is the safe direction and it is what you will see. Its deadline is
+`confirm_timeout_s` in `[plr]` if you set it, otherwise plrd's own default,
+which **no response reports**. So:
+
+- the plugin's dialog **wait** is longer than any deadline plrd could be
+  using (derived from the same `[plr]` value, plus named headroom), so
+  plrd's own abort always wins the race and is always what gets reported;
+- but if you did not set `confirm_timeout_s`, the plugin stops **claiming**
+  the question is live once plrd's own default has passed: `recovery_state`
+  becomes `unknown`, the console says plrd has probably aborted already, and
+  a new recovery stops being refused. The question stays answerable, because
+  plrd's reply is the only thing that can settle it.
+
+If your answer arrives after plrd gave up, plrd says so and the plugin
+reports it as the abort it is — never as a transport error. If plrd answers
+that it is no longer waiting for that answer *without* saying the recovery
+ended, the plugin says exactly that and goes to `unknown`: it will not tell
+you a recovery aborted when plrd may still be paused with the nozzle over
+the part.
+
+If klippy shuts down (M112, an MCU fault) while a question is open — or if
+one **arrives** after the shutdown, which is the likelier order — the
 plugin answers `abort` for you so plrd stops immediately rather than at its
-deadline, tells you it did, and clears the dialog.
+deadline, tells you it did, and clears the dialog. It never leaves a live
+dialog on screen whose Continue button could not work. A shutdown *during*
+execution cannot interrupt plrd; the plugin says so and waits for plrd's
+own report, which still arrives. A shutdown does **not** stop `PLR_STATUS`,
+`PLR_RECOVER` or `PLR_WIZARD_START` from working — klippy stays up until
+`FIRMWARE_RESTART`, and that is exactly when you need to know what plrd
+thinks it is doing — but it does forbid *acting*: starting a recovery, or
+answering `continue`, are both refused until the shutdown is cleared.
 
 ### Recovery and setup wizards
 

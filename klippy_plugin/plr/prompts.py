@@ -52,7 +52,12 @@ _LINE_BREAKS = ("\r\n", "\r", "\n", " ", " ")
 
 
 def one_line(text):
-    """Collapse anything that would break an action line into one line."""
+    """Collapse anything that would break an action LINE into one line.
+
+    Handles line breaks and whitespace runs, and nothing else.  In
+    particular it does NOT touch ``|``, which is a field separator rather
+    than a line break: see :func:`field` for the fields that need it.
+    """
     if not isinstance(text, str):
         return text
     for token in _LINE_BREAKS:
@@ -70,6 +75,22 @@ Prompt = collections.namedtuple(
 )
 
 
+def field(text):
+    """A string safe to place in a PIPE-DELIMITED button field.
+
+    ``|`` separates ``<label>|<gcode>|<color>``, so a pipe inside any of
+    them shifts every following field — the client would render the tail of
+    a label as the g-code a button fires.  Nothing in this plugin passes a
+    pipe today (every label and command is a source literal), but
+    :func:`button_spec` is where the separator lives, so it is also where
+    the separator has to be neutralised.
+    """
+    text = one_line(text)
+    if not isinstance(text, str):
+        return text
+    return text.replace("|", "/")
+
+
 def button_spec(label, gcode, color):
     """``<label>|<gcode?>|<color?>`` with the pipes the Mainsail spec uses.
 
@@ -77,8 +98,8 @@ def button_spec(label, gcode, color):
     on the client); gcode alone yields ``label|gcode``; label alone is
     bare.
     """
-    label = one_line(label)
-    gcode = one_line(gcode)
+    label = field(label)
+    gcode = field(gcode)
     if color is not None:
         return "|".join([label, gcode or "", color])
     if gcode is not None:

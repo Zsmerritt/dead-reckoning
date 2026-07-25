@@ -396,3 +396,31 @@ def test_button_fields_are_collapsed_too():
     # one edit away from being built from daemon prose.
     line = prompts.action_prompt_button("two\nwords", "PLR_X\nY", "primary")
     assert line == "action:prompt_button two words|PLR_X Y|primary"
+
+
+@pytest.mark.parametrize(
+    "raw,expected",
+    [
+        pytest.param("Continue", "Continue", id="plain"),
+        pytest.param("a|b", "a/b", id="pipe"),
+        pytest.param("a|b\nc", "a/b c", id="pipe-and-newline"),
+        pytest.param(None, None, id="none"),
+    ],
+)
+def test_button_fields_neutralize_the_field_separator(raw, expected):
+    # `|` separates <label>|<gcode>|<color>, so a pipe inside a field shifts
+    # every following one — a client would render the tail of a label as the
+    # g-code the button fires.  `one_line` deliberately does NOT cover this
+    # (it handles line breaks); `field` does, where the separator lives.
+    assert prompts.field(raw) == expected
+
+
+def test_one_line_says_what_it_does_not_cover():
+    # Documented boundary, pinned: one_line is about LINES.
+    assert prompts.one_line("a|b") == "a|b"
+
+
+def test_a_pipe_in_a_button_field_cannot_shift_the_other_fields():
+    line = prompts.action_prompt_button("Continue|now", "PLR_X|Y", "warning")
+    assert line == "action:prompt_button Continue/now|PLR_X/Y|warning"
+    assert line.count("|") == 2

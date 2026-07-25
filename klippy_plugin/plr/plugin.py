@@ -544,7 +544,8 @@ class PLRPlugin:
             # still exists, so it stops asserting that it does (the state
             # goes to "unknown" for the same reason).
             "recovery_state": self.recovery.state(),
-            "recovery_awaiting_confirmation": self.recovery.is_awaiting_confirmed(),
+            "recovery_awaiting_confirmation": self.recovery.state()
+            == recovery.STATE_AWAITING,
             "clean_nozzle_macro_available": self.clean_nozzle_macro_available,
             "noise_floor_rms": self.noise_floor_rms,
             "noise_floor_temp": self.noise_floor_temp,

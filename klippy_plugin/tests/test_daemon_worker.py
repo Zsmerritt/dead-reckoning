@@ -521,3 +521,41 @@ def test_ping_is_covered_by_the_derived_method_set():
     # silently narrows to nothing.
     methods = _blocking_methods()
     assert {"call", "ping"} <= methods, methods
+
+
+def test_a_cancelled_calls_refusal_does_not_promise_a_report(fake_printer, channel):
+    # `cancel()` throws the answer away, so saying "its report will appear
+    # when it does" would be the same lie in a different place — and the slot
+    # stays taken for the orphan's whole deadline, which on a 300 s dry run is
+    # five minutes of being told to wait for nothing.
+    release = threading.Event()
+    daemon = channel(Link(block=release))
+    results, errors, on_result, on_error = collect()
+    try:
+        daemon.call("recover_dryrun", None, 300.0, on_result, on_error)
+        live = daemon.refusal_text("PLR_RECOVER")
+        assert "recover_dryrun" in live
+        assert "report appears when it does" in live
+        assert "300 s" in live or "299 s" in live
+        daemon.cancel()
+        dropped = daemon.refusal_text("PLR_RECOVER")
+        assert "will be discarded" in dropped
+        assert "report" not in dropped.replace("will be discarded", "")
+        # The wait is NAMED, in seconds, from the deadline the call was given.
+        assert "300 s" in dropped or "299 s" in dropped
+        assert "try again after that" in dropped
+    finally:
+        release.set()
+    fake_printer.reactor.pump_async(1, timeout=2.0)
+
+
+def test_the_refusal_names_the_command_that_is_holding_the_slot(fake_printer, channel):
+    release = threading.Event()
+    daemon = channel(Link(block=release))
+    results, errors, on_result, on_error = collect()
+    try:
+        daemon.call("status", None, 5.0, on_result, on_error)
+        assert "(status)" in daemon.refusal_text("PLR_STATUS")
+    finally:
+        release.set()
+    fake_printer.reactor.pump_async(1, timeout=2.0)

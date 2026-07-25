@@ -106,6 +106,7 @@ than the bug being fixed:
 
 import logging
 import threading
+import time
 
 from . import daemon_link
 
@@ -133,6 +134,11 @@ class AsyncDaemon:
         self._busy = False
         self._generation = 0
         self._closed = False
+        # What is in flight, so a refusal can name it and say how long it
+        # can still hold the slot (`refusal_text`).
+        self._in_flight_cmd = None
+        self._in_flight_until = None
+        self._in_flight_generation = 0
         # klippy lifecycle: `klippy:disconnect` is the teardown event —
         # klippy/klippy.py:195 sends it on every exit and restart, as the
         # run loop unwinds — so after it no callback may run.  A SHUTDOWN
@@ -156,19 +162,36 @@ class AsyncDaemon:
         flight" when the truth is "this channel is closed" promises the
         operator a report that will never arrive, at the moment they most
         need the truth.  Every call site renders this string.
+
+        It also has to be honest about a CANCELLED call.  Its answer is
+        deliberately discarded (:meth:`cancel`), so promising a report would
+        be the same lie in a different place — and the slot stays taken until
+        the orphan's own deadline, which on a dry run is minutes.  So the
+        wait is named, in seconds, from the deadline the call was given.
         """
         with self._lock:
             closed, busy = self._closed, self._busy
+            dropped = self._in_flight_generation != self._generation
+            cmd, until = self._in_flight_cmd, self._in_flight_until
         if closed:
             return "%s: klippy is shutting down, so nothing was asked of plrd." % (
                 command,
             )
-        if busy:
+        if not busy:
+            return None
+        remaining = max(0.0, (until or 0.0) - time.monotonic())
+        if dropped:
             return (
-                "%s: a plrd conversation on this channel has not answered "
-                "yet; its report will appear when it does." % (command,)
+                "%s: the previous plrd call (%s) was dismissed and its answer "
+                "will be discarded, but its socket is still open — this "
+                "channel frees in up to %d s. Nothing is coming before then; "
+                "try again after that." % (command, cmd, int(remaining) + 1)
             )
-        return None
+        return (
+            "%s: a plrd call (%s) has not answered yet; its report appears "
+            "when it does, or within %d s at the latest."
+            % (command, cmd, int(remaining) + 1)
+        )
 
     # -- the one entry point -----------------------------------------
 
@@ -186,6 +209,9 @@ class AsyncDaemon:
                 return False
             self._busy = True
             generation = self._generation
+            self._in_flight_cmd = cmd
+            self._in_flight_generation = generation
+            self._in_flight_until = time.monotonic() + float(timeout)
         thread = threading.Thread(
             target=self._work,
             args=(generation, cmd, args, timeout, on_result, on_error),
@@ -206,6 +232,8 @@ class AsyncDaemon:
             # would shut the printer down.
             with self._lock:
                 self._busy = False
+                self._in_flight_cmd = None
+                self._in_flight_until = None
             logger.exception("plr: cannot start the %s worker thread", self.label)
             return False
         return True
