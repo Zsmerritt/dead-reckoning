@@ -25,9 +25,22 @@ The footer is not re-captured. It is copied from the already-committed
 `fixtures/synthetic/orca_real_footer.gcode`, which `footer_generator.py`
 already scrubbed and vetted -- so this adds **zero** new content derived from
 anyone's model. The header is written from scratch to OrcaSlicer's shape.
-Deliberately absent: the `THUMBNAIL_BLOCK`, which in a real file is a
-base64 PNG *rendering of the part*, i.e. exactly the geometry we must not
-commit.
+
+## No THUMBNAIL_BLOCK, and it must stay that way
+
+Real OrcaSlicer output opens with a `THUMBNAIL_BLOCK` holding a base64 PNG.
+That PNG is **a rendering of the part**, so adding one would reintroduce
+exactly the content the operator ruled out -- more directly than the g-code
+does, since it is a picture rather than coordinates.
+
+This is written down because the omission looks like a gap. A future reader
+comparing this fixture against a real file will notice the missing block and
+reasonably wonder whether the corpus should carry one for fidelity: to
+exercise the parser against a very long base64 comment run, say. The answer is
+no, and the reason is not fidelity but provenance. If a thumbnail-shaped input
+is ever genuinely needed, synthesize the base64 payload (random bytes, or an
+image of nothing) rather than copying a real block -- the parser cannot tell
+the difference and the repository history can.
 
 # What makes the body realistic rather than a sketch
 

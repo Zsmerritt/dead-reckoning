@@ -2,7 +2,13 @@
 //! (`fixtures/synthetic/`) and any real sliced files dropped into
 //! `fixtures/real/`.
 
-#![allow(clippy::float_cmp)] // exact replay equality is intentional
+#![allow(clippy::float_cmp)]
+// exact replay equality is intentional
+// The density measurements below average small counts (candidates per sampled
+// stop point, tens at most) into f64 for reporting. `usize -> f64` cannot lose
+// precision until 2^53, so the lint has nothing to catch here; the alternative
+// is `u32` casts that would need their own justification.
+#![allow(clippy::cast_precision_loss)]
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -109,14 +115,361 @@ fn synthetic_corpus_builds_sane_models() {
     }
 }
 
+/// # This test used to pass vacuously too
+///
+/// `fixtures/real/` held only a README, so this loop body never executed —
+/// the same hole as `plr-gcode`'s `real_corpus_full_pipeline`, in a second
+/// place, found only because the first one was being fixed. The corpus
+/// assertion is the fix: an empty corpus now fails loudly rather than
+/// reporting `ok` while testing nothing.
 #[test]
 fn real_corpus_builds_sane_models() {
-    for path in gcode_files(&fixtures_dir().join("real")) {
+    let files = gcode_files(&fixtures_dir().join("real"));
+    assert!(
+        !files.is_empty(),
+        "fixtures/real/ has no *.gcode: this test would pass vacuously. \
+         Regenerate with `python3 fixtures/real/realistic_generator.py`."
+    );
+    for path in files {
         let data = fs::read(&path).expect("read fixture");
         let model = model_of(&data);
         check_model_invariants(&model, data.len() as u64);
         for n in 0..=u32::try_from(model.layers.len().min(30)).unwrap() {
             let _ = select_contact_zone(&model, n, [0.0, 0.0], &ContactConfig::default());
+        }
+    }
+}
+
+// --- stop-point discrimination at realistic extrusion density -------------
+//
+// `plrd`'s end-to-end fixture deliberately puts 0.65 mm of E on single lines
+// so that stop-point matching is unambiguous, and it sits at exactly 8 of 8
+// candidates against `ambiguity_limit`. Both properties make it useless for
+// asking how well the matcher actually discriminates on production files,
+// where per-line E is 0.028–0.078 mm (measured; see
+// `fixtures/real/README.md`) — more than ten times smaller.
+//
+// These tests ask that question against the realistic corpus.
+
+fn realistic() -> Vec<u8> {
+    let path = fixtures_dir().join("real").join("realistic_orca.gcode");
+    fs::read(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
+}
+
+/// The move at `index` in the model, and evidence naming it exactly: a tight
+/// XY box around its endpoint, its Z, and its own E range.
+///
+/// This is the *best case* for the matcher — evidence as precise as any
+/// reconstruction could produce. Whatever ambiguity remains is intrinsic to
+/// the file, not a product of loose bounds.
+fn evidence_for(model: &LayerModel, index: usize, e_pad: f64) -> (StopEvidence, &SimMove) {
+    evidence_for_xy(model, index, e_pad, 0.05)
+}
+
+/// [`evidence_for`] with an explicit XY half-width.
+///
+/// The tight default (0.05 mm) is the best case and deliberately gives XY the
+/// strongest possible hand, which *understates* what the E constraint
+/// contributes. A real reconstruction reports XY as a bounding region over the
+/// whole evaluated window, which can be tens of millimetres — so E's real
+/// contribution has to be measured against a loose box too.
+fn evidence_for_xy(
+    model: &LayerModel,
+    index: usize,
+    e_pad: f64,
+    xy_pad: f64,
+) -> (StopEvidence, &SimMove) {
+    evidence_full(model, index, e_pad, xy_pad, None)
+}
+
+/// Realistic byte-window half-width, bytes.
+///
+/// **This is the dominant filter, and omitting it makes every other number
+/// meaningless.** The real pipeline never matches against a whole file: the
+/// window is `[frontier at t_a - max_processing_lead, extension resume
+/// offset]`. At the frontier rates measured on real slicer output (~1400 B/s
+/// median) a 3 s lead is ~4 KB behind the stop, and the 2 s extension horizon
+/// ~3 KB ahead. Measured on `plrd`'s own e2e fixture the window was
+/// `[8, 2246]` of a 4262-byte file.
+///
+/// A `whole_file()` window on a 348 KB corpus admits two orders of magnitude
+/// more moves than production ever would, which inflates candidate counts and
+/// makes the E constraint look far more load-bearing than it is.
+const WINDOW_HALF: u64 = 4_096;
+
+/// [`evidence_for_xy`] with an explicit byte window (`None` = realistic).
+fn evidence_full(
+    model: &LayerModel,
+    index: usize,
+    e_pad: f64,
+    xy_pad: f64,
+    window: Option<ByteWindow>,
+) -> (StopEvidence, &SimMove) {
+    let mv = &model.moves[index];
+    let (ex, ey) = (mv.end[0], mv.end[1]);
+    let e_lo = mv.start[3].min(mv.end[3]);
+    let e_hi = mv.start[3].max(mv.end[3]);
+    (
+        StopEvidence {
+            x: iv(ex - xy_pad, ex + xy_pad),
+            y: iv(ey - xy_pad, ey + xy_pad),
+            e: Some(iv(e_lo - e_pad, e_hi + e_pad)),
+            z_candidates: vec![mv.end[2]],
+            window: window.unwrap_or(ByteWindow {
+                start: mv.span.start.saturating_sub(WINDOW_HALF),
+                end: Some(mv.span.end + WINDOW_HALF),
+            }),
+        },
+        mv,
+    )
+}
+
+/// Sample move indices spread across the model, skipping the first layer
+/// (which has no predecessor geometry) and any non-depositing move.
+fn sample_indices(model: &LayerModel) -> Vec<usize> {
+    let n = model.moves.len();
+    (0..24)
+        .map(|k| n / 6 + k * (n / 40).max(1))
+        .filter(|i| *i < n && model.moves[*i].kind == MoveKind::Extrusion)
+        .collect()
+}
+
+/// **How much work is the E constraint actually doing at realistic density?**
+///
+/// `MatchConfig::e_tolerance` is a fixed 1.0 mm. At the ~0.05 mm per line a
+/// real slicer emits that spans roughly twenty lines, so the E filter should
+/// be nearly non-discriminating in production — which would mean per-line
+/// matching is carried almost entirely by XY, and that the E evidence this
+/// project spends considerable effort sharpening contributes far less than
+/// assumed.
+///
+/// This measures it directly: the same sampled stop points matched with E
+/// evidence present and with `e: None`, and the candidate counts compared.
+/// If the counts are equal, E changed nothing.
+#[test]
+fn e_constraint_contribution_at_realistic_density() {
+    let data = realistic();
+    let model = model_of(&data);
+    let config = MatchConfig::default();
+    let mut samples = 0_usize;
+    let mut with_e = 0_usize;
+    let mut without_e = 0_usize;
+    let mut identical = 0_usize;
+    // Swept across XY looseness, because a tight XY box hides E's value.
+    for xy_pad in [0.05_f64, 5.0, 15.0, 30.0] {
+        let (mut w, mut wo, mut same, mut n) = (0_usize, 0_usize, 0_usize, 0_usize);
+        for i in sample_indices(&model) {
+            let (ev, _) = evidence_for_xy(&model, i, 0.0, xy_pad);
+            let mut ev_none = ev.clone();
+            ev_none.e = None;
+            let (Ok(a), Ok(b)) = (
+                match_stop_point(&model, &ev, &config),
+                match_stop_point(&model, &ev_none, &config),
+            ) else {
+                continue;
+            };
+            n += 1;
+            w += a.candidates.len();
+            wo += b.candidates.len();
+            if a.candidates.len() == b.candidates.len() {
+                same += 1;
+            }
+        }
+        if n == 0 {
+            continue;
+        }
+        eprintln!(
+            "E-CONTRIBUTION xy_pad={xy_pad:>5} n={n:>3} with_E={w:>5} without_E={wo:>5}  E_removes={:>5.1}%  unchanged_in={same}/{n}",
+            100.0 * (wo - w) as f64 / wo.max(1) as f64
+        );
+        if (xy_pad - 0.05).abs() < 1e-9 {
+            (samples, with_e, without_e, identical) = (n, w, wo, same);
+        }
+    }
+    assert!(samples >= 8, "too few usable samples ({samples})");
+    // Recorded as a measurement, not a threshold: the point is the number,
+    // and the assertion only pins the direction (E can never *add*
+    // candidates, since it is a filter).
+    assert!(
+        with_e <= without_e,
+        "E evidence added candidates ({with_e} vs {without_e}) — impossible \
+         for a filter; the harness is wrong"
+    );
+    eprintln!(
+        "E-CONTRIBUTION samples={samples} candidates_with_E={with_e} \
+         candidates_without_E={without_e} unchanged_in={identical}/{samples} \
+         e_tolerance={}",
+        config.e_tolerance
+    );
+}
+
+/// **Is `e_tolerance = 1.0 mm` mis-tuned for real files?**
+///
+/// The companion question to
+/// [`e_constraint_contribution_at_realistic_density`]. If a tighter tolerance
+/// sharply reduces candidate counts, the constant is leaving discrimination on
+/// the table and should arguably be derived from local per-line E density. If
+/// it barely moves them, 1.0 mm is fine and XY genuinely carries per-line
+/// matching.
+///
+/// **This measures granularity only, and tightening is not free.**
+/// `e_tolerance` absorbs every error in the E evidence — frame reconstruction,
+/// the un-evidenced coverage band, pressure advance, the one-line sampling
+/// skew. A value below the true error excludes the actual stop line, which is
+/// a containment failure and strictly worse than ambiguity. So a low candidate
+/// count here is a reason to investigate, never on its own a reason to lower
+/// the constant.
+#[test]
+fn e_tolerance_sweep_at_realistic_density() {
+    let data = realistic();
+    let model = model_of(&data);
+    let tolerances = [1.0_f64, 0.5, 0.2, 0.1, 0.05, 0.01];
+    let mut totals = vec![0_usize; tolerances.len()];
+    let mut misses = vec![0_usize; tolerances.len()];
+    let mut samples = 0_usize;
+    for i in sample_indices(&model) {
+        let (ev, mv) = evidence_for(&model, i, 0.0);
+        let truth = mv.span.start;
+        let mut row = Vec::with_capacity(tolerances.len());
+        for t in tolerances {
+            let config = MatchConfig {
+                e_tolerance: t,
+                ..MatchConfig::default()
+            };
+            match match_stop_point(&model, &ev, &config) {
+                // Does the candidate set still CONTAIN the true line?
+                Ok(r) => row.push((
+                    r.candidates.len(),
+                    r.candidates.iter().any(|c| c.offset == truth),
+                )),
+                Err(_) => row.push((usize::MAX, false)),
+            }
+        }
+        if row.iter().any(|(n, _)| *n == usize::MAX) {
+            continue;
+        }
+        samples += 1;
+        for (k, (n, hit)) in row.iter().enumerate() {
+            totals[k] += n;
+            if !hit {
+                misses[k] += 1;
+            }
+        }
+    }
+    assert!(samples >= 8, "too few usable samples ({samples})");
+    let mean: Vec<String> = totals
+        .iter()
+        .map(|t| format!("{:.2}", *t as f64 / samples as f64))
+        .collect();
+    eprintln!(
+        "E-TOLERANCE samples={samples} tolerances={tolerances:?}\n  \
+         mean_candidates=[{}]\n  containment_misses={misses:?}",
+        mean.join(", ")
+    );
+    // At the shipped tolerance the true line must always survive. This is the
+    // containment property; the sweep exists to show what tightening costs it.
+    assert_eq!(
+        misses[0], 0,
+        "the true stop line was excluded at the shipped e_tolerance of {} — \
+         a containment failure independent of any widening question",
+        tolerances[0]
+    );
+}
+
+/// The Q1 ladder at realistic density: what does widening the E interval
+/// actually cost when a line carries 0.05 mm rather than 0.65 mm?
+///
+/// `plrd`'s fixture went 8 → 9 → 10 → 12 candidates for progressively wider
+/// `e_internal`, tipping past `ambiguity_limit` at the first step. The
+/// prediction under test is that at realistic density the same widenings cost
+/// little or nothing, because `e_tolerance` already dominates them.
+#[test]
+fn e_widening_cost_at_realistic_density() {
+    let data = realistic();
+    let model = model_of(&data);
+    let config = MatchConfig::default();
+    // Widenings in mm, spanning the band widths measured on real files: a
+    // 0.65 s coverage lag at 0.05 mm/line over 22-147 lines is 1.1-7.4 mm.
+    let pads = [0.0_f64, 0.5, 1.0, 2.0, 4.0, 8.0];
+    // Swept across XY looseness, because E's contribution scales with it:
+    // measured, E removes 27% of candidates against a 0.05 mm XY box but 73%
+    // against a 5 mm one. A tight box makes the band look free when it is not.
+    for xy_pad in [0.05_f64, 5.0, 15.0, 30.0] {
+        let mut totals = vec![0_usize; pads.len()];
+        let mut maxima = vec![0_usize; pads.len()];
+        let mut inconclusive = vec![0_usize; pads.len()];
+        let mut samples = 0_usize;
+        for i in sample_indices(&model) {
+            samples += 1;
+            for (k, pad) in pads.iter().enumerate() {
+                let (ev, _) = evidence_for_xy(&model, i, *pad, xy_pad);
+                match match_stop_point(&model, &ev, &config) {
+                    Ok(r) => {
+                        totals[k] += r.candidates.len();
+                        maxima[k] = maxima[k].max(r.candidates.len());
+                    }
+                    // The outcome that becomes a ManualFallback downstream.
+                    Err(_) => inconclusive[k] += 1,
+                }
+            }
+        }
+        assert!(samples >= 8, "too few usable samples ({samples})");
+        let mean: Vec<String> = totals
+            .iter()
+            .zip(&inconclusive)
+            .map(|(t, bad)| {
+                let ok = samples - bad;
+                if ok == 0 {
+                    "-".to_owned()
+                } else {
+                    format!("{:.2}", *t as f64 / ok as f64)
+                }
+            })
+            .collect();
+        eprintln!(
+            "E-WIDENING xy_pad={xy_pad:>5} n={samples} pads={pads:?}
+  mean=[{}]
+  max={maxima:?}
+  inconclusive={inconclusive:?}",
+            mean.join(", ")
+        );
+        // Monotone in the pad: a wider interval can only admit more lines, so
+        // it can only push samples toward inconclusive, never away.
+        for w in inconclusive.windows(2) {
+            assert!(w[0] <= w[1], "inconclusive not monotone: {inconclusive:?}");
+        }
+        // --- pinned measurements, not hopes -------------------------------
+        //
+        // The prediction going in was that widening E is free at realistic
+        // extrusion density, because `e_tolerance` (1.0 mm) already dwarfs a
+        // 0.05 mm line. Measured against a TIGHT XY box that looked true. It
+        // is false in the regime that actually ships: the daemon reports XY as
+        // a bounding region over the evaluated window, measured at 30-60 mm
+        // wide on `plrd`'s own e2e fixture, and there E does most of the
+        // filtering (63-81% of candidates removed) so widening it costs real
+        // refusals.
+        //
+        // These assertions pin that, in the hazard-pin style used elsewhere in
+        // this project: they assert what was measured, and if one fires the
+        // finding has changed and the numbers in this comment plus
+        // `plr_reconstruct::stopset`'s module docs must be updated rather than
+        // the assertion relaxed.
+        if xy_pad < 1.0 {
+            // Tight XY: E is a minor filter and widening it is genuinely free.
+            assert_eq!(
+                inconclusive,
+                vec![0; pads.len()],
+                "tight-XY regime stopped being refusal-free: {inconclusive:?}"
+            );
+        } else {
+            // Loose (production-shaped) XY: widening E to the top of the
+            // measured band range DOES turn resolvable stop points into
+            // refusals. If this stops being true, the band may have become
+            // affordable -- verify and update the docs, do not delete this.
+            assert!(
+                *inconclusive.last().unwrap() > inconclusive[0],
+                "widening E no longer costs refusals at xy_pad={xy_pad}                  ({inconclusive:?}); if that is a real improvement, update                  stopset's \"Durable extruder coverage\" docs, which cite                  this measurement as the reason the band is unaffordable"
+            );
         }
     }
 }

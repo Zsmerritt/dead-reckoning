@@ -131,6 +131,34 @@
 //! of 8, so *any* widening anywhere tips it. That is a property of the
 //! harness, not of this crate, and it is recorded at the fixture.
 //!
+//! ## And it is not just that fixture — measured at realistic density
+//!
+//! The obvious objection is that `plrd`'s fixture carries 0.65 mm of E per
+//! line against the 0.028–0.078 mm real slicers emit, so its zero margin
+//! is an artifact. That was the working hypothesis, and it is **wrong**.
+//! `plr-analyzer`'s `e_widening_cost_at_realistic_density` measures the
+//! same ladder over `fixtures/real/realistic_orca.gcode`, and the answer
+//! depends entirely on how loose the XY region is:
+//!
+//! | XY half-width | mean candidates, E pad 0 → 8 mm | refusals |
+//! | --- | --- | --- |
+//! | 0.05 mm (unrealistic) | 2.04 → 2.78 | none |
+//! | 5 mm | 11.2 → 31.2 | 2 of 23 |
+//! | 15–30 mm (**production**) | already beyond the limit at pad 0 | — |
+//!
+//! Production is the bottom row: `plrd`'s own pipeline reports XY regions
+//! **30–60 mm wide**, because `xy` is a bounding region over everything
+//! the WAL span and the extension touched. In that regime the E constraint
+//! removes **63–81 %** of candidates and matters in *every* sampled stop
+//! point, so it is not the marginal filter a tight-box measurement makes
+//! it look like — and widening it therefore costs real refusals.
+//!
+//! Two consequences worth carrying: the band is unaffordable for a reason
+//! that is not fixture-specific, and per-line granularity on a real part
+//! may be rarer than this crate's vocabulary suggests, since candidate
+//! counts at production XY widths exceed `ambiguity_limit` even with
+//! perfect E evidence.
+//!
 //! So the route chosen is the one that needs **no** widening: feed the
 //! matcher the `e_file` interval, which is already exact on the replay
 //! path and already computed here, instead of discarding it. See below.
