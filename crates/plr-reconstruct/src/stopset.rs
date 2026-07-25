@@ -310,8 +310,20 @@ pub struct Degradation {
     /// extension did not run. **The containment guarantee is void for
     /// true power loss** in this state — only WAL evidence is reported.
     pub extension_unavailable: bool,
-    /// The extension hit its line budget before its time horizon; the
-    /// far end of the window may be under-covered.
+    /// The extension's coverage of the far end of the window is not
+    /// guaranteed. Two causes:
+    ///
+    /// * it hit its line budget before its time horizon; or
+    /// * the print-time axis was unusable (the `wal_eval_end - start_pt`
+    ///   span overflowed to non-finite), so the horizon could not be
+    ///   sized in time at all. The extension then runs unbounded for
+    ///   maximal coverage and sets this flag, because a horizon that
+    ///   cannot be computed cannot be claimed to bound anything — see
+    ///   [`run_extension`].
+    ///
+    /// Either way this forces [`Confidence::PerLayer`], so automation
+    /// refuses rather than resuming on an answer whose far end is
+    /// unverified.
     pub extension_truncated: bool,
     /// The extension stopped at an unparseable/unsupported line;
     /// candidates beyond it are missing.
@@ -796,6 +808,18 @@ fn extension_start_time(
     } else {
         None
     };
+    // Every available bound participates on EVERY path: "anchored" names
+    // which evidence exists, not which term wins. On the anchored branch
+    // `anchor_pt` still competes and can be the smallest of the three,
+    // which is deliberate — only the smallest term can shorten the
+    // horizon, so a term being *larger* than another never matters, and
+    // each is independently a valid lower bound on when the frontier
+    // begins executing (or, for `t_a`, the cap justified above). Taking
+    // the min can therefore only widen coverage, never narrow it.
+    //
+    // `t_a` is both the third bound and the seed of the fold, so the
+    // result is finite even when neither other source is available, and
+    // non-finite candidates are dropped rather than poisoning the min.
     [journaled, degenerate, anchor_pt]
         .into_iter()
         .flatten()
@@ -856,17 +880,37 @@ fn run_extension(
     //
     // `wal_eval_end` and `start_pt` both derive from raw
     // `TrapqSegment::print_time`/`duration` values, range-checked at
-    // ingest only for finiteness, so this is a new untrusted-input
-    // surface. A hostile-but-finite value (±1e300) makes `catchup` huge;
-    // that cannot panic (checked arithmetic below, and `simulate` bounds
-    // itself by `sim.max_lines`), and it degrades honestly instead of
-    // silently: the line budget stops consumption, `StopReason::
-    // LineBudget` sets `extension_truncated`, which forces
-    // `Confidence::PerLayer`. A non-finite result falls back to no
-    // catch-up at all, which is the pre-existing behaviour.
-    let catchup = (wal_eval_end - start_pt).max(0.0);
-    let catchup = if catchup.is_finite() { catchup } else { 0.0 };
-    let horizon = config.extension_horizon + catchup;
+    // ingest only for finiteness, so this is an untrusted-input surface.
+    // A hostile-but-finite value (±1e300) makes the span huge; that
+    // cannot panic (`simulate` bounds itself by `sim.max_lines`) and it
+    // degrades honestly: the line budget stops consumption,
+    // `StopReason::LineBudget` sets `extension_truncated`, which forces
+    // `Confidence::PerLayer`.
+    //
+    // If the subtraction itself overflows to ±infinity (or produces NaN
+    // from two same-signed infinities), the time axis is unusable. The
+    // fallback then has to be the CONSERVATIVE branch, not the
+    // convenient one: collapsing to `extension_horizon` alone would give
+    // the NARROWEST possible horizon — a confident, narrow answer built
+    // on arithmetic that just failed, which is the containment-unsafe
+    // direction and exactly the bug this module was fixed for. So an
+    // unusable axis means an unbounded horizon (consumption limited only
+    // by `sim.max_lines`, giving maximal coverage) plus
+    // `extension_truncated`, which forces `PerLayer` regardless of where
+    // the simulation happens to stop — an honest refusal instead of a
+    // confident guess, and the same honest branch the paragraph above
+    // describes for huge-but-finite values.
+    //
+    // Note `NaN.max(0.0)` returns 0.0 (`f64::max` prefers the non-NaN
+    // operand), so the finiteness test must come BEFORE the clamp or NaN
+    // would silently reach the narrow path.
+    let span = wal_eval_end - start_pt;
+    let horizon = if span.is_finite() {
+        config.extension_horizon + span.max(0.0)
+    } else {
+        degradation.extension_truncated = true;
+        f64::INFINITY
+    };
 
     // Byte skip fits in usize: file_position - base_offset <= bytes.len().
     #[allow(clippy::cast_possible_truncation)]
@@ -886,7 +930,9 @@ fn run_extension(
     let sim = simulate(&mut sim_state, &lines, &sim_config);
     let consumed = lines.get(..sim.lines_consumed).unwrap_or(&lines[..]);
 
-    degradation.extension_truncated = matches!(sim.stop, StopReason::LineBudget) || collect_capped;
+    // `|=`, not `=`: an unusable time axis already set this above, and a
+    // simulation that then stopped at end-of-input must not clear it.
+    degradation.extension_truncated |= matches!(sim.stop, StopReason::LineBudget) || collect_capped;
     degradation.extension_error = matches!(sim.stop, StopReason::LineError { .. });
 
     let z = extension_z_candidates(&anchor_state, consumed, degradation);
@@ -1300,8 +1346,8 @@ mod tests {
     use crate::config::ReconstructConfig;
     use crate::error::{ContextDefect, ReconstructError};
     use crate::testutil::{
-        context_at, context_with_gcode, heartbeat_at, ingest_records, stepper_range_with_clock,
-        trapq_segment_xyz,
+        context_at, context_with_gcode, heartbeat_at, ingest_records, stepper_range,
+        stepper_range_with_clock, trapq_segment_xyz,
     };
     use crate::window::compute_stop_window;
 
@@ -1596,6 +1642,64 @@ mod tests {
         );
         let e = set.e_internal.expect("internal E");
         assert!(e.hi > 20.0, "e_internal {e:?} stops short of the horizon");
+    }
+
+    /// When the print-time axis overflows, the horizon fallback must be
+    /// the conservative branch. Every value here is finite — so ingest
+    /// accepts all of it — but `wal_eval_end - start_pt` is
+    /// `1e308 - (-1e308)`, which overflows to infinity.
+    ///
+    /// Collapsing to `extension_horizon` alone in that case would hand
+    /// back the *narrowest* horizon, i.e. a confident narrow answer
+    /// resting on arithmetic that just failed. The honest outcome is an
+    /// unbounded horizon plus `extension_truncated`, so confidence drops
+    /// out of `PerLine` and automation refuses. Restoring the old
+    /// `else { 0.0 }` fallback fails this test rather than only
+    /// contradicting a comment.
+    #[test]
+    fn an_overflowing_time_axis_refuses_instead_of_narrowing() {
+        let huge = 1.0e308_f64;
+        // t_a = -1e308 (heartbeat and its correlation sample), committed
+        // motion reported at +1e308, and no trapq row — so the origin is
+        // the degenerate bound at t_a - lead and stays hugely negative.
+        let records = vec![
+            WalRecord::Heartbeat(heartbeat_at(0, -huge)),
+            WalRecord::StepperRange(stepper_range("stepper_z", huge, 1_000)),
+            WalRecord::Context(context_at(2_000, 0)),
+        ];
+        let timeline = ingest_records(records);
+        // Precondition: the hostile values survived ingest intact.
+        assert_eq!(timeline.stepper_ranges.len(), 1);
+        let config = ReconstructConfig {
+            mcu_freq: None,
+            ..ReconstructConfig::default()
+        };
+        let window = compute_stop_window(&timeline, None, &config).unwrap();
+        assert!((window.t_a - -huge).abs() < 1.0);
+        assert!((window.t_b - huge).abs() < 1.0);
+        let text = long_tail_text();
+        let tail = FileTail {
+            base_offset: 0,
+            bytes: text.as_bytes(),
+        };
+        let set = compute_stop_set(&timeline, &window, Some(&tail), &config).unwrap();
+        let ext = set.extension.expect("extension ran");
+        // Unbounded, not `extension_horizon`: the axis was unusable, so
+        // coverage is maximal rather than minimal.
+        assert!(
+            ext.horizon.is_infinite(),
+            "horizon {} collapsed to the narrow fallback",
+            ext.horizon
+        );
+        assert!(ext.horizon > config.extension_horizon);
+        // And the answer is labelled as a refusal, whatever the
+        // simulation's own stop reason turned out to be.
+        assert!(set.degradation.extension_truncated);
+        assert_ne!(
+            set.degradation.confidence,
+            Confidence::PerLine,
+            "an unusable time axis must not yield per-line confidence"
+        );
     }
 
     #[test]
