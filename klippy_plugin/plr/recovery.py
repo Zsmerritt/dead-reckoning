@@ -146,7 +146,12 @@ ANSWER_ABORT = "abort"
 # Whether an ANSWER can still be sent is a separate fact (``_token``), not a
 # state: a question can outlive the plugin's ability to vouch for it.
 STATE_IDLE = "idle"  # nothing known to be happening
-STATE_RUNNING = "running"  # plrd is executing THIS session's recovery
+# A request of OURS is in flight, so plrd is engaged with this session and
+# its reply comes to this console.  Set the moment the request goes out,
+# which is what makes it honest: it claims a live conversation, not a
+# completed handshake, and plrd's reply moves the state again within one
+# round trip.
+STATE_RUNNING = "running"
 STATE_AWAITING = "awaiting_confirmation"  # paused, answerable, demonstrably live
 # plrd told us it IS executing a recovery (`busy`) that this session cannot
 # report on or answer.  Positive evidence of liveness — the opposite of
@@ -621,7 +626,15 @@ class RecoverySession:
                 % (source, CMD_CONTINUE, CMD_ABORT)
             )
             self._end_dialog()
-        self._transition(STATE_RUNNING, reason="plrd accepted a new recover_execute")
+        # Accurate about what is known at this instant: the worker started
+        # and a request is in flight, which is exactly what `running` means.
+        # plrd has NOT answered yet and may reply `busy` — that reply is one
+        # round trip away and puts the state back, which is the same bounded,
+        # self-correcting claim as N1 in `answer()`.
+        self._transition(
+            STATE_RUNNING,
+            reason="a recover_execute is in flight; plrd's reply adjudicates",
+        )
         # Conditional on purpose: plrd has not answered yet and may refuse
         # (it is entitled to say `busy`, or that the machine does not
         # validate), so the first line the operator reads must not assert
