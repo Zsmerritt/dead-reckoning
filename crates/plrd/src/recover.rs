@@ -1290,8 +1290,12 @@ mod tests {
             Ok(v)
         }));
         let config = test_config("barrier-macro", &fake.url());
+        // `plan_outcome_in`, not `plan_outcome`: the latter puts the sdcard
+        // root in an unrelated temp dir, which made the "no recovery file
+        // left behind" assertion below vacuously true — caught by mutation,
+        // which removed the cleanup and saw the test still pass.
         let (code, output) = run_drive(
-            &plan_outcome(),
+            &plan_outcome_in(&config.wal_dir),
             &config,
             &fast_recover(true, true, false),
             "y\n",
