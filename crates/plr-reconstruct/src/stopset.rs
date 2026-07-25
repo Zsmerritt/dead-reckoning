@@ -20,11 +20,26 @@
 //!    the last preceding segment, which contributes a candidate.
 //! 2. **Extension.** From the last context's file offset and g-code
 //!    state, [`plr_gcode::simulate`] runs for
-//!    `extension_horizon + max(0, t_b - t_anchor)` seconds of simulated
-//!    motion (the catch-up term covers contexts that lag the committed
-//!    boundary). Because the simulator's per-line accounting is a
-//!    documented lower bound on real durations, the horizon covers at
-//!    least that much real machine time.
+//!    `extension_horizon + max(0, wal_eval_end - t_ext_start)` seconds
+//!    of simulated motion, where `t_ext_start` is the print time at
+//!    which the machine **begins executing the first simulated line**
+//!    ([`extension_start_time`]) — *not* the anchor snapshot's capture
+//!    time. The two differ by seconds whenever the g-code reader stalls
+//!    on one long move: the frontier then sits still while the queued
+//!    move executes, so the snapshot records a file position whose
+//!    motion started long before the snapshot itself. Measuring from the
+//!    capture time spends the horizon re-simulating already-executed
+//!    motion and under-covers the window (the bug behind proptest seed
+//!    `9938d965…`). The simulator's per-line accounting is a documented
+//!    lower bound on real durations **with one documented exception**:
+//!    the window starts from zero velocity, so the *first* move's
+//!    duration can be overestimated by up to one acceleration ramp
+//!    (`plr-gcode/src/sim.rs` module docs). Simulating
+//!    `T - t_ext_start` seconds therefore consumes every line the
+//!    machine could have executed by real time `T` less at most that one
+//!    ramp — ~0.1 s at Klipper-typical limits, which the default 2 s
+//!    `extension_horizon` covers with margin, and which matters most
+//!    when the horizon is short.
 //! 3. **Z is exact.** The extension's Z candidates come from
 //!    [`plr_gcode::scan_z_events`] over exactly the consumed lines — a
 //!    byte-faithful replay with no timing model. Combined with the WAL
@@ -56,6 +71,43 @@
 //! run or cannot reach the window end does the computation fall back to
 //! unioning the WAL-internal interval converted under recent context
 //! frames, flagged [`Degradation::e_file_frames_incomplete`].
+//!
+//! **Known limit in `e_internal`, open and unfixed.** `e_internal` comes
+//! from the trapq evaluation plus the extension. If the durable WAL is
+//! missing extruder rows for lines the anchor context already counts as
+//! processed — possible in production because `dump_trapq` batches at
+//! ~0.5 s, so a row can land in the batch *after* the flush that wrote
+//! the context — then an E excursion confined to those lines (a retract,
+//! say) is bounded by no evidence this crate holds, while `PerLine`
+//! confidence lets a resume proceed on it. This is net-neutral against
+//! the behaviour before the extension-horizon fix; it is recorded here,
+//! not worked around, and it is being scheduled separately because
+//! changing it once broke 18 daemon end-to-end tests and each option
+//! needs its own measurement. `e_file` is unaffected: on the exact path
+//! (`reached_end` and a certain floor) the replay covers those lines, so
+//! the interval does contain the truth — but `plr-analyzer`'s
+//! `StopEvidence` (fed by `plrd`) carries only `e_internal` and discards
+//! `e_file`.
+//!
+//! Options, with what each costs — no verdict here:
+//!
+//! * **Union the replay's internal E over only the un-evidenced tail
+//!   band** — from the newest durable extruder-trapq coverage to the
+//!   anchor frontier, rather than the whole loose-floored window. Costs
+//!   no granularity (the band is the ~0.5 s of lines that lack rows, not
+//!   everything since the floor) but needs a way to map "newest durable
+//!   extruder coverage" onto a file offset.
+//! * **Start the forward extension at the last file offset covered by
+//!   durable trapq** instead of the anchor frontier. A monotone widening
+//!   by a few lines, reusing machinery that already exists here; costs
+//!   some simulated-motion budget on every recovery, and the offset needs
+//!   the same context/offset mapping as the option above.
+//! * **Write-side ordering in the daemon**: never journal a `Context`
+//!   whose processing frontier runs ahead of durable trapq coverage,
+//!   making the invariant hold by construction. Costs precision on
+//!   *every* print and every recovery — each `Context` then reports a
+//!   staler frontier, widening the offset window permanently — to close a
+//!   ~0.5 s band.
 //!
 //! # File-offset window
 //!
@@ -258,8 +310,20 @@ pub struct Degradation {
     /// extension did not run. **The containment guarantee is void for
     /// true power loss** in this state — only WAL evidence is reported.
     pub extension_unavailable: bool,
-    /// The extension hit its line budget before its time horizon; the
-    /// far end of the window may be under-covered.
+    /// The extension's coverage of the far end of the window is not
+    /// guaranteed. Two causes:
+    ///
+    /// * it hit its line budget before its time horizon; or
+    /// * the print-time axis was unusable (the `wal_eval_end - start_pt`
+    ///   span overflowed to non-finite), so the horizon could not be
+    ///   sized in time at all. The extension then runs unbounded for
+    ///   maximal coverage and sets this flag, because a horizon that
+    ///   cannot be computed cannot be claimed to bound anything — see
+    ///   [`run_extension`].
+    ///
+    /// Either way this forces [`Confidence::PerLayer`], so automation
+    /// refuses rather than resuming on an answer whose far end is
+    /// unverified.
     pub extension_truncated: bool,
     /// The extension stopped at an unparseable/unsupported line;
     /// candidates beyond it are missing.
@@ -280,6 +344,17 @@ pub struct Degradation {
     /// replaced between two context flushes. Treat `e_file` as
     /// best-effort in this state.
     pub e_file_frames_incomplete: bool,
+    /// No durable trapq row precedes the anchor context, so the
+    /// extension's simulated clock was placed on the print-time axis
+    /// from the `t_a - max_processing_lead` reader-lead bound instead of
+    /// from motion evidence (see [`extension_start_time`]).
+    ///
+    /// Not a degradation of the result: that bound is a genuine lower
+    /// bound on when the frontier begins executing, so coverage is
+    /// preserved — it is *information*, telling an operator that the
+    /// horizon rests on the reader-lead premise rather than on measured
+    /// motion. Normal early in a print, before any trapq row is durable.
+    pub extension_start_unanchored: bool,
     /// No context old enough to predate `t_a - max_processing_lead`
     /// exists; the offset-window floor fell back to the oldest known
     /// frontier and may be optimistic.
@@ -377,10 +452,17 @@ pub fn compute_stop_set(
         ..Degradation::default()
     };
 
-    let extension = run_extension(anchor, window, file_tail, config, &mut degradation)?;
+    let extension = run_extension(
+        timeline,
+        anchor,
+        window,
+        wal_eval_end,
+        file_tail,
+        config,
+        &mut degradation,
+    )?;
     let floor = floor_context(timeline, window, anchor, config, &mut degradation);
 
-    let mut e_internal = wal_e;
     let mut e_file = file_frame_e(
         timeline,
         window,
@@ -392,6 +474,7 @@ pub fn compute_stop_set(
         config,
         &mut degradation,
     );
+    let mut e_internal = wal_e;
     if let Some(ext) = &extension {
         z_candidates.extend(ext.z.iter().cloned());
         if let Some(ext_xy) = ext.xy {
@@ -662,11 +745,95 @@ struct ExtensionResult {
     e_file: Option<Interval>,
 }
 
+/// Print time at which the extension's **first simulated move begins
+/// executing** — the origin of the simulated clock, and therefore of the
+/// horizon.
+///
+/// The extension starts at the anchor context's processing frontier `F`.
+/// The machine reaches `F` only after finishing every move produced by
+/// lines before `F`, at a print time this function lower-bounds. Getting
+/// it wrong in the *late* direction is a containment bug, not an
+/// efficiency loss: a frontier can correspond to an execution time
+/// seconds *earlier* than the snapshot that recorded it, and a horizon
+/// measured from the snapshot time is then spent re-simulating
+/// already-executed motion (the containment hole behind proptest seed
+/// `9938d965…`).
+///
+/// Bounds used, smallest wins:
+///
+/// * **`trapq_end_time_journaled_by(anchor.mono_ns)` — motion evidence,
+///   the anchored branch.** Every line up to `F` was processed by the
+///   anchor's capture time, so its trapq row was journaled by then; the
+///   newest such row's end time is when motion preceding `F` completes.
+///   Batching delay can only drop rows from this set, which lowers the
+///   value — conservative. Whether the daemon journals rows at planning
+///   time (the reader running ahead, so the value exceeds the capture
+///   time) or later, the quantity is the same: the end of motion for
+///   lines before `F`.
+/// * **`t_a - max_processing_lead` — the degenerate branch**, taken when
+///   no durable trapq row precedes the anchor and reported as
+///   [`Degradation::extension_start_unanchored`]. It rests on the same
+///   premise as the offset-window floor rather than a new invention: the
+///   reader runs at most `max_processing_lead` ahead of execution, so a
+///   frontier recorded at or before `t_a` cannot have begun executing
+///   earlier than `t_a - max_processing_lead` unless the reader stalled
+///   for longer than that — the very condition the motion-evidence bound
+///   detects whenever rows are present. Containment on this branch is
+///   therefore proven *from that premise*, not from direct evidence, and
+///   the flag says which branch was taken.
+/// * **`anchor_pt`** — the anchor's own capture time. With the reader
+///   ahead of execution (the usual case) execution has not reached `F`
+///   yet, so this is a valid, looser bound.
+///
+/// `window.t_a` seeds the fold, so **`start_pt <= t_a` on every path**,
+/// including when both other bounds are absent or non-finite. That cap
+/// is also the safety envelope against a klippy restart resetting the
+/// print-time axis while host `mono_ns` keeps advancing: however far
+/// forward a stale correlation places `anchor_pt`, the origin can never
+/// be pushed past the instant the machine was last *proven* to be
+/// executing, so the horizon can never shrink below the stop window
+/// itself.
+fn extension_start_time(
+    timeline: &WalTimeline,
+    window: &StopWindow,
+    anchor: &Context,
+    anchor_pt: Option<f64>,
+    config: &ReconstructConfig,
+    degradation: &mut Degradation,
+) -> f64 {
+    let journaled = timeline.trapq_end_time_journaled_by(anchor.mono_ns);
+    let degenerate = if journaled.is_none() {
+        degradation.extension_start_unanchored = true;
+        Some(window.t_a - config.max_processing_lead)
+    } else {
+        None
+    };
+    // Every available bound participates on EVERY path: "anchored" names
+    // which evidence exists, not which term wins. On the anchored branch
+    // `anchor_pt` still competes and can be the smallest of the three,
+    // which is deliberate — only the smallest term can shorten the
+    // horizon, so a term being *larger* than another never matters, and
+    // each is independently a valid lower bound on when the frontier
+    // begins executing (or, for `t_a`, the cap justified above). Taking
+    // the min can therefore only widen coverage, never narrow it.
+    //
+    // `t_a` is both the third bound and the seed of the fold, so the
+    // result is finite even when neither other source is available, and
+    // non-finite candidates are dropped rather than poisoning the min.
+    [journaled, degenerate, anchor_pt]
+        .into_iter()
+        .flatten()
+        .filter(|pt| pt.is_finite())
+        .fold(window.t_a, f64::min)
+}
+
 /// Runs the forward extension; `Ok(None)` when it cannot run (no
 /// `virtual_sdcard` state or no file tail), flagged on `degradation`.
 fn run_extension(
+    timeline: &WalTimeline,
     anchor: &Context,
     window: &StopWindow,
+    wal_eval_end: f64,
     file_tail: Option<&FileTail<'_>>,
     config: &ReconstructConfig,
     degradation: &mut Degradation,
@@ -686,14 +853,64 @@ fn run_extension(
     let anchor_state = anchor_state_from_context(&anchor.gcode)?;
 
     let anchor_pt = window.mono_ns_to_print_time(anchor.mono_ns);
-    let catchup = if let Some(pt) = anchor_pt {
-        (window.t_b - pt).max(0.0)
-    } else {
+    if anchor_pt.is_none() {
         degradation.anchor_time_unknown = true;
-        (window.t_b - window.t_a).max(0.0)
+    }
+    let start_pt = extension_start_time(timeline, window, anchor, anchor_pt, config, degradation);
+    // The simulated clock starts when the machine begins the first
+    // simulated line, at print time `start_pt`; the latest possible stop
+    // is `wal_eval_end + extension_horizon`.
+    //
+    // Coverage rests on plr_gcode's per-line accounting being a lower
+    // bound on real durations (`min_move_t`, distance over capped cruise
+    // velocity), which holds for every move *except the first*: the
+    // simulation window starts from zero velocity while the real machine
+    // was typically mid-motion at the resume offset, so the first move's
+    // duration can be OVERestimated by up to one acceleration ramp
+    // (`plr-gcode/src/sim.rs` module docs). The excess is bounded by
+    // `max_velocity / max_accel` (0.1 s at the Klipper-typical
+    // 300 mm/s and 3000 mm/s², one twentieth of the 2 s default
+    // `extension_horizon`) and it bites hardest when the horizon is
+    // short. So the claim is: simulating this many seconds consumes at
+    // least every line the machine could have executed by then, minus at
+    // most one accel ramp of the first move — not an unqualified "every
+    // line", and the ramp is why `extension_horizon` carries margin over
+    // the ~1.5 s of unreceived tail it must cover rather than being
+    // sized to it exactly.
+    //
+    // `wal_eval_end` and `start_pt` both derive from raw
+    // `TrapqSegment::print_time`/`duration` values, range-checked at
+    // ingest only for finiteness, so this is an untrusted-input surface.
+    // A hostile-but-finite value (±1e300) makes the span huge; that
+    // cannot panic (`simulate` bounds itself by `sim.max_lines`) and it
+    // degrades honestly: the line budget stops consumption,
+    // `StopReason::LineBudget` sets `extension_truncated`, which forces
+    // `Confidence::PerLayer`.
+    //
+    // If the subtraction itself overflows to ±infinity (or produces NaN
+    // from two same-signed infinities), the time axis is unusable. The
+    // fallback then has to be the CONSERVATIVE branch, not the
+    // convenient one: collapsing to `extension_horizon` alone would give
+    // the NARROWEST possible horizon — a confident, narrow answer built
+    // on arithmetic that just failed, which is the containment-unsafe
+    // direction and exactly the bug this module was fixed for. So an
+    // unusable axis means an unbounded horizon (consumption limited only
+    // by `sim.max_lines`, giving maximal coverage) plus
+    // `extension_truncated`, which forces `PerLayer` regardless of where
+    // the simulation happens to stop — an honest refusal instead of a
+    // confident guess, and the same honest branch the paragraph above
+    // describes for huge-but-finite values.
+    //
+    // Note `NaN.max(0.0)` returns 0.0 (`f64::max` prefers the non-NaN
+    // operand), so the finiteness test must come BEFORE the clamp or NaN
+    // would silently reach the narrow path.
+    let span = wal_eval_end - start_pt;
+    let horizon = if span.is_finite() {
+        config.extension_horizon + span.max(0.0)
+    } else {
+        degradation.extension_truncated = true;
+        f64::INFINITY
     };
-    let catchup = if catchup.is_finite() { catchup } else { 0.0 };
-    let horizon = config.extension_horizon + catchup;
 
     // Byte skip fits in usize: file_position - base_offset <= bytes.len().
     #[allow(clippy::cast_possible_truncation)]
@@ -713,7 +930,9 @@ fn run_extension(
     let sim = simulate(&mut sim_state, &lines, &sim_config);
     let consumed = lines.get(..sim.lines_consumed).unwrap_or(&lines[..]);
 
-    degradation.extension_truncated = matches!(sim.stop, StopReason::LineBudget) || collect_capped;
+    // `|=`, not `=`: an unusable time axis already set this above, and a
+    // simulation that then stopped at end-of-input must not clear it.
+    degradation.extension_truncated |= matches!(sim.stop, StopReason::LineBudget) || collect_capped;
     degradation.extension_error = matches!(sim.stop, StopReason::LineError { .. });
 
     let z = extension_z_candidates(&anchor_state, consumed, degradation);
@@ -886,7 +1105,7 @@ fn floor_context<'a>(
     })
 }
 
-/// File-frame E over the whole candidate window.
+/// File-frame ("g-code") E over the whole candidate window.
 ///
 /// Primary (exact) path: replay the file from the **floor context**
 /// through the extension end, recording the g-code-frame E after every
@@ -896,14 +1115,23 @@ fn floor_context<'a>(
 /// flushes (e.g. `G92 E0` + retract processed in a burst after a
 /// dwell), which no snapshot ever captured. Consecutive per-line values
 /// bracket every mid-line E because E moves monotonically within a line
-/// under a fixed frame.
+/// (one `G1` sets one E target).
 ///
-/// Fallback (when the replay cannot run or cannot reach the window
-/// end — no file tail, tail not covering the floor, malformed floor
-/// snapshot, line budget, unparseable line): union the WAL-internal
-/// interval converted under every recent context frame, flagged
-/// [`Degradation::e_file_frames_incomplete`] because a frame that
-/// lived entirely between two flushes is unrecoverable without the
+/// Only the *file* frame is taken from this replay. The replay spans the
+/// whole offset window, whose floor is a deliberately loose **lower
+/// bound** on the stop offset, so its Klipper-internal E envelope would
+/// cover states the liveness proof at `t_a` already excludes — and
+/// `e_internal` is what the downstream line matcher narrows candidates
+/// with, so widening it that far costs per-line granularity on every
+/// recovery. File-frame E does not have that problem: it is consumed
+/// only as a frame-corrected reading of the same interval.
+///
+/// Fallback for the file frame (when the replay cannot run or cannot
+/// reach the window end — no file tail, tail not covering the floor,
+/// malformed floor snapshot, line budget, unparseable line): union the
+/// WAL-internal interval converted under every recent context frame,
+/// flagged [`Degradation::e_file_frames_incomplete`] because a frame
+/// that lived entirely between two flushes is unrecoverable without the
 /// file. The fallback is also unioned in when the floor itself is
 /// uncertain, since the replay may then start past in-window motion.
 #[allow(clippy::too_many_arguments)] // one cohesive assembly step; a param struct would just rename the call site
@@ -927,20 +1155,17 @@ fn file_frame_e(
     };
     let context_fallback =
         || wal_e.and_then(|iv| convert_e_to_file_frame(iv, timeline, window, anchor, config));
-    if let Some((interval, reached_end)) = replay {
-        let complete = reached_end && floor.is_some_and(|f| !f.uncertain);
-        if complete {
-            Some(interval)
-        } else {
-            if !reached_end {
-                degradation.e_file_frames_incomplete = true;
-            }
-            union_opt(Some(interval), context_fallback())
-        }
-    } else {
+    let Some(replay) = replay else {
         degradation.e_file_frames_incomplete = true;
-        context_fallback()
+        return context_fallback();
+    };
+    if replay.reached_end && floor.is_some_and(|f| !f.uncertain) {
+        return Some(replay.file);
     }
+    if !replay.reached_end {
+        degradation.e_file_frames_incomplete = true;
+    }
+    union_opt(Some(replay.file), context_fallback())
 }
 
 /// Replays file bytes from the floor context's offset up to
@@ -953,7 +1178,7 @@ fn replay_file_e(
     end_offset: u64,
     tail: &FileTail<'_>,
     config: &ReconstructConfig,
-) -> Option<(Interval, bool)> {
+) -> Option<ReplayedE> {
     let tail_end = tail.base_offset.saturating_add(tail.bytes.len() as u64);
     if floor.file_position < tail.base_offset || floor.file_position > tail_end {
         return None;
@@ -963,24 +1188,35 @@ fn replay_file_e(
     #[allow(clippy::cast_possible_truncation)]
     let skip = (floor.file_position - tail.base_offset) as usize;
     let bytes = tail.bytes.get(skip..).unwrap_or(&[]);
-    let mut interval = Interval::point(state.gcode_position()[3]);
+    let mut file = Interval::point(state.gcode_position()[3]);
     let mut position = floor.file_position;
     let mut budget = config.sim.max_lines.unwrap_or(usize::MAX);
+    let mut truncated = false;
     for line in LineIter::new(bytes, floor.file_position) {
         if line.span.start >= end_offset {
             break;
         }
-        if budget == 0 {
-            return Some((interval, false));
+        if budget == 0 || state.apply(&line).is_err() {
+            truncated = true;
+            break;
         }
         budget -= 1;
-        if state.apply(&line).is_err() {
-            return Some((interval, false));
-        }
-        interval.expand(state.gcode_position()[3]);
+        file.expand(state.gcode_position()[3]);
         position = line.span.end;
     }
-    Some((interval, position >= end_offset || position >= tail_end))
+    Some(ReplayedE {
+        file,
+        reached_end: !truncated && (position >= end_offset || position >= tail_end),
+    })
+}
+
+/// Per-line file-frame E envelope recovered by replaying the offset
+/// window, plus whether the replay reached the window end.
+struct ReplayedE {
+    /// G-code-frame ("file") E across every replayed line.
+    file: Interval,
+    /// Whether the replay actually reached the window end.
+    reached_end: bool,
 }
 
 /// Converts a Klipper-internal E interval to the file frame by unioning
@@ -1110,8 +1346,8 @@ mod tests {
     use crate::config::ReconstructConfig;
     use crate::error::{ContextDefect, ReconstructError};
     use crate::testutil::{
-        context_at, context_with_gcode, heartbeat_at, ingest_records, stepper_range_with_clock,
-        trapq_segment_xyz,
+        context_at, context_with_gcode, heartbeat_at, ingest_records, stepper_range,
+        stepper_range_with_clock, trapq_segment_xyz,
     };
     use crate::window::compute_stop_window;
 
@@ -1141,6 +1377,329 @@ mod tests {
         ];
         records.extend(extra);
         records
+    }
+
+    /// Regression for the internal-E containment hole (proptest seed
+    /// 9938d965…): the anchor context's processing frontier is stalled
+    /// on ONE long move, so the frontier's execution time sits seconds
+    /// behind the snapshot that recorded it. Sizing the extension
+    /// horizon from the snapshot's capture time spends the whole budget
+    /// re-simulating already-executed motion and leaves everything the
+    /// machine really did afterwards outside the reported E interval.
+    #[test]
+    fn extension_horizon_starts_where_the_stalled_frontier_executes() {
+        // File: one 212 mm move (4.24 s at 50 mm/s) at the frontier,
+        // then four short extruding moves of 10 mm (0.2 s each).
+        let text = concat!(
+            "G1 X200 Y200 E5 F3000
+",
+            "G1 X210 Y200 E6
+",
+            "G1 X220 Y200 E7
+",
+            "G1 X230 Y200 E8
+",
+            "G1 X240 Y200 E9
+",
+        );
+        // Durable trapq for the motion PRECEDING the frontier: journaled
+        // at mono 10 s, executing until print time 16.0. This is the
+        // print time at which the frontier's first line starts.
+        let preceding = trapq_segment_xyz(
+            "toolhead",
+            10.0,
+            6.0,
+            [0.0, 0.0, 0.2],
+            [1.0, 0.0, 0.0],
+            20.0,
+            10_000_000_000,
+        );
+        let gcode = WalGcodeState {
+            speed_factor: 1.0,
+            speed: 3000.0,
+            extrude_factor: 1.0,
+            absolute_coordinates: true,
+            absolute_extrude: true,
+            homing_origin: vec![0.0; 4],
+            position: vec![50.0, 50.0, 0.2, 4.0],
+            gcode_position: vec![50.0, 50.0, 0.2, 4.0],
+        };
+        // Heartbeat/commit at 20.0/20.1; the anchor context is captured
+        // at 20.0 but its frontier began executing at 16.0.
+        let records = base_records(
+            20.0,
+            20.1,
+            vec![
+                WalRecord::TrapqSegment(preceding),
+                WalRecord::Context(context_with_gcode(20_000_000_000, 0, gcode)),
+            ],
+        );
+        let timeline = ingest_records(records);
+        let window = compute_stop_window(&timeline, None, &cfg()).unwrap();
+        let tail = FileTail {
+            base_offset: 0,
+            bytes: text.as_bytes(),
+        };
+        let set = compute_stop_set(&timeline, &window, Some(&tail), &cfg()).unwrap();
+        let ext = set.extension.clone().expect("extension ran");
+
+        // Horizon origin is the frontier's execution start (16.0), not
+        // the snapshot time (20.0): 2.0 + (20.1 - 16.0) = 6.1 s.
+        assert!(
+            (ext.horizon - 6.1).abs() < 1e-9,
+            "horizon {} should be measured from the stalled frontier",
+            ext.horizon
+        );
+        // The old formula (2.0 + (t_b - anchor_pt) = 2.1 s) could not
+        // even finish the 4.24 s move; the corrected one reaches the
+        // short moves after it.
+        assert!(
+            ext.lines_consumed >= 3,
+            "consumed only {} lines",
+            ext.lines_consumed
+        );
+        let e = set.e_internal.expect("internal E interval");
+        // E after the long move is 5; the short moves take it to 7+.
+        assert!(e.contains(5.0, 1e-9), "e_internal {e:?}");
+        assert!(
+            e.contains(7.0, 1e-9),
+            "e_internal {e:?} misses motion the machine had time to execute"
+        );
+        assert!(!set.degradation.extension_start_unanchored);
+    }
+
+    /// A long file of 10 mm extruding moves (0.2 s each at F3000), so a
+    /// horizon difference of seconds is observable as a line count.
+    fn long_tail_text() -> String {
+        use std::fmt::Write as _;
+        let mut text = String::from("G1 X60 Y50 E1 F3000\n");
+        for i in 0..400 {
+            let x = 60 + i % 40;
+            let e = 2 + i;
+            let _ = writeln!(text, "G1 X{x} Y50 E{e}");
+        }
+        text
+    }
+
+    /// With no durable trapq row before the anchor there is no motion
+    /// evidence for the frontier's execution start, so the origin falls
+    /// back to the reader-lead bound `t_a - max_processing_lead`. The
+    /// assertion is on the resulting **horizon**: a test that only
+    /// checked the flag would still pass with the origin left at the
+    /// capture time, which is exactly the hole this branch had.
+    #[test]
+    fn unanchored_extension_start_uses_the_reader_lead_bound() {
+        let records = base_records(
+            20.0,
+            20.1,
+            vec![WalRecord::Context(context_at(20_000_000_000, 0))],
+        );
+        let timeline = ingest_records(records);
+        assert!(
+            timeline
+                .trapq_end_time_journaled_by(20_000_000_000)
+                .is_none(),
+            "fixture must carry no trapq evidence before the anchor"
+        );
+        let window = compute_stop_window(&timeline, None, &cfg()).unwrap();
+        let text = long_tail_text();
+        let tail = FileTail {
+            base_offset: 0,
+            bytes: text.as_bytes(),
+        };
+        let config = cfg();
+        let set = compute_stop_set(&timeline, &window, Some(&tail), &config).unwrap();
+        let ext = set.extension.clone().expect("extension ran");
+        // t_ext_start = t_a - max_processing_lead = 20.0 - 3.0 = 17.0;
+        // horizon = 2.0 + (20.1 - 17.0) = 5.1 s.
+        let expected =
+            config.extension_horizon + (window.t_b - (window.t_a - config.max_processing_lead));
+        assert!(
+            (ext.horizon - expected).abs() < 1e-9 && (ext.horizon - 5.1).abs() < 1e-9,
+            "horizon {} is not the reader-lead bound {expected}",
+            ext.horizon
+        );
+        // Anchoring on the capture time would give 2.1 s: less than half.
+        let capture_time_horizon = config.extension_horizon + (window.t_b - window.t_a);
+        assert!(ext.horizon > capture_time_horizon * 2.0);
+        assert!(set.degradation.extension_start_unanchored);
+        // The flag is information, not degradation: coverage is intact,
+        // so confidence stays per-line and a resume is not refused.
+        assert_eq!(set.degradation.confidence, Confidence::PerLine);
+    }
+
+    /// `t_a` seeds the origin fold, so the origin can never be pushed
+    /// past the instant the machine was last *proven* to be executing.
+    /// That cap is the envelope against a klippy restart resetting the
+    /// print-time axis while host `mono_ns` keeps advancing, which would
+    /// otherwise place `anchor_pt` far in the future and shrink the
+    /// horizon below the stop window.
+    #[test]
+    fn an_anchor_dated_after_t_a_cannot_shrink_the_horizon() {
+        // Both non-`t_a` bounds sit *after* `t_a` here, so the cap is the
+        // binding term: durable planned motion reaching print time 24.0,
+        // and a context whose `mono_ns` maps to print time 40.0 (the
+        // klippy-restart shape — the print-time axis reset while host
+        // monotonic time kept advancing).
+        let planned = trapq_segment_xyz(
+            "toolhead",
+            21.0,
+            3.0,
+            [0.0, 0.0, 0.2],
+            [1.0, 0.0, 0.0],
+            20.0,
+            19_500_000_000,
+        );
+        let records = base_records(
+            20.0,
+            20.1,
+            vec![
+                WalRecord::TrapqSegment(planned),
+                WalRecord::Context(context_at(40_000_000_000, 0)),
+            ],
+        );
+        let timeline = ingest_records(records);
+        let window = compute_stop_window(&timeline, None, &cfg()).unwrap();
+        assert!((window.t_a - 20.0).abs() < 1e-9);
+        let text = long_tail_text();
+        let tail = FileTail {
+            base_offset: 0,
+            bytes: text.as_bytes(),
+        };
+        let config = cfg();
+        let set = compute_stop_set(&timeline, &window, Some(&tail), &config).unwrap();
+        assert!((set.wal_eval_end - 24.0).abs() < 1e-9);
+        let ext = set.extension.expect("extension ran");
+        // The context dates itself 20 s after t_a, and motion evidence
+        // reaches 24.0 — both later than t_a...
+        assert_eq!(ext.anchor_print_time, Some(40.0));
+        assert!(timeline
+            .trapq_end_time_journaled_by(40_000_000_000)
+            .is_some_and(|end| end > window.t_a));
+        // ...so without the `t_a` seed the origin would be 24.0 and the
+        // horizon would collapse to `extension_horizon` (2.0 s), losing
+        // the whole stop window. Capped, it is 2.0 + (24.0 - 20.0).
+        assert!((ext.horizon - 6.0).abs() < 1e-9, "horizon {}", ext.horizon);
+        assert!(
+            ext.horizon > config.extension_horizon + (window.t_b - window.t_a),
+            "horizon {} fell back to the uncapped origin",
+            ext.horizon
+        );
+        assert!(!set.degradation.extension_start_unanchored);
+    }
+
+    /// The horizon runs out to `wal_eval_end` = `max(t_b, durable trapq
+    /// end)`, not to `t_b`. Trapq rows are journaled as Klipper *plans*
+    /// moves, so durable knowledge routinely extends past the committed
+    /// boundary; ending the horizon at `t_b` under-simulates by exactly
+    /// that difference.
+    #[test]
+    fn horizon_end_follows_trapq_knowledge_past_the_commit_boundary() {
+        // Planned motion journaled before the anchor but executing out to
+        // print time 24.0, while Z commits only to 20.1.
+        let planned = trapq_segment_xyz(
+            "toolhead",
+            19.0,
+            5.0,
+            [0.0, 0.0, 0.2],
+            [1.0, 0.0, 0.0],
+            20.0,
+            19_500_000_000,
+        );
+        let records = base_records(
+            20.0,
+            20.1,
+            vec![
+                WalRecord::TrapqSegment(planned),
+                WalRecord::Context(context_at(20_000_000_000, 0)),
+            ],
+        );
+        let timeline = ingest_records(records);
+        let window = compute_stop_window(&timeline, None, &cfg()).unwrap();
+        assert!((window.t_b - 20.1).abs() < 1e-6, "t_b {}", window.t_b);
+        let text = long_tail_text();
+        let tail = FileTail {
+            base_offset: 0,
+            bytes: text.as_bytes(),
+        };
+        let config = cfg();
+        let set = compute_stop_set(&timeline, &window, Some(&tail), &config).unwrap();
+        // Durable trapq knowledge reaches 24.0, ~4 s beyond t_b.
+        assert!((set.wal_eval_end - 24.0).abs() < 1e-9);
+        assert!(set.wal_eval_end - window.t_b > 3.0);
+        let ext = set.extension.expect("extension ran");
+        // Origin is capped at t_a (20.0), end is wal_eval_end (24.0):
+        // horizon = 2.0 + 4.0 = 6.0 s. Ending at t_b would give 2.1 s.
+        assert!((ext.horizon - 6.0).abs() < 1e-9, "horizon {}", ext.horizon);
+        let t_b_horizon = config.extension_horizon + (window.t_b - window.t_a);
+        assert!(ext.horizon > t_b_horizon * 2.0);
+        // And the extra seconds are real coverage: ~0.2 s per 10 mm line,
+        // so 6.0 s reaches far more lines than 2.1 s could.
+        assert!(
+            ext.lines_consumed >= 25,
+            "consumed only {} lines",
+            ext.lines_consumed
+        );
+        let e = set.e_internal.expect("internal E");
+        assert!(e.hi > 20.0, "e_internal {e:?} stops short of the horizon");
+    }
+
+    /// When the print-time axis overflows, the horizon fallback must be
+    /// the conservative branch. Every value here is finite — so ingest
+    /// accepts all of it — but `wal_eval_end - start_pt` is
+    /// `1e308 - (-1e308)`, which overflows to infinity.
+    ///
+    /// Collapsing to `extension_horizon` alone in that case would hand
+    /// back the *narrowest* horizon, i.e. a confident narrow answer
+    /// resting on arithmetic that just failed. The honest outcome is an
+    /// unbounded horizon plus `extension_truncated`, so confidence drops
+    /// out of `PerLine` and automation refuses. Restoring the old
+    /// `else { 0.0 }` fallback fails this test rather than only
+    /// contradicting a comment.
+    #[test]
+    fn an_overflowing_time_axis_refuses_instead_of_narrowing() {
+        let huge = 1.0e308_f64;
+        // t_a = -1e308 (heartbeat and its correlation sample), committed
+        // motion reported at +1e308, and no trapq row — so the origin is
+        // the degenerate bound at t_a - lead and stays hugely negative.
+        let records = vec![
+            WalRecord::Heartbeat(heartbeat_at(0, -huge)),
+            WalRecord::StepperRange(stepper_range("stepper_z", huge, 1_000)),
+            WalRecord::Context(context_at(2_000, 0)),
+        ];
+        let timeline = ingest_records(records);
+        // Precondition: the hostile values survived ingest intact.
+        assert_eq!(timeline.stepper_ranges.len(), 1);
+        let config = ReconstructConfig {
+            mcu_freq: None,
+            ..ReconstructConfig::default()
+        };
+        let window = compute_stop_window(&timeline, None, &config).unwrap();
+        assert!((window.t_a - -huge).abs() < 1.0);
+        assert!((window.t_b - huge).abs() < 1.0);
+        let text = long_tail_text();
+        let tail = FileTail {
+            base_offset: 0,
+            bytes: text.as_bytes(),
+        };
+        let set = compute_stop_set(&timeline, &window, Some(&tail), &config).unwrap();
+        let ext = set.extension.expect("extension ran");
+        // Unbounded, not `extension_horizon`: the axis was unusable, so
+        // coverage is maximal rather than minimal.
+        assert!(
+            ext.horizon.is_infinite(),
+            "horizon {} collapsed to the narrow fallback",
+            ext.horizon
+        );
+        assert!(ext.horizon > config.extension_horizon);
+        // And the answer is labelled as a refusal, whatever the
+        // simulation's own stop reason turned out to be.
+        assert!(set.degradation.extension_truncated);
+        assert_ne!(
+            set.degradation.confidence,
+            Confidence::PerLine,
+            "an unusable time axis must not yield per-line confidence"
+        );
     }
 
     #[test]

@@ -166,10 +166,35 @@ impl WalTimeline {
     /// [`crate::stopset`] for why the stop set evaluates out to it.
     #[must_use]
     pub fn trapq_end_time(&self) -> Option<f64> {
+        self.trapq_end_time_journaled_by(u64::MAX)
+    }
+
+    /// End of durable trapq knowledge counting **only rows journaled at
+    /// or before `mono_ns`**.
+    ///
+    /// Trapq rows are journaled when the daemon receives them, i.e. when
+    /// Klipper *plans* the move, which is also when the g-code line
+    /// producing it has been processed. So for a [`Context`] snapshot
+    /// with capture time `t` and processing frontier `F`, this value at
+    /// `mono_ns = t` is an upper bound on the execution time of all
+    /// motion up to `F` — and, because every line up to `F` was
+    /// processed by `t` (and so had its row journaled by `t`, modulo
+    /// batching delay that only lowers this value), it is also a **sound
+    /// lower bound** on when the machine finishes the motion preceding
+    /// `F`.
+    ///
+    /// [`crate::stopset`] uses that to place the forward extension's
+    /// first simulated move on the print-time axis: a frontier stalled
+    /// on one long move can sit seconds *behind* the snapshot's own
+    /// capture time, and sizing the extension horizon from the capture
+    /// time instead under-simulates by exactly that much.
+    #[must_use]
+    pub fn trapq_end_time_journaled_by(&self, mono_ns: u64) -> Option<f64> {
         let end = self
             .toolhead_segments
             .iter()
             .chain(&self.extruder_segments)
+            .filter(|seg| seg.mono_ns <= mono_ns)
             .map(TrapqSegment::end_time)
             .fold(f64::NEG_INFINITY, f64::max);
         end.is_finite().then_some(end)
@@ -418,6 +443,27 @@ mod tests {
         let empty = ingest(&scan_of(vec![]), None);
         assert_eq!(empty.trapq_end_time(), None);
         assert_eq!(empty.last_motion_mono_ns, None);
+    }
+
+    #[test]
+    fn trapq_end_time_can_be_restricted_to_rows_journaled_by_a_time() {
+        // Two rows: one journaled at mono 1 ending at pt 10.5, one
+        // journaled at mono 100 ending at pt 20.5. Restricting to
+        // mono <= 1 must ignore the later row entirely — this is what
+        // places a stalled processing frontier on the print-time axis
+        // (see crate::stopset::extension_start_time).
+        let scan = scan_of(vec![
+            WalRecord::TrapqSegment(trapq_segment("toolhead", 10.0, 0.5, 1)),
+            WalRecord::TrapqSegment(trapq_segment("toolhead", 20.0, 0.5, 100)),
+        ]);
+        let timeline = ingest(&scan, None);
+        let all = timeline.trapq_end_time().unwrap();
+        assert!((all - 20.5).abs() < 1e-12);
+        let early = timeline.trapq_end_time_journaled_by(1).unwrap();
+        assert!((early - 10.5).abs() < 1e-12);
+        assert!((timeline.trapq_end_time_journaled_by(99).unwrap() - 10.5).abs() < 1e-12);
+        assert!((timeline.trapq_end_time_journaled_by(100).unwrap() - 20.5).abs() < 1e-12);
+        assert_eq!(timeline.trapq_end_time_journaled_by(0), None);
     }
 
     #[test]

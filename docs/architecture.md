@@ -214,9 +214,17 @@ possible-stop set = { state(t) : t ∈ [t_a, wal_eval_end] }   (from the WAL)
   are all typed anomalies.
 - **The forward extension** simulates the G-code from the last recorded
   context (file offset + interpreter state) for a horizon of 2 s of
-  simulated motion plus catch-up when the context lags `t_b`. Because the
-  simulator's per-line time accounting is a documented *lower bound* on real
-  durations, the horizon covers at least that much real machine time.
+  simulated motion plus catch-up from the print time at which that context's
+  processing frontier *begins executing* out to the end of WAL knowledge.
+  That origin is derived from durable trapq rows, not from the context's own
+  capture time: when the G-code reader stalls on a long move the frontier
+  stands still while the queued move executes, so the snapshot records a file
+  position whose motion began seconds earlier, and measuring the horizon from
+  the capture time spends it re-simulating motion that already happened.
+  Because the simulator's per-line time accounting is a documented *lower
+  bound* on real durations — except for the first move, which starts from
+  zero velocity and so can be overestimated by up to one acceleration ramp —
+  the horizon covers at least that much real machine time, less that ramp.
 
 ### The guarantee, and its honest caveats
 

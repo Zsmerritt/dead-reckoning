@@ -160,8 +160,35 @@ This is the possible-stop set:
   - `observation_gap: true` — a subscription gap or socket loss overlaps
     the window (disk stall, Klipper restart); WAL candidates inside it may
     be missing and containment leans on the extension.
+  - `extension_start_unanchored: true` — no durable trapq row precedes the
+    anchor context, so the extension's horizon was anchored on the
+    reader-lead bound (`t_a` minus `max_processing_lead`) instead of on
+    measured motion. **Coverage is preserved** — this is not a reason to
+    distrust the set. It is normal for a stop early in a print, before the
+    first motion rows became durable, and it is the expected shape after a
+    Klipper or daemon restart. Expect `ManualFallback` alongside it (see
+    below). Treat it as a prompt to sanity-check `max_processing_lead`
+    against the machine if the reported window looks implausibly narrow.
   - `confidence: PerLayer` — match only at layer granularity; automatic
     resume would be refused (`MatchTooCoarse`), manual recovery indicated.
+
+### A power loss in the opening moments of a print
+
+Expect manual recovery, and expect it to cost you almost nothing.
+
+Before the first moves are planned there is no durable motion evidence, so
+the reconstruction cannot tell where in the queued G-code the toolhead
+actually was; it reports `extension_start_unanchored: true` and widens the
+candidate window to stay honest, which leaves more candidate lines than the
+matcher can separate. The daemon then declines with `stop-point match
+failed: N candidate lines … below layer granularity`.
+
+This is correct behaviour, not a bug: with no motion evidence there is
+nothing to place the nozzle from, and guessing is what destroys a print (or
+a nozzle). It costs little in practice because barely anything has been
+deposited — and a stop on the very first layer has no layer beneath it to
+probe against, so automated recovery is refused on structural grounds
+anyway. Restart the print.
 
 ## What markers mean
 

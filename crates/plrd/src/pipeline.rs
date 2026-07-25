@@ -844,7 +844,7 @@ pub(crate) mod e2e_tests {
     use crate::config::{Config, MachineSection, MachineZStepper};
     use plr_wal::{
         Context, FanTarget, GcodeState, Heartbeat, HeaterTarget, SegmentHeader,
-        TransformObservations, VirtualSdState, WalRecord, WalWriter,
+        TransformObservations, TrapqSegment, VirtualSdState, WalRecord, WalWriter,
     };
     use std::path::PathBuf;
 
@@ -1171,6 +1171,49 @@ G1 X60 Y60 E0.02
         }
     }
 
+    /// One durable trapq row for the motion that precedes the crash
+    /// context's processing frontier, ending exactly at the heartbeat's
+    /// print time.
+    ///
+    /// Load-bearing, and the reason is narrow: a zero-trapq WAL is
+    /// perfectly possible (see
+    /// [`early_print_fixture`] — a cut in the opening moments of a print,
+    /// or shortly after a klippy/plrd restart, has no durable motion row
+    /// yet). What cannot happen is this fixture's *combination*: a
+    /// `Context` reporting a frontier at byte 2138 with the toolhead
+    /// already moved to (30, 30, 0.2) and 3 mm extruded, while the log
+    /// contains no trapq row for any of that motion. Klipper journals a
+    /// row per planned move, so motion that demonstrably happened has
+    /// rows; claiming the motion without them is an impossible input.
+    ///
+    /// It matters because without a row journaled before the anchor
+    /// context `plr-reconstruct` cannot place the frontier on the
+    /// print-time axis from motion evidence and falls back to the
+    /// reader-lead bound (`t_a` minus `max_processing_lead`), which
+    /// correctly assumes execution may lag the frontier by seconds and so
+    /// widens the extension horizon — and with it the offset candidate
+    /// window, past what the matcher can resolve per line. With this row
+    /// the fixture exercises the anchored path, which is the path a
+    /// mid-print crash takes. The unanchored path keeps its own
+    /// end-to-end coverage in
+    /// [`an_early_print_cut_without_motion_evidence_falls_back_to_manual`].
+    fn preceding_motion() -> TrapqSegment {
+        TrapqSegment {
+            mono_ns: 4_500_000_000,
+            queue: "toolhead".to_owned(),
+            print_time: 9.5,
+            duration: 0.5,
+            start_velocity: 20.0,
+            acceleration: 0.0,
+            start_x: 20.0,
+            start_y: 30.0,
+            start_z: 0.2,
+            x_r: 1.0,
+            y_r: 0.0,
+            z_r: 0.0,
+        }
+    }
+
     /// Builds a WAL dir + print file + config primed to reach a plan.
     pub(crate) fn fixture(tag: &str) -> (PathBuf, Config) {
         let dir = temp_dir(tag);
@@ -1178,6 +1221,9 @@ G1 X60 Y60 E0.02
         std::fs::write(&gcode_path, MODEL_TEXT.as_bytes()).unwrap();
         let mut writer = WalWriter::create(Vec::new(), &SegmentHeader::new(1, 1)).unwrap();
         writer.append(&WalRecord::Heartbeat(heartbeat())).unwrap();
+        writer
+            .append(&WalRecord::TrapqSegment(preceding_motion()))
+            .unwrap();
         // An early context (before any deposition) anchors the layer
         // model so it covers layer 0 — contact selection probes layer
         // N−1, which must exist in the modeled window.
@@ -1224,10 +1270,102 @@ G1 X60 Y60 E0.02
         (dir, config)
     }
 
+    /// The internally consistent zero-trapq shape: a cut in the opening
+    /// moments of a print (or just after a klippy/plrd restart), before
+    /// any move was planned. The frontier has **not** moved — position is
+    /// the origin, nothing extruded — so the absence of trapq rows is
+    /// exactly what the machine state claims, unlike [`fixture`], whose
+    /// frontier has moved and therefore must carry a row.
+    ///
+    /// This is the end-to-end coverage of `plr-reconstruct`'s unanchored
+    /// horizon branch: with no motion evidence the extension origin comes
+    /// from the reader-lead bound, which widens the candidate window past
+    /// per-line resolution. See
+    /// [`an_early_print_cut_without_motion_evidence_falls_back_to_manual`]
+    /// for the outcome that is deliberately accepted.
+    fn early_print_fixture(tag: &str) -> (PathBuf, Config) {
+        let (dir, config) = fixture(tag);
+        let gcode_path = dir.join("part.gcode");
+        let mut writer = WalWriter::create(Vec::new(), &SegmentHeader::new(1, 1)).unwrap();
+        writer.append(&WalRecord::Heartbeat(heartbeat())).unwrap();
+        let mut early = crash_context(gcode_path.to_str().unwrap());
+        early.mono_ns = 5_000_000_000;
+        if let Some(vsd) = &mut early.virtual_sdcard {
+            vsd.file_position = 8; // after G90/M83, before layer 0
+        }
+        // Nothing has moved and nothing has been extruded, which is why
+        // no trapq row exists: consistent, not impossible.
+        early.gcode.position = vec![0.0, 0.0, 0.0, 0.0];
+        early.gcode.gcode_position = vec![0.0, 0.0, 0.0, 0.0];
+        writer.append(&WalRecord::Context(early)).unwrap();
+        std::fs::write(dir.join("wal-000001.plr"), writer.into_inner()).unwrap();
+        (dir, config)
+    }
+
     fn run(config: &Config) -> (PipelineOutcome, String) {
         let mut out = Vec::new();
         let outcome = run_pipeline(config, &mut out).expect("pipeline hard error");
         (outcome, String::from_utf8(out).unwrap())
+    }
+
+    /// End-to-end coverage of `plr-reconstruct`'s **unanchored** horizon
+    /// branch, and a ratification of the trade it makes.
+    ///
+    /// A cut before any move was planned leaves no durable trapq row, so
+    /// the extension's start time cannot be read from motion evidence and
+    /// falls back to the reader-lead bound (`t_a` minus
+    /// `max_processing_lead`). That bound assumes execution may lag the
+    /// recorded frontier by seconds, which is what keeps the set
+    /// containing the truth, and it widens the offset candidate window
+    /// past what the matcher can resolve per line. The outcome is
+    /// therefore `ManualFallback`, deliberately.
+    ///
+    /// Asserted rather than left implicit for two reasons: it records the
+    /// degradation as intended behaviour, so nobody narrows the bound to
+    /// "fix" this and silently reopens the containment hole the bound
+    /// closes; and it gives the unanchored path a consumer-level test
+    /// that can fail. `docs/operations.md` carries the operator-facing
+    /// half — an early-print power loss lands in manual recovery, which
+    /// costs the operator little because almost nothing has printed.
+    #[test]
+    fn an_early_print_cut_without_motion_evidence_falls_back_to_manual() {
+        let (_dir, config) = early_print_fixture("early-print-unanchored");
+        let (outcome, output) = run(&config);
+        let PipelineOutcome::ManualFallback(reason) = outcome else {
+            panic!("expected ManualFallback, got {outcome:?}\n{output}");
+        };
+        // The reason it reports today: the widened window leaves more
+        // candidate lines than layer granularity can separate.
+        assert!(
+            reason.contains("stop-point match failed"),
+            "reason changed: {reason}\n{output}"
+        );
+        assert!(
+            reason.contains("below layer granularity"),
+            "reason changed: {reason}\n{output}"
+        );
+        // Pin the widening numerically, not just by message: the
+        // reader-lead bound gives a 5 s horizon and 16 candidate lines
+        // here, where anchoring on the capture time would give 2 s and 8.
+        // Narrowing the bound therefore fails this assertion instead of
+        // silently reopening the containment hole the bound closes.
+        let count: usize = reason
+            .split_whitespace()
+            .find_map(|word| word.parse().ok())
+            .unwrap_or(0);
+        assert!(
+            count >= 12,
+            "only {count} candidate lines — the reader-lead widening is gone: {reason}"
+        );
+        // Nothing is lost by declining here: a stop this early has no
+        // layer below the resume layer to probe, so recovery is refused
+        // on structural grounds too (with the narrow horizon this same
+        // fixture fails contact selection with "resume layer 0 out of
+        // range"). See docs/operations.md.
+        assert!(
+            output.contains("layer model from byte 8: 2 layers"),
+            "{output}"
+        );
     }
 
     #[test]
@@ -1650,18 +1788,16 @@ mod tests {
             e_file: None,
             file_window: window,
             extension: None,
+            // `..Degradation::default()` (every flag clear) so that adding
+            // a degradation flag upstream cannot break this fixture. The
+            // two fields kept explicit are not read by `stop_evidence`;
+            // they are spelled out because they define the "healthy set"
+            // baseline these tests start from, and a reader should not
+            // have to know `Degradation::default()` to see it.
             degradation: Degradation {
                 confidence: Confidence::PerLine,
                 observation_gap: false,
-                extension_unavailable: false,
-                extension_truncated: false,
-                extension_error: false,
-                unknown_z_in_extension: false,
-                unknown_xy_in_extension: false,
-                e_frame_shift_in_extension: false,
-                offset_floor_uncertain: false,
-                e_file_frames_incomplete: false,
-                anchor_time_unknown: false,
+                ..Degradation::default()
             },
         }
     }
