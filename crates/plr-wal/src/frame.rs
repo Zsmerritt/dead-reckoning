@@ -900,6 +900,7 @@ mod tests {
         huge.virtual_sdcard = Some(crate::record::VirtualSdState {
             file_path: "g".repeat(usize::try_from(MAX_PAYLOAD_LEN).unwrap() + 1),
             file_position: 0,
+            file_size: None,
         });
         let err = writer.append(&WalRecord::Context(huge)).unwrap_err();
         match err {

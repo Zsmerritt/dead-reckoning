@@ -9,6 +9,16 @@
 # script is the Linux-side check, runnable from a Linux box, a container,
 # or WSL against a Windows worktree.
 #
+# THE WINDOWS RUN IS NOT SUFFICIENT. Concretely, on 2026-07-24 this script
+# caught six clippy diagnostics in `crates/plrd/src/detect.rs` — a
+# too-similar binding and two `u64 as usize` casts, at `-D warnings` — on a
+# branch whose Windows gate was clean and whose author believed it green.
+# The Windows pre-commit hook passes `--exclude plrd`, so those diagnostics
+# are not merely unlikely to be seen there, they are *structurally
+# invisible*: the crate is never compiled. Any change touching `plrd`, or
+# touching a crate `plrd` depends on, needs this script before it is called
+# green. Do not conclude from a clean Windows run that this one is redundant.
+#
 # Two footguns it defends against. Both have produced false "green"
 # reports on this project; the notes below record what was *measured* on
 # the pinned toolchain, because a gate script that documents unverified
@@ -87,7 +97,36 @@ test_counts() {
 }
 
 echo "==> repo: $(pwd)"
-echo "==> commit: $(git rev-parse --short HEAD 2>/dev/null || echo '(unknown)')"
+# Resolves HEAD even for a git *worktree* whose `.git` file points at a
+# Windows path, which is the normal shape when running this from WSL against a
+# Windows checkout. Git inside WSL cannot follow `gitdir: C:/…` — it reads the
+# drive-letter path as relative and fails — so the `C:/x` form is translated
+# to `/mnt/c/x` and retried.
+#
+# This matters more than cosmetics: a gate report that cannot name the commit
+# it ran against is exactly the ambiguity that let a false "green" claim stand
+# on this project once already.
+resolve_commit() {
+    if git rev-parse --short HEAD 2>/dev/null; then
+        return
+    fi
+    if [ ! -f .git ]; then
+        echo '(unknown: not a git worktree)'
+        return
+    fi
+    gitdir=$(sed -n 's/^gitdir: *//p' .git | tr -d '\r')
+    case "$gitdir" in
+        [A-Za-z]:[/\\]*)
+            drive=$(printf '%s' "$gitdir" | cut -c1 | tr '[:upper:]' '[:lower:]')
+            rest=$(printf '%s' "$gitdir" | cut -c3- | tr '\\' '/')
+            git --git-dir="/mnt/$drive$rest" rev-parse --short HEAD 2>/dev/null \
+                || echo "(unknown: cannot read /mnt/$drive$rest)"
+            ;;
+        *) echo "(unknown: gitdir $gitdir)" ;;
+    esac
+}
+
+echo "==> commit: $(resolve_commit)"
 echo "==> logs: $log_dir"
 echo
 

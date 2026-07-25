@@ -220,6 +220,33 @@ pub struct VirtualSdState {
     pub file_path: String,
     /// Byte offset the G-code reader has reached in that file.
     pub file_position: u64,
+    /// Size of that file as Klipper reported it
+    /// (`virtual_sdcard.file_size`), when observed.
+    ///
+    /// # Why the size and not just the path
+    ///
+    /// A path is not an identity. The file under it can be truncated,
+    /// re-sliced, or replaced between the loss and the recovery — a
+    /// re-slice under the same name is the normal way an operator iterates
+    /// — and then [`file_position`](Self::file_position) indexes into
+    /// different content. Replaying from a stale offset can land anywhere,
+    /// including inside the new file's trailing config block, where a
+    /// completion gate would find no extrusion and conclude the print
+    /// finished. The recorded size makes that detectable: it is a cheap
+    /// checksum over "is this still the file we were printing?", and it
+    /// costs one `u64` in a record the recorder was already writing.
+    ///
+    /// It does not make the check *complete* — an edit that preserves the
+    /// byte count slips through — so consumers must treat a match as
+    /// "not obviously a different file", never as proof of identity.
+    ///
+    /// `None` means **not observed**: a pre-change WAL, or a status update
+    /// that carried `file_path`/`file_position` without `file_size`. Same
+    /// `#[serde(default)]` / `skip_serializing_if` treatment as
+    /// [`Context::exclude`], so a pre-change payload still decodes and a
+    /// state without it serializes byte-identically to the old format.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_size: Option<u64>,
 }
 
 /// Snapshot of `gcode_move.get_status`: everything needed to re-enter the
@@ -644,6 +671,53 @@ pub struct Context {
     /// decoder ignores the key.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exclude: Option<Box<ExcludeState>>,
+    /// `print_stats.state` at capture time, verbatim as Klipper reported
+    /// it (`klippy/extras/print_stats.py`, `PrintStats.get_status`
+    /// returns `state` alongside `filename`, the durations and
+    /// `filament_used`).
+    ///
+    /// # Why this is journaled
+    ///
+    /// It is the printer's **authoritative print state machine** —
+    /// `standby` / `printing` / `paused` / `complete` / `cancelled` /
+    /// `error` — and it is the only signal that distinguishes "the
+    /// operator ended this print" from "the machine died", which is the
+    /// difference between offering a recovery and not offering one.
+    ///
+    /// Everything else recovery could use for that is an *inference*:
+    /// `virtual_sdcard.is_active` is `work_timer is not None`, which a
+    /// pause and a cancel-after-a-pause leave identical, and
+    /// `file_position >= file_size` cannot see a print that died in its
+    /// last layer (the trailing slicer config block is a near-constant
+    /// 14–18 KB, so the ratio means nothing on its own). Recording the
+    /// state itself removes the inference.
+    ///
+    /// # Verbatim, not parsed
+    ///
+    /// Stored as the reported string rather than an enum for the same
+    /// reason [`TransformObservations::bed_mesh_profile`] is: this
+    /// format's job is to preserve what the printer said, and a state
+    /// string a future Klipper introduces must survive a round trip
+    /// through a reader that predates it rather than collapsing into an
+    /// `Unknown` variant. Consumers interpret it
+    /// (`plrd::convert::PrintState::parse`).
+    ///
+    /// `None` means **not observed** — the printer has no `[print_stats]`
+    /// section, or no status update has carried it yet — never "no print
+    /// is running".
+    ///
+    /// # WAL format compatibility
+    ///
+    /// Added after [`exclude`](Self::exclude), and given the same
+    /// `#[serde(default)]` / `skip_serializing_if` treatment for the same
+    /// reasons: every payload written before *this* field existed still
+    /// decodes (yielding `None`), and a `Context` that never observed
+    /// `print_stats` serializes byte-identically to what the recorder wrote
+    /// before it. The compatibility fixture in this module's tests is pinned
+    /// to a payload predating **both** fields, so it exercises the older of
+    /// the two contracts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub print_state: Option<String>,
 }
 
 impl Context {
@@ -695,6 +769,38 @@ pub enum MarkerKind {
     /// authoritative when this marker postdates the newest journaled
     /// exclude state.
     ExclusionUpdateLost,
+    /// **The recorder stopped on purpose; the print's fate is unknown.**
+    ///
+    /// Written as the last act of a graceful daemon shutdown (SIGTERM /
+    /// SIGINT — `systemctl restart plrd`, a package upgrade, a reboot).
+    ///
+    /// # Why the log needs to say this
+    ///
+    /// A graceful stop and a mid-print death produce *identical* log
+    /// tails: no [`CleanShutdown`](MarkerKind::CleanShutdown) marker and a
+    /// print in progress. But `plrd.service` is `Restart=always`, so the
+    /// daemon restarting under a running print is routine, and the next
+    /// start's boot-time detection runs before its Klipper client can ask
+    /// whether the print is still going. Without this marker every
+    /// `systemctl restart plrd` announces a recovery for a print that is
+    /// still happily printing, which trains the operator to ignore the
+    /// announcement — the one outcome a power-loss tool cannot afford.
+    ///
+    /// # What it does and does not license
+    ///
+    /// It says only "the recorder stopped here, on purpose". It does
+    /// **not** say the print ended: the print may have finished, been
+    /// cancelled, or died of a power cut a minute later with nothing left
+    /// to record it. So it suppresses the *announcement* and nothing else.
+    /// The WAL prefix before it stays fully valid evidence, `plrd recover`
+    /// still reconstructs and still offers to resume, and a
+    /// pending-recovery offer already on disk is **not** retracted.
+    ///
+    /// Distinct from [`CleanShutdown`](MarkerKind::CleanShutdown), which
+    /// asserts the *print* ended deliberately and does suppress recovery
+    /// outright, and from [`SocketLost`](MarkerKind::SocketLost), which
+    /// says Klipper went away while the recorder kept running.
+    RecorderStopped,
     /// A marker kind written by a newer format revision; preserved as
     /// opaque. Never written by this version except when round-tripping.
     #[serde(other)]
@@ -933,10 +1039,12 @@ pub(crate) mod samples {
 
     pub(crate) fn sample_context() -> Context {
         Context {
+            print_state: Some("printing".to_owned()),
             mono_ns: 3_333,
             virtual_sdcard: Some(VirtualSdState {
                 file_path: "/home/pi/gcodes/benchy.gcode".into(),
                 file_position: 123_456,
+                file_size: None,
             }),
             gcode: GcodeState {
                 speed_factor: 1.0,
@@ -979,6 +1087,7 @@ pub(crate) mod samples {
     pub(crate) fn sample_context_without_exclude() -> Context {
         Context {
             exclude: None,
+            print_state: None,
             ..sample_context()
         }
     }
@@ -1024,6 +1133,10 @@ mod tests {
     /// A `Context` payload exactly as the recorder wrote it **before**
     /// the `exclude` field existed. Pinned verbatim: it is the
     /// backward-compatibility contract, not a value to regenerate.
+    /// A `Context` payload as it was written **before both** the
+    /// `exclude` and `print_state` fields existed. Pinned verbatim: it is
+    /// the compatibility contract, so it must never be regenerated from
+    /// the current types.
     const PRE_EXCLUDE_CONTEXT_JSON: &str = concat!(
         r#"{"type":"Context","mono_ns":3333,"#,
         r#""virtual_sdcard":{"file_path":"/home/pi/gcodes/benchy.gcode","file_position":123456},"#,
@@ -1107,6 +1220,57 @@ mod tests {
         let json =
             serde_json::to_string(&WalRecord::Context(sample_context_without_exclude())).unwrap();
         assert_eq!(json, PRE_EXCLUDE_CONTEXT_JSON);
+    }
+
+    /// A pre-change payload decodes with `print_state == None` —
+    /// "not observed", never "no print is running".
+    #[test]
+    fn a_pre_print_state_context_still_decodes() {
+        let record: WalRecord = serde_json::from_str(PRE_EXCLUDE_CONTEXT_JSON).unwrap();
+        let WalRecord::Context(ctx) = &record else {
+            panic!("variant changed");
+        };
+        assert_eq!(ctx.print_state, None);
+        assert!(record.values_are_finite());
+    }
+
+    /// And a `Context` that never observed `print_stats` serializes
+    /// byte-identically to the pre-change format, so a pre-change reader
+    /// sees exactly the bytes it used to.
+    #[test]
+    fn context_without_print_state_serializes_byte_identically() {
+        let json =
+            serde_json::to_string(&WalRecord::Context(sample_context_without_exclude())).unwrap();
+        assert_eq!(json, PRE_EXCLUDE_CONTEXT_JSON);
+        assert!(!json.contains("print_state"), "{json}");
+    }
+
+    /// The field is stored verbatim, so any state string — including one
+    /// this version has never heard of — survives a round trip intact.
+    #[test]
+    fn print_state_roundtrips_verbatim_including_unknown_states() {
+        for state in [
+            "standby",
+            "printing",
+            "paused",
+            "complete",
+            "cancelled",
+            "error",
+            // A state a future Klipper might introduce.
+            "hibernating",
+            "",
+        ] {
+            let record = WalRecord::Context(Context {
+                print_state: Some(state.to_owned()),
+                ..sample_context_without_exclude()
+            });
+            assert_eq!(roundtrip(&record), record, "state {state:?}");
+            let json = serde_json::to_string(&record).unwrap();
+            assert!(
+                json.contains(&format!(r#""print_state":"{state}""#)),
+                "{json}"
+            );
+        }
     }
 
     #[test]

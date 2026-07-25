@@ -7,6 +7,18 @@ klipper_socket = /tmp/klippy_uds
 
 # Where WAL segments, the heartbeat file, and the receive_seq sidecar
 # live. Must be on storage that survives power loss with the printer.
+#
+# plrd also keeps two small state files here:
+#   pending_recovery.json  — "a recovery is available" (operator UX; the
+#                            wizard reads this, and boot detection
+#                            re-derives it from the WAL each start)
+#   frame_invalid.json     — safety interlock: a recovery aborted with
+#                            Klipper's Z frame in an unknown state, so
+#                            `--execute` is refused until a fresh dry run
+#
+# A deliberate plrd stop (SIGTERM) is recorded IN the WAL itself, as a
+# RecorderStopped marker, so the next start does not mistake this session's
+# marker-less tail for a dead print. There is no sidecar file for it.
 wal_dir = /var/lib/plrd/wal
 
 # Heartbeat file path override (default: <wal_dir>/heartbeat.bin).

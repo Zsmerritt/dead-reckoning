@@ -88,14 +88,101 @@
 //! bounding box, so a hostile polygon can never make the whole context
 //! non-finite and cost us the excluded set.
 //!
+//! # `print_stats`: journaled, and also a clean-shutdown signal
+//!
+//! `print_stats.state` is recorded verbatim into every context
+//! ([`plr_wal::Context::print_state`]) and a change to it triggers an
+//! immediate context, because it is the printer's authoritative print
+//! state machine and it changes a handful of times per print, not per
+//! move. Recording the state itself is what lets recovery tell "the
+//! operator ended this print" from "the machine died" without inferring
+//! it from `is_active` edges or byte ratios.
+//!
+//! The same merge also drives signal 1 below. Both matter: the journaled
+//! field is *evidence* a later `plrd detect` reads directly, while the
+//! `CleanShutdown` marker is the *control signal* that stops
+//! `plr_reconstruct::reconstruct` producing a recovery at all. Either one
+//! surviving alone is enough to avoid a false offer.
+//!
 //! # Clean-shutdown detection
 //!
-//! Keyed on `virtual_sdcard.is_active` transitioning true→false in a
-//! status update where, after merging that same update, either the file
-//! reader reached the end of the file (`file_position >= file_size`,
-//! complete) or the loaded file was cleared (`file_path == null`,
-//! cancel via `SDCARD_RESET_FILE`). A pause (`is_active` false, file
-//! still loaded mid-file) does **not** count.
+//! Three independent signals, OR-ed. Any one of them journals a
+//! `CleanShutdown` marker; a **pause** trips none of them.
+//!
+//! 1. **`print_stats.state` left an in-progress state for a finished
+//!    one** — `printing`/`paused` → `complete`/`cancelled`/`standby`.
+//!    This is the authoritative signal and the only one that is a state
+//!    machine rather than an inference. Klipper sets it in
+//!    `klippy/extras/print_stats.py`: `reset()` → `"standby"`,
+//!    `note_start()` → `"printing"`, `note_pause()` → `"paused"`, and
+//!    `_note_finish()` → `"complete"` (from `note_complete`),
+//!    `"cancelled"` (from `note_cancel`) or `"error"` (from
+//!    `note_error`). `error` is deliberately **not** a finished state
+//!    here: a print that died on an error is exactly what recovery is
+//!    for.
+//! 2. **`virtual_sdcard.file_path` went `Some` → `None`** while a print
+//!    was in progress this session. `virtual_sdcard.do_cancel` /
+//!    `_reset_file` close the file (`self.current_file = None`), so
+//!    `file_path()` starts reporting `null`.
+//! 3. **`virtual_sdcard.is_active` went true → false** in an update
+//!    that, once merged, shows the reader at or past the end of the file
+//!    (`file_position >= file_size`) or no file loaded.
+//!
+//! ## Why signal 3 alone was not enough
+//!
+//! `is_active` is `self.work_timer is not None`
+//! (`klippy/extras/virtual_sdcard.py`, `is_active`), and `do_cancel`
+//! begins with `do_pause()`, whose body is guarded:
+//!
+//! ```text
+//! def do_pause(self):
+//!     if self.work_timer is not None:
+//!         self.must_pause_work = True
+//!         while self.work_timer is not None and not self.cmd_from_sd:
+//!             self.reactor.pause(self.reactor.monotonic() + .001)
+//! ```
+//!
+//! * **Pause → cancel** (the default Mainsail/Fluidd button order, the
+//!   filament-runout flow, and the post-error flow) already cleared
+//!   `work_timer`, so `do_pause()` is a no-op, `is_active` never
+//!   changes, and the status **diff carries no `is_active` key at all**.
+//!   Signal 3 cannot fire; signals 1 and 2 both do, deterministically.
+//! * **Direct cancel while printing** races: the 1 ms `reactor.pause`
+//!   loop yields to the reactor, so the status subscription can sample
+//!   *between* `work_timer` going `None` and the file closing. That
+//!   update carries `is_active: false` with the file still loaded
+//!   mid-file — a pause, as far as signal 3 can tell — and the *next*
+//!   update carries `file_path: null` with no `is_active` key. Signal 2
+//!   catches the second update; signal 1 catches whichever update
+//!   carries `print_stats`.
+//!
+//! ## Why signal 2 needs a session gate
+//!
+//! `reset_session` exists because a klippy `RESTART` resets
+//! `virtual_sdcard` server-side, and diffing the fresh baseline against
+//! the stale snapshot would look like a deliberate end. That baseline
+//! reports `file_path: null`, which is precisely a `Some` → `None`
+//! transition against the pre-restart snapshot. Signal 2 is therefore
+//! gated on [`Recorder`]'s `print_in_progress`, set only by a *positive*
+//! observation that a print is running (`is_active: true`, or
+//! `print_stats.state` in `printing`/`paused`) and cleared by
+//! `reset_session`. After a restart the gate is closed, so the killed
+//! print still reads as an unclean stop.
+//!
+//! ## Duplicate markers are expected and harmless
+//!
+//! The three signals are independent, not prioritized, so one print end
+//! can journal the marker **more than once** — most commonly when
+//! `file_path: null` and `print_stats.state == "cancelled"` arrive in
+//! separate status updates, tripping signals 2 and 1 in turn. That is
+//! deliberate: suppressing the second would mean picking a "primary"
+//! signal, and the whole point is that no single signal is reliable.
+//!
+//! Duplicates cost one extra 40-odd-byte marker record and change no
+//! reader's answer: `plr_reconstruct::timeline::ingest` keeps the *index*
+//! of the newest `CleanShutdown` marker (`clean_marker_idx = Some(idx)`,
+//! last write wins) and only calls the log clean when no motion record
+//! follows it, so N markers in a row decide exactly what one would.
 
 use std::collections::BTreeMap;
 
@@ -255,6 +342,13 @@ pub struct Output {
 /// Pure logic — no I/O, no clocks. The caller supplies `mono_ns`
 /// (host `CLOCK_MONOTONIC`, the same clock Klipper's reactor `eventtime`
 /// runs on) with every message.
+// Four bools, each a distinct and independent observation about the live
+// session (is the reader active, is a print in progress, has
+// `exclude_object` ever been seen, do its definitions still need
+// journaling). They are not a state enum in disguise: every one of the 16
+// combinations is reachable, and folding them into flag structs would
+// only add indirection to a hot-path merge.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug)]
 pub struct Recorder {
     correlator: ClockCorrelator,
@@ -266,6 +360,20 @@ pub struct Recorder {
     file_position: u64,
     file_size: u64,
     is_active: bool,
+    /// Newest `print_stats.state`, verbatim, for
+    /// [`plr_wal::Context::print_state`]. `None` before the first
+    /// observation of the session — which is exactly "not observed".
+    print_state: Option<String>,
+    /// Whether a print has been *positively* observed running this
+    /// session — `virtual_sdcard.is_active == true`, or
+    /// `print_stats.state` in `printing`/`paused`.
+    ///
+    /// This is the "was there a print to end?" gate for both the
+    /// `print_stats` transition (signal 1) and the `file_path`
+    /// `Some` → `None` transition (signal 2), so a klippy restart cannot
+    /// forge either — see the module-level "Why signal 2 needs a session
+    /// gate". Cleared by `reset_session` and by a print end.
+    print_in_progress: bool,
     transforms: TransformObservations,
     heaters: BTreeMap<String, f64>,
     fans: BTreeMap<String, f64>,
@@ -304,6 +412,8 @@ impl Recorder {
             file_position: 0,
             file_size: 0,
             is_active: false,
+            print_state: None,
+            print_in_progress: false,
             transforms: TransformObservations {
                 bed_mesh_active: false,
                 bed_mesh_profile: None,
@@ -352,8 +462,16 @@ impl Recorder {
     /// longer honours. Clearing forces the next session's initial full
     /// status to re-journal definitions and the excluded set from
     /// scratch.
+    /// `print_stats` state is dropped for the same reason
+    /// `virtual_sdcard` state is: Klipper's copy belongs to the klippy
+    /// instance that died. Dropping it also closes the
+    /// `print_in_progress` gate, which is what stops the next session's
+    /// fresh (empty) `virtual_sdcard` baseline from reading as a
+    /// deliberate cancel.
     pub fn reset_session(&mut self) {
         self.is_active = false;
+        self.print_state = None;
+        self.print_in_progress = false;
         self.est_sample = None;
         self.latest_print_time = 0.0;
         self.exclude = ExcludeObjectSnapshot::new();
@@ -406,12 +524,22 @@ impl Recorder {
         if let Ok(Some(gm)) = update.status.gcode_move() {
             state_changed |= self.merge_gcode(&gm);
         }
+        // `print_stats` is merged BEFORE `virtual_sdcard` so that a
+        // single update carrying both (the normal shape of a cancel)
+        // opens the `print_in_progress` gate from the authoritative
+        // signal before the `file_path` signal consults it.
+        let print_stats = self.merge_print_stats(update);
+        out.clean_shutdown = print_stats.clean_shutdown;
+        // A print-state change is journaled immediately: it is the whole
+        // point of recording the field, and it happens a handful of times
+        // per print, not per move.
+        state_changed |= print_stats.state_changed;
         let mut position_advanced = false;
         if let Ok(Some(vsd)) = update.status.virtual_sdcard() {
             let vsd_result = self.merge_virtual_sdcard(&vsd);
             state_changed |= vsd_result.path_changed;
             position_advanced = vsd_result.position_advanced;
-            out.clean_shutdown = vsd_result.clean_shutdown;
+            out.clean_shutdown |= vsd_result.clean_shutdown;
         }
         state_changed |= self.merge_heaters_and_fans(update);
         state_changed |= self.merge_transforms(update);
@@ -583,12 +711,58 @@ impl Recorder {
         trigger
     }
 
+    /// Merges `print_stats.state` and reports whether the transition is a
+    /// deliberate print end (see the module-level signal 1).
+    ///
+    /// Unrecognized state strings are kept as
+    /// [`PrintState::Other`]: a future Klipper state must never be
+    /// mistaken for a finished one, and must not silently overwrite the
+    /// knowledge that a print *was* running either — which is why
+    /// `print_in_progress` is only ever cleared by a state that is
+    /// positively finished (or by `reset_session`).
+    fn merge_print_stats(&mut self, update: &StatusUpdate) -> PrintStatsMerge {
+        let mut merge = PrintStatsMerge::default();
+        let Ok(Some(stats)) = update.status.get::<PrintStatsStatus>("print_stats") else {
+            return merge;
+        };
+        let Some(reported_text) = stats.state else {
+            return merge;
+        };
+        // The verbatim string is what gets journaled; the parse is only for
+        // deciding what the transition means.
+        if self.print_state.as_deref() != Some(reported_text.as_str()) {
+            merge.state_changed = true;
+            self.print_state = Some(reported_text.clone());
+        }
+        let reported = PrintState::parse(&reported_text);
+        if reported.is_in_progress() {
+            self.print_in_progress = true;
+            return merge;
+        }
+        // A finished state is only a *transition* if a print was known to
+        // be running. Without that, this is just the state of an idle
+        // printer the daemon has only now started watching.
+        if reported.is_finished() && self.print_in_progress {
+            self.print_in_progress = false;
+            merge.clean_shutdown = true;
+        }
+        merge
+    }
+
     fn merge_virtual_sdcard(&mut self, vsd: &VirtualSdcardStatus) -> VsdMerge {
         let mut merge = VsdMerge::default();
         if let Some(path) = &vsd.file_path {
             // Outer Option: present in this diff. Inner: nullable value.
             if *path != self.file_path {
                 merge.path_changed = true;
+                // Signal 2: the loaded file was closed while a print was
+                // known to be running. `do_cancel`/`_reset_file` are the
+                // only things that do this, and they are deterministic
+                // where the `is_active` edge is not.
+                if path.is_none() && self.file_path.is_some() && self.print_in_progress {
+                    merge.clean_shutdown = true;
+                    self.print_in_progress = false;
+                }
                 self.file_path.clone_from(path);
             }
         }
@@ -602,10 +776,16 @@ impl Recorder {
             self.file_size = size;
         }
         if let Some(active) = vsd.is_active {
-            if self.is_active && !active {
+            if active {
+                // A positive observation that a print is running: this is
+                // what opens the signal-2 gate on printers whose
+                // `print_stats` never reaches us.
+                self.print_in_progress = true;
+            } else if self.is_active {
+                // Signal 3, unchanged: the historical edge test.
                 let complete = self.file_size > 0 && self.file_position >= self.file_size;
                 let cancelled = self.file_path.is_none();
-                merge.clean_shutdown = complete || cancelled;
+                merge.clean_shutdown |= complete || cancelled;
             }
             self.is_active = active;
         }
@@ -718,9 +898,17 @@ impl Recorder {
         let gcode = self.gcode.clone()?;
         Some(Context {
             mono_ns,
+            // The authoritative print state, verbatim. `None` until the
+            // first `print_stats` observation of the session, which is
+            // exactly "not observed".
+            print_state: self.print_state.clone(),
             virtual_sdcard: self.file_path.clone().map(|file_path| VirtualSdState {
                 file_path,
                 file_position: self.file_position,
+                // 0 is Klipper's "no file loaded" value, not a real size, so
+                // it must stay `None` = not observed rather than become a
+                // size nothing can match.
+                file_size: (self.file_size > 0).then_some(self.file_size),
             }),
             gcode,
             transforms: self.transforms.clone(),
@@ -755,6 +943,112 @@ impl Recorder {
 /// only introduce a mismatch.
 fn exclude_definition(def: &ExcludeObjectDefinition) -> ExcludeObjectDef {
     ExcludeObjectDef::normalized(def.name.clone(), def.center_xy(), def.polygon_xy())
+}
+
+/// The `print_stats` status fields this daemon reads.
+///
+/// `klippy/extras/print_stats.py`, `PrintStats.get_status`, returns
+/// `{filename, total_duration, print_duration, filament_used, state,
+/// message, info: {total_layer, current_layer}}`. Only `state` is
+/// consumed here; the rest is derived timing the WAL already records
+/// better. Declared locally rather than in `plr-klipper` because the
+/// generic [`plr_klipper::Status::get`] accessor already covers it and
+/// nothing outside this daemon needs the shape.
+///
+/// `state` is `Option` because Klipper's subscription stream sends
+/// **diffs**: an update that changed only `print_duration` carries no
+/// `state` key.
+#[derive(Debug, Clone, serde::Deserialize)]
+struct PrintStatsStatus {
+    #[serde(default)]
+    state: Option<String>,
+}
+
+/// `print_stats.state`, the authoritative print state machine.
+///
+/// Every variant but [`Other`](PrintState::Other) is a literal Klipper
+/// assigns in `klippy/extras/print_stats.py`: `reset()` → `standby`,
+/// `note_start()` → `printing`, `note_pause()` → `paused`, and
+/// `_note_finish()` → `complete` / `cancelled` / `error`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrintState {
+    /// No print loaded (`reset()`).
+    Standby,
+    /// A print is running (`note_start()`).
+    Printing,
+    /// A print is paused (`note_pause()`); it can still be resumed.
+    Paused,
+    /// The file reached its end (`note_complete()`).
+    Complete,
+    /// The operator cancelled (`note_cancel()`).
+    Cancelled,
+    /// The print failed (`note_error()`).
+    Error,
+    /// A state string this version does not know. Never treated as
+    /// finished — a future Klipper state must not suppress a recovery.
+    Other,
+}
+
+impl PrintState {
+    /// Maps a Klipper state string onto this enum. Unknown strings become
+    /// [`PrintState::Other`].
+    #[must_use]
+    pub fn parse(state: &str) -> Self {
+        match state {
+            "standby" => Self::Standby,
+            "printing" => Self::Printing,
+            "paused" => Self::Paused,
+            "complete" => Self::Complete,
+            "cancelled" => Self::Cancelled,
+            "error" => Self::Error,
+            _ => Self::Other,
+        }
+    }
+
+    /// `true` while a print exists and could still make progress.
+    #[must_use]
+    pub const fn is_in_progress(self) -> bool {
+        matches!(self, Self::Printing | Self::Paused)
+    }
+
+    /// `true` when the print ended on purpose *and the state alone proves
+    /// it* — `complete` or `cancelled`, both of which Klipper only ever
+    /// reaches through `_note_finish()` at the end of a real print.
+    ///
+    /// [`Standby`](PrintState::Standby) is excluded, unlike
+    /// [`is_finished`](Self::is_finished): `PrintStats.reset()` sets it on
+    /// every klippy re-init, so a `FIRMWARE_RESTART` after a recoverable
+    /// death journals `standby` for a print that very much did not end on
+    /// purpose. This module can tell the difference because
+    /// `print_in_progress` gates the transition; a *reader* of the journaled
+    /// field has no such context, so it must not treat `standby` as proof.
+    /// See `detect::last_print_state_for`.
+    #[must_use]
+    pub const fn is_conclusive_end(self) -> bool {
+        matches!(self, Self::Complete | Self::Cancelled)
+    }
+
+    /// `true` when the print ended **on purpose**.
+    ///
+    /// [`Error`](PrintState::Error) is excluded deliberately: an errored
+    /// print is the exact case power-loss recovery exists for, so it must
+    /// never journal a clean shutdown. [`Standby`](PrintState::Standby)
+    /// counts because the only way to reach it from a running print is
+    /// `virtual_sdcard._reset_file`, which the operator asked for.
+    #[must_use]
+    pub const fn is_finished(self) -> bool {
+        matches!(self, Self::Standby | Self::Complete | Self::Cancelled)
+    }
+}
+
+/// Result of merging one `print_stats` diff.
+#[derive(Debug, Default, Clone, Copy)]
+struct PrintStatsMerge {
+    /// `print_stats.state` differs from the recorded one, so a `Context`
+    /// must be journaled immediately.
+    state_changed: bool,
+    /// The state left `printing`/`paused` for a finished state: signal 1.
+    clean_shutdown: bool,
 }
 
 /// Result of merging one `virtual_sdcard` diff.
@@ -1153,6 +1447,328 @@ mod tests {
             false,
         );
         assert!(out.clean_shutdown);
+    }
+
+    // -----------------------------------------------------------------
+    // D2 / D5 / D6: the clean-shutdown signals that were missing
+    // -----------------------------------------------------------------
+
+    /// **D2.** Pause, then cancel — the default Mainsail/Fluidd button
+    /// order, the filament-runout flow, and the post-error flow.
+    ///
+    /// `do_cancel` starts with `do_pause()`, whose body is guarded by
+    /// `if self.work_timer is not None`. The PAUSE already cleared
+    /// `work_timer`, so that guard fails, `is_active` never changes, and
+    /// the cancel's status diff carries **no `is_active` key at all** —
+    /// only `file_path: null` (plus `print_stats.state`, since
+    /// `do_cancel` calls `note_cancel()`). Keying on the `is_active`
+    /// edge therefore cannot see this, deterministically, every time.
+    #[test]
+    fn pause_then_cancel_journals_a_clean_shutdown() {
+        let mut r = recorder_with_snapshot();
+        // PAUSE: is_active drops, the file stays loaded mid-file.
+        let out = r.on_status(
+            &status(json!({"eventtime": 200.0, "status": {
+                "virtual_sdcard": {"is_active": false},
+                "print_stats": {"state": "paused"},
+            }})),
+            9_000_000_000,
+            false,
+        );
+        assert!(!out.clean_shutdown, "a pause is not a print end");
+
+        // CANCEL_PRINT: exactly the diff Klipper produces. Note the
+        // absence of `is_active`.
+        let out = r.on_status(
+            &status(json!({"eventtime": 201.0, "status": {
+                "print_stats": {"state": "cancelled"},
+                "virtual_sdcard": {"file_path": null, "file_position": 0,
+                                    "file_size": 0},
+            }})),
+            9_100_000_000,
+            false,
+        );
+        assert!(
+            out.clean_shutdown,
+            "pause->cancel must journal a CleanShutdown marker"
+        );
+    }
+
+    /// The same flow on a printer whose `print_stats` never reaches the
+    /// recorder: signal 2 (`file_path` Some -> None) carries it alone.
+    #[test]
+    fn pause_then_cancel_journals_a_clean_shutdown_without_print_stats() {
+        let mut r = recorder_with_snapshot();
+        let out = r.on_status(
+            &status(json!({"eventtime": 200.0, "status": {
+                "virtual_sdcard": {"is_active": false},
+            }})),
+            9_000_000_000,
+            false,
+        );
+        assert!(!out.clean_shutdown);
+        let out = r.on_status(
+            &status(json!({"eventtime": 201.0, "status": {
+                "virtual_sdcard": {"file_path": null, "file_position": 0,
+                                    "file_size": 0},
+            }})),
+            9_100_000_000,
+            false,
+        );
+        assert!(out.clean_shutdown);
+    }
+
+    /// **D5.** The direct-cancel race: `do_pause`'s 1 ms `reactor.pause`
+    /// loop yields to the reactor, so the 250 ms status subscription can
+    /// sample *between* `work_timer` going `None` and the file closing.
+    ///
+    /// That intermediate update looks exactly like a pause (`is_active`
+    /// false, file still loaded mid-file); the file-clearing update that
+    /// follows carries no `is_active`. Two updates, neither of which the
+    /// `is_active` edge test can call a print end.
+    #[test]
+    fn the_direct_cancel_race_shape_journals_a_clean_shutdown() {
+        let mut r = recorder_with_snapshot();
+        // Sampled inside do_pause's spin loop.
+        let out = r.on_status(
+            &status(json!({"eventtime": 200.0, "status": {
+                "virtual_sdcard": {"is_active": false, "file_position": 1_400},
+            }})),
+            9_000_000_000,
+            false,
+        );
+        assert!(
+            !out.clean_shutdown,
+            "mid-file with the file loaded is indistinguishable from a pause"
+        );
+        // Sampled after current_file.close().
+        let out = r.on_status(
+            &status(json!({"eventtime": 200.25, "status": {
+                "print_stats": {"state": "cancelled"},
+                "virtual_sdcard": {"file_path": null, "file_position": 0,
+                                    "file_size": 0},
+            }})),
+            9_250_000_000,
+            false,
+        );
+        assert!(out.clean_shutdown, "the race must not lose the marker");
+    }
+
+    /// A pause alone, in every shape it arrives in, is never a print end.
+    #[test]
+    fn a_pause_is_never_a_clean_shutdown() {
+        for diff in [
+            json!({"virtual_sdcard": {"is_active": false}}),
+            json!({"print_stats": {"state": "paused"}}),
+            json!({"virtual_sdcard": {"is_active": false},
+                   "print_stats": {"state": "paused"}}),
+            // Paused, then a heater change: still paused, still not an end.
+            json!({"print_stats": {"state": "paused"},
+                   "extruder": {"target": 0.0}}),
+        ] {
+            let mut r = recorder_with_snapshot();
+            let out = r.on_status(
+                &status(json!({"eventtime": 200.0, "status": diff})),
+                9_000_000_000,
+                false,
+            );
+            assert!(!out.clean_shutdown, "{diff:?} must not be a print end");
+        }
+    }
+
+    /// **D6.** `print_stats` is the authoritative state machine, and its
+    /// transitions out of `printing`/`paused` are what the marker keys on.
+    /// The recorder journals `virtual_sdcard.file_size` alongside the
+    /// position, so a reader can tell "same path" from "same file". Klipper's
+    /// 0 (no file loaded) stays `None` — "not observed" — rather than
+    /// becoming a size nothing can match.
+    #[test]
+    fn the_file_size_is_journaled_beside_the_position() {
+        let mut r = recorder_with_snapshot();
+        let out = r.on_status(
+            &status(json!({"eventtime": 200.0, "status": {
+                "virtual_sdcard": {"file_position": 1_200},
+            }})),
+            9_000_000_000,
+            false,
+        );
+        let (WalRecord::Context(ctx), _) = &out.records[0] else {
+            panic!("expected a context");
+        };
+        let vsd = ctx.virtual_sdcard.as_ref().expect("vsd");
+        assert_eq!(vsd.file_position, 1_200);
+        assert_eq!(vsd.file_size, Some(2_000), "from the initial status");
+
+        // A printer that never reported a size, and Klipper's 0 sentinel,
+        // both stay "not observed".
+        let mut r = Recorder::new();
+        let out = r.on_status(
+            &status(json!({"eventtime": 1.0, "status": {
+                "gcode_move": {
+                    "speed_factor": 1.0, "speed": 1500.0, "extrude_factor": 1.0,
+                    "absolute_coordinates": true, "absolute_extrude": true,
+                    "homing_origin": [0.0, 0.0, 0.0, 0.0],
+                    "position": [0.0, 0.0, 0.0, 0.0],
+                    "gcode_position": [0.0, 0.0, 0.0, 0.0]
+                },
+                "virtual_sdcard": {"file_path": "/g/y.gcode", "file_position": 0,
+                                    "file_size": 0},
+            }})),
+            1_000,
+            true,
+        );
+        let (WalRecord::Context(ctx), _) = &out.records[0] else {
+            panic!("expected a context");
+        };
+        assert_eq!(ctx.virtual_sdcard.as_ref().unwrap().file_size, None);
+    }
+
+    #[test]
+    fn print_stats_transitions_decide_the_marker() {
+        use super::PrintState;
+        // The finished states, straight from `printing`.
+        for state in ["complete", "cancelled", "standby"] {
+            let mut r = recorder_with_snapshot();
+            let out = r.on_status(
+                &status(json!({"eventtime": 200.0, "status": {
+                    "print_stats": {"state": state},
+                }})),
+                9_000_000_000,
+                false,
+            );
+            assert!(out.clean_shutdown, "printing -> {state} is a print end");
+        }
+        // `error` is NOT a deliberate end: an errored print is exactly
+        // what recovery exists for.
+        let mut r = recorder_with_snapshot();
+        let out = r.on_status(
+            &status(json!({"eventtime": 200.0, "status": {
+                "print_stats": {"state": "error", "message": "Move out of range"},
+            }})),
+            9_000_000_000,
+            false,
+        );
+        assert!(
+            !out.clean_shutdown,
+            "an errored print must stay recoverable"
+        );
+        // Neither is a state this version does not know.
+        let mut r = recorder_with_snapshot();
+        let out = r.on_status(
+            &status(json!({"eventtime": 200.0, "status": {
+                "print_stats": {"state": "hibernating"},
+            }})),
+            9_000_000_000,
+            false,
+        );
+        assert!(!out.clean_shutdown);
+        assert_eq!(PrintState::parse("hibernating"), PrintState::Other);
+        assert!(!PrintState::Other.is_finished());
+        assert!(!PrintState::Other.is_in_progress());
+        assert!(!PrintState::Error.is_finished());
+        assert!(PrintState::Printing.is_in_progress());
+        assert!(PrintState::Paused.is_in_progress());
+        assert!(PrintState::Standby.is_finished());
+        assert!(PrintState::Complete.is_finished());
+        assert!(PrintState::Cancelled.is_finished());
+        // The narrower read-side predicate excludes `standby`, which a
+        // klippy re-init sets for a print that did not end on purpose.
+        assert!(!PrintState::Standby.is_conclusive_end());
+        assert!(PrintState::Complete.is_conclusive_end());
+        assert!(PrintState::Cancelled.is_conclusive_end());
+        assert!(!PrintState::Error.is_conclusive_end());
+        assert!(!PrintState::Other.is_conclusive_end());
+        assert!(!PrintState::Printing.is_conclusive_end());
+        assert!(!PrintState::Paused.is_conclusive_end());
+        // A diff that carries print_stats without a `state` key (only the
+        // duration ticked) changes nothing.
+        let mut r = recorder_with_snapshot();
+        let out = r.on_status(
+            &status(json!({"eventtime": 200.0, "status": {
+                "print_stats": {"print_duration": 12.5},
+            }})),
+            9_000_000_000,
+            false,
+        );
+        assert!(!out.clean_shutdown);
+        // And a finished state with no in-progress state ever observed is
+        // not a transition: a daemon starting up beside an idle printer
+        // must not journal a print end.
+        let mut r = Recorder::new();
+        let out = r.on_status(
+            &status(json!({"eventtime": 1.0, "status": {
+                "print_stats": {"state": "standby"},
+            }})),
+            1_000,
+            false,
+        );
+        assert!(!out.clean_shutdown);
+    }
+
+    /// The session gate: after a klippy RESTART the fresh baseline reports
+    /// `file_path: null`, which against the stale snapshot *is* a
+    /// Some -> None transition. It must not forge a print end.
+    #[test]
+    fn a_restart_baseline_does_not_forge_a_file_path_clean_shutdown() {
+        let mut r = recorder_with_snapshot(); // printing /g/x.gcode
+        r.reset_session();
+        let out = r.on_status(
+            &status(json!({"eventtime": 150.0, "status": {
+                "virtual_sdcard": {"file_path": null, "file_position": 0,
+                                    "file_size": 0},
+            }})),
+            50_000,
+            false,
+        );
+        assert!(
+            !out.clean_shutdown,
+            "the restart killed the print; it must stay recoverable"
+        );
+        // A print started after the restart reopens the gate, and its
+        // cancel is seen again.
+        let out = r.on_status(
+            &status(json!({"eventtime": 160.0, "status": {
+                "virtual_sdcard": {"file_path": "/g/y.gcode", "is_active": true,
+                                    "file_position": 0, "file_size": 5_000},
+                "print_stats": {"state": "printing"},
+            }})),
+            60_000,
+            false,
+        );
+        assert!(!out.clean_shutdown);
+        let out = r.on_status(
+            &status(json!({"eventtime": 170.0, "status": {
+                "virtual_sdcard": {"file_path": null},
+            }})),
+            70_000,
+            false,
+        );
+        assert!(out.clean_shutdown);
+    }
+
+    /// `reset_session` drops the print state as well, so nothing about the
+    /// dead klippy instance leaks into the next session's inference.
+    #[test]
+    fn reset_session_drops_the_print_state() {
+        let mut r = recorder_with_snapshot();
+        let _ = r.on_status(
+            &status(json!({"eventtime": 200.0, "status": {
+                "print_stats": {"state": "printing"},
+            }})),
+            9_000_000_000,
+            false,
+        );
+        r.reset_session();
+        // With the previous state forgotten, a `cancelled` from the new
+        // session's baseline is not a transition out of printing.
+        let out = r.on_status(
+            &status(json!({"eventtime": 210.0, "status": {
+                "print_stats": {"state": "cancelled"},
+            }})),
+            9_100_000_000,
+            false,
+        );
+        assert!(!out.clean_shutdown);
     }
 
     #[test]

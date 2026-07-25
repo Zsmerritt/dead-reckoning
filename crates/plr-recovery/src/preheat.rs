@@ -138,6 +138,7 @@ mod tests {
             heaters,
             fans,
             exclude: None,
+            print_state: None,
         }
     }
 

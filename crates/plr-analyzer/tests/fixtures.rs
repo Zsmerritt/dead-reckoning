@@ -8,10 +8,10 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use plr_analyzer::{
-    assess_contact_point, build_layer_model, match_stop_point, select_contact_zone,
+    assess_contact_point, build_layer_model, match_stop_point, remaining_work, select_contact_zone,
     select_contact_zone_detailed, ByteWindow, ContactConfig, ContactError, ContactMode,
     ContactOutcome, DeclineReason, FeatureClass, Interval, LayerModel, MatchConfidence,
-    MatchConfig, ModelConfig, MoveKind, SimMove, StopEvidence, StructuralAnalysis,
+    MatchConfig, ModelConfig, MoveKind, RemainingWork, SimMove, StopEvidence, StructuralAnalysis,
     StructuralAssessment, StructuralCriterion, StructuralOutcome, StructuralVerdict, TraceStatus,
 };
 use plr_gcode::GcodeState;
@@ -838,4 +838,650 @@ fn structural_fixtures_survive_every_resume_layer_in_both_modes() {
             }
         }
     }
+}
+
+// ---------------------------------------------------------------------
+// The completion gate over footer-bearing fixtures (D12).
+//
+// `fixtures/synthetic/` used to contain no file with a footer at all,
+// which is precisely why nothing could observe that a functionally
+// complete print stops well short of EOF.
+//
+// Two of the four fixtures carry a REAL slicer footer, verbatim except for
+// a scrubbed model name (see `fixtures/synthetic/footer_generator.py` for
+// the licensing rationale). They are the primary evidence; the fully
+// synthetic pair is kept for the excluded-object path, which needs
+// EXCLUDE_OBJECT brackets around deposition.
+// ---------------------------------------------------------------------
+
+/// The mode flags of `plr_gcode::GcodeState::new()` — Klipper's own
+/// defaults (`G90` + `M82`, both absolute). Every golden here replays a
+/// whole file from byte 0 with a fresh state, so these are the flags the
+/// replay starts in and what `remaining_work`'s extruder-frame trust check
+/// compares against.
+///
+/// The fixtures declare their real modes in their own header, a few bytes
+/// in. For the deep tested offsets these goldens mostly use, the header
+/// precedes the offset, so the file has settled both axes and the check has
+/// nothing to compare. For a tested offset of 0 the declarations land
+/// *after* the offset instead, and what keeps the check quiet there is the
+/// materiality narrowing: no move sits in the doubtful span.
+fn fresh_state_frame() -> plr_analyzer::AnchorFrame {
+    let state = GcodeState::new();
+    plr_analyzer::AnchorFrame {
+        absolute_coordinates: state.absolute_coord,
+        absolute_extrude: state.absolute_extrude,
+    }
+}
+
+/// Lossless on 64-bit; the fixtures are kilobytes.
+fn offset_u64(v: usize) -> u64 {
+    u64::try_from(v).expect("fixture offsets fit in u64")
+}
+
+/// The comment the fixture generator plants immediately after the last
+/// positive-extrusion line, so "the whole footer" is exactly "every byte
+/// at or after this".
+const LAST_DEPOSITION_MARKER: &str = "; THE LAST DEPOSITING LINE IS ABOVE THIS COMMENT";
+
+/// Byte offset one past the end of the line containing `needle`.
+fn offset_after_line(data: &[u8], needle: &str) -> u64 {
+    let n = needle.as_bytes();
+    let start = data
+        .windows(n.len())
+        .position(|w| w == n)
+        .unwrap_or_else(|| panic!("needle {needle:?} not found"));
+    let rest = data.get(start..).unwrap_or_default();
+    let nl = rest
+        .iter()
+        .position(|&b| b == b'\n')
+        .map_or(rest.len(), |i| i + 1);
+    offset_u64(start + nl)
+}
+
+/// `(fixture, total bytes, bytes after the last depositing line)`.
+///
+/// The two `*_real_footer` entries carry a genuine footer: `PrusaSlicer`
+/// 2.9.3 wrote 14,537 bytes over 403 lines after the last extrusion
+/// (13,913 as committed — the model name and the footprint outline are
+/// substituted for licensing, see `fixtures/synthetic/footer_generator.py`),
+/// and `OrcaSlicer` 2.3.1 wrote 17,699 over 560 lines (17,695 committed).
+///
+/// Those are **measured, not estimated**, and they are the whole argument
+/// against a percentage threshold: the gap is a near-constant 14–18 KB
+/// regardless of how big the print is, so the same finished print reads as
+/// 7% remaining in these small fixtures, ~5% in a 300 KB file and ~0.09%
+/// in a 20 MB one. Nothing separates "finished" from "died on the last
+/// layer" on that axis.
+const FOOTER_FIXTURES: [(&str, u64, u64); 5] = [
+    ("prusa_real_footer.gcode", 15_459, 13_962),
+    ("orca_real_footer.gcode", 19_162, 17_744),
+    ("prusa_footer_complete.gcode", 14_377, 12_783),
+    ("orca_footer_complete.gcode", 13_922, 12_684),
+    ("cura_footer_complete.gcode", 13_698, 12_780),
+];
+
+/// Offsets in `cura_footer_complete.gcode` at which the extruder-frame trust
+/// check refuses rather than suppressing.
+///
+/// **Measured exhaustively**, not sampled: every offset in the file was
+/// tested, the refusing set is contiguous `0..1060`, and the part of it at or
+/// after the last-deposition marker (918) is `918..1060` — **142 offsets**.
+/// `a_footer_that_changes_extrusion_mode_is_still_gated_correctly` re-derives
+/// both bounds from the fixture so this constant cannot drift from the
+/// measurement.
+///
+/// Cura's footer switches to relative positioning (`G91` at byte 1071) for
+/// its wipe-out move, which contradicts the absolute-coordinates frame a
+/// whole-file replay from `GcodeState::new()` starts in. For a tested offset
+/// early enough that a *depositing-capable* move still sits between it and
+/// that `G91`, the span was classified under a flag the file disagrees with,
+/// so the check refuses. Past the last such move the materiality narrowing
+/// lets it through — the span does still contain two `ExtrudeOnly` retracts,
+/// so the property that holds is "no move whose classification the flag could
+/// flip", not "no move at all".
+///
+/// 142 bytes of a 12,780-byte footer, failing towards **announcing**: a Cura
+/// print that died in that window is offered a recovery it did not need,
+/// which costs a dry run. Pinned so the cost stays visible.
+const CURA_REFUSAL_WINDOW: std::ops::Range<u64> = 918..1_060;
+
+/// The exact placeholder outline `footer_generator.py` substitutes for the
+/// real one: a 20x20 mm square with 5 mm-spaced collinear vertices.
+///
+/// Pinned here so the guard below can assert the polygon **is** this, which
+/// is a complete check. Asserting the *absence* of the real coordinates
+/// would have meant writing those coordinates down in this file — putting
+/// the very content the substitution removes back into the repository and
+/// its history.
+const PLACEHOLDER_POLYGON: &str = "[100.000,100.000],[105.000,100.000],[110.000,100.000],\
+     [115.000,100.000],[120.000,100.000],[120.000,105.000],[120.000,110.000],\
+     [120.000,115.000],[120.000,120.000],[115.000,120.000],[110.000,120.000],\
+     [105.000,120.000],[100.000,120.000],[100.000,115.000],[100.000,110.000],\
+     [100.000,105.000]";
+
+/// The neutral object name the real footers were scrubbed to.
+const PLACEHOLDER_NAME: &str = "part_a.stl";
+
+/// **No fixture may carry third-party model content.** The real footers were
+/// extracted from prints of a CC BY-ND model, and this repository is public.
+/// Two things were substituted: the model file name, and the 52-point
+/// footprint outline `PrusaSlicer` embeds in its `; objects_info = {...}`
+/// line.
+///
+/// The assertions are **positive** — the polygon *is* the placeholder, every
+/// object name *is* the placeholder — rather than "the real values are
+/// absent". That is both stronger (any substitution failure fails here,
+/// including one this test's author never thought of) and the only form that
+/// does not require the real name and coordinates to be written into this
+/// file, which would defeat the point.
+///
+/// # It checks the WORKING TREE only
+///
+/// A test can only see the files on disk. It says nothing about git history,
+/// and history is where the real licensing exposure lives: a commit that
+/// once contained the content puts it in the repository permanently, even if
+/// a later commit removes it. **Do not treat a green run here as evidence
+/// that a branch is clean.** That is a separate check, on the commits —
+/// `git log -p main..HEAD -- fixtures/` — and the branch this test arrived
+/// on was squashed to one commit for exactly that reason.
+#[test]
+fn no_fixture_carries_third_party_model_content() {
+    // 1. Every object name in the real-footer fixtures is the placeholder.
+    //    Both slicers label object boundaries with `; stop printing object
+    //    <name> id:`, and Orca repeats the name on `EXCLUDE_OBJECT_END`.
+    let mut names_checked = 0_usize;
+    for name in ["prusa_real_footer.gcode", "orca_real_footer.gcode"] {
+        let text = String::from_utf8(load(name)).expect("ascii fixture");
+        for line in text.lines() {
+            if let Some(rest) = line.strip_prefix("; stop printing object ") {
+                let object = rest.split(" id:").next().unwrap_or(rest);
+                assert_eq!(object, PLACEHOLDER_NAME, "{name}: {line}");
+                names_checked += 1;
+            }
+            if let Some(rest) = line.strip_prefix("EXCLUDE_OBJECT_END NAME=") {
+                assert!(rest.starts_with(PLACEHOLDER_NAME), "{name}: {line}");
+                names_checked += 1;
+            }
+        }
+    }
+    assert!(names_checked >= 3, "only {names_checked} object names seen");
+
+    // 2. The footprint outline IS the placeholder, and the line around it is
+    //    still structurally what `PrusaSlicer` emits: same key names, same
+    //    nesting, same numeric formatting, so the fixture keeps exercising a
+    //    long comma-and-brace-heavy comment.
+    let text = String::from_utf8(load("prusa_real_footer.gcode")).expect("ascii");
+    let line = text
+        .lines()
+        .find(|l| l.starts_with("; objects_info = "))
+        .expect("objects_info line");
+    assert_eq!(
+        line,
+        format!(
+            "; objects_info = {{\"objects\":[{{\"name\":\"{PLACEHOLDER_NAME} id:0 copy 0\",\
+             \"polygon\":[{PLACEHOLDER_POLYGON}]}}]}}"
+        ),
+        "the objects_info line must be exactly the scrubbed form"
+    );
+    assert!(line.len() > 300, "{} bytes is too short", line.len());
+
+    // 3. No OTHER fixture grew an `objects_info` line carrying an outline.
+    let mut scanned = 0_usize;
+    for path in gcode_files(&fixtures_dir().join("synthetic")) {
+        let text = String::from_utf8(fs::read(&path).expect("readable")).expect("ascii");
+        let name = path.file_name().unwrap_or_default().to_string_lossy();
+        for line in text.lines() {
+            if line.starts_with("; objects_info = ") {
+                assert!(
+                    line.contains(PLACEHOLDER_POLYGON),
+                    "{name} carries an outline that is not the placeholder"
+                );
+            }
+        }
+        scanned += 1;
+    }
+    assert!(scanned >= 5, "only {scanned} fixtures scanned");
+}
+
+/// **The corpus must contain a footer that changes extrusion mode.** Cura's
+/// stock end g-code switches to relative positioning for its wipe-out move
+/// and back (`G91` ... `G90`), and since the effective extruder frame is
+/// `absolute_coord && absolute_extrude`, those are exactly the commands
+/// `remaining_work`'s trust check reasons about. Without a fixture like this
+/// the check's branch is never reached by the goldens, and an over-refusal on
+/// ordinary Cura output would go unnoticed.
+///
+/// The gate must still answer "complete" here: the mode commands sit after
+/// the tested offset but agree with the anchor frame these goldens replay
+/// from, so there is nothing to contradict.
+#[test]
+fn a_footer_that_changes_extrusion_mode_is_still_gated_correctly() {
+    let data = load("cura_footer_complete.gcode");
+    let text = String::from_utf8(data.clone()).expect("ascii fixture");
+    let marker = offset_of(&data, LAST_DEPOSITION_MARKER);
+    // The mode commands really are in the footer, i.e. after the offset.
+    let g91 = offset_of(&data, "G91 ;relative positioning");
+    let g90 = offset_of(&data, "G90 ;absolute positioning");
+    assert!(g91 > marker && g90 > g91, "{g91} {g90} vs {marker}");
+    assert!(text.contains("M82 ;absolute extrusion mode"));
+
+    let model = model_of(&data);
+
+    // At the marker a move still sits between the offset and the `G91`, so
+    // the span was classified under a flag the file contradicts: refuse.
+    // This is the over-refusal, and it is the safe direction.
+    let refused = remaining_work(&model, &data, 0, marker, fresh_state_frame(), None);
+    assert_eq!(
+        refused,
+        Err(plr_analyzer::WorkUnknown::ExtrudeModeContradiction {
+            offset: g91,
+            axis: plr_analyzer::ModeAxis::Coordinates,
+            file_absolute: false,
+        }),
+        "the coordinate axis is what bites here, not the extrusion axis"
+    );
+    assert_eq!(marker, CURA_REFUSAL_WINDOW.start, "the window's low end");
+
+    // The window's bounds are re-derived here, exhaustively, so the pinned
+    // constant is the measurement rather than a claim about it.
+    let refusing: Vec<u64> = (0..offset_u64(data.len()))
+        .filter(|off| remaining_work(&model, &data, 0, *off, fresh_state_frame(), None).is_err())
+        .collect();
+    assert!(
+        refusing.windows(2).all(|w| w[1] == w[0] + 1),
+        "the refusing set must be contiguous"
+    );
+    let measured = *refusing.first().expect("some offset refuses")
+        ..*refusing.last().expect("some offset refuses") + 1;
+    assert_eq!(measured.start, 0, "refusal starts at the file head");
+    assert_eq!(
+        CURA_REFUSAL_WINDOW,
+        marker..measured.end,
+        "the pinned window must equal the measurement from the marker on"
+    );
+    assert_eq!(CURA_REFUSAL_WINDOW.count(), 142);
+
+    // Immediately past the window the check lets it through — including the
+    // offsets between the window's end and the `G91` itself, which a sampling
+    // stride can miss entirely.
+    for offset in [CURA_REFUSAL_WINDOW.end, 1_065, g91, g90] {
+        let work = remaining_work(&model, &data, 0, offset, fresh_state_frame(), None)
+            .unwrap_or_else(|e| panic!("at {offset}: {e}"));
+        assert!(work.is_complete(), "at {offset}: {work:?}");
+    }
+
+    // The window is not move-free: it holds two `ExtrudeOnly` retracts. What
+    // holds is that none of them deposits.
+    let in_window: Vec<MoveKind> = model
+        .moves
+        .iter()
+        .filter(|m| m.span.start >= marker && m.span.start < g91)
+        .map(|m| m.kind)
+        .collect();
+    assert_eq!(
+        in_window,
+        vec![MoveKind::ExtrudeOnly, MoveKind::ExtrudeOnly]
+    );
+
+    // And an anchor that agrees with the footer suppresses from the marker.
+    let agreeing = plr_analyzer::AnchorFrame {
+        absolute_coordinates: false,
+        absolute_extrude: true,
+    };
+    assert!(remaining_work(&model, &data, 0, marker, agreeing, None)
+        .expect("agreeing frame")
+        .is_complete());
+}
+
+/// The measured distance from the last depositing line to EOF, pinned.
+#[test]
+fn footer_fixtures_end_far_before_eof() {
+    for (name, expected_size, expected_gap) in FOOTER_FIXTURES {
+        let data = load(name);
+        assert_eq!(offset_u64(data.len()), expected_size, "{name} size changed");
+        let model = model_of(&data);
+        assert_eq!(
+            model.stop,
+            plr_analyzer::model::ModelStop::EndOfInput,
+            "{name} must replay to the end"
+        );
+        let last = model
+            .moves
+            .iter()
+            .rfind(|m| m.kind == MoveKind::Extrusion)
+            .unwrap_or_else(|| panic!("{name} has no deposition"));
+        let marker = offset_of(&data, LAST_DEPOSITION_MARKER);
+        assert!(
+            last.span.end <= marker,
+            "{name}: deposition at {}..{} must precede the marker at {marker}",
+            last.span.start,
+            last.span.end
+        );
+        assert_eq!(
+            offset_u64(data.len()) - marker,
+            expected_gap,
+            "{name}: bytes after the last depositing line"
+        );
+        // The whole tail is a footer: replaying it finds nothing that
+        // deposits, anywhere in it — except inside the measured window where
+        // Cura's `G91` makes the trust check refuse rather than suppress
+        // (see `CURA_REFUSAL_WINDOW`; refusing is the safe direction).
+        let cura = name == "cura_footer_complete.gcode";
+        for offset in std::iter::once(marker).chain((marker..offset_u64(data.len())).step_by(97)) {
+            let got = remaining_work(&model, &data, 0, offset, fresh_state_frame(), None);
+            if cura && CURA_REFUSAL_WINDOW.contains(&offset) {
+                assert!(
+                    matches!(
+                        got,
+                        Err(plr_analyzer::WorkUnknown::ExtrudeModeContradiction { .. })
+                    ),
+                    "{name} at {offset}: expected the documented refusal, got {got:?}"
+                );
+            } else {
+                let work = got.unwrap_or_else(|e| panic!("{name} at {offset}: {e}"));
+                assert!(work.is_complete(), "{name} at {offset}: {work:?}");
+            }
+        }
+    }
+}
+
+/// One line earlier — the true "died on the last move" case — the gate
+/// announces. The distinction a percentage cannot make.
+#[test]
+fn footer_fixtures_still_report_the_final_move_as_work() {
+    for (name, last_line) in [
+        // The real-footer fixtures end their body on a leading-dot float,
+        // which is the form real slicers emit.
+        ("prusa_real_footer.gcode", "G1 X117.121 Y105.942 E.03577"),
+        ("orca_real_footer.gcode", "G1 X111.453 Y115.5 E.03577"),
+        ("prusa_footer_complete.gcode", "G1 X70 Y30 E4.9768"),
+        (
+            "orca_footer_complete.gcode",
+            "G1 X55 Y55 E0.7465\nEXCLUDE_OBJECT_END",
+        ),
+    ] {
+        let data = load(name);
+        let model = model_of(&data);
+        let offset = offset_of(&data, last_line);
+        let work =
+            remaining_work(&model, &data, 0, offset, fresh_state_frame(), None).expect("modeled");
+        assert!(
+            !work.is_complete(),
+            "{name}: one move short of done must still be work: {work:?}"
+        );
+    }
+}
+
+/// **Leading-dot floats.** Both `PrusaSlicer` and `OrcaSlicer` write E values
+/// with no digit before the decimal point (`E-.64987`, `E.03577`). No
+/// fixture in the corpus carried that form before the real footers arrived,
+/// so this asserts the parser's behaviour rather than reasoning about it —
+/// a positive leading-dot E that failed to classify as
+/// [`MoveKind::Extrusion`] would silently hide work in every
+/// `PrusaSlicer`/Orca file.
+#[test]
+fn leading_dot_floats_parse_and_classify() {
+    // Positive, negative, and negative-with-XY, all leading-dot.
+    let text = "G90\nM83\nG1 Z0.2 F7200\n\
+                G1 X10 Y0 E.03577 F1800\n\
+                G1 E-.64987 F1800\n\
+                G1 X11 Y0 E-.01429\n\
+                G1 X12 Y0 E.5\n";
+    let data = text.as_bytes();
+    let model = model_of(data);
+    assert_eq!(model.stop, plr_analyzer::model::ModelStop::EndOfInput);
+    let expected = [
+        (MoveKind::Travel, 0.0),            // the Z move
+        (MoveKind::Extrusion, 0.035_77),    // E.03577 -> DEPOSITS
+        (MoveKind::ExtrudeOnly, -0.649_87), // E-.64987 retract
+        (MoveKind::Travel, -0.014_29),      // wipe: XY motion, negative E
+        (MoveKind::Extrusion, 0.5),         // E.5
+    ];
+    assert_eq!(model.moves.len(), expected.len());
+    for (got, (kind, e_delta)) in model.moves.iter().zip(expected) {
+        assert_eq!(got.kind, kind, "at {:?}", got.span);
+        // Epsilon, not equality: E accumulates across moves in relative
+        // mode, so the *difference* carries one rounding step. The parse
+        // itself is exact; that is what is being asserted.
+        assert!(
+            (got.e_delta() - e_delta).abs() < 1e-12,
+            "leading-dot float parsed as {} not {e_delta} at {:?}",
+            got.e_delta(),
+            got.span
+        );
+    }
+    // And the same forms as they appear in the real footers.
+    for name in ["prusa_real_footer.gcode", "orca_real_footer.gcode"] {
+        let data = load(name);
+        let text = String::from_utf8(data.clone()).expect("ascii fixture");
+        assert!(
+            text.contains("E-."),
+            "{name} must retain the real leading-dot forms"
+        );
+        assert_eq!(
+            model_of(&data).stop,
+            plr_analyzer::model::ModelStop::EndOfInput,
+            "{name}: leading-dot floats must not stop the replay"
+        );
+    }
+}
+
+/// **The wipe trail is not work.** Both real footers begin with a retract
+/// and then a `;WIPE_START`…`;WIPE_END` block of genuine XY moves carrying
+/// negative E. So "no motion remaining" would be the wrong test and would
+/// announce a recovery for every completed print; "no positive extrusion
+/// remaining" is the right one.
+#[test]
+fn the_real_wipe_trail_is_motion_but_not_work() {
+    for (name, wipe_line) in [
+        ("prusa_real_footer.gcode", "G1 X117.069 Y105.757 E-.04571"),
+        ("orca_real_footer.gcode", "G1 X111.935 Y115.272 E-.08008"),
+    ] {
+        let data = load(name);
+        let model = model_of(&data);
+        let wipe_at = offset_of(&data, wipe_line);
+        // It really is XY motion, and it really carries negative E.
+        let wipe = model
+            .moves
+            .iter()
+            .find(|m| m.span.start == wipe_at)
+            .unwrap_or_else(|| panic!("{name}: no move for the wipe line"));
+        assert!(
+            (wipe.end[0] - wipe.start[0]).abs() + (wipe.end[1] - wipe.start[1]).abs() > 0.0,
+            "{name}: the wipe must actually move XY"
+        );
+        assert!(wipe.e_delta() < 0.0, "{name}: the wipe must retract");
+        assert_eq!(wipe.kind, MoveKind::Travel, "{name}");
+        // And the gate is unmoved by it.
+        let marker = offset_of(&data, LAST_DEPOSITION_MARKER);
+        assert!(
+            remaining_work(&model, &data, 0, marker, fresh_state_frame(), None)
+                .expect("modeled")
+                .is_complete()
+        );
+    }
+}
+
+/// The footer's un-run commands are *named*, not offered: this is what an
+/// operator gets instead of a bogus recovery. Pinned against the real
+/// `PrusaSlicer` end sequence.
+#[test]
+fn a_real_footer_stop_names_the_end_sequence() {
+    let data = load("prusa_real_footer.gcode");
+    let model = model_of(&data);
+    let offset = offset_of(&data, LAST_DEPOSITION_MARKER);
+    let work =
+        remaining_work(&model, &data, 0, offset, fresh_state_frame(), None).expect("modeled");
+    let RemainingWork::EndSequenceOnly { commands } = &work else {
+        panic!("expected EndSequenceOnly, got {work:?}");
+    };
+    // The real sequence: retract, wipe, fan off, four park moves, bed off,
+    // nozzle off, fan off again, motors off.
+    assert_eq!(
+        commands,
+        &["G1", "G1", "G1", "G1", "M107", "G1", "G1", "G1", "G1", "M140", "M104", "M107", "M84"]
+            .map(str::to_owned)
+    );
+    assert!(!work.commands_truncated());
+    // Deeper into the config block there is nothing left at all.
+    let offset = offset_of(&data, "; prusaslicer_config = begin");
+    assert_eq!(
+        remaining_work(&model, &data, 0, offset, fresh_state_frame(), None).expect("modeled"),
+        RemainingWork::Nothing
+    );
+}
+
+/// The synthetic pair's end sequence, for the same assertion on a fixture
+/// that is free to change.
+#[test]
+fn a_synthetic_footer_stop_names_the_end_sequence() {
+    let data = load("prusa_footer_complete.gcode");
+    let model = model_of(&data);
+    let offset = offset_after_line(&data, "; --- end gcode ---");
+    let work =
+        remaining_work(&model, &data, 0, offset, fresh_state_frame(), None).expect("modeled");
+    let RemainingWork::EndSequenceOnly { commands } = &work else {
+        panic!("expected EndSequenceOnly, got {work:?}");
+    };
+    assert_eq!(
+        commands,
+        &["M107", "M104", "M140", "G1", "G4", "M400", "G1", "G1", "M84", "M117"].map(str::to_owned)
+    );
+}
+
+/// Object attribution comes off the `EXCLUDE_OBJECT_START`/`END` brackets,
+/// upper-cased as Klipper stores names.
+#[test]
+fn footer_fixtures_attribute_deposition_to_objects() {
+    let data = load("prusa_footer_complete.gcode");
+    let model = model_of(&data);
+    let names: std::collections::BTreeSet<&str> = model
+        .moves
+        .iter()
+        .filter(|m| m.kind == MoveKind::Extrusion)
+        .filter_map(|m| m.object.as_deref())
+        .collect();
+    assert_eq!(
+        names.into_iter().collect::<Vec<_>>(),
+        vec!["PART_A", "PART_B"]
+    );
+    let data = load("orca_footer_complete.gcode");
+    let model = model_of(&data);
+    assert!(model
+        .moves
+        .iter()
+        .filter(|m| m.kind == MoveKind::Extrusion)
+        .all(|m| m.object.as_deref() == Some("BODY1_ID_0_COPY_0")));
+    // Orca emits the real command form, and it appears INSIDE the footer:
+    // `EXCLUDE_OBJECT_END NAME=part_a.stl_id_0_copy_0`. The bracket closes
+    // regardless of the name, which is what keeps a nesting disagreement
+    // from leaving an object open forever.
+    let data = load("orca_real_footer.gcode");
+    let model = model_of(&data);
+    assert!(model
+        .moves
+        .iter()
+        .filter(|m| m.kind == MoveKind::Extrusion)
+        .all(|m| m.object.as_deref() == Some("PART_A.STL_ID_0_COPY_0")));
+}
+
+/// **`; stop printing object …` is a comment, and stays one.**
+///
+/// `PrusaSlicer` (and Orca) mark object boundaries with
+/// `; printing object …` / `; stop printing object …` comments. Klipper's
+/// object-cancellation support needs the `EXCLUDE_OBJECT_*` *commands*, so
+/// a preprocessor (Moonraker's `preprocess_cancellation`, or the slicer's
+/// own "label objects: firmware" setting) rewrites them — meaning a file in
+/// the wild may carry either form, or the comment form alone.
+///
+/// This asserts the conservative outcome rather than adding a second
+/// attribution path: an unconverted file yields **no** object attribution,
+/// so its deposition is unattributed, so it always counts as work. A
+/// cancelled object on such a file produces a false offer, never a
+/// suppressed one.
+#[test]
+fn the_comment_form_of_object_markers_yields_no_attribution() {
+    struct ExcludeEverything;
+    impl plr_analyzer::ExclusionOracle for ExcludeEverything {
+        fn is_conclusive(&self) -> bool {
+            true
+        }
+        fn is_excluded(&self, _object: &str) -> bool {
+            true
+        }
+    }
+
+    let data = load("prusa_real_footer.gcode");
+    let text = String::from_utf8(data.clone()).expect("ascii fixture");
+    assert!(
+        text.contains("; stop printing object part_a.stl id:0 copy 0"),
+        "the fixture must retain the comment form"
+    );
+    let model = model_of(&data);
+    // No EXCLUDE_OBJECT command anywhere, so nothing is attributed.
+    assert!(
+        !text.contains("EXCLUDE_OBJECT_START"),
+        "this fixture is deliberately unconverted"
+    );
+    assert!(
+        model.moves.iter().all(|m| m.object.is_none()),
+        "the comment form must not attribute deposition"
+    );
+    // And unattributed deposition counts as work even when every named
+    // object is excluded — the safe direction.
+    let body_start = offset_of(&data, "G1 X155 Y95 E1.8663");
+    let work = remaining_work(
+        &model,
+        &data,
+        0,
+        body_start,
+        fresh_state_frame(),
+        Some(&ExcludeEverything),
+    )
+    .expect("modeled");
+    assert!(
+        !work.is_complete(),
+        "unattributed deposition must survive a blanket exclusion: {work:?}"
+    );
+}
+
+/// If the whole plate is cancelled, the remaining deposition does not
+/// count — but only while the exclusion picture is conclusive.
+#[test]
+fn a_fully_cancelled_plate_is_complete_only_when_conclusive() {
+    struct Oracle(bool);
+    impl plr_analyzer::ExclusionOracle for Oracle {
+        fn is_conclusive(&self) -> bool {
+            self.0
+        }
+        fn is_excluded(&self, object: &str) -> bool {
+            object == "PART_A" || object == "PART_B"
+        }
+    }
+    let data = load("prusa_footer_complete.gcode");
+    let model = model_of(&data);
+    let conclusive = remaining_work(
+        &model,
+        &data,
+        0,
+        0,
+        fresh_state_frame(),
+        Some(&Oracle(true)),
+    )
+    .expect("modeled");
+    assert!(conclusive.is_complete(), "{conclusive:?}");
+    let doubtful = remaining_work(
+        &model,
+        &data,
+        0,
+        0,
+        fresh_state_frame(),
+        Some(&Oracle(false)),
+    )
+    .expect("modeled");
+    assert!(
+        !doubtful.is_complete(),
+        "an inconclusive report must count excluded work as work: {doubtful:?}"
+    );
 }

@@ -59,6 +59,11 @@ const STATUS_OBJECTS: &[&str] = &[
     "gcode_move",
     "toolhead",
     "virtual_sdcard",
+    // The authoritative print state machine (standby/printing/paused/
+    // complete/cancelled/error). `virtual_sdcard.is_active` alone cannot
+    // tell a pause→cancel from a pause — see convert.rs's
+    // "Clean-shutdown detection".
+    "print_stats",
     "mcu",
     "heaters",
     "fan",
@@ -696,6 +701,7 @@ mod tests {
             MarkerKind::Resubscribed => "Resubscribed",
             MarkerKind::SubscriptionGap { .. } => "SubscriptionGap",
             MarkerKind::ExclusionUpdateLost => "ExclusionUpdateLost",
+            MarkerKind::RecorderStopped => "RecorderStopped",
             MarkerKind::Unknown => "Unknown",
         }
     }

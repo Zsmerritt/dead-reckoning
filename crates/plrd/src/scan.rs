@@ -462,6 +462,7 @@ mod tests {
             virtual_sdcard: Some(VirtualSdState {
                 file_path: file_path.to_owned(),
                 file_position,
+                file_size: None,
             }),
             gcode: GcodeState {
                 speed_factor: 1.0,
@@ -484,6 +485,7 @@ mod tests {
             heaters: Vec::new(),
             fans: Vec::new(),
             exclude: None,
+            print_state: None,
         }
     }
 

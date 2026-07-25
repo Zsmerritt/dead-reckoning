@@ -274,6 +274,7 @@ pub(crate) mod testutil {
             virtual_sdcard: Some(VirtualSdState {
                 file_path: "/tmp/test.gcode".to_owned(),
                 file_position,
+                file_size: None,
             }),
             gcode,
             transforms: TransformObservations {
@@ -287,6 +288,7 @@ pub(crate) mod testutil {
             heaters: Vec::new(),
             fans: Vec::new(),
             exclude: None,
+            print_state: None,
         }
     }
 }

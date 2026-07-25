@@ -532,6 +532,7 @@ mod tests {
     fn exclusion_context(mono_ns: u64, excluded: &[&str], redefine: bool) -> WalRecord {
         WalRecord::Context(plr_wal::Context {
             mono_ns,
+            print_state: None,
             virtual_sdcard: None,
             gcode: plr_wal::GcodeState {
                 speed_factor: 1.0,

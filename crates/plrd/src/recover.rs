@@ -107,6 +107,16 @@ pub(crate) fn drive(
             say!("recover: the WAL ends with a CLEAN print end; nothing to recover.");
             return EXIT_OK;
         }
+        // The log ended torn, but the print had finished: report the cause
+        // accurately instead of claiming the log ended cleanly, and name
+        // the end-sequence commands that did not run so the operator can
+        // decide about them. Deliberately NOT offered for execution — an
+        // end macro homes and moves Z, and no part of the plan's envelope
+        // or pre-flight analysis covers an opaque macro body.
+        PipelineOutcome::Complete(report) => {
+            report_completion(report, out);
+            return EXIT_OK;
+        }
         PipelineOutcome::MachineRejected(rejection) => {
             say!("recover: REFUSED — machine prerequisites failed:");
             for failure in &rejection.failures {
@@ -691,6 +701,37 @@ async fn printer_ready_and_idle(client: &mut MoonrakerClient) -> Result<(), Stri
     Ok(())
 }
 
+/// Renders a finished print: the accurate cause, and the end-sequence
+/// commands that did not run.
+///
+/// Deliberately does **not** offer to execute them. An end macro homes,
+/// drops the bed or moves Z, and none of the plan's envelope or pre-flight
+/// analysis covers an opaque macro body.
+fn report_completion(report: &crate::pipeline::CompletionReport, out: &mut (dyn Write + Send)) {
+    macro_rules! say {
+        ($($arg:tt)*) => { let _ = writeln!(out, $($arg)*); };
+    }
+    say!(
+        "recover: the print is COMPLETE — no extrusion remains after byte {} of {}; \
+         the {} trailing bytes are the slicer's config-block footer.",
+        report.tested_offset,
+        report.file_size,
+        report.trailing_bytes(),
+    );
+    let unrun = report.unrun_commands();
+    if unrun.is_empty() {
+        say!("  Nothing to recover; the print ran its end sequence too.");
+    } else {
+        say!("  Nothing to recover. These end-sequence commands did not run:");
+        say!("    {}", unrun.join(" "));
+        say!(
+            "  They are NOT offered for execution: an end macro homes, drops the bed \
+             or moves Z, and none of the plan's envelope or pre-flight checks apply \
+             to a macro body. Run them by hand if you want them."
+        );
+    }
+}
+
 /// Reads one line; only `y`/`yes` (case-insensitive) is consent.
 fn read_yes(stdin: &mut dyn BufRead) -> bool {
     let mut line = String::new();
@@ -1122,6 +1163,42 @@ mod tests {
         let (code, output) = run_drive(&PipelineOutcome::CleanShutdown, &config, &options, "");
         assert_eq!(code, crate::EXIT_OK);
         assert!(output.contains("CLEAN"), "{output}");
+        // A finished print whose LOG ended torn: exit 0, and the wording
+        // must not claim the log ended cleanly, because it did not.
+        let complete = |work| {
+            PipelineOutcome::Complete(Box::new(crate::pipeline::CompletionReport {
+                file: "/g/part.gcode".to_owned(),
+                tested_offset: 500_000,
+                file_size: 514_537,
+                work,
+            }))
+        };
+        let (code, output) = run_drive(
+            &complete(plr_analyzer::RemainingWork::EndSequenceOnly {
+                commands: vec!["M107".to_owned(), "M104".to_owned(), "M84".to_owned()],
+            }),
+            &config,
+            &options,
+            "",
+        );
+        assert_eq!(code, crate::EXIT_OK);
+        assert!(output.contains("the print is COMPLETE"), "{output}");
+        assert!(output.contains("14537 trailing bytes"), "{output}");
+        assert!(output.contains("M107 M104 M84"), "{output}");
+        assert!(output.contains("NOT offered for execution"), "{output}");
+        assert!(
+            !output.contains("WAL ends with a CLEAN"),
+            "the log did NOT end cleanly: {output}"
+        );
+        // A print that ran its end sequence too has nothing to name.
+        let (code, output) = run_drive(
+            &complete(plr_analyzer::RemainingWork::Nothing),
+            &config,
+            &options,
+            "",
+        );
+        assert_eq!(code, crate::EXIT_OK);
+        assert!(output.contains("ran its end sequence too"), "{output}");
         let (code, output) = run_drive(
             &PipelineOutcome::ManualFallback("vase mode".to_owned()),
             &config,

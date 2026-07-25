@@ -164,32 +164,38 @@ fn any_context() -> impl Strategy<Value = Context> {
         any_gcode_state(),
         any_f64(),
         proptest::option::of(any_exclude_state().prop_map(Box::new)),
+        // Verbatim field: totality must hold for any reported state.
+        proptest::option::of(".{0,12}"),
     )
-        .prop_map(|(mono_ns, vsd, gcode, target, exclude)| Context {
-            mono_ns,
-            virtual_sdcard: vsd.map(|(file_position, file_path)| VirtualSdState {
-                file_path,
-                file_position,
-            }),
-            gcode,
-            transforms: TransformObservations {
-                bed_mesh_active: false,
-                bed_mesh_profile: None,
-                z_thermal_adjust_enabled: Some(true),
-                z_thermal_adjust_offset: Some(target),
-                skew_active: false,
-                skew_profile: None,
+        .prop_map(
+            |(mono_ns, vsd, gcode, target, exclude, print_state)| Context {
+                mono_ns,
+                print_state,
+                virtual_sdcard: vsd.map(|(file_position, file_path)| VirtualSdState {
+                    file_path,
+                    file_position,
+                    file_size: None,
+                }),
+                gcode,
+                transforms: TransformObservations {
+                    bed_mesh_active: false,
+                    bed_mesh_profile: None,
+                    z_thermal_adjust_enabled: Some(true),
+                    z_thermal_adjust_offset: Some(target),
+                    skew_active: false,
+                    skew_profile: None,
+                },
+                heaters: vec![HeaterTarget {
+                    name: "extruder".to_owned(),
+                    target,
+                }],
+                fans: vec![FanTarget {
+                    name: "fan".to_owned(),
+                    speed: target,
+                }],
+                exclude,
             },
-            heaters: vec![HeaterTarget {
-                name: "extruder".to_owned(),
-                target,
-            }],
-            fans: vec![FanTarget {
-                name: "fan".to_owned(),
-                speed: target,
-            }],
-            exclude,
-        })
+        )
 }
 
 fn any_marker() -> impl Strategy<Value = Marker> {
