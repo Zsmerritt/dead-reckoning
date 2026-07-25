@@ -700,20 +700,50 @@ indefensible).
 from inside a macro therefore passed the gate against a machine the macro
 had not finished changing, and the plan's first command could not land
 until the macro's last one had — the macro was free to home, move Z or
-start a print in between. Execution now sends one read-only `M115`
+start a print in between. Execution now sends one read-only `M110`
 *before* anything else: its reply cannot arrive until dead-reckoning has
 itself held and released the mutex, i.e. until everything queued ahead of
 it has finished, and the ready-and-idle gate is then re-sampled against
-that state. A mutex nobody releases resolves into
-`ExecOptions::gcode_barrier_timeout` and a refusal. What it does not
-cover, and what nothing observable to the daemon could: a
-`[delayed_gcode]` taking the mutex *between* two of the plan's steps.
+that state. A mutex nobody releases resolves into the `[plr]`
+`gcode_barrier_timeout_s` budget (default 30 s) and a refusal.
+
+`M110`'s handler is literally `pass`, so it changes nothing and prints
+nothing. `M115` was the first choice and was wrong twice over: it is
+renameable via `[gcode_macro M115]` + `rename_existing`, which would make
+the "read-only" barrier run an arbitrary macro body as the recovery's first
+act, and because the API socket calls `run_script` with `need_ack=False`
+its handler falls through to `respond_info`, dropping an unexplained
+firmware banner into the operator's console on every attempt including
+every refusal.
+
+**Once is not enough.** That gate is still a sample, and the gap after it
+contains the entire pre-flight confirm pause — `preflight_confirmations`
+and the step-debug pause both run before any command is issued — which is
+bounded only by `confirm_timeout_s`: up to an hour, or unbounded human time
+at a CLI `--step` prompt. A job that starts during it used to be answered
+by issuing `SET_KINEMATIC_POSITION` and `PROBE` into a running print and
+reporting `COMPLETED`. So the whole check is re-run once per step,
+immediately before that step's commands go out, which covers the gap since
+the pre-execution gate, the pre-flight pause, and any per-step pause or
+gate with one call site. It cannot refuse the recovery's own progress: the
+only plan command that makes the printer non-idle is the `M24` in
+`Phase::RecoveryFileSelect`, which is property-tested to be the final step.
+
+What remains is one Moonraker round trip: another g-code source can take
+the mutex between the re-check and the send. That is microseconds and is
+not closable from outside Klipper. An earlier version of this section
+claimed a `[delayed_gcode]` between two plan steps was unobservable — that
+was false, it costs one `printer.objects.query`, and it is now what
+happens.
 
 Gating on `idle_timeout.state` was considered and rejected — it is wrong
 in both directions (false negative for the macro whose motion follows the
-`PLR_RECOVER` line, false refusal for any printer whose `[delayed_gcode]`
-pokes a fan every few seconds). `recover.rs`'s module docs carry the
-line-by-line reading of Klipper that shows why.
+`PLR_RECOVER` line; false refusal for any printer whose `[delayed_gcode]`
+pokes a fan every few seconds, and again for the ~ms during which
+`transition_idle_state` holds the field at `"Printing"` while it runs
+`TURN_OFF_HEATERS`/`M84`, i.e. exactly as the machine becomes maximally
+idle). `recover.rs`'s module docs carry the line-by-line reading of Klipper
+that shows why.
 
 **Observability: `recover_state`.** A read-only query reporting whether an
 execution is in flight, whether it is awaiting confirmation, and if so the

@@ -244,6 +244,10 @@ pub struct PlrSettings {
     /// answer before aborting cleanly, seconds. `None` uses the daemon
     /// default.
     pub confirm_timeout_s: Option<f64>,
+    /// `gcode_barrier_timeout_s` — how long execution waits for
+    /// Klipper's g-code mutex before refusing, seconds. `None` uses the
+    /// daemon default.
+    pub gcode_barrier_timeout_s: Option<f64>,
     /// Operator attestation autosaved by the plugin's `PLR_SETUP`.
     pub self_locking_z: bool,
     /// Autosaved probe resolution, mm; `None` before first calibration.
@@ -498,6 +502,7 @@ impl PlrSettings {
                 plr_recovery::UNSAFE_PURGE_Z_BELOW_BED,
             ),
             confirm_timeout_s: opt_opt_f64(plr, "confirm_timeout_s"),
+            gcode_barrier_timeout_s: opt_opt_f64(plr, "gcode_barrier_timeout_s"),
             self_locking_z,
             probe_resolution,
             noise_floor,
@@ -572,6 +577,7 @@ impl PlrSettings {
             debug_confirm_each_step: self.debug_confirm_each_step,
             unsafe_allow_purge_z_below_bed: self.unsafe_allow_purge_z_below_bed,
             confirm_timeout_s: self.confirm_timeout_s,
+            gcode_barrier_timeout_s: self.gcode_barrier_timeout_s,
             // [plr] mode: the plugin (and its PLR_TOUCH command) is
             // present, so the consensus touch is used.
             legacy_single_probe: false,
@@ -2336,6 +2342,7 @@ pub(crate) mod tests {
         assert!(!plr.debug_confirm_each_step);
         assert!(!plr.unsafe_allow_purge_z_below_bed);
         assert_eq!(plr.confirm_timeout_s, None);
+        assert_eq!(plr.gcode_barrier_timeout_s, None);
         for value in [
             plr.recovery_accel,
             plr.accel_home,
@@ -2362,6 +2369,7 @@ pub(crate) mod tests {
             ("accel_probe", json!(400.0)),
             ("accel_entry", json!(600.0)),
             ("confirm_timeout_s", json!(120.0)),
+            ("gcode_barrier_timeout_s", json!(45.0)),
         ]);
         let config = plr.plan_config();
         assert!(config.confirm_z_before_resume);
@@ -2372,6 +2380,7 @@ pub(crate) mod tests {
         assert_eq!(config.accel_probe, Some(400.0));
         assert_eq!(config.accel_entry, Some(600.0));
         assert_eq!(config.confirm_timeout_s, Some(120.0));
+        assert_eq!(config.gcode_barrier_timeout_s, Some(45.0));
 
         // Out-of-band values are parsed, then REFUSED by validation with
         // the typed diagnosis — never silently clamped into range.

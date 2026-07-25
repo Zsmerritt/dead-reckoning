@@ -113,27 +113,39 @@
 //! additive, so an older plugin — which never sends it and ignores unknown
 //! keys — is unaffected.
 //!
-//! **It cannot act.** Not by convention: [`cmd_recover_state`] is
-//! synchronous (no `await`, therefore no I/O and no session lock) and its
-//! entire input is a [`StateSnapshot`] of `bool`/`String`/`f64`. Answering a
-//! pause needs the pause's `oneshot::Sender`, whose `send` consumes
-//! `self`; starting one needs to assign a new `ExecSession` into the
-//! session slot. Neither value is reachable from what the renderer holds.
-//! See [`Observed`] for the locking argument.
+//! **It cannot act**, and that is a property of its type rather than of its
+//! body: [`cmd_recover_state`] is handed `&`[`Observed`], so the session
+//! slot and the outstanding pause's `oneshot::Sender` are not reachable from
+//! it, and [`render_state`] is handed a [`StateSnapshot`] of
+//! `bool`/`String`/`f64`. Being synchronous is *not* what buys this —
+//! `try_lock`, `Sender::send` and `std::fs::write` are all synchronous, so a
+//! handler holding `&CtrlState` could answer an operator's Z-height
+//! confirmation without ever awaiting. See [`Observed`] for the locking
+//! argument.
 //!
-//! **On exposing the token.** The resume token is a *correlation*
-//! identifier, not a capability: it exists so a stale or duplicate answer
-//! cannot be mistaken for a fresh one, and it never authenticated anybody.
-//! This socket has no authentication at all — mode 0666 by design, see
-//! below — so any client that can read the token could already have sent
-//! `recover_execute {"confirm": true}`, and could reach the same printer
-//! through Moonraker's own unauthenticated local API. Exposing it therefore
-//! grants no new capability, and it removes a genuinely bad state: today,
-//! if the connection that received the pause goes away (klippy restarts the
-//! plugin, the operator reloads the browser), *nobody* can answer, and the
-//! recovery sits paused with the heaters on and the nozzle over the part
-//! until the deadline. Being able to re-discover the token and abort is a
-//! safety improvement in the direction that matters.
+//! **On exposing the token — what it enables.** The resume token is a
+//! *correlation* identifier, not a capability: it exists so a stale or
+//! duplicate answer cannot be mistaken for a fresh one, and it never
+//! authenticated anybody. This socket has no authentication at all (mode
+//! 0666 by design, see below), so any client that can read the token could
+//! already have sent `recover_execute {"confirm": true}` and could reach the
+//! same printer through Moonraker's own unauthenticated local API.
+//!
+//! Be precise about what changes, though, because one thing does. The
+//! confirm-points exist to require *a human at the machine* — the Z-height
+//! pause asks somebody to look at the nozzle. Before `recover_state`, a
+//! client could only answer a pause it had **received**; now any local
+//! client can **discover** the token and answer it, including "continue",
+//! having never been shown the diagnosis. That is a genuine widening, not
+//! merely re-discovery of something already held.
+//!
+//! It is judged worth it because the state it fixes is worse: if the
+//! connection that received the pause goes away (klippy restarts the
+//! plugin, the operator reloads the browser) then *nobody* can answer today,
+//! and the recovery sits paused with the heaters on and the nozzle over the
+//! part until the deadline expires. An operator on a multi-user host who
+//! does not want that widening has the same remedy as for every other
+//! mutating command here: tighten the socket's mode (below).
 //!
 //! # Diagnoses on the wire
 //!
@@ -667,10 +679,14 @@ pub(crate) async fn respond_line(state: &CtrlState, line: &str) -> Value {
             &json!({"version": env!("CARGO_PKG_VERSION")}),
         ),
         "status" => cmd_status(state).await,
-        // Deliberately NOT `async`: a synchronous handler cannot await, so
-        // it cannot perform I/O, cannot take the session lock and cannot
-        // drive a session, whatever anybody later writes inside it.
-        "recover_state" => cmd_recover_state(state),
+        // Handed `&state.observed`, NOT `&state`. That is what makes the
+        // handler unable to act, and it is deliberate: being synchronous is
+        // not enough on its own — `try_lock`, `oneshot::Sender::send` and
+        // `std::fs::write` are all synchronous, so a handler holding
+        // `&CtrlState` could answer somebody's Z-height confirmation
+        // without ever awaiting. Narrowing the argument removes the
+        // capability instead of asking future authors not to use it.
+        "recover_state" => cmd_recover_state(&state.observed),
         "recover_dryrun" => cmd_recover_dryrun(state).await,
         "recover_execute" => cmd_recover_execute(state, args).await,
         "recover_confirm" => cmd_recover_confirm(state, args).await,
@@ -692,11 +708,16 @@ async fn cmd_status(state: &CtrlState) -> Value {
 /// `recover_state`: the read-only "is a recovery in flight, and is it
 /// waiting on me?" query (module docs).
 ///
-/// Two lines, both of which are the point:
-/// * it reads the plain-data mirror, never the session;
-/// * it hands that plain data to a renderer and returns what comes back.
-fn cmd_recover_state(state: &CtrlState) -> Value {
-    render_state(&state.observed.snapshot())
+/// **Takes `&Observed`, not `&CtrlState`.** The session and the outstanding
+/// confirm-point's `oneshot::Sender` are simply not reachable from here, so
+/// "this handler cannot start, answer or cancel a recovery" is a fact about
+/// its signature rather than a promise about its body. An earlier version
+/// took `&CtrlState` and argued the point from being synchronous; that was
+/// false — `try_lock`, `Sender::send` and `std::fs::write` are all
+/// synchronous, and a reviewer answered a live Z-height confirmation from
+/// inside this function to prove it.
+fn cmd_recover_state(observed: &Observed) -> Value {
+    render_state(&observed.snapshot())
 }
 
 /// Renders a [`StateSnapshot`]. Takes plain data by reference and returns
@@ -1924,6 +1945,25 @@ mod tests {
         tag: &str,
         plr_overrides: &[(&str, Value)],
     ) -> (PathBuf, PathBuf, FakeMoonraker) {
+        let (path, wal_dir, fake, _sim) = spawn_confirm_server_sim(tag, plr_overrides).await;
+        (path, wal_dir, fake)
+    }
+
+    /// [`spawn_confirm_server`], also handing back the simulated printer so
+    /// a test can change the machine's state *while* execution is paused —
+    /// which is the only way to reproduce the case where a job starts
+    /// during an operator's confirm pause.
+    #[cfg(unix)]
+    #[allow(clippy::type_complexity)] // four related handles, not a struct
+    async fn spawn_confirm_server_sim(
+        tag: &str,
+        plr_overrides: &[(&str, Value)],
+    ) -> (
+        PathBuf,
+        PathBuf,
+        FakeMoonraker,
+        Arc<std::sync::Mutex<SimPrinter>>,
+    ) {
         let (_dir, mut config) = crate::pipeline::e2e_tests::plr_fixture(tag, plr_overrides);
         let sim = Arc::new(std::sync::Mutex::new(SimPrinter::new(
             config.wal_dir.to_str().unwrap(),
@@ -1935,7 +1975,7 @@ mod tests {
         // The state must outlive this helper: leak it deliberately (the
         // test process is the lifetime).
         std::mem::forget(state);
-        (path, wal_dir, fake)
+        (path, wal_dir, fake, sim)
     }
 
     const EXECUTE_ASK: &str =
@@ -2309,6 +2349,93 @@ mod tests {
                 "{d}"
             );
         }
+    }
+
+    /// **The operator case.** Power loss, `PLR_RECOVER`, the plan raises a
+    /// Z-height confirmation, the operator walks to the printer to look at
+    /// the nozzle — and while they are away an autostart macro or a queued
+    /// job begins printing. They come back and answer "continue".
+    ///
+    /// Both pre-execution gates passed, honestly, before the pause. The
+    /// window between them and the next command is the whole confirm
+    /// deadline: up to an hour at the top of the permitted band. Without the
+    /// per-step re-check, answering "continue" issued the plan's remaining
+    /// commands — `SET_KINEMATIC_POSITION`, `PROBE`, and finally `M24` — into
+    /// a running print, and reported `COMPLETED`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_job_that_starts_during_the_confirm_pause_stops_the_resume() {
+        let (path, wal_dir, fake, sim) =
+            spawn_confirm_server_sim("pause-window", &[("confirm_z_before_resume", json!(true))])
+                .await;
+        let paused = roundtrip(&path, EXECUTE_ASK).await;
+        assert_eq!(
+            paused["data"]["outcome"],
+            json!("awaiting_confirmation"),
+            "{paused}"
+        );
+        let token = paused["data"]["resume_token"].as_str().unwrap().to_owned();
+        // Everything up to the standoff really did run, so this is the
+        // dangerous moment and not a pause before anything happened.
+        let before = fake.gcode_sent();
+        assert!(
+            before.iter().any(|c| c.starts_with("PLR_TOUCH")),
+            "the contact operation should already have run: {before:?}"
+        );
+        assert!(!before.iter().any(|c| c == "M24"), "{before:?}");
+
+        // The operator is at the printer. Something else starts a job.
+        sim.lock().expect("sim").is_active = true;
+
+        // They answer "continue".
+        let done = roundtrip(&path, &confirm_request(&token, "continue")).await;
+        assert_eq!(done["ok"], json!(false), "{done}");
+        assert_eq!(
+            done["data"]["outcome"],
+            json!("aborted-or-refused"),
+            "{done}"
+        );
+        let text = done["text"].as_str().unwrap();
+        assert!(text.contains("exclusive-gcode-access-lost"), "{text}");
+        assert!(
+            text.contains("Something else is driving this printer"),
+            "{text}"
+        );
+        // The resume never happened.
+        assert!(
+            !fake.gcode_sent().iter().any(|c| c == "M24"),
+            "the print must not have been started: {:?}",
+            fake.gcode_sent()
+        );
+        // And the frame is marked unknown, so a re-execute is refused until
+        // a fresh dry run — correct, because the plan is now stale.
+        let marker = crate::detect::read_frame_invalid(&wal_dir).expect("frame-invalid marker");
+        assert_eq!(marker.reason, "exclusive-gcode-access-lost");
+        let transcript = read_transcript(&wal_dir);
+        assert!(
+            transcript.contains("\"event\":\"exclusivity-lost\""),
+            "{transcript}"
+        );
+    }
+
+    /// The complement, so the test above is not passing for the trivial
+    /// reason that the re-check refuses everything: the same plan, the same
+    /// pause, nothing else touching the printer — and the resume completes.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_undisturbed_confirm_pause_still_resumes() {
+        let (path, wal_dir, fake) = spawn_confirm_server(
+            "pause-window-ok",
+            &[("confirm_z_before_resume", json!(true))],
+        )
+        .await;
+        let paused = roundtrip(&path, EXECUTE_ASK).await;
+        let token = paused["data"]["resume_token"].as_str().unwrap().to_owned();
+        let done = roundtrip(&path, &confirm_request(&token, "continue")).await;
+        assert_eq!(done["ok"], json!(true), "{done}");
+        assert_eq!(done["data"]["outcome"], json!("completed"));
+        assert!(fake.gcode_sent().iter().any(|c| c == "M24"));
+        assert!(crate::detect::read_frame_invalid(&wal_dir).is_none());
     }
 
     // --- `recover_state`: observing without acting -----------------------

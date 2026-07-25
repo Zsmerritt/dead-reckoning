@@ -556,6 +556,29 @@ impl Diagnose for crate::error::RecoveryError {
             )
             .measured("confirm_timeout_s", *value, "s")
             .expected("confirm_timeout_s", Some(*min), Some(*max), "s"),
+            E::GcodeBarrierTimeoutOutOfRange { value, min, max } => Diagnosis::new(
+                "gcode_barrier_timeout_out_of_range",
+                Tier::Hard,
+                format!(
+                    "gcode_barrier_timeout_s is {} s, outside the permitted band",
+                    fmt_num(*value)
+                ),
+                "This is how long the recovery waits for exclusive control of Klipper's \
+                 g-code channel before refusing. Set too short, an ordinary macro tail or a \
+                 momentarily busy host reads as somebody else owning the printer and healthy \
+                 recoveries are refused; set too long (or to zero, or to infinity), a \
+                 recovery that will never get the channel sits silent instead of telling you \
+                 that something else is printing.",
+                format!(
+                    "Set `gcode_barrier_timeout_s` in printer.cfg's [plr] section to a value \
+                     in [{}, {}] seconds, or remove the key to use the {} s default.",
+                    fmt_num(*min),
+                    fmt_num(*max),
+                    fmt_num(crate::build::GCODE_BARRIER_TIMEOUT_DEFAULT_S)
+                ),
+            )
+            .measured("gcode_barrier_timeout_s", *value, "s")
+            .expected("gcode_barrier_timeout_s", Some(*min), Some(*max), "s"),
             E::MachineRejected { failures } => Diagnosis::new(
                 "machine_prerequisites_failed",
                 Tier::Hard,

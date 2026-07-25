@@ -59,13 +59,34 @@
 //!
 //! A source that never releases the mutex — the deadlock shape, an old
 //! blocking plugin whose macro is itself waiting on this daemon — resolves
-//! into [`ExecOptions::gcode_barrier_timeout`] and a refusal, which is the
+//! into the `[plr]` `gcode_barrier_timeout_s` budget (or
+//! [`ExecOptions::gcode_barrier_timeout`]) and a refusal, which is the
 //! fail-closed direction.
 //!
-//! What the barrier does **not** cover: a `[delayed_gcode]` or another
-//! client can still take the mutex *between* two of the plan's steps.
-//! Nothing observable to this daemon can prevent that, and no gate here
-//! claims to.
+//! ## Once is not enough: the gap between this gate and the first command
+//!
+//! This gate is still only a sample, and the gap after it is not small. On
+//! the socket path it contains the **entire pre-flight confirm pause** —
+//! `executor::preflight_confirmations` and the `debug_confirm_each_step`
+//! pause both run before any command is issued — which is bounded only by
+//! `confirm_timeout_s`, i.e. up to an hour at the top of the permitted band,
+//! or unbounded human time at a CLI `--step` prompt. During it an autostart
+//! macro or a queued job can begin printing, and answering "continue" would
+//! then issue `SET_KINEMATIC_POSITION` and `PROBE` into a running print and
+//! report `COMPLETED`.
+//!
+//! So [`BarrierGate`] re-runs this whole check once per step, immediately
+//! before that step's commands go out — see [`crate::executor::Exclusivity`]
+//! for the placement argument and for why it cannot refuse the recovery's
+//! own progress.
+//!
+//! **The residual, stated accurately.** What is left is one Moonraker round
+//! trip: another g-code source can take the mutex between the re-check and
+//! the send. That gap is *microseconds* and cannot be closed from outside
+//! Klipper, which is a genuinely different claim from the one this comment
+//! used to make — it said a `[delayed_gcode]` between two plan steps was
+//! unobservable, and that was false and harmful, because observing it costs
+//! exactly one `printer.objects.query` and is now what happens.
 //!
 //! ## What was considered and rejected: `idle_timeout.state`
 //!
@@ -73,14 +94,15 @@
 //! is not one, in both directions. Read at source
 //! (`../klipper/klippy/extras/idle_timeout.py`):
 //!
-//! * The only transition *into* `"Printing"` is `handle_sync_print_time`
-//!   (`idle_timeout.py:98-107`), fired from the `toolhead:sync_print_time`
-//!   event, which `ToolHead._calc_print_time` emits only when it advances
-//!   `print_time` past the estimate (`../klipper/klippy/toolhead.py:260-268`).
-//!   Nothing about *entering* a macro or taking the mutex does that. A
-//!   macro whose motion comes *after* its `PLR_RECOVER` line — which is
-//!   precisely the dangerous shape — is still `"Idle"`/`"Ready"` at gate
-//!   time. **False negative in the unsafe direction.**
+//! * The transition *into* `"Printing"` that tracks the toolhead is
+//!   `handle_sync_print_time` (`idle_timeout.py:98-107`), fired from the
+//!   `toolhead:sync_print_time` event, which `ToolHead._calc_print_time`
+//!   emits only when it advances `print_time` past the estimate
+//!   (`../klipper/klippy/toolhead.py:260-268`). Nothing about *entering* a
+//!   macro or taking the mutex does that. A macro whose motion comes *after*
+//!   its `PLR_RECOVER` line — which is precisely the dangerous shape — is
+//!   still `"Idle"`/`"Ready"` at gate time. **False negative in the unsafe
+//!   direction.**
 //! * Conversely `_calc_print_time` also runs from
 //!   `ToolHead.get_last_move_time` (`toolhead.py:320-326`), which
 //!   `register_lookahead_callback` calls on an empty lookahead
@@ -95,6 +117,14 @@
 //!   there for ~1.5 s, since the exit path needs `lookahead_empty`, a
 //!   negative buffer *and* a free mutex (`idle_timeout.py:80-97`).
 //!   **False refusal of a legitimate recovery, on a common configuration.**
+//! * And there is a *second* assignment of `"Printing"` that has nothing to
+//!   do with the toolhead at all: `transition_idle_state` sets it while it
+//!   runs the idle g-code (`idle_timeout.py:46-49`) and only then settles to
+//!   `"Idle"` (`:56`). So the field also reads `"Printing"` for the duration
+//!   of `TURN_OFF_HEATERS` + `M84` — the moment the machine is *becoming*
+//!   maximally idle. Another transient false positive, and it lands exactly
+//!   where an operator is most likely to start a recovery: on a printer that
+//!   has been sitting untouched.
 //!
 //! Boot and `FIRMWARE_RESTART` both land on `"Idle"` — the field is
 //! initialised there (`idle_timeout.py:32`) and a firmware restart builds
@@ -415,11 +445,15 @@ pub(crate) async fn execute_with_gates(
     // G-code scripts legitimately run for minutes (heat soak, probe).
     client.set_call_timeout(exec_options.temp_timeout);
 
-    // Gates 4 and 4b.
-    if let Err(reason) = idle_and_exclusive(&mut client, exec_options).await {
-        let _ = writeln!(out, "recover: REFUSED — {reason}");
-        return EXIT_RUNTIME;
-    }
+    // The two filesystem gates come BEFORE the printer gates, deliberately.
+    // Both are pure local I/O with no RPC, so a disk failure refuses with
+    // "nothing was sent" in the literal sense — not "nothing that changes
+    // the machine". Ordering them the other way round would trade that
+    // exact wording for nothing: the printer gates would still run, and
+    // their sentinel would already be on the wire by the time the disk
+    // failed. The cost is that a *printer* refusal now happens with a
+    // transcript and a recovery file already on disk, which is handled
+    // where that refusal is raised.
 
     // Transcript file: no transcript, no execution.
     let transcript_path = config.wal_dir.join(format!(
@@ -452,6 +486,18 @@ pub(crate) async fn execute_with_gates(
     }
     let bundle = &bundle;
 
+    // Gates 4 and 4b. First point at which anything reaches the printer.
+    if let Err(reason) = idle_and_exclusive(
+        &mut client,
+        barrier_budget(&bundle.plan, exec_options),
+        exec_options.temp_timeout,
+    )
+    .await
+    {
+        refuse_at_printer_gate(&reason, bundle, &mut transcript_file, out);
+        return EXIT_RUNTIME;
+    }
+
     let mut frame_guard = MarkerFrameGuard {
         wal_dir: config.wal_dir.clone(),
     };
@@ -466,6 +512,9 @@ pub(crate) async fn execute_with_gates(
         gate.confirm(step, out)
     };
 
+    let mut exclusivity = BarrierGate {
+        restore_timeout: exec_options.temp_timeout,
+    };
     let outcome = {
         let mut transcript = Transcript::new(&mut transcript_file);
         execute(
@@ -475,6 +524,7 @@ pub(crate) async fn execute_with_gates(
             &mut gate_fn,
             confirmer,
             &mut frame_guard,
+            &mut exclusivity,
             &mut transcript,
         )
         .await
@@ -537,6 +587,20 @@ fn report_abort(outcome: &ExecOutcome, config: &Config, out: &mut (dyn Write + S
              recover:   Fix the WAL directory {} (it also holds the transcript), then \
              retry or cool the printer down by hand.",
             config.wal_dir.display()
+        );
+    } else if let crate::executor::StopCause::ExclusivityLost(why) = cause {
+        // The operator's problem is not this recovery — it is that
+        // something else owns their printer. Say that, and say what this
+        // step did NOT do, because the abort landed before the step's
+        // commands went out.
+        let _ = writeln!(
+            out,
+            "recover: STOPPED before step {step_id} — {why}\n\
+             recover:   Step {step_id} sent nothing. Everything before it ran and is left \
+             exactly as any abort at this point leaves it.\n\
+             recover:   Something else is driving this printer: an autostart macro, a queued \
+             job, or a [gcode_macro] that called PLR_RECOVER and kept going. Let it finish (or \
+             cancel it), then run a fresh dry run before resuming — the plan is now stale."
         );
     } else {
         let _ = writeln!(
@@ -762,23 +826,45 @@ fn retarget_recovery_file(bundle: &mut PlanBundle, new_name: &str) -> usize {
     patched
 }
 
-/// The g-code mutex barrier's sentinel command (gate 4b).
+/// The g-code mutex barrier's sentinel command.
 ///
-/// `M115` (report firmware version) is the right choice and not an
-/// arbitrary one:
+/// `M110` (set line number) is chosen because it is inert *by
+/// construction*, which is the only property that matters here:
 ///
 /// * it goes through `gcode.run_script`, so it takes and releases the
 ///   g-code mutex — that is the whole point
 ///   (`../klipper/klippy/webhooks.py:447-448`, `gcode.py:239-241`);
-/// * it is *read-only*. Its handler formats a string and acks it
-///   (`../klipper/klippy/gcode.py:344-351`): no toolhead call, no heater,
-///   no pin, no queued move. Nothing about the machine changes, so the
-///   "a refusal changes nothing" property of the gate stack survives even
-///   though the barrier is no longer literally silent;
-/// * it is registered among the commands that exist *before* the config
-///   is loaded (same block), so it cannot fail because of how the
-///   operator's printer is configured.
-pub(crate) const GCODE_BARRIER_SENTINEL: &str = "M115";
+/// * **its handler is literally `pass`** (`gcode.py:338-340`). It changes
+///   no state, queues no move, touches no toolhead or heater, and emits no
+///   output at all;
+/// * it is registered in the block of commands that exist *before* the
+///   config is loaded (`gcode.py:117-124`), so it cannot fail because of
+///   how the operator's printer is configured.
+///
+/// # Why not `M115`, which this used to be
+///
+/// Two reasons, both found in review, and both disqualifying:
+///
+/// * **It is not unconditionally inert.** `[gcode_macro M115]` with
+///   `rename_existing: M115.1` is legal Klipper config — the rename passes
+///   the `is_traditional_gcode` consistency check (`gcode.py:137-142`) — so
+///   on such a printer the "read-only" barrier would run an arbitrary macro
+///   body, possibly homing or heating, as the recovery's first act, and
+///   that body could `gcmd.error` the barrier into a refusal.
+/// * **It is not silent.** The API socket calls `run_script` with
+///   `need_ack=False`, so `gcmd.ack` returns false and `cmd_M115` falls
+///   through to `respond_info` (`gcode.py:344-351`): every recovery
+///   attempt, *including every refusal*, would drop an unexplained
+///   firmware banner into the operator's console and Moonraker's g-code
+///   store.
+///
+/// `M110` is renameable in principle too — nothing in Klipper forbids
+/// `[gcode_macro M110]` — so "inert" is a property of stock Klipper plus a
+/// config nobody writes, not a proof. The barrier's failure direction is a
+/// refusal, so a hijacked sentinel that errors costs a false refusal rather
+/// than a hidden hazard; one that silently succeeds costs nothing the
+/// following ready-and-idle re-sample does not re-check.
+pub(crate) const GCODE_BARRIER_SENTINEL: &str = "M110";
 
 /// Gates 4 and 4b together, in the order that makes each worth having.
 ///
@@ -789,7 +875,8 @@ pub(crate) const GCODE_BARRIER_SENTINEL: &str = "M115";
 /// three different things for the operator to do.
 async fn idle_and_exclusive(
     client: &mut MoonrakerClient,
-    exec_options: &ExecOptions,
+    barrier_budget: Duration,
+    restore_timeout: Duration,
 ) -> Result<(), String> {
     // Gate 4, FIRST: a plainly busy printer is refused without this daemon
     // putting a single byte of g-code on the wire.
@@ -801,13 +888,7 @@ async fn idle_and_exclusive(
     // describes the machine as it was *before* whatever was already holding
     // the mutex — most importantly the `[gcode_macro]` a console
     // `PLR_RECOVER` is nested in — got to run its remaining commands.
-    if let Err(reason) = gcode_mutex_barrier(
-        client,
-        exec_options.gcode_barrier_timeout,
-        exec_options.temp_timeout,
-    )
-    .await
-    {
+    if let Err(reason) = gcode_mutex_barrier(client, barrier_budget, restore_timeout).await {
         return Err(format!(
             "{reason}. Nothing but the read-only {GCODE_BARRIER_SENTINEL} was sent. If this \
              recovery was started from a [gcode_macro], that macro still holds the mutex: \
@@ -823,6 +904,74 @@ async fn idle_and_exclusive(
         ));
     }
     Ok(())
+}
+
+/// Refuses at gates 4/4b, after the filesystem gates have already run.
+///
+/// Two clean-ups the earlier ordering did not need, both consequences of
+/// doing the disk work first (see the ordering note in
+/// [`execute_with_gates`]):
+///
+/// * **journal it.** The transcript exists by now, and a gate refusal used
+///   to be recorded nowhere but stdout — which on the socket path means it
+///   survived only as long as the response the plugin printed.
+/// * **remove the recovery file.** Nothing will select it, and leaving it
+///   behind would make the next attempt re-resolve to a `-2` name and
+///   litter the sdcard root one file per refusal. `write_recovery_file`
+///   created it with `create_new`, so this cannot remove somebody else's
+///   file; if the removal fails, the existing collision handling copes,
+///   which is already tested.
+fn refuse_at_printer_gate(
+    reason: &str,
+    bundle: &PlanBundle,
+    transcript_file: &mut std::fs::File,
+    out: &mut (dyn Write + Send),
+) {
+    let _ = writeln!(
+        transcript_file,
+        "{}",
+        serde_json::json!({"event": "refused", "gate": "idle-and-exclusive", "reason": reason})
+    );
+    let _ = transcript_file.flush();
+    let _ = std::fs::remove_file(&bundle.recovery_file_path);
+    let _ = writeln!(out, "recover: REFUSED — {reason}");
+}
+
+/// The barrier budget in force for `plan`: the operator's `[plr]`
+/// `gcode_barrier_timeout_s` when set, else the daemon's default.
+///
+/// The same rule the executor applies to its own per-step re-checks, in one
+/// function so the pre-execution gate and the per-step gate cannot disagree
+/// about how long the operator asked to wait.
+fn barrier_budget(plan: &plr_recovery::RecoveryPlan, exec_options: &ExecOptions) -> Duration {
+    crate::executor::plan_duration_or(
+        plan.gcode_barrier_timeout_s,
+        exec_options.gcode_barrier_timeout,
+    )
+}
+
+/// The production [`Exclusivity`]: [`idle_and_exclusive`], re-run before
+/// every step's commands go out.
+///
+/// It is the *same* check as gates 4 and 4b, deliberately — a second,
+/// weaker predicate for the per-step case would be a second thing to keep
+/// true. `restore_timeout` is what the client's per-call budget is put back
+/// to afterwards, so a barrier does not silently shorten the multi-minute
+/// budget a heat-soak step needs.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) struct BarrierGate {
+    pub(crate) restore_timeout: Duration,
+}
+
+impl crate::executor::Exclusivity for BarrierGate {
+    fn recheck<'a>(
+        &'a mut self,
+        client: &'a mut MoonrakerClient,
+        budget: Duration,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + 'a>> {
+        let restore = self.restore_timeout;
+        Box::pin(async move { idle_and_exclusive(client, budget, restore).await })
+    }
 }
 
 /// Gate 4b's first half: block until dead-reckoning has held and released
@@ -1160,16 +1309,31 @@ mod tests {
             vec![super::GCODE_BARRIER_SENTINEL.to_owned()],
             "the barrier refusal must send nothing but the sentinel"
         );
-        // And no transcript, because execution never began.
+        // The refusal is journalled. A transcript exists because the two
+        // filesystem gates now run first, and a gate refusal that survived
+        // only in stdout was invisible after the fact on the socket path.
+        let transcript = std::fs::read_dir(&config.wal_dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .find(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with("recovery-transcript-")
+            })
+            .expect("transcript");
+        let text = std::fs::read_to_string(transcript.path()).unwrap();
+        assert!(text.contains("\"event\":\"refused\""), "{text}");
+        assert!(text.contains("idle-and-exclusive"), "{text}");
+        // No step ever started.
+        assert!(!text.contains("step-start"), "{text}");
+        // And the recovery file this run created was removed rather than
+        // left to litter the sdcard root one file per refusal.
         assert!(
             !std::fs::read_dir(&config.wal_dir)
                 .unwrap()
                 .filter_map(Result::ok)
-                .any(|e| e
-                    .file_name()
-                    .to_string_lossy()
-                    .starts_with("recovery-transcript-")),
-            "nothing executed, so nothing should have been transcribed"
+                .any(|e| e.file_name().to_string_lossy().contains("_RECOVERY")),
+            "the unused recovery file must not be left behind"
         );
     }
 
@@ -1320,13 +1484,18 @@ mod tests {
         );
         assert_eq!(code, crate::EXIT_OK, "{output}");
         assert!(output.contains("COMPLETED"), "{output}");
+        // The full send order, spelled out: gate 4b's barrier, then one
+        // per-step re-check barrier immediately before each step's commands
+        // (`executor::Exclusivity`). Nothing else, and nothing out of order.
         assert_eq!(
             fake.gcode_sent(),
             vec![
-                // Gate 4b's read-only barrier, before any plan command.
+                super::GCODE_BARRIER_SENTINEL,
                 super::GCODE_BARRIER_SENTINEL,
                 "SET_IDLE_TIMEOUT TIMEOUT=86400",
+                super::GCODE_BARRIER_SENTINEL,
                 "PROBE PROBE_SPEED=1 SAMPLES=1",
+                super::GCODE_BARRIER_SENTINEL,
                 "SET_KINEMATIC_POSITION Z=12.25",
             ]
         );
@@ -1488,12 +1657,13 @@ mod tests {
         );
         assert_eq!(code, crate::EXIT_RUNTIME, "{output}");
         assert!(output.contains("cannot write recovery file"), "{output}");
-        // Nothing but gate 4b's read-only barrier: a write failure still
-        // aborts before anything that moves or heats.
-        assert_eq!(
-            fake.gcode_sent(),
-            vec![super::GCODE_BARRIER_SENTINEL.to_owned()],
-            "a write failure must abort before any motion"
+        // Literally nothing on the wire. The two filesystem gates run
+        // BEFORE the printer gates precisely so that a disk failure keeps
+        // this assertion in its strongest form.
+        assert!(
+            fake.gcode_sent().is_empty(),
+            "a write failure must abort before anything is sent: {:?}",
+            fake.gcode_sent()
         );
     }
 
@@ -1511,11 +1681,15 @@ mod tests {
         );
         assert_eq!(code, crate::EXIT_RUNTIME, "{output}");
         assert!(output.contains("ABORTED at step 3"), "{output}");
+        // The declined third step re-checks nothing and sends nothing: the
+        // gate refuses before the per-step barrier.
         assert_eq!(
             fake.gcode_sent(),
             vec![
                 super::GCODE_BARRIER_SENTINEL,
+                super::GCODE_BARRIER_SENTINEL,
                 "SET_IDLE_TIMEOUT TIMEOUT=86400",
+                super::GCODE_BARRIER_SENTINEL,
                 "PROBE PROBE_SPEED=1 SAMPLES=1",
             ]
         );
@@ -1546,6 +1720,7 @@ mod tests {
         assert_eq!(
             fake.gcode_sent(),
             vec![
+                super::GCODE_BARRIER_SENTINEL,
                 super::GCODE_BARRIER_SENTINEL,
                 "SET_IDLE_TIMEOUT TIMEOUT=86400"
             ],

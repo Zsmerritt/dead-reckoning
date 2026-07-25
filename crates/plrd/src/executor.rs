@@ -131,9 +131,10 @@ pub struct ExecOptions {
     /// control socket, where the client that asked to be consulted may
     /// simply go away.
     pub confirm_timeout: Duration,
-    /// How long the g-code mutex barrier
-    /// ([`crate::recover::GCODE_BARRIER_SENTINEL`]) may wait for Klipper's
-    /// g-code mutex before the recovery is refused.
+    /// Fallback budget for the g-code mutex barrier, used when the plan
+    /// carries no [`RecoveryPlan::gcode_barrier_timeout_s`] of its own.
+    /// The plan's value always wins: it is the operator's `[plr]` setting,
+    /// and this is only the daemon's default.
     ///
     /// See [`crate::recover`]'s gate 4b. A source that holds the mutex
     /// longer than this while a recovery is being asked for is doing work
@@ -177,14 +178,11 @@ impl Default for ExecOptions {
 
 /// Default [`ExecOptions::gcode_barrier_timeout`].
 ///
-/// Generous enough to absorb the ordinary case the barrier exists for — a
-/// `[gcode_macro]` that called `PLR_RECOVER` and has a handful of
-/// commands left, or a console command that was already in flight — and
-/// short enough that the operator gets a diagnosis instead of a hang.
-/// Thirty seconds of somebody else's g-code is not a queue to wait out:
-/// it is a heat soak, a bed mesh or a homing sequence, none of which may
-/// overlap a recovery.
-pub const DEFAULT_GCODE_BARRIER_TIMEOUT: Duration = Duration::from_secs(30);
+/// **Derived, not restated** — the same single-definition rule as
+/// [`DEFAULT_CONFIRM_TIMEOUT`]. `plr-recovery` owns the value because it
+/// is what the `[plr] gcode_barrier_timeout_s` diagnosis quotes back to
+/// the operator.
+pub const DEFAULT_GCODE_BARRIER_TIMEOUT: Duration = plr_recovery::GCODE_BARRIER_TIMEOUT_DEFAULT;
 
 /// Which of the three confirm-point features raised this pause.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -281,6 +279,64 @@ pub trait Confirmer: Send {
         &'a mut self,
         point: &'a ConfirmPoint,
     ) -> Pin<Box<dyn Future<Output = ConfirmAnswer> + Send + 'a>>;
+}
+
+/// Re-establishes exclusive control of Klipper's g-code channel at every
+/// point where execution is about to send something after a gap it does not
+/// control.
+///
+/// # Why this is a per-step obligation and not a one-time gate
+///
+/// The caller's pre-execution gate (`recover`'s gates 4 and 4b) is a
+/// *sample*, and every gap after it is somebody else's opportunity. The
+/// widest of those gaps is inside this module: `preflight_confirmations`
+/// and the `debug_confirm_each_step` pause both run **before any command is
+/// issued**, and both can block for the operator's whole
+/// `confirm_timeout_s` — up to an hour at the top of the permitted band, or
+/// unbounded human time at a CLI `--step` prompt. During it an autostart
+/// macro or a queued job can begin printing, and execution would then
+/// answer "continue" by issuing `SET_KINEMATIC_POSITION` and `PROBE` into a
+/// running print and reporting `COMPLETED`.
+///
+/// So the check is re-run once per step, immediately before that step's
+/// commands go out, which covers all three gaps with one call site: the gap
+/// since the caller's gate, the pre-flight pause, and any per-step pause or
+/// gate. `Err(reason)` aborts through the ordinary abort path, so the
+/// frame-invalidation rule applies exactly as it would to a verification
+/// failure at the same step.
+///
+/// The residual is one Moonraker round trip wide: another g-code source can
+/// still take the mutex between the check and the send. That is not
+/// closable from outside Klipper — but it is *microseconds*, not the
+/// operator's coffee break, and the difference between those two is the
+/// whole point of this trait.
+pub trait Exclusivity: Send {
+    /// Re-asserts exclusive g-code access. `Err(reason)` aborts.
+    fn recheck<'a>(
+        &'a mut self,
+        client: &'a mut MoonrakerClient,
+        budget: Duration,
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>>;
+}
+
+/// An [`Exclusivity`] that checks nothing.
+///
+/// For tests that drive [`execute`] against a hand-built plan and a static
+/// fake, where there is no second g-code source to detect. Named so that
+/// choosing it is visible: production callers pass `recover`'s real one.
+/// `dead_code` is allowed because plrd is a binary crate, so `pub` alone
+/// does not count as a use.
+#[cfg_attr(not(test), allow(dead_code))]
+pub struct NoExclusivity;
+
+impl Exclusivity for NoExclusivity {
+    fn recheck<'a>(
+        &'a mut self,
+        _client: &'a mut MoonrakerClient,
+        _budget: Duration,
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+        Box::pin(async { Ok(()) })
+    }
 }
 
 /// The default, non-interactive confirmer: every confirm-point aborts.
@@ -499,6 +555,11 @@ pub enum StopCause {
         /// The diagnosis code that went unanswered.
         code: &'static str,
     },
+    /// Exclusive control of Klipper's g-code channel could not be
+    /// re-established before this step's commands went out — the printer
+    /// stopped being idle, or another source is holding the g-code mutex
+    /// (see [`Exclusivity`]). Nothing from this step was sent.
+    ExclusivityLost(String),
 }
 
 impl StopCause {
@@ -518,7 +579,8 @@ impl StopCause {
             | StopCause::FrameGuardUnwritable(_)
             | StopCause::HardDiagnosis { .. }
             | StopCause::ConfirmationDeclined { .. }
-            | StopCause::ConfirmationTimedOut { .. } => None,
+            | StopCause::ConfirmationTimedOut { .. }
+            | StopCause::ExclusivityLost(_) => None,
         }
     }
 }
@@ -658,7 +720,9 @@ impl FrameGuard for NoFrameGuard {
 /// [`AbortConfirmer`] for the non-interactive behaviour in which any
 /// Confirmable diagnosis aborts. `frame_guard` is armed immediately
 /// before the shifted-frame declare and refuses entry if it cannot
-/// persist (see [`FrameGuard`]).
+/// persist (see [`FrameGuard`]). `exclusivity` is re-asserted before every
+/// step's commands go out (see [`Exclusivity`] for why once is not enough).
+#[allow(clippy::too_many_arguments)] // one collaborator per safety invariant
 pub async fn execute(
     plan: &RecoveryPlan,
     client: &mut MoonrakerClient,
@@ -666,6 +730,7 @@ pub async fn execute(
     gate: &mut (dyn FnMut(&RecoveryStep) -> bool + Send),
     confirmer: &mut dyn Confirmer,
     frame_guard: &mut dyn FrameGuard,
+    exclusivity: &mut dyn Exclusivity,
     transcript: &mut Transcript<'_>,
 ) -> ExecOutcome {
     transcript.entry(&json!({
@@ -694,10 +759,9 @@ pub async fn execute(
     // The operator's `[plr]` confirm_timeout_s wins over the daemon's
     // default; a plan that carries none keeps the default (which is what
     // tests shrink).
-    let confirm_deadline = plan
-        .confirm_timeout_s
-        .filter(|s| s.is_finite() && *s > 0.0)
-        .map_or(options.confirm_timeout, Duration::from_secs_f64);
+    let confirm_deadline = plan_duration_or(plan.confirm_timeout_s, options.confirm_timeout);
+    let barrier_budget =
+        plan_duration_or(plan.gcode_barrier_timeout_s, options.gcode_barrier_timeout);
     if let Some(cause) =
         preflight_confirmations(plan, anchor, confirm_deadline, confirmer, transcript).await
     {
@@ -734,6 +798,26 @@ pub async fn execute(
                 )
                 .await;
             }
+        }
+        // LAST thing before anything is sent: re-assert exclusive g-code
+        // access. Placed here, after the `--step` gate and after the
+        // step-debug pause, one call site covers every gap this loop can
+        // contain — including the pre-flight pause before step 1, which is
+        // bounded only by `confirm_timeout_s`. See `Exclusivity`.
+        //
+        // It cannot refuse this recovery's own progress: the only command
+        // in any plan that makes the printer non-idle is the `M24` in
+        // `Phase::RecoveryFileSelect`, which is property-tested to be the
+        // FINAL step (`RecoveryPlan::recovery_file_select_last`,
+        // `plr-recovery/tests/properties.rs`), so no step is ever reached
+        // with a print this recovery itself started.
+        if let Some(cause) =
+            reassert_exclusivity(step, exclusivity, client, barrier_budget, transcript).await
+        {
+            return finish_abort(
+                client, step, cause, &cleanups, accel, shifted_id, transcript,
+            )
+            .await;
         }
         // Entry to the danger zone: arm the interlock BEFORE the declare
         // is issued, and refuse to issue it if that cannot be persisted.
@@ -776,6 +860,49 @@ pub async fn execute(
     transcript.entry(&json!({"event": "plan-complete", "steps": plan.steps.len()}));
     ExecOutcome::Completed {
         steps: plan.steps.len(),
+    }
+}
+
+/// Resolves one `[plr]`-configurable duration: the operator's value from
+/// the plan when it carries a usable one, else the daemon's fallback.
+///
+/// One function for both the confirm deadline and the barrier budget, so
+/// "the operator's setting wins" cannot mean two different things in two
+/// places — and so the fail-safe treatment of nonsense is written once.
+/// Non-finite and non-positive values fall back rather than being honoured:
+/// a zero deadline would abort every pause and a zero barrier budget would
+/// refuse every recovery, and while both are the safe *direction* they are
+/// not what an operator who typed a bad number meant.
+#[must_use]
+pub fn plan_duration_or(plan_value: Option<f64>, fallback: Duration) -> Duration {
+    plan_value
+        .filter(|s| s.is_finite() && *s > 0.0)
+        .map_or(fallback, Duration::from_secs_f64)
+}
+
+/// Re-asserts exclusive g-code access before `step` sends anything.
+///
+/// `Some(cause)` means somebody else has the printer and the step must NOT
+/// be issued — the fail-closed direction, and the reason this is the last
+/// thing to happen before any command goes out (see [`Exclusivity`]).
+async fn reassert_exclusivity(
+    step: &RecoveryStep,
+    exclusivity: &mut dyn Exclusivity,
+    client: &mut MoonrakerClient,
+    budget: Duration,
+    transcript: &mut Transcript<'_>,
+) -> Option<StopCause> {
+    match exclusivity.recheck(client, budget).await {
+        Ok(()) => None,
+        Err(reason) => {
+            transcript.entry(&json!({
+                "event": "exclusivity-lost",
+                "step": step.id,
+                "phase": step.phase.name(),
+                "reason": reason,
+            }));
+            Some(StopCause::ExclusivityLost(reason))
+        }
     }
 }
 
@@ -1147,6 +1274,9 @@ fn abort(
         StopCause::ConfirmationDeclined { .. } => "confirmation-declined".to_owned(),
         StopCause::ConfirmationTimedOut { .. } => "confirmation-timeout".to_owned(),
         StopCause::FrameGuardUnwritable(_) => "frame-interlock-unwritable".to_owned(),
+        // Not the step's own abort reason: the step never ran. What
+        // stopped the recovery is that somebody else had the printer.
+        StopCause::ExclusivityLost(_) => "exclusive-gcode-access-lost".to_owned(),
         StopCause::HardDiagnosis { code } => (*code).to_owned(),
         StopCause::VerificationFailed { .. }
         | StopCause::Transport(_)
@@ -1159,6 +1289,15 @@ fn abort(
     // so the frame is exactly as valid as it was before this run — and
     // saying otherwise would demand a marker we have just proven we
     // cannot write.
+    //
+    // `ExclusivityLost` is deliberately NOT given that exemption even
+    // though it too stops before the step's commands. At the shifted-frame
+    // step itself the frame is in fact still valid, so the marker
+    // over-reports by exactly one step — but the marker is writable here
+    // (unlike the FrameGuard case), the cost of over-reporting is one dry
+    // run, and the operator has just been told that something else was
+    // printing on their machine, which is a state they should re-plan
+    // from rather than resume into.
     let frame_invalid = !matches!(cause, StopCause::FrameGuardUnwritable(_))
         && shifted_id.is_some_and(|sid| step.id >= sid);
     let diagnosis = cause.step_failure().map(|f| f.diagnosis());
@@ -1448,8 +1587,8 @@ fn evaluate(predicate: &Predicate, value: Option<&Value>, computed: Option<f64>)
 pub(crate) mod tests {
     use super::{
         dry_run, evaluate, execute, lookup, AbortConfirmer, ConfirmAnswer, ConfirmKind,
-        ConfirmPoint, Confirmer, ExecOptions, ExecOutcome, FrameGuard, NoFrameGuard, StepFailure,
-        StopCause, Transcript,
+        ConfirmPoint, Confirmer, Exclusivity, ExecOptions, ExecOutcome, FrameGuard, NoExclusivity,
+        NoFrameGuard, StepFailure, StopCause, Transcript,
     };
     use crate::moonraker::MoonrakerClient;
     use crate::testmoon::FakeMoonraker;
@@ -1545,6 +1684,7 @@ pub(crate) mod tests {
             recovery_file: plr_recovery::RecoveryFileSpec::default(),
             debug_confirm_each_step: false,
             confirm_timeout_s: None,
+            gcode_barrier_timeout_s: None,
             warnings: vec![],
         }
     }
@@ -1604,7 +1744,37 @@ pub(crate) mod tests {
         confirmer: &mut dyn Confirmer,
         options: &ExecOptions,
     ) -> (ExecOutcome, String) {
-        run_guarded(plan, fake, gate, confirmer, &mut NoFrameGuard, options).await
+        run_guarded(
+            plan,
+            fake,
+            gate,
+            confirmer,
+            &mut NoFrameGuard,
+            &mut NoExclusivity,
+            options,
+        )
+        .await
+    }
+
+    /// [`run_with`] plus an explicit [`Exclusivity`], for the tests about
+    /// losing the g-code channel mid-plan.
+    pub(crate) async fn run_exclusive(
+        plan: &RecoveryPlan,
+        fake: &FakeMoonraker,
+        confirmer: &mut dyn Confirmer,
+        exclusivity: &mut dyn Exclusivity,
+        options: &ExecOptions,
+    ) -> (ExecOutcome, String) {
+        run_guarded(
+            plan,
+            fake,
+            &mut |_| true,
+            confirmer,
+            &mut NoFrameGuard,
+            exclusivity,
+            options,
+        )
+        .await
     }
 
     /// [`run_with`] plus an explicit [`FrameGuard`], for the tests that
@@ -1615,6 +1785,7 @@ pub(crate) mod tests {
         gate: &mut (dyn FnMut(&RecoveryStep) -> bool + Send),
         confirmer: &mut dyn Confirmer,
         frame_guard: &mut dyn FrameGuard,
+        exclusivity: &mut dyn Exclusivity,
         options: &ExecOptions,
     ) -> (ExecOutcome, String) {
         let mut client = MoonrakerClient::connect(&fake.url(), Duration::from_secs(5))
@@ -1630,6 +1801,7 @@ pub(crate) mod tests {
                 gate,
                 confirmer,
                 frame_guard,
+                exclusivity,
                 &mut transcript,
             )
             .await
@@ -2429,6 +2601,170 @@ pub(crate) mod tests {
         );
     }
 
+    /// An [`Exclusivity`] that succeeds for the first `allow` calls and
+    /// then reports the printer busy — standing in for a job that started
+    /// while execution was paused, or a `[delayed_gcode]` that grabbed the
+    /// g-code channel between two steps.
+    struct LosesAccessAfter {
+        allow: usize,
+        calls: std::sync::Arc<std::sync::Mutex<Vec<Duration>>>,
+    }
+
+    impl LosesAccessAfter {
+        fn new(allow: usize) -> Self {
+            Self {
+                allow,
+                calls: std::sync::Arc::default(),
+            }
+        }
+    }
+
+    impl Exclusivity for LosesAccessAfter {
+        fn recheck<'a>(
+            &'a mut self,
+            _client: &'a mut MoonrakerClient,
+            budget: Duration,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + 'a>>
+        {
+            Box::pin(async move {
+                let mut calls = self.calls.lock().expect("call log");
+                calls.push(budget);
+                if calls.len() <= self.allow {
+                    Ok(())
+                } else {
+                    Err("printer is not idle (print_stats.state \"printing\")".to_owned())
+                }
+            })
+        }
+    }
+
+    /// Losing exclusive g-code access aborts BEFORE the step's commands go
+    /// out, at every step — including the first, where nothing has been
+    /// sent at all.
+    ///
+    /// This is the hole gates 4 and 4b alone left open: they are a sample,
+    /// and `preflight_confirmations` plus the step-debug pause both run
+    /// before step 1 and are bounded only by `confirm_timeout_s`. A job that
+    /// starts during that pause used to be answered by issuing
+    /// `SET_KINEMATIC_POSITION` and `PROBE` into a running print and
+    /// reporting `COMPLETED`.
+    #[tokio::test]
+    async fn losing_exclusive_gcode_access_aborts_before_the_step_sends_anything() {
+        // (1) Lost before step 1: literally nothing reaches the printer.
+        let plan = z_confirm_plan();
+        let fake = FakeMoonraker::spawn(happy_handler).await;
+        let mut exclusivity = LosesAccessAfter::new(0);
+        let (outcome, transcript) = run_exclusive(
+            &plan,
+            &fake,
+            &mut AbortConfirmer,
+            &mut exclusivity,
+            &fast_options(),
+        )
+        .await;
+        let ExecOutcome::Aborted {
+            step_id,
+            reason,
+            cause,
+            frame_invalid,
+            ..
+        } = outcome
+        else {
+            panic!("expected an abort, got {outcome:?}");
+        };
+        assert_eq!(step_id, 1);
+        assert_eq!(reason, "exclusive-gcode-access-lost");
+        assert!(
+            matches!(cause, StopCause::ExclusivityLost(ref why) if why.contains("not idle")),
+            "{cause:?}"
+        );
+        // Step 1 of this plan IS the shifted-frame declare, which never
+        // went out — so the frame is in fact still valid and the marker
+        // over-reports by one step. Deliberate, and documented on `abort`:
+        // the marker is writable here, over-reporting costs one dry run,
+        // and an operator who has just been told another job owns their
+        // printer should re-plan rather than resume.
+        assert!(frame_invalid);
+        assert!(
+            transcript.contains("\"event\":\"exclusivity-lost\""),
+            "{transcript}"
+        );
+        assert!(
+            fake.gcode_sent().is_empty(),
+            "nothing may be sent once access is lost: {:?}",
+            fake.gcode_sent()
+        );
+
+        // (2) Lost mid-plan: the steps before it ran, the step it fired on
+        // sent nothing, and nothing after it ran either.
+        let fake = FakeMoonraker::spawn(happy_handler).await;
+        let mut exclusivity = LosesAccessAfter::new(2);
+        let (outcome, _transcript) = run_exclusive(
+            &plan,
+            &fake,
+            &mut AbortConfirmer,
+            &mut exclusivity,
+            &fast_options(),
+        )
+        .await;
+        let ExecOutcome::Aborted { step_id, .. } = outcome else {
+            panic!("expected an abort, got {outcome:?}");
+        };
+        assert_eq!(step_id, 3, "aborts at the step whose re-check failed");
+        // Steps 1 and 2 of this plan are SET_IDLE_TIMEOUT and PROBE; step 3
+        // is the true-Z declare that never went out.
+        let sent = fake.gcode_sent();
+        assert!(
+            sent.iter().any(|c| c.starts_with("SET_IDLE_TIMEOUT")),
+            "step 1 ran: {sent:?}"
+        );
+        assert!(
+            sent.iter().any(|c| c.starts_with("PROBE")),
+            "step 2 ran: {sent:?}"
+        );
+        assert!(
+            !sent.iter().any(|c| c.starts_with("SET_KINEMATIC_POSITION")),
+            "step 3's commands must never have been issued: {sent:?}"
+        );
+    }
+
+    /// The budget handed to each re-check is the operator's `[plr]`
+    /// `gcode_barrier_timeout_s` when the plan carries one, else the
+    /// daemon's default — the same resolution rule as the confirm deadline,
+    /// and it must reach the re-check rather than being re-derived there.
+    #[tokio::test]
+    async fn the_recheck_budget_comes_from_the_plan_then_the_daemon_default() {
+        for (plan_value, expected) in [
+            (Some(90.0), Duration::from_secs(90)),
+            (None, Duration::from_millis(300)),
+            // Nonsense values fall back rather than being honoured: a zero
+            // budget would refuse every recovery.
+            (Some(0.0), Duration::from_millis(300)),
+            (Some(f64::NAN), Duration::from_millis(300)),
+        ] {
+            let mut plan = z_confirm_plan();
+            plan.gcode_barrier_timeout_s = plan_value;
+            let fake = FakeMoonraker::spawn(happy_handler).await;
+            // Fails on the first call, so exactly one budget is recorded and
+            // the test does not depend on how far the plan gets.
+            let mut exclusivity = LosesAccessAfter::new(0);
+            let calls = std::sync::Arc::clone(&exclusivity.calls);
+            let _ = run_exclusive(
+                &plan,
+                &fake,
+                &mut AbortConfirmer,
+                &mut exclusivity,
+                &fast_options(),
+            )
+            .await;
+            assert_eq!(
+                calls.lock().unwrap().as_slice(),
+                &[expected],
+                "plan value {plan_value:?}"
+            );
+        }
+    }
+
     /// The `[plr]` key's documented default and the deadline this daemon
     /// enforces are one value, and it lies inside the band the key is
     /// validated against.
@@ -2454,6 +2790,20 @@ pub(crate) mod tests {
             ExecOptions::default().confirm_timeout,
             Duration::from_secs_f64(plr_recovery::CONFIRM_TIMEOUT_DEFAULT_S),
             "the daemon's fallback deadline and the [plr] key's default must be one number"
+        );
+        // Same two properties for the barrier budget.
+        assert!(
+            (plr_recovery::GCODE_BARRIER_TIMEOUT_MIN_S..=plr_recovery::GCODE_BARRIER_TIMEOUT_MAX_S)
+                .contains(&plr_recovery::GCODE_BARRIER_TIMEOUT_DEFAULT_S),
+            "the barrier default must be a value an operator could also have set: {} not in \
+             {}..={}",
+            plr_recovery::GCODE_BARRIER_TIMEOUT_DEFAULT_S,
+            plr_recovery::GCODE_BARRIER_TIMEOUT_MIN_S,
+            plr_recovery::GCODE_BARRIER_TIMEOUT_MAX_S,
+        );
+        assert_eq!(
+            ExecOptions::default().gcode_barrier_timeout,
+            Duration::from_secs_f64(plr_recovery::GCODE_BARRIER_TIMEOUT_DEFAULT_S),
         );
     }
 
