@@ -117,11 +117,31 @@ fn synthetic_corpus_full_pipeline() {
     }
 }
 
+/// Full parse + simulate + Z-scan over `fixtures/real/`.
+///
+/// # This test used to pass vacuously, and that is why the count is asserted
+///
+/// It was written as a bare `for` over an auto-discovered directory that held
+/// nothing but a README, so the loop body never executed once. It reported
+/// `ok` on every run for its entire life while testing exactly nothing — a
+/// vacuous test and a passing test are indistinguishable in any output anyone
+/// actually reads. The corpus assertion below is the fix: an empty or
+/// deleted corpus now fails loudly instead of silently succeeding.
+///
+/// The corpus is a *synthetic* stand-in with real slicer structure, not
+/// captured production files — see `fixtures/real/README.md` for why, and
+/// `fixtures/real/realistic_generator.py` for how its move and E density were
+/// matched to measurements from real output.
 #[test]
 fn real_corpus_full_pipeline() {
-    // Auto-discovers any *.gcode dropped into fixtures/real/; passes
-    // vacuously while the directory is empty.
-    for f in &gcode_files(&fixtures_dir().join("real")) {
+    let files = gcode_files(&fixtures_dir().join("real"));
+    assert!(
+        !files.is_empty(),
+        "fixtures/real/ has no *.gcode: this test would pass vacuously, which \
+         is the exact failure it was changed to prevent. Regenerate with \
+         `python3 fixtures/real/realistic_generator.py`."
+    );
+    for f in &files {
         run_pipeline(f);
     }
 }
