@@ -1650,18 +1650,13 @@ mod tests {
             e_file: None,
             file_window: window,
             extension: None,
+            // `..Default::default()` (every flag clear) so that adding a
+            // degradation flag upstream cannot break this fixture; the
+            // fields this test actually cares about stay explicit.
             degradation: Degradation {
                 confidence: Confidence::PerLine,
                 observation_gap: false,
-                extension_unavailable: false,
-                extension_truncated: false,
-                extension_error: false,
-                unknown_z_in_extension: false,
-                unknown_xy_in_extension: false,
-                e_frame_shift_in_extension: false,
-                offset_floor_uncertain: false,
-                e_file_frames_incomplete: false,
-                anchor_time_unknown: false,
+                ..Degradation::default()
             },
         }
     }
