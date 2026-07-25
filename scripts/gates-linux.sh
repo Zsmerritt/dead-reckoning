@@ -53,6 +53,18 @@
 #      a test binary that never ran produces no `test result:` line, which
 #      would otherwise sum to "0 failed".
 #
+#      This footgun is NOT hypothetical, and reading about it is not
+#      enough to avoid it. On 2026-07-24 it caught someone who had just
+#      finished writing about it: they ran
+#      `git rev-parse --short HEAD && sh scripts/gates-linux.sh` across the
+#      bridge to label the run with its commit. Inside WSL the worktree's
+#      `.git` file holds a Windows `gitdir:` path, so `rev-parse` failed,
+#      the `&&` short-circuited, THE GATES NEVER RAN, and the command still
+#      looked like it had succeeded. Do not prepend anything to this
+#      script's invocation. It prints the commit itself (see below) for
+#      exactly this reason — use that line, and if you do not see it, the
+#      script did not run.
+#
 # Usage (from the repo root, or any directory inside it):
 #     sh scripts/gates-linux.sh [--clean-clippy]
 #

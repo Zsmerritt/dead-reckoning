@@ -275,10 +275,6 @@ fn any_config() -> impl Strategy<Value = ReconstructConfig> {
             step_gen_lead: lead,
             quiet_tail_ns: 2_000_000_000,
             max_processing_lead: lead,
-            // Deliberately fed the same unconstrained f64 (NaN, infinity,
-            // negatives included): the premise knob must never panic or
-            // silently certify on a nonsense value.
-            max_lookahead_lead: lead,
             extension_horizon: horizon,
             exclusion_freshness_horizon: horizon,
             // Hostile but in-domain: 0 would fail validation, so the

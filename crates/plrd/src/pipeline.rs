@@ -1071,6 +1071,32 @@ pub(crate) mod e2e_tests {
     ///   sweep starts at the crash, so the first move after the layer
     ///   change is what it reaches. Leading with the big-E L keeps that
     ///   neighbourhood as unambiguous as the pre-hatch fixture's was.
+    ///
+    /// # This fixture has ZERO margin against `ambiguity_limit`
+    ///
+    /// Measured, on `6cf2f68` and unchanged since: the two planning
+    /// end-to-end tests reach the matcher with **exactly 8 candidate
+    /// lines** — offsets `[2104, 2121, 2138, 2152, 2189, 2212, 2229,
+    /// 2246]`, from `e_internal` `[3.00, 4.96]` — against
+    /// `plr_analyzer::MatchConfig::ambiguity_limit` of **8**. That is
+    /// `MatchConfidence::AmbiguousWindow`, the last rung before
+    /// `MatchError::Inconclusive`.
+    ///
+    /// So **any** widening of any evidence interval, anywhere upstream,
+    /// tips these tests from a plan to a `ManualFallback`. Not
+    /// hypothetical: it is what happened when the un-evidenced extruder
+    /// band was unioned into `e_internal` — 10 candidates with the
+    /// coverage-certified band, 12 floor-wide, both `Inconclusive` across
+    /// layers `[0, 1]` — and it is why that work is not in the tree. See
+    /// `plr_reconstruct::stopset`'s "Durable extruder coverage".
+    ///
+    /// If you are reading this because two planning tests just started
+    /// failing with "below layer granularity", the cause is almost
+    /// certainly an upstream interval that got wider, not a bug in these
+    /// tests. **Do not raise `ambiguity_limit` to buy room**: that trades a
+    /// visible failure for an invisible one, because the candidate count is
+    /// the only width gate the pipeline has — nothing consumes
+    /// `plr_reconstruct::Confidence` (see its docs).
     const MODEL_TEXT: &str = "G90
 M83
 G1 Z0.2 F7200

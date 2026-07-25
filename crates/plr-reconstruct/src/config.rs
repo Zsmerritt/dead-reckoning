@@ -47,50 +47,6 @@ pub struct ReconstructConfig {
     /// bounds the low end of the file-offset candidate window and the
     /// set of E-frame snapshots that can apply to in-window motion.
     pub max_processing_lead: f64,
-    /// **A premise, not a measurement.** Upper bound, seconds, on how much
-    /// *move time* Klipper's `LookAheadQueue` can hold at once — i.e. how
-    /// far the trapq **append** frontier can lag the g-code **processing**
-    /// frontier.
-    ///
-    /// # Why a premise is unavoidable here
-    ///
-    /// The residue in that queue has **no observable extent**.
-    /// `toolhead.get_status` reports no queue depth (`stalls` is an
-    /// input-stall counter), and `dump_trapq` cannot see the queue at all:
-    /// `trapq_extract_old` (`klippy/chelper/trapq.c`) walks only
-    /// `tq->moves` and `tq->history`, both of which a move enters only
-    /// *after* `ToolHead._process_lookahead` appends it. So from the
-    /// status stream a snapshot `(file_position, print_time)` cannot
-    /// distinguish "lookahead empty" from "lookahead holds 200 moves from
-    /// lines the frontier already claims". No write-side observation fixes
-    /// this — it is why the recorder cannot make the ordering invariant
-    /// hold by construction, and why coverage is *certified* rather than
-    /// guaranteed.
-    ///
-    /// # What justifies the default
-    ///
-    /// `LOOKAHEAD_FLUSH_TIME = 0.150` (`klippy/toolhead.py`) is the
-    /// accumulated-move-time trigger for a lazy flush, so the queue is
-    /// *designed* to sit near 0.15 s. Default 0.5 s gives >3x margin.
-    ///
-    /// # What a violation looks like, and what it costs
-    ///
-    /// `LookAheadQueue.flush(lazy=True)` can legitimately flush
-    /// **nothing** — if the reverse pass never establishes
-    /// `peak_cruise_v2` it returns `[]` and resets the trigger
-    /// (`klippy/toolhead.py`) — so a long run of moves that can neither
-    /// accelerate nor decelerate grows the queue past the trigger. Then
-    /// the certified band start over-claims and the replayed E band is
-    /// **too narrow**, which is the containment-unsafe direction.
-    ///
-    /// The residual exposure is bounded by how far the *frontier* moves in
-    /// the excess: raising this value costs band width (a wider, safer E
-    /// interval) and nothing else, so it is the knob to raise if a
-    /// printer's kinematics are unusual. It is never *silently* wrong:
-    /// when no context can be certified at all,
-    /// [`crate::stopset::Degradation::e_internal_band`] records it and
-    /// forces per-layer confidence rather than reporting a narrow band.
-    pub max_lookahead_lead: f64,
     /// Forward-simulation horizon, seconds of simulated motion beyond
     /// the committed boundary. The unreceived tail after power loss is
     /// at most ~0.5 s of dump batching plus ~1 s of trapq planning
@@ -195,7 +151,6 @@ impl Default for ReconstructConfig {
             step_gen_lead: 0.7,
             quiet_tail_ns: 2_000_000_000,
             max_processing_lead: 3.0,
-            max_lookahead_lead: 0.5,
             extension_horizon: 2.0,
             exclusion_freshness_horizon: 5.0,
             // 1 s: plrd's default 10 Hz file heartbeat divided by
