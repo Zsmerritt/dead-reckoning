@@ -1071,6 +1071,32 @@ pub(crate) mod e2e_tests {
     ///   sweep starts at the crash, so the first move after the layer
     ///   change is what it reaches. Leading with the big-E L keeps that
     ///   neighbourhood as unambiguous as the pre-hatch fixture's was.
+    ///
+    /// # This fixture has ZERO margin against `ambiguity_limit`
+    ///
+    /// Measured, on `6cf2f68` and unchanged since: the two planning
+    /// end-to-end tests reach the matcher with **exactly 8 candidate
+    /// lines** — offsets `[2104, 2121, 2138, 2152, 2189, 2212, 2229,
+    /// 2246]`, from `e_internal` `[3.00, 4.96]` — against
+    /// `plr_analyzer::MatchConfig::ambiguity_limit` of **8**. That is
+    /// `MatchConfidence::AmbiguousWindow`, the last rung before
+    /// `MatchError::Inconclusive`.
+    ///
+    /// So **any** widening of any evidence interval, anywhere upstream,
+    /// tips these tests from a plan to a `ManualFallback`. Not
+    /// hypothetical: it is what happened when the un-evidenced extruder
+    /// band was unioned into `e_internal` — 10 candidates with the
+    /// coverage-certified band, 12 floor-wide, both `Inconclusive` across
+    /// layers `[0, 1]` — and it is why that work is not in the tree. See
+    /// `plr_reconstruct::stopset`'s "Durable extruder coverage".
+    ///
+    /// If you are reading this because two planning tests just started
+    /// failing with "below layer granularity", the cause is almost
+    /// certainly an upstream interval that got wider, not a bug in these
+    /// tests. **Do not raise `ambiguity_limit` to buy room**: that trades a
+    /// visible failure for an invisible one, because the candidate count is
+    /// the only width gate the pipeline has — nothing consumes
+    /// `plr_reconstruct::Confidence` (see its docs).
     const MODEL_TEXT: &str = "G90
 M83
 G1 Z0.2 F7200
@@ -1315,6 +1341,11 @@ G1 X60 Y60 E0.02
     fn crash_context(file_path: &str) -> Context {
         Context {
             mono_ns: 5_000_000_000,
+            // Faithful to the recorder: Klipper reports
+            // `toolhead.print_time` (the trapq append frontier) in the same
+            // status pass as `file_position`. 10.0 matches this fixture's
+            // heartbeat and the end of `preceding_motion`.
+            print_time: Some(10.0),
             virtual_sdcard: Some(VirtualSdState {
                 file_path: file_path.to_owned(),
                 file_position: crash_offset(),
@@ -1427,6 +1458,11 @@ G1 X60 Y60 E0.02
         // N−1, which must exist in the modeled window.
         let mut early = crash_context(gcode_path.to_str().unwrap());
         early.mono_ns = 1_000_000_000;
+        // The append frontier must move with the clock: an earlier context
+        // claiming the later context's print_time is a shape the recorder
+        // cannot produce (Klipper's `print_time` is monotone within a
+        // klippy instance) and would hand the coverage certificate a lie.
+        early.print_time = Some(6.0);
         if let Some(vsd) = &mut early.virtual_sdcard {
             vsd.file_position = 8; // after G90/M83, before layer 0
         }

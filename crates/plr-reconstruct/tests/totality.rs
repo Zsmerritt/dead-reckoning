@@ -166,11 +166,15 @@ fn any_context() -> impl Strategy<Value = Context> {
         proptest::option::of(any_exclude_state().prop_map(Box::new)),
         // Verbatim field: totality must hold for any reported state.
         proptest::option::of(".{0,12}"),
+        // Includes NaN/infinity: the coverage certificate compares against
+        // this, and a non-finite value must not panic or certify.
+        proptest::option::of(any_f64()),
     )
         .prop_map(
-            |(mono_ns, vsd, gcode, target, exclude, print_state)| Context {
+            |(mono_ns, vsd, gcode, target, exclude, print_state, print_time)| Context {
                 mono_ns,
                 print_state,
+                print_time,
                 virtual_sdcard: vsd.map(|(file_position, file_path)| VirtualSdState {
                     file_path,
                     file_position,

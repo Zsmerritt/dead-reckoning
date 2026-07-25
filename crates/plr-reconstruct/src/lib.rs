@@ -289,6 +289,9 @@ pub(crate) mod testutil {
             fans: Vec::new(),
             exclude: None,
             print_state: None,
+            // `None` = not observed, the pre-change WAL shape. No reader
+            // consumes `print_time` yet (see `plr_wal::Context::print_time`).
+            print_time: None,
         }
     }
 }

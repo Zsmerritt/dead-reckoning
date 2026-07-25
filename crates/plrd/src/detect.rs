@@ -1165,6 +1165,9 @@ mod tests {
     fn context(mono_ns: u64, file_path: &str, file_position: u64) -> Context {
         Context {
             mono_ns,
+            // Detection classifies the previous session from paths,
+            // positions and markers; the print-time axis plays no part.
+            print_time: None,
             virtual_sdcard: Some(VirtualSdState {
                 file_path: file_path.to_owned(),
                 file_position,

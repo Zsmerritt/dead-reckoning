@@ -508,6 +508,10 @@ mod tests {
         writer
             .append(&WalRecord::Context(plr_wal::Context {
                 mono_ns: 1_000_000_000,
+                // Matches this fixture's heartbeat print time: Klipper
+                // reports the trapq append frontier in the same status pass
+                // as the file position.
+                print_time: Some(5.0),
                 virtual_sdcard: Some(plr_wal::VirtualSdState {
                     file_path: gcode.to_string_lossy().into_owned(),
                     file_position: 250,
@@ -921,6 +925,10 @@ G1 X60 Y60 E900 F1800
         writer
             .append(&WalRecord::Context(plr_wal::Context {
                 mono_ns: 1_000_000_000,
+                // Matches this fixture's heartbeat print time: Klipper
+                // reports the trapq append frontier in the same status pass
+                // as the file position.
+                print_time: Some(5.0),
                 virtual_sdcard: Some(plr_wal::VirtualSdState {
                     file_path: file.to_owned(),
                     file_position: position,

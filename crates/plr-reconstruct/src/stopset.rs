@@ -72,42 +72,84 @@
 //! unioning the WAL-internal interval converted under recent context
 //! frames, flagged [`Degradation::e_file_frames_incomplete`].
 //!
-//! **Known limit in `e_internal`, open and unfixed.** `e_internal` comes
-//! from the trapq evaluation plus the extension. If the durable WAL is
-//! missing extruder rows for lines the anchor context already counts as
-//! processed — possible in production because `dump_trapq` batches at
-//! ~0.5 s, so a row can land in the batch *after* the flush that wrote
-//! the context — then an E excursion confined to those lines (a retract,
-//! say) is bounded by no evidence this crate holds, while `PerLine`
-//! confidence lets a resume proceed on it. This is net-neutral against
-//! the behaviour before the extension-horizon fix; it is recorded here,
-//! not worked around, and it is being scheduled separately because
-//! changing it once broke 18 daemon end-to-end tests and each option
-//! needs its own measurement. `e_file` is unaffected: on the exact path
-//! (`reached_end` and a certain floor) the replay covers those lines, so
-//! the interval does contain the truth — but `plr-analyzer`'s
-//! `StopEvidence` (fed by `plrd`) carries only `e_internal` and discards
-//! `e_file`.
+//! # Durable extruder coverage, and the `e_internal` band
 //!
-//! Options, with what each costs — no verdict here:
+//! `e_internal` comes from the trapq evaluation plus the extension. The
+//! durable WAL can be missing extruder rows for lines the anchor context
+//! already counts as processed, for two independent reasons (both proved
+//! from Klipper's source in [`Context::print_time`]'s docs): the move
+//! waits in a `LookAheadQueue` invisible to `dump_trapq`, and then waits
+//! up to one ~0.5 s dump batch. Measured against real `OrcaSlicer` output
+//! at real print settings, the frontier runs **17–119 lines** ahead over
+//! 0.5 s and **22–147 lines** over 0.65 s (median–max).
 //!
-//! * **Union the replay's internal E over only the un-evidenced tail
-//!   band** — from the newest durable extruder-trapq coverage to the
-//!   anchor frontier, rather than the whole loose-floored window. Costs
-//!   no granularity (the band is the ~0.5 s of lines that lack rows, not
-//!   everything since the floor) but needs a way to map "newest durable
-//!   extruder coverage" onto a file offset.
-//! * **Start the forward extension at the last file offset covered by
-//!   durable trapq** instead of the anchor frontier. A monotone widening
-//!   by a few lines, reusing machinery that already exists here; costs
-//!   some simulated-motion budget on every recovery, and the offset needs
-//!   the same context/offset mapping as the option above.
-//! * **Write-side ordering in the daemon**: never journal a `Context`
-//!   whose processing frontier runs ahead of durable trapq coverage,
-//!   making the invariant hold by construction. Costs precision on
-//!   *every* print and every recovery — each `Context` then reports a
-//!   staler frontier, widening the offset window permanently — to close a
-//!   ~0.5 s band.
+//! ## What is actually missing is an *interior extremum*, not an endpoint
+//!
+//! This is the trap, and it is worth being explicit because the obvious
+//! reading of the hazard suggests a fix that does not work. Both
+//! **endpoints** of the un-evidenced band are already known exactly:
+//!
+//! * the low end from the newest durable extruder row, and
+//! * the high end from `anchor.gcode.position[3]`, which is Klipper's
+//!   `gcode_move.last_position` — internal accumulated E at the
+//!   *processing* frontier, updated inside `cmd_G1` ahead of the
+//!   lookahead and the trapq — and which already seeds the extension via
+//!   [`anchor_state_from_context`].
+//!
+//! So "bound E by the value at the frontier" looks sufficient and is
+//! **not**. The hazard is a *non-monotone excursion* strictly inside the
+//! band: a retract to `E−5` and back leaves both endpoints at `E₀`, and
+//! neither the trapq evaluation nor the extension (which starts at `F`,
+//! after the excursion) ever sees `E−5`. Only a replay of the band's
+//! lines recovers it.
+//!
+//! ## Still open, and the widening approach is measured out
+//!
+//! [`replay_file_e`] already computes exact cumulative E after **every**
+//! line from the floor forward, so the excursion is in reach; what was
+//! missing was a *safe* band start. [`plr_wal::Context::print_time`] — the
+//! trapq append frontier, journaled since this was investigated — supplies
+//! one: paired with `file_position` in a single Klipper status pass, it
+//! certifies that every move from lines at or before some earlier
+//! frontier is durable. **No reader consumes it yet**, deliberately.
+//!
+//! Every variant that closes the hole by *widening* `e_internal` has been
+//! built and measured, and none is affordable:
+//!
+//! * **Whole loose-floored window.** Broke 18 daemon end-to-end tests with
+//!   "below layer granularity" — manual fallback or a wrong line on every
+//!   real recovery. Reverted before this module was written.
+//! * **Floor-wide band under an uncertified certificate.** 12 candidate
+//!   lines across layers `[0, 1]`, `MatchError::Inconclusive`.
+//! * **The coverage-certified band** — the narrow one, bounded by the
+//!   sub-second coverage lag rather than by `max_processing_lead`. Still
+//!   10 candidate lines, still `Inconclusive`.
+//!
+//! The reason none of them fit is not that the band is wide; it is that
+//! there is **no room at all**. `plrd`'s end-to-end fixture already
+//! produces exactly 8 candidates against `MatchConfig::ambiguity_limit`
+//! of 8, so *any* widening anywhere tips it. That is a property of the
+//! harness, not of this crate, and it is recorded at the fixture.
+//!
+//! So the route chosen is the one that needs **no** widening: feed the
+//! matcher the `e_file` interval, which is already exact on the replay
+//! path and already computed here, instead of discarding it. See below.
+//!
+//! `e_file` was never affected: on the exact path (`reached_end` and a
+//! certain floor) the replay covers those lines, so the interval *does*
+//! contain the truth. But `plr-analyzer`'s `StopEvidence` (fed by `plrd`'s
+//! `stop_evidence`) carries only `e_internal` and **discards `e_file`**,
+//! which is what makes the hole reachable in production. Two independent
+//! investigations reached that same discarded interval — this one from the
+//! recorder side, and an earlier review probing a different bug, which
+//! found a case where `e_internal` missed the truth and `e_file` contained
+//! it on exactly the `reached_end` + certain-floor path.
+//!
+//! **Until that lands the limit is open**, and it is pinned as an
+//! executable assertion rather than prose:
+//! `e_internal_does_not_bound_a_retract_inside_the_un_evidenced_band` in
+//! this module's tests asserts the bug, and says in its own docs that
+//! closing it means inverting the assertion, not deleting the test.
 //!
 //! # File-offset window
 //!
@@ -280,6 +322,24 @@ pub struct ExtensionSummary {
 }
 
 /// How much confidence downstream matching can place in the result.
+///
+/// # This value currently decides nothing
+///
+/// It is computed in [`compute_stop_set`] and it reads like a control
+/// signal, but **no consumer anywhere in the workspace acts on it**. Its
+/// only use outside this crate is a forensic `eprintln!` in `plrd::scan`.
+/// `plr-analyzer`'s matcher derives its own `MatchConfidence` from the
+/// candidate count and never receives this field, and nothing in the
+/// `plrd` pipeline consults it before offering a plan.
+///
+/// That matters because several flags on [`Degradation`] are documented as
+/// forcing [`Confidence::PerLayer`] "so automation refuses rather than
+/// resuming" — see [`Degradation::extension_truncated`]. **That claim is
+/// not true today.** Setting this field is a confession, not a guarantee.
+/// Any new flag that needs to be consequential must reach the code that
+/// decides whether to offer a recovery; wiring it here is a no-op, which
+/// was verified by experiment (forcing `PerLayer` from a new flag changed
+/// the behaviour of zero tests).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Confidence {
     /// Evidence covers the window without known holes: candidates are
@@ -321,9 +381,9 @@ pub struct Degradation {
     ///   cannot be computed cannot be claimed to bound anything — see
     ///   [`run_extension`].
     ///
-    /// Either way this forces [`Confidence::PerLayer`], so automation
-    /// refuses rather than resuming on an answer whose far end is
-    /// unverified.
+    /// Either way this sets [`Confidence::PerLayer`] — which, despite how
+    /// this comment used to read, does **not** make automation refuse:
+    /// nothing consumes that field. See [`Confidence`].
     pub extension_truncated: bool,
     /// The extension stopped at an unparseable/unsupported line;
     /// candidates beyond it are missing.
@@ -762,14 +822,30 @@ struct ExtensionResult {
 /// Bounds used, smallest wins:
 ///
 /// * **`trapq_end_time_journaled_by(anchor.mono_ns)` — motion evidence,
-///   the anchored branch.** Every line up to `F` was processed by the
-///   anchor's capture time, so its trapq row was journaled by then; the
-///   newest such row's end time is when motion preceding `F` completes.
-///   Batching delay can only drop rows from this set, which lowers the
-///   value — conservative. Whether the daemon journals rows at planning
-///   time (the reader running ahead, so the value exceeds the capture
-///   time) or later, the quantity is the same: the end of motion for
-///   lines before `F`.
+///   the anchored branch.** The newest trapq row journaled by the
+///   anchor's capture time; its end is a lower bound on when motion
+///   preceding `F` completes.
+///
+///   **This is a lower bound, not the quantity itself, and the
+///   distinction is load-bearing.** An earlier version of this comment
+///   claimed "every line up to `F` was processed by the anchor's capture
+///   time, so its trapq row was journaled by then". That is **false**, in
+///   two independent ways. Klipper's reader advances `file_position`
+///   *after* running a line (`klippy/extras/virtual_sdcard.py`,
+///   `work_handler`), but the move that line produced first sits in a
+///   Python-side `LookAheadQueue` that `dump_trapq` cannot see at all —
+///   `trapq_extract_old` (`klippy/chelper/trapq.c`) walks only
+///   `tq->moves` and `tq->history` — and is appended to the trapq only on
+///   a later flush (`ToolHead._process_lookahead`); *then* it waits up to
+///   one ~0.5 s dump batch (`klippy/extras/bulk_sensor.py`,
+///   `BATCH_INTERVAL`). So rows for lines before `F` are routinely
+///   missing from this set.
+///
+///   It remains safe **here** precisely because a lower bound is what
+///   this function wants: missing rows can only lower the value, and only
+///   the smallest term shortens the horizon. It is **not** safe wherever
+///   the same premise would license treating trapq evidence as *complete*
+///   — see the module-level "Durable extruder coverage".
 /// * **`t_a - max_processing_lead` — the degenerate branch**, taken when
 ///   no durable trapq row precedes the anchor and reported as
 ///   [`Degradation::extension_start_unanchored`]. It rests on the same
@@ -1466,6 +1542,96 @@ mod tests {
             "e_internal {e:?} misses motion the machine had time to execute"
         );
         assert!(!set.degradation.extension_start_unanchored);
+    }
+
+    // --- the un-evidenced extruder band: the OPEN hazard ----------------
+
+    /// File whose lines up to the anchor frontier contain a retract to E-4
+    /// and back. Absolute E so the values are readable; the trailing lines
+    /// give the extension something to consume.
+    const RETRACT_TEXT: &str = concat!(
+        "G1 X60 Y50 E10 F3000
+", //  0..21  E=10
+        "G1 E6
+", // 21..28  retract to 6  <-- the excursion
+        "G1 E10
+", // 28..36  back to 10
+        "G1 X70 Y50 E11
+", // 36..52  E=11
+        "G1 X80 Y50 E12
+", // 52..68
+        "G1 X90 Y50 E13
+",
+    );
+
+    /// Offset just past `G1 E10` (the unretract), so the excursion is
+    /// strictly *inside* the processed-but-un-evidenced region.
+    const RETRACT_FRONTIER: u64 = 36;
+
+    fn e10_gcode(e: f64) -> WalGcodeState {
+        WalGcodeState {
+            speed_factor: 1.0,
+            speed: 3000.0,
+            extrude_factor: 1.0,
+            absolute_coordinates: true,
+            absolute_extrude: true,
+            homing_origin: vec![0.0; 4],
+            position: vec![60.0, 50.0, 0.2, e],
+            gcode_position: vec![60.0, 50.0, 0.2, e],
+        }
+    }
+
+    /// **Pins the open containment limit in `e_internal`.**
+    ///
+    /// Durable extruder coverage stops before the retract's own rows, so a
+    /// retract to E = 6 and back to E = 10 sits entirely inside lines the
+    /// anchor context already counts as processed. Both *endpoints* read
+    /// E = 10, so neither the trapq evaluation (which sees only coverage)
+    /// nor the extension (which starts at the frontier, after the
+    /// excursion) can bound the interior — and this asserts that
+    /// `e_internal` does **not** contain E = 6.
+    ///
+    /// This test asserts the bug, deliberately. It exists so the limit is
+    /// executable rather than prose, and so whatever finally closes it has
+    /// a target: `e_file`'s replay already recovers E = 6 on the exact
+    /// path, and `plrd::pipeline`'s `stop_evidence` discards `e_file`. When
+    /// that is fixed this assertion must be inverted, not deleted. See the
+    /// module-level "Durable extruder coverage".
+    #[test]
+    fn e_internal_does_not_bound_a_retract_inside_the_un_evidenced_band() {
+        // Extruder coverage ending at print time 9.0 — before the anchor.
+        let e_row = trapq_segment_xyz(
+            "extruder",
+            8.0,
+            1.0,
+            [10.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            1.0,
+            8_000_000_000,
+        );
+        let floor = context_with_gcode(9_000_000_000, 0, e10_gcode(10.0));
+        let anchor = context_with_gcode(20_000_000_000, RETRACT_FRONTIER, e10_gcode(10.0));
+        let records = base_records(
+            20.0,
+            20.1,
+            vec![
+                WalRecord::TrapqSegment(e_row),
+                WalRecord::Context(floor),
+                WalRecord::Context(anchor),
+            ],
+        );
+        let timeline = ingest_records(records);
+        let window = compute_stop_window(&timeline, None, &cfg()).unwrap();
+        let tail = FileTail {
+            base_offset: 0,
+            bytes: RETRACT_TEXT.as_bytes(),
+        };
+        let set = compute_stop_set(&timeline, &window, Some(&tail), &cfg()).unwrap();
+        let e = set.e_internal.expect("internal E interval");
+        assert!(
+            !e.contains(6.0, 1e-9),
+            "e_internal {e:?} now bounds the retract low point E=6 — the open              limit this pins has been closed; invert this assertion and update              the module docs rather than deleting the test"
+        );
     }
 
     /// A long file of 10 mm extruding moves (0.2 s each at F3000), so a

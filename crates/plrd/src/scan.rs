@@ -458,6 +458,9 @@ mod tests {
 
     fn context(mono_ns: u64, file_position: u64, file_path: &str) -> Context {
         Context {
+            // The forensic scan prints records; the append frontier is not
+            // part of what these fixtures assert.
+            print_time: None,
             mono_ns,
             virtual_sdcard: Some(VirtualSdState {
                 file_path: file_path.to_owned(),
