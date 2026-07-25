@@ -34,6 +34,7 @@ real blocking client, so nothing here is a tautology over a constant.
 """
 
 import threading
+import time
 
 import fake_klippy
 import fake_plrd
@@ -384,11 +385,14 @@ def test_a_blocking_call_in_a_handler_stalls_the_reactor_past_the_mcu_watchdog(
     blocking_timeout = KLIPPER_MAX_HEAT_TIME + 0.2
     holder = [None]
     pushed = []
+    # Deliberately half the handler's block, so the push provably gives up
+    # WHILE the handler is still holding the reactor rather than racing it.
+    push_timeout = blocking_timeout / 2.0
 
     def on_request(cmd, args):
         # Runs on the daemon's thread, once the blocking handler's request
         # has arrived — i.e. provably while the handler holds the reactor.
-        pushed.append(holder[0].send_script("M140 S60", timeout=blocking_timeout))
+        pushed.append(holder[0].send_script("M140 S60", timeout=push_timeout))
 
     plrd = fake_plrd.FakePlrd(hang=True, on_request=on_request)
     h = harness(plrd)
@@ -417,6 +421,10 @@ def test_a_blocking_call_in_a_handler_stalls_the_reactor_past_the_mcu_watchdog(
             "measured %.3fs" % (KLIPPER_MAX_HEAT_TIME, h.reactor.max_stall)
         )
         # plrd's script did not run while the handler was blocked...
+        for _ in range(400):
+            if pushed:
+                break
+            time.sleep(0.005)
         assert pushed == [False]
         assert ("plrd", "M140 S60") not in h.gcode.scripts_run
         # ...and the operator has already been told it failed.

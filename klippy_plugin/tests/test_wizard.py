@@ -986,3 +986,44 @@ def test_every_recovery_terminal_path_emits_prompt_end(
         # Deliver whatever that step handed off (0 for the local ones).
         pump(0, timeout=1.0)
     assert "action:prompt_end" in since()
+
+
+# --- cancelling while a query is in flight ----------------------------
+
+
+def test_cancel_during_the_status_query_is_not_undone_when_plrd_answers(
+    plugin, run_cmd, pump, fake_printer
+):
+    # The handler returns while the `status` query is still in flight, so the
+    # operator can cancel before the answer exists.  When it arrives, it must
+    # NOT reopen the flow: a dismissed wizard that comes back on its own is
+    # exactly the kind of surprise a recovery UI must not spring.
+    plugin.daemon = FakeDaemon(responses={"status": _status_pending()})
+    run_cmd("PLR_WIZARD_START")
+    assert plugin.wizard.state() == "query"
+    run_cmd("PLR_WIZARD_CANCEL")
+    assert plugin.wizard.is_active() is False
+    gcode = fake_printer.lookup_object("gcode")
+    since = _new_responses(gcode)
+    # plrd's answer is delivered and dropped.
+    assert pump() == 1
+    assert since() == []
+    assert plugin.wizard.is_active() is False
+
+
+def test_a_second_start_while_the_query_is_in_flight_does_not_fork_it(
+    plugin, run_cmd, pump, fake_printer
+):
+    plugin.daemon = FakeDaemon(responses={"status": _status_pending()})
+    run_cmd("PLR_WIZARD_START")
+    gcode = fake_printer.lookup_object("gcode")
+    since = _new_responses(gcode)
+    run_cmd("PLR_WIZARD_START")
+    # No second query, and no claim to have re-shown a prompt that does not
+    # exist yet.
+    assert any("still waiting for plrd's answer" in line for line in since())
+    assert not any(line.startswith("action:") for line in since())
+    assert pump() == 1
+    assert len([c for c in plugin.daemon.calls if c[0] == "status"]) == 1
+    # ...and the one answer still opens the flow.
+    assert plugin.wizard.state() == "offered"

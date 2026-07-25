@@ -615,6 +615,12 @@ class RecoverySession:
                 "frame, so a fresh dry run is required before any resume."
             )
             self._end_dialog()
+        # Tell the listener too, or the wizard sits in its "running" state
+        # for the rest of the klippy session (a shutdown does not tear the
+        # plugin down — klippy stays up until FIRMWARE_RESTART), reporting a
+        # recovery that is over.  That is the wedged-UI failure this whole
+        # branch exists to remove.
+        self._notify_finished()
 
     def _abort_detached(self, token):
         """Fire-and-forget ``recover_confirm ... abort``; the reply is dropped.

@@ -260,9 +260,6 @@ def cmd_PLR_STATUS(plugin, gcmd):
         pending = " [awaiting SAVE_CONFIG]" if plugin.is_pending_save(name) else ""
         lines.append("  %s: %g%s" % (name, value, pending))
     lines.extend("  %s" % (line,) for line in plugin.recovery.status_lines())
-    lines.append("plrd (%s):" % (plugin.control_socket,))
-    lines.append("  asking the daemon (report follows)...")
-    gcmd.respond_info("\n".join(lines))
     gcode = plugin.printer.lookup_object("gcode")
     socket_path = plugin.control_socket
 
@@ -276,12 +273,17 @@ def cmd_PLR_STATUS(plugin, gcmd):
     def on_error(err):
         respond_error(gcode, "plrd (%s): %s" % (socket_path, err))
 
-    if not plugin.daemon_query.call(
-        "status", None, STATUS_TIMEOUT, on_result, on_error
-    ):
-        gcmd.respond_info(
-            "  a plrd query is already in flight; its report will appear above."
+    lines.append("plrd (%s):" % (socket_path,))
+    # Start the query BEFORE announcing it, so the announcement is true:
+    # either a report is coming, or the console says why it is not.
+    if plugin.daemon_query.call("status", None, STATUS_TIMEOUT, on_result, on_error):
+        lines.append("  asking the daemon (its report follows)...")
+    else:
+        lines.append(
+            "  a plrd query is already in flight; its report will appear "
+            "when it answers."
         )
+    gcmd.respond_info("\n".join(lines))
 
 
 def cmd_PLR_RECOVER(plugin, gcmd):

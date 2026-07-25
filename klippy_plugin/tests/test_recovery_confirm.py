@@ -828,3 +828,38 @@ def test_a_failing_shutdown_abort_is_contained(plugin, run, fake_printer, caplog
     assert plugin.daemon.tokens() == ["plrc-17bd4c0f9a2-3"]
     time.sleep(0.05)
     assert plugin.recovery.state() == "idle"
+
+
+def test_a_shutdown_mid_recovery_does_not_leave_the_wizard_wedged(
+    plugin, run_cmd, pump, fake_printer
+):
+    # klippy stays UP in the shutdown state until FIRMWARE_RESTART, so the
+    # plugin object survives.  If the session forgot to tell its listener,
+    # the wizard would report "a recovery is already in flight" for the rest
+    # of the session and PLR_WIZARD_START would never work again.
+    plugin.daemon = ScriptedDaemon({"recover_execute": [fx.pause()]})
+    # Walk the wizard to its execute prompt, then execute through it.
+    plugin.daemon.script["status"] = [
+        {
+            "ok": True,
+            "text": "",
+            "data": {"pending": {"file": "/x/bench.gcode", "percent": 10.0}},
+        }
+    ]
+    plugin.daemon.script["recover_dryrun"] = [
+        {"ok": True, "text": "PLAN", "data": {"outcome": "plan"}}
+    ]
+    run_cmd("PLR_WIZARD_START")
+    assert pump() == 1
+    run_cmd("PLR_WIZARD_DRYRUN")
+    assert pump() == 1
+    run_cmd("PLR_WIZARD_CONFIRM_CLEAN")
+    run_cmd("PLR_WIZARD_EXECUTE")
+    assert pump() == 1
+    assert plugin.wizard.state() == "running"
+    assert plugin.recovery.is_awaiting() is True
+
+    fake_printer.invoke_shutdown("Manual stop (M112)")
+    assert plugin.recovery.state() == "idle"
+    assert plugin.wizard.is_active() is False
+    assert plugin.get_status(100.0)["wizard_active"] is False

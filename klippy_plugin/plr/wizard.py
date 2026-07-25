@@ -321,6 +321,12 @@ class RecoveryWizard:
     def _reset(self):
         self._state = STATE_IDLE
         self._prompt = None
+        # Drop any answer still in flight for this flow.  Without this, a
+        # PLR_WIZARD_CANCEL issued while the `status` query was outstanding
+        # would be undone the moment plrd answered: the callback would open
+        # the offer prompt again and resurrect a wizard the operator had
+        # just dismissed.
+        self.plugin.daemon_wizard.cancel()
 
     def _fail_daemon(self, command, err):
         """Reset, clear any shown dialog, and report a console error.
@@ -359,6 +365,15 @@ class RecoveryWizard:
             gcmd.respond_info(
                 "PLR wizard: a recovery is already in flight.\n%s"
                 % ("\n".join(self.plugin.recovery.status_lines()),)
+            )
+            return
+        if self._state == STATE_QUERY:
+            # There is nothing to re-show yet: the answer that decides what
+            # the prompt says has not arrived.  Say that, rather than
+            # claiming a re-show that emits nothing.
+            gcmd.respond_info(
+                "PLR wizard: still waiting for plrd's answer — the prompt "
+                "appears as soon as it replies."
             )
             return
         if self._state != STATE_IDLE:
