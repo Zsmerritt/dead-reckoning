@@ -26,6 +26,7 @@
 //!   `G92 E` would have run.
 
 use std::fmt::Write as _;
+use std::time::Duration;
 
 use plr_analyzer::{
     ContactOutcome, DeclineReason, FeatureClass, LayerModel, MatchConfidence, MatchResult,
@@ -321,11 +322,30 @@ pub struct PlanConfig {
     pub confirm_timeout_s: Option<f64>,
 }
 
-/// Default [`PlanConfig::confirm_timeout_s`], seconds.
+/// Default [`PlanConfig::confirm_timeout_s`].
 ///
 /// Long enough to walk to the printer, look at the nozzle, and walk back
 /// — which is exactly what a Z-height confirmation asks for.
-pub const CONFIRM_TIMEOUT_DEFAULT_S: f64 = 600.0;
+///
+/// **This is the single definition of that default.** It used to be
+/// written out twice in two units in two crates — `600.0` here and
+/// `Duration::from_mins(10)` in `plrd`'s executor — which is not a
+/// duplication but a latent divergence: the number this crate *documents*
+/// to the operator (and quotes back at them in
+/// [`crate::diagnosis`]'s `confirm_timeout_out_of_range` fix text) would
+/// have silently stopped describing the number the daemon *enforces*, and
+/// nothing on the operator's side could reveal the difference. `plrd`'s
+/// `executor::DEFAULT_CONFIRM_TIMEOUT` is now this constant, and
+/// [`CONFIRM_TIMEOUT_DEFAULT_S`] is derived from it.
+pub const CONFIRM_TIMEOUT_DEFAULT: Duration = Duration::from_mins(10);
+
+/// [`CONFIRM_TIMEOUT_DEFAULT`] in seconds — the units of the `[plr]`
+/// `confirm_timeout_s` key and of the band below. Derived, never written
+/// out a second time.
+// A whole number of seconds in the hundreds is exact in f64; the band
+// (30..=3600 s) cannot reach a magnitude where u64 -> f64 loses anything.
+#[allow(clippy::cast_precision_loss)]
+pub const CONFIRM_TIMEOUT_DEFAULT_S: f64 = CONFIRM_TIMEOUT_DEFAULT.as_secs() as f64;
 
 /// Lower bound for [`PlanConfig::confirm_timeout_s`], seconds.
 ///

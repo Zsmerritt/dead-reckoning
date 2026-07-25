@@ -8,10 +8,10 @@
 //! * Responses: one line of JSON,
 //!   `{"ok": bool, "text": "<human-readable multi-line report>",
 //!   "data": {...}}\n`.
-//! * Commands: `ping`, `status`, `recover_dryrun`, `recover_execute`
-//!   (args `{"confirm": true, "step": bool, "on_confirm":
-//!   "abort"|"ask"}`), `recover_confirm` (args `{"token": string,
-//!   "answer": "continue"|"abort"}`).
+//! * Commands: `ping`, `status`, `recover_state`, `recover_dryrun`,
+//!   `recover_execute` (args `{"confirm": true, "step": bool,
+//!   "on_confirm": "abort"|"ask"}`), `recover_confirm` (args `{"token":
+//!   string, "answer": "continue"|"abort"}`).
 //! * Malformed JSON and unknown commands get an `ok: false` response —
 //!   never a dropped connection. A request line larger than
 //!   [`MAX_REQUEST_BYTES`] gets an error response and the connection is
@@ -56,7 +56,14 @@
 //! * `"ask"` — execution PAUSES at each confirm-point. The
 //!   `recover_execute` response is then `ok:false` with
 //!   `data.outcome = "awaiting_confirmation"`, the structured
-//!   `data.diagnosis`, and an opaque `data.resume_token`.
+//!   `data.diagnosis`, an opaque `data.resume_token`, and the deadline:
+//!   `data.confirm_timeout_s` (the bound the executor is enforcing for
+//!   this pause) plus `data.confirm_expires_in_s` (what is left of it as
+//!   the response is written). Both come off
+//!   [`crate::executor::ConfirmPoint::deadline`], the same field the
+//!   executor's timer was constructed from — a client never has to guess,
+//!   and in particular never has to assume the top of the permitted band
+//!   to stay fail-safe.
 //!
 //! The paused execution is a live task, not stored state to be replayed:
 //! it is sitting on one `await`. The client answers with
@@ -75,6 +82,58 @@
 //! bounds it — a client that goes away resolves to a clean abort, with
 //! frame invalidation applied exactly as any other abort at that step
 //! would apply it.
+//!
+//! # `recover_state`: asking without acting
+//!
+//! `recover_execute` and `recover_confirm` were the only commands that
+//! could see [`CtrlState::session`], so the only way to find out whether a
+//! recovery was in flight was to *try to start one* and read the `busy`
+//! refusal — telling an operator to run a command that moves the machine
+//! in order to learn whether the machine is moving. `recover_state` answers
+//! that directly:
+//!
+//! ```text
+//! {"cmd": "recover_state"}
+//! -> {"ok": true, "text": "...", "data": {
+//!      "outcome": "state",
+//!      "executing": bool,              // same window as the `busy` refusal
+//!      "running_for_s": number|null,
+//!      "awaiting_confirmation": bool,
+//!      "confirm_expired": bool,        // a pause lapsed unanswered
+//!      "resume_token": string|null,
+//!      "confirm_kind": string|null,    // "diagnosis"|"z-height"|"step-debug"
+//!      "step": number|null,
+//!      "phase": string|null,
+//!      "diagnosis_code": string|null,
+//!      "confirm_timeout_s": number|null,
+//!      "confirm_expires_in_s": number|null}}
+//! ```
+//!
+//! It is a **new** command and every field it introduces elsewhere is
+//! additive, so an older plugin — which never sends it and ignores unknown
+//! keys — is unaffected.
+//!
+//! **It cannot act.** Not by convention: [`cmd_recover_state`] is
+//! synchronous (no `await`, therefore no I/O and no session lock) and its
+//! entire input is a [`StateSnapshot`] of `bool`/`String`/`f64`. Answering a
+//! pause needs the pause's `oneshot::Sender`, whose `send` consumes
+//! `self`; starting one needs to assign a new `ExecSession` into the
+//! session slot. Neither value is reachable from what the renderer holds.
+//! See [`Observed`] for the locking argument.
+//!
+//! **On exposing the token.** The resume token is a *correlation*
+//! identifier, not a capability: it exists so a stale or duplicate answer
+//! cannot be mistaken for a fresh one, and it never authenticated anybody.
+//! This socket has no authentication at all — mode 0666 by design, see
+//! below — so any client that can read the token could already have sent
+//! `recover_execute {"confirm": true}`, and could reach the same printer
+//! through Moonraker's own unauthenticated local API. Exposing it therefore
+//! grants no new capability, and it removes a genuinely bad state: today,
+//! if the connection that received the pause goes away (klippy restarts the
+//! plugin, the operator reloads the browser), *nobody* can answer, and the
+//! recovery sits paused with the heaters on and the nozzle over the part
+//! until the deadline. Being able to re-discover the token and abort is a
+//! safety improvement in the direction that matters.
 //!
 //! # Diagnoses on the wire
 //!
@@ -162,6 +221,18 @@ struct PauseNotice {
     phase: String,
     diagnosis: plr_recovery::Diagnosis,
     detail: Value,
+    /// The deadline the executor is holding this pause to — read straight
+    /// off [`ConfirmPoint::deadline`], which is the field the executor's
+    /// own `tokio::time::timeout` was constructed from.
+    deadline: Duration,
+    /// When the deadline started running, on the monotonic clock.
+    ///
+    /// Sampled at the top of [`SocketConfirmer::confirm`], which is the
+    /// first thing the executor's timeout wrapper polls, so it trails the
+    /// real timer start by the cost of one future poll. Wall-clock time is
+    /// deliberately not used: a client needs to know how long is left, and
+    /// an NTP step must not be able to answer that question wrongly.
+    raised_at: std::time::Instant,
     answer: tokio::sync::oneshot::Sender<ConfirmAnswer>,
 }
 
@@ -174,6 +245,11 @@ struct PauseNotice {
 /// unanswerable question must not be treated as a yes.
 struct SocketConfirmer {
     pauses: tokio::sync::mpsc::Sender<PauseNotice>,
+    /// Where each pause is mirrored for [`cmd_recover_state`] to read.
+    /// Published here rather than in the connection handler so the mirror
+    /// is written by the same task, next to the same `await`, that the
+    /// executor's deadline is being measured against.
+    observed: Arc<Observed>,
 }
 
 impl Confirmer for SocketConfirmer {
@@ -190,13 +266,233 @@ impl Confirmer for SocketConfirmer {
                 phase: point.phase.clone(),
                 diagnosis: point.diagnosis.clone(),
                 detail: point.detail.clone(),
+                // NOT re-derived from the config or from
+                // `DEFAULT_CONFIRM_TIMEOUT`: the executor stamped the
+                // deadline it is enforcing onto the point.
+                deadline: point.deadline,
+                raised_at: std::time::Instant::now(),
                 answer: tx,
             };
+            self.observed.publish_pause(&notice);
             if self.pauses.send(notice).await.is_err() {
+                self.observed.clear_pause();
                 return ConfirmAnswer::Abort;
             }
-            rx.await.unwrap_or(ConfirmAnswer::Abort)
+            let answer = rx.await.unwrap_or(ConfirmAnswer::Abort);
+            self.observed.clear_pause();
+            answer
         })
+    }
+}
+
+/// The plain-data mirror of the session that `recover_state` reports.
+///
+/// # Why a mirror instead of reading the session
+///
+/// [`CtrlState::session`] cannot answer a status query. It is the
+/// serialization lock, and `cmd_recover_execute` holds it across every
+/// `await` of a recovery — the pipeline, the execution, a pause lasting up
+/// to `confirm_timeout_s`. A `try_lock` from a status handler would
+/// therefore fail for exactly as long as there was something to report,
+/// and a `lock().await` would make the status query wait out the recovery
+/// it was asking about.
+///
+/// So the execute path *publishes* into this, and the status path reads
+/// only this. Consequences, stated as the properties they are:
+///
+/// * **A status query cannot stall the executor and cannot be stalled by
+///   it.** Every critical section here is straight-line code over
+///   `bool`/`String`/`Instant` with no `await` and no I/O inside it, held
+///   for tens of nanoseconds. It is a `std::sync::Mutex` precisely so that
+///   holding it across an `await` is not expressible: the guard is not
+///   `Send`, so any attempt to would fail to compile in the async
+///   functions here.
+/// * **No lock cycle.** The execute path takes `session` then this; the
+///   status path takes this alone. There is no path that takes them in the
+///   other order.
+/// * **Poisoning cannot silence observability.** A panic elsewhere while
+///   the lock was held would leave plain data, not a torn invariant, so a
+///   poisoned lock is recovered into rather than propagated. Refusing to
+///   answer "are you still paused?" is not a safe failure mode.
+#[derive(Debug, Default)]
+pub struct Observed {
+    inner: std::sync::Mutex<Option<LiveExecution>>,
+}
+
+/// One `recover_execute` in progress, as the mirror sees it.
+#[derive(Debug)]
+struct LiveExecution {
+    /// When [`ExecutionLease::begin`] was taken.
+    started: std::time::Instant,
+    /// The outstanding confirm-point, if execution is paused on one.
+    pause: Option<LivePause>,
+}
+
+/// The mirror of one outstanding confirm-point.
+#[derive(Debug, Clone)]
+struct LivePause {
+    token: String,
+    kind: &'static str,
+    step_id: u32,
+    phase: String,
+    code: &'static str,
+    raised_at: std::time::Instant,
+    deadline: Duration,
+}
+
+/// Everything `recover_state` is allowed to see: plain owned data, and no
+/// handle to anything that could act.
+///
+/// This type is the guarantee asked of the read-only query. The renderer
+/// ([`render_state`]) takes *this* and nothing else — no `&CtrlState`, no
+/// `JoinHandle`, no `oneshot::Sender` — so "the status path cannot start,
+/// answer or cancel a recovery" is a property of what it is handed rather
+/// than a property of what its body happens not to say. There is no
+/// method on `bool`, `String` or `f64` that resumes a recovery.
+#[derive(Debug, Default, PartialEq)]
+struct StateSnapshot {
+    /// A `recover_execute` is in progress (the same condition that makes a
+    /// second one `busy`).
+    executing: bool,
+    /// How long it has been in progress.
+    running_for_s: Option<f64>,
+    /// It is paused on a confirm-point whose deadline has NOT lapsed.
+    awaiting: bool,
+    /// The outstanding pause's details, when `awaiting`.
+    token: Option<String>,
+    kind: Option<&'static str>,
+    step_id: Option<u32>,
+    phase: Option<String>,
+    code: Option<&'static str>,
+    /// The full deadline the executor is enforcing, seconds.
+    confirm_timeout_s: Option<f64>,
+    /// What is left of it, seconds.
+    expires_in_s: Option<f64>,
+    /// A pause was raised and its deadline lapsed without an answer.
+    ///
+    /// Distinguishes "never paused" from "paused, and you missed it" so a
+    /// client can retire an operator prompt with a reason instead of
+    /// silently dropping it.
+    confirm_expired: bool,
+}
+
+impl Observed {
+    /// Publishes "an execution is in progress". Called by
+    /// [`ExecutionLease::begin`] only.
+    fn begin(&self) {
+        *self.guard() = Some(LiveExecution {
+            started: std::time::Instant::now(),
+            pause: None,
+        });
+    }
+
+    /// Publishes "nothing is in progress". Called by
+    /// [`ExecutionLease`]'s `Drop` only, so it runs on completion, on a
+    /// panic inside the execution task, and on the task being dropped by a
+    /// runtime shutdown.
+    fn end(&self) {
+        *self.guard() = None;
+    }
+
+    fn publish_pause(&self, notice: &PauseNotice) {
+        if let Some(live) = self.guard().as_mut() {
+            live.pause = Some(LivePause {
+                token: notice.token.clone(),
+                kind: notice.kind,
+                step_id: notice.step_id,
+                phase: notice.phase.clone(),
+                code: notice.diagnosis.code,
+                raised_at: notice.raised_at,
+                deadline: notice.deadline,
+            });
+        }
+    }
+
+    fn clear_pause(&self) {
+        if let Some(live) = self.guard().as_mut() {
+            live.pause = None;
+        }
+    }
+
+    /// The snapshot as of now.
+    fn snapshot(&self) -> StateSnapshot {
+        self.snapshot_at(std::time::Instant::now())
+    }
+
+    /// The snapshot as of `now` — a pure function of the mirror and the
+    /// clock, which is what makes the expiry rule testable.
+    ///
+    /// **The expiry rule is why this is derived at read time rather than
+    /// trusted as published.** The executor cancels
+    /// `SocketConfirmer::confirm` when the deadline fires, so the future
+    /// that would have cleared the pause is dropped instead of completing:
+    /// a mirror that only ever believed what it was told would keep
+    /// claiming a confirmation was outstanding after the daemon had
+    /// already aborted the recovery. That is the exact defect this query
+    /// exists to remove from the plugin, and reintroducing it one layer
+    /// down would be worse than not answering at all. So a lapsed pause
+    /// reads as *not* awaiting — the conservative answer for a client
+    /// deciding whether to keep asking an operator for something.
+    fn snapshot_at(&self, now: std::time::Instant) -> StateSnapshot {
+        let guard = self.guard();
+        let Some(live) = guard.as_ref() else {
+            return StateSnapshot::default();
+        };
+        let mut snapshot = StateSnapshot {
+            executing: true,
+            running_for_s: Some(now.saturating_duration_since(live.started).as_secs_f64()),
+            ..StateSnapshot::default()
+        };
+        if let Some(pause) = live.pause.as_ref() {
+            let elapsed = now.saturating_duration_since(pause.raised_at);
+            match pause.deadline.checked_sub(elapsed) {
+                Some(left) if !left.is_zero() => {
+                    snapshot.awaiting = true;
+                    snapshot.token = Some(pause.token.clone());
+                    snapshot.kind = Some(pause.kind);
+                    snapshot.step_id = Some(pause.step_id);
+                    snapshot.phase = Some(pause.phase.clone());
+                    snapshot.code = Some(pause.code);
+                    snapshot.confirm_timeout_s = Some(pause.deadline.as_secs_f64());
+                    snapshot.expires_in_s = Some(left.as_secs_f64());
+                }
+                // Lapsed (or a deadline of zero, which is the never-stamped
+                // sentinel): report it as gone, and say so.
+                _ => snapshot.confirm_expired = true,
+            }
+        }
+        snapshot
+    }
+
+    /// The lock, recovering from poisoning (see the type docs).
+    fn guard(&self) -> std::sync::MutexGuard<'_, Option<LiveExecution>> {
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+/// Publishes "an execution is in progress" for as long as it exists.
+///
+/// Taken by `cmd_recover_execute` the moment the busy check passes, and
+/// moved into the execution task, so `executing` covers the pipeline as
+/// well as execution proper — i.e. exactly the window in which a second
+/// `recover_execute` would be refused as `busy`. `Drop` is what publishes
+/// the end, so completion, a panic, and a runtime shutdown that drops the
+/// task all clear it; nothing has to *run* successfully for the mirror to
+/// stop claiming an execution is live.
+struct ExecutionLease(Arc<Observed>);
+
+impl ExecutionLease {
+    fn begin(observed: Arc<Observed>) -> Self {
+        observed.begin();
+        Self(observed)
+    }
+}
+
+impl Drop for ExecutionLease {
+    fn drop(&mut self) {
+        self.0.end();
     }
 }
 
@@ -227,6 +523,9 @@ pub struct CtrlState {
     /// between `recover_execute` and `recover_confirm` (module docs).
     /// `try_lock` failure and an occupied slot both mean "busy".
     session: tokio::sync::Mutex<Option<ExecSession>>,
+    /// The read-only mirror `recover_state` reports from. See
+    /// [`Observed`] for why the session itself cannot answer.
+    observed: Arc<Observed>,
 }
 
 impl CtrlState {
@@ -238,6 +537,7 @@ impl CtrlState {
             exec_options: ExecOptions::default(),
             connect_timeout: Duration::from_secs(10),
             session: tokio::sync::Mutex::new(None),
+            observed: Arc::new(Observed::default()),
         }
     }
 }
@@ -365,6 +665,10 @@ pub(crate) async fn respond_line(state: &CtrlState, line: &str) -> Value {
             &json!({"version": env!("CARGO_PKG_VERSION")}),
         ),
         "status" => cmd_status(state).await,
+        // Deliberately NOT `async`: a synchronous handler cannot await, so
+        // it cannot perform I/O, cannot take the session lock and cannot
+        // drive a session, whatever anybody later writes inside it.
+        "recover_state" => cmd_recover_state(state),
         "recover_dryrun" => cmd_recover_dryrun(state).await,
         "recover_execute" => cmd_recover_execute(state, args).await,
         "recover_confirm" => cmd_recover_confirm(state, args).await,
@@ -381,6 +685,69 @@ async fn cmd_status(state: &CtrlState) -> Value {
         Ok((text, data)) => ok_response(&text, &data),
         Err(e) => error_response("error", &format!("status task failed: {e}")),
     }
+}
+
+/// `recover_state`: the read-only "is a recovery in flight, and is it
+/// waiting on me?" query (module docs).
+///
+/// Two lines, both of which are the point:
+/// * it reads the plain-data mirror, never the session;
+/// * it hands that plain data to a renderer and returns what comes back.
+fn cmd_recover_state(state: &CtrlState) -> Value {
+    render_state(&state.observed.snapshot())
+}
+
+/// Renders a [`StateSnapshot`]. Takes plain data by reference and returns
+/// JSON: there is nothing here to act with even in principle.
+fn render_state(snapshot: &StateSnapshot) -> Value {
+    use std::fmt::Write as _;
+    let mut text = String::new();
+    if snapshot.executing {
+        let _ = write!(text, "execution: in flight");
+        if let Some(seconds) = snapshot.running_for_s {
+            let _ = write!(text, " ({seconds:.1}s)");
+        }
+        let _ = writeln!(text);
+    } else {
+        let _ = writeln!(text, "execution: none");
+    }
+    if snapshot.awaiting {
+        let _ = writeln!(
+            text,
+            "awaiting confirmation: step {} [{}] {} ({}); {:.1}s of {:.1}s left",
+            snapshot.step_id.unwrap_or(0),
+            snapshot.phase.as_deref().unwrap_or("?"),
+            snapshot.kind.unwrap_or("?"),
+            snapshot.code.unwrap_or("?"),
+            snapshot.expires_in_s.unwrap_or(0.0),
+            snapshot.confirm_timeout_s.unwrap_or(0.0),
+        );
+    } else if snapshot.confirm_expired {
+        let _ = writeln!(
+            text,
+            "awaiting confirmation: no — a confirm-point lapsed unanswered; the recovery \
+             is aborting or has aborted"
+        );
+    } else {
+        let _ = writeln!(text, "awaiting confirmation: no");
+    }
+    ok_response(
+        text.trim_end(),
+        &json!({
+            "outcome": "state",
+            "executing": snapshot.executing,
+            "running_for_s": snapshot.running_for_s,
+            "awaiting_confirmation": snapshot.awaiting,
+            "confirm_expired": snapshot.confirm_expired,
+            "resume_token": snapshot.token,
+            "confirm_kind": snapshot.kind,
+            "step": snapshot.step_id,
+            "phase": snapshot.phase,
+            "diagnosis_code": snapshot.code,
+            "confirm_timeout_s": snapshot.confirm_timeout_s,
+            "confirm_expires_in_s": snapshot.expires_in_s,
+        }),
+    )
 }
 
 /// Builds the status report (blocking context).
@@ -648,6 +1015,12 @@ async fn cmd_recover_execute(state: &CtrlState, args: &Map<String, Value>) -> Va
         *slot = None;
     }
 
+    // Publish "in flight" from HERE — the point past which a second
+    // request is refused as busy — so `recover_state` and the busy refusal
+    // describe the same window, pipeline included. Dropped on every early
+    // return below; moved into the execution task on the success path.
+    let lease = ExecutionLease::begin(Arc::clone(&state.observed));
+
     // Pipeline (blocking work) off the runtime thread.
     let config = state.config.clone();
     let pipeline_result = tokio::task::spawn_blocking(move || {
@@ -706,10 +1079,18 @@ async fn cmd_recover_execute(state: &CtrlState, args: &Map<String, Value>) -> Va
     let config = state.config.clone();
     let exec_options = state.exec_options.clone();
     let connect_timeout = state.connect_timeout;
+    let observed = Arc::clone(&state.observed);
     let join = tokio::spawn(async move {
+        // Owned by the task from here on: whenever the task stops existing
+        // — return, panic, or being dropped by a runtime shutdown — this
+        // drops and the mirror stops claiming an execution is live.
+        let _lease = lease;
         let mut report: Vec<u8> = Vec::new();
         let mut abort_confirmer = AbortConfirmer;
-        let mut socket_confirmer = SocketConfirmer { pauses: pause_tx };
+        let mut socket_confirmer = SocketConfirmer {
+            pauses: pause_tx,
+            observed,
+        };
         let confirmer: &mut dyn Confirmer = if ask {
             &mut socket_confirmer
         } else {
@@ -842,12 +1223,24 @@ async fn drive_session(slot: &mut Option<ExecSession>) -> Value {
 /// Renders an `awaiting_confirmation` response and stores the pause as
 /// the session's outstanding question.
 fn report_pause(session: &mut ExecSession, notice: PauseNotice) -> Value {
+    // The remaining budget at the moment the response is composed. It is
+    // the total deadline minus what the pause has already spent getting
+    // here (one channel hop), so a client that adds it to "now" lands on
+    // the executor's own abort instant rather than on a guess. Saturating,
+    // and reported as 0 when the deadline has already gone — never as a
+    // negative number a client might sign-extend into the future.
+    let expires_in = notice
+        .deadline
+        .checked_sub(notice.raised_at.elapsed())
+        .unwrap_or_default();
     let text = format!(
-        "{}recover: PAUSED at step {} [{}] awaiting confirmation ({})\n{}",
+        "{}recover: PAUSED at step {} [{}] awaiting confirmation ({}); answer within \
+         {:.0}s or the recovery aborts\n{}",
         session.prefix,
         notice.step_id,
         notice.phase,
         notice.kind,
+        expires_in.as_secs_f64(),
         notice.diagnosis.full(),
     );
     let response = json!({
@@ -861,6 +1254,14 @@ fn report_pause(session: &mut ExecSession, notice: PauseNotice) -> Value {
             "phase": notice.phase,
             "diagnosis": notice.diagnosis,
             "detail": notice.detail,
+            // ADDITIVE (a client that ignores both behaves exactly as
+            // before). `confirm_timeout_s` is the deadline the executor is
+            // enforcing — the operator's `[plr] confirm_timeout_s` when
+            // set, else the daemon default — read off the ConfirmPoint the
+            // executor's own timer was built from, so a client never has
+            // to assume the band ceiling again.
+            "confirm_timeout_s": notice.deadline.as_secs_f64(),
+            "confirm_expires_in_s": expires_in.as_secs_f64(),
         },
     });
     session.outstanding = Some(notice);
@@ -889,7 +1290,10 @@ fn outcome_diagnoses(outcome: &PipelineOutcome) -> Option<Value> {
 
 #[cfg(test)]
 mod tests {
-    use super::{bind, respond_line, serve, CtrlState, MAX_REQUEST_BYTES};
+    use super::{
+        bind, respond_line, serve, CtrlState, ExecutionLease, Observed, PauseNotice, StateSnapshot,
+        MAX_REQUEST_BYTES,
+    };
     use crate::config::Config;
     use crate::executor::tests::happy_handler;
     use crate::executor::ExecOptions;
@@ -920,6 +1324,7 @@ mod tests {
             temp_timeout: Duration::from_millis(300),
             poll_interval: Duration::from_millis(20),
             confirm_timeout: Duration::from_millis(300),
+            gcode_barrier_timeout: Duration::from_millis(300),
         };
         state.connect_timeout = Duration::from_secs(2);
         Arc::new(state)
@@ -1883,6 +2288,247 @@ mod tests {
                 "{d}"
             );
         }
+    }
+
+    // --- `recover_state`: observing without acting -----------------------
+
+    #[tokio::test]
+    async fn recover_state_answers_on_an_idle_daemon_and_starts_nothing() {
+        // A real WAL fixture with a real recoverable plan and a reachable
+        // (simulated) printer: if `recover_state` could start anything,
+        // there is something here for it to start.
+        let (_dir, mut config) = crate::pipeline::e2e_tests::fixture("ctrl-state-idle");
+        let sim = Arc::new(std::sync::Mutex::new(SimPrinter::new(
+            config.wal_dir.to_str().unwrap(),
+        )));
+        let fake = FakeMoonraker::spawn(sim_handler(Arc::clone(&sim))).await;
+        config.moonraker_url = fake.url();
+        let wal_dir = config.wal_dir.clone();
+        let (path, _state) = spawn_server("state-idle", config);
+
+        for _ in 0..3 {
+            let response = roundtrip(&path, "{\"cmd\": \"recover_state\"}\n").await;
+            assert_eq!(response["ok"], json!(true), "{response}");
+            assert_eq!(response["data"]["outcome"], json!("state"));
+            assert_eq!(response["data"]["executing"], json!(false), "{response}");
+            assert_eq!(
+                response["data"]["awaiting_confirmation"],
+                json!(false),
+                "{response}"
+            );
+            assert_eq!(response["data"]["confirm_expired"], json!(false));
+            assert!(response["data"]["resume_token"].is_null(), "{response}");
+            assert!(response["data"]["confirm_timeout_s"].is_null());
+            assert!(response["text"]
+                .as_str()
+                .unwrap()
+                .contains("execution: none"));
+        }
+        // It acted on nothing: no gcode, and no transcript (which
+        // `execute_with_gates` creates before it sends anything at all, so
+        // its absence rules out even a refused execution having started).
+        assert!(fake.gcode_sent().is_empty(), "{:?}", fake.gcode_sent());
+        assert!(
+            !std::fs::read_dir(&wal_dir)
+                .unwrap()
+                .filter_map(Result::ok)
+                .any(|e| e
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("recovery-transcript-")),
+            "recover_state must not have begun an execution"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn recover_state_reports_the_outstanding_pause_its_token_and_its_deadline() {
+        // The operator's own `[plr] confirm_timeout_s`, deliberately
+        // different from BOTH the daemon default and the test harness's
+        // 300 ms `exec_options.confirm_timeout` — so a response that echoed
+        // either of those instead of the enforced value fails here.
+        let (path, _wal_dir, _fake) = spawn_confirm_server(
+            "state-paused",
+            &[
+                ("confirm_z_before_resume", json!(true)),
+                ("confirm_timeout_s", json!(90.0)),
+            ],
+        )
+        .await;
+        let paused = roundtrip(&path, EXECUTE_ASK).await;
+        assert_eq!(
+            paused["data"]["outcome"],
+            json!("awaiting_confirmation"),
+            "{paused}"
+        );
+        let token = paused["data"]["resume_token"].as_str().unwrap().to_owned();
+        // The pause response reports the deadline the executor enforces.
+        assert_eq!(paused["data"]["confirm_timeout_s"], json!(90.0), "{paused}");
+        let left = paused["data"]["confirm_expires_in_s"].as_f64().unwrap();
+        assert!(left > 80.0 && left <= 90.0, "{paused}");
+        assert!(
+            paused["text"].as_str().unwrap().contains("answer within"),
+            "{paused}"
+        );
+
+        // The read-only query agrees, without being told anything.
+        let state = roundtrip(&path, "{\"cmd\": \"recover_state\"}\n").await;
+        assert_eq!(state["ok"], json!(true), "{state}");
+        assert_eq!(state["data"]["executing"], json!(true), "{state}");
+        assert_eq!(
+            state["data"]["awaiting_confirmation"],
+            json!(true),
+            "{state}"
+        );
+        assert_eq!(state["data"]["resume_token"], json!(token), "{state}");
+        assert_eq!(state["data"]["confirm_kind"], json!("z-height"));
+        assert_eq!(
+            state["data"]["diagnosis_code"],
+            json!("z_confirm_before_resume")
+        );
+        assert_eq!(state["data"]["confirm_timeout_s"], json!(90.0), "{state}");
+        let left = state["data"]["confirm_expires_in_s"].as_f64().unwrap();
+        assert!(left > 80.0 && left <= 90.0, "{state}");
+        assert!(state["data"]["step"].as_u64().is_some(), "{state}");
+
+        // And it agrees with the `busy` refusal, which was the only probe a
+        // client used to have: both describe the same window.
+        let busy = roundtrip(&path, EXECUTE_ASK).await;
+        assert_eq!(busy["data"]["outcome"], json!("busy"), "{busy}");
+        let state = roundtrip(&path, "{\"cmd\": \"recover_state\"}\n").await;
+        assert_eq!(state["data"]["executing"], json!(true), "{state}");
+
+        // The query consumed nothing: the token still answers.
+        let done = roundtrip(&path, &confirm_request(&token, "continue")).await;
+        assert_eq!(done["ok"], json!(true), "{done}");
+        let state = roundtrip(&path, "{\"cmd\": \"recover_state\"}\n").await;
+        assert_eq!(state["data"]["executing"], json!(false), "{state}");
+        assert_eq!(state["data"]["awaiting_confirmation"], json!(false));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_lapsed_pause_reads_as_not_awaiting_over_the_socket() {
+        // This is the plugin defect being deleted: with nothing reported,
+        // a client assumed the band ceiling (3600 s) and went on claiming a
+        // confirmation was live for ~50 minutes after the daemon aborted.
+        let (path, wal_dir, _fake) =
+            spawn_confirm_server("state-lapsed", &[("confirm_z_before_resume", json!(true))]).await;
+        let paused = roundtrip(&path, EXECUTE_ASK).await;
+        let token = paused["data"]["resume_token"].as_str().unwrap().to_owned();
+        // The harness's confirm_timeout is 300 ms, and it is reported.
+        assert_eq!(paused["data"]["confirm_timeout_s"], json!(0.3), "{paused}");
+        tokio::time::sleep(Duration::from_millis(900)).await;
+        let state = roundtrip(&path, "{\"cmd\": \"recover_state\"}\n").await;
+        assert_eq!(
+            state["data"]["awaiting_confirmation"],
+            json!(false),
+            "a lapsed confirmation must not read as live: {state}"
+        );
+        assert!(state["data"]["resume_token"].is_null(), "{state}");
+        // The daemon really did abort, so "not awaiting" was the truth.
+        let marker = crate::detect::read_frame_invalid(&wal_dir).expect("frame-invalid marker");
+        assert_eq!(marker.reason, "confirmation-timeout");
+        let expired = roundtrip(&path, &confirm_request(&token, "continue")).await;
+        assert_eq!(expired["data"]["outcome"], json!("unknown-token"));
+    }
+
+    /// The expiry derivation itself, as a pure function of the clock.
+    ///
+    /// It has to be derived at read time and cannot be trusted as
+    /// published: the executor's `tokio::time::timeout` *cancels*
+    /// `SocketConfirmer::confirm` when the deadline fires, so the code that
+    /// would have cleared the mirror is dropped rather than run. Both
+    /// directions are checked against the same published pause.
+    #[test]
+    fn a_published_pause_expires_by_the_clock_not_by_being_told() {
+        let observed = Observed::default();
+        observed.begin();
+        let raised_at = std::time::Instant::now();
+        let (tx, _rx) = tokio::sync::oneshot::channel();
+        observed.publish_pause(&PauseNotice {
+            token: "plrc-test".to_owned(),
+            kind: "z-height",
+            step_id: 7,
+            phase: "z-confirm-standoff".to_owned(),
+            diagnosis: plr_recovery::Diagnosis::new(
+                "z_confirm_before_resume",
+                plr_recovery::Tier::Confirmable,
+                "what".to_owned(),
+                "why".to_owned(),
+                "fix".to_owned(),
+            ),
+            detail: Value::Null,
+            deadline: Duration::from_mins(10),
+            raised_at,
+            answer: tx,
+        });
+
+        // Halfway: live, with the remaining budget reported.
+        let mid = observed.snapshot_at(raised_at + Duration::from_mins(5));
+        assert!(mid.awaiting, "{mid:?}");
+        assert!(!mid.confirm_expired);
+        assert_eq!(mid.token.as_deref(), Some("plrc-test"));
+        assert_eq!(mid.confirm_timeout_s, Some(600.0));
+        assert_eq!(mid.expires_in_s, Some(300.0));
+
+        // Exactly at the deadline, and past it: gone, and said to be gone.
+        for after in [Duration::from_mins(10), Duration::from_mins(67)] {
+            let late = observed.snapshot_at(raised_at + after);
+            assert!(!late.awaiting, "{after:?}: {late:?}");
+            assert!(late.confirm_expired, "{after:?}: {late:?}");
+            assert!(late.token.is_none(), "{after:?}: {late:?}");
+            // Still executing: the abort path is running.
+            assert!(late.executing, "{after:?}: {late:?}");
+        }
+
+        // A never-stamped deadline is treated as already expired, not as a
+        // deadline far in the future.
+        let (tx, _rx) = tokio::sync::oneshot::channel();
+        observed.publish_pause(&PauseNotice {
+            token: "plrc-unstamped".to_owned(),
+            kind: "diagnosis",
+            step_id: 1,
+            phase: "idle-timeout".to_owned(),
+            diagnosis: plr_recovery::Diagnosis::new(
+                "x",
+                plr_recovery::Tier::Confirmable,
+                "w".to_owned(),
+                "y".to_owned(),
+                "f".to_owned(),
+            ),
+            detail: Value::Null,
+            deadline: Duration::ZERO,
+            raised_at: std::time::Instant::now(),
+            answer: tx,
+        });
+        let snapshot = observed.snapshot();
+        assert!(!snapshot.awaiting, "{snapshot:?}");
+        assert!(snapshot.confirm_expired, "{snapshot:?}");
+
+        // And the lease's end is what stops the claim entirely.
+        observed.end();
+        assert_eq!(observed.snapshot(), StateSnapshot::default());
+    }
+
+    /// The mirror stops claiming an execution is live when the execution
+    /// task is *dropped* rather than finishing — `systemctl restart plrd`.
+    /// Nothing on a success path has to run for this to hold.
+    #[tokio::test]
+    async fn an_aborted_execution_task_releases_the_lease() {
+        let observed = Arc::new(Observed::default());
+        let lease = ExecutionLease::begin(Arc::clone(&observed));
+        let join = tokio::spawn(async move {
+            let _lease = lease;
+            std::future::pending::<()>().await;
+        });
+        assert!(observed.snapshot().executing);
+        join.abort();
+        let _ = join.await;
+        assert!(
+            !observed.snapshot().executing,
+            "a dropped execution task must not leave the daemon looking busy forever"
+        );
     }
 
     /// The one transcript the WAL dir holds after an execution.
