@@ -119,8 +119,8 @@ control_socket = /var/lib/plrd/plrd.sock
 #                          REFUSAL POINT: the plugin rejects PLR_TOUCH /
 #                          PLR_DRAG_PROBE when max(current, target)
 #                          exceeds it. plrd therefore deliberately targets
-#                          BELOW it (see probe_nozzle_temp) and forgives
-#                          measured overshoot by a small tolerance:
+#                          BELOW it (see THE PROBE TEMPERATURE below) and
+#                          forgives measured overshoot by a small tolerance:
 #                            commanded target  <= ceiling - 5 C (headroom)
 #                            measured temp     <= ceiling + 2 C (tolerance,
 #                              mirrors the plugin's
@@ -130,22 +130,32 @@ control_socket = /var/lib/plrd/plrd.sock
 #                          around a legitimate target is absorbed;
 #                          commanding a hotter nozzle is not.
 #
-#                          !! Setting max_probe_nozzle_temp and
-#                          probe_nozzle_temp (or probe_temp_min) too close
-#                          together is what WEDGES a recovery: the probe
-#                          step runs after the Z frame is declared, so a
-#                          temperature refusal there aborts with the frame
-#                          unknown, blocks re-execution, and regenerates an
-#                          identical plan that fails identically. plrd
-#                          refuses such a config up front rather than
-#                          letting it wedge: the band must be wide enough
-#                          to hold the 5 C headroom below the ceiling.
-#   probe_nozzle_temp      nozzle temperature COMMANDED for probing, C.
-#                          Pulled into
-#                          [probe_temp_min, ceiling - 5] before it is
-#                          emitted, so with the defaults the plan sends
-#                          M104 S145 under a 150 C ceiling. Raising this
-#                          to the ceiling does NOT raise what is sent.
+#                          !! Setting max_probe_nozzle_temp too low WEDGES
+#                          a recovery: the probe step runs after the Z frame
+#                          is declared, so a temperature refusal there
+#                          aborts with the frame unknown, blocks
+#                          re-execution, and regenerates an identical plan
+#                          that fails identically. plrd refuses such a
+#                          config up front rather than letting it wedge:
+#                          the band must be wide enough to hold the 5 C
+#                          headroom below the ceiling, i.e.
+#                          min(160, this) - 5 >= 140, so this >= 145.
+#
+#                          THE PROBE TEMPERATURE IS DERIVED, NOT
+#                          CONFIGURED. There is no probe temperature key
+#                          in [plr]: the nozzle temperature plrd COMMANDS
+#                          for probing is
+#                            min(150, min(160, max_probe_nozzle_temp) - 5)
+#                          floored at 140 — the probing band [140, 160]
+#                          and the 150 C target are built-in constants
+#                          (PlanConfig / PROBE_TEMP_HEADROOM in
+#                          crates/plr-recovery/src/build.rs), and the -5 is
+#                          the headroom above. So with the defaults the
+#                          plan sends M104 S145 under a 150 C ceiling, and
+#                          max_probe_nozzle_temp is the ONE knob that moves
+#                          it: lower the ceiling and the commanded target
+#                          follows it down (145 C ceiling -> M104 S140);
+#                          from 155 C up the target stops at 150.
 #   pre_home_z_lift        Z lift added to the believed Z BEFORE XY homing,
 #                          mm, so the homing moves clear the part  (0,20] (5)
 #   reheat_park_x/y        nozzle park XY while reheating to print temps.

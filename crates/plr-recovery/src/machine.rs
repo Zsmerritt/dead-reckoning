@@ -134,14 +134,29 @@ pub struct MachineConfig {
     pub virtual_sdcard_root: Option<String>,
     /// Calibrated ADXL noise floor (the representative RMS the
     /// plugin's `PLR_NOISE_TEST` autosaves into `[plr]` as
-    /// `noise_floor_*`). Required — finite and positive — when the
-    /// probe kind is [`ProbeKind::AdxlDrag`]; ignored otherwise.
+    /// `noise_floor_rms` / `noise_floor_still_rms` / `noise_floor_peak`).
+    /// Required — finite and positive — when the probe kind is
+    /// [`ProbeKind::AdxlDrag`]; ignored otherwise.
+    ///
+    /// A **measurement** only. The `noise_floor_*` options that merely
+    /// describe a calibration — the speed and temperature it was taken at,
+    /// and the temperature sensor's name — must never land here: they are
+    /// classified out where the `[plr]` section is parsed
+    /// (`crates/plrd/src/plrcfg.rs`, `NOISE_FLOOR_METADATA_KEYS`).
+    /// Nothing at this layer can tell the difference — a recorded 40 °C is
+    /// a perfectly valid noise-floor number — so metadata reaching this
+    /// field silently retires the [`PrereqFailure::NoiseFloorMissing`]
+    /// refusal instead of tripping anything
+    /// (`a_metadata_only_calibration_must_arrive_as_missing` pins the
+    /// consequence).
     #[serde(default)]
     pub noise_floor: Option<f64>,
     /// Drag speed the noise floor was measured at, mm/s (the OPTIONAL
     /// `[plr]` `noise_floor_speed` autosave, staged by the plugin's
     /// `PLR_NOISE_TEST` alongside the `noise_floor_*` measurements —
-    /// `klippy_plugin/plr/noise_test.py`). The noise floor is
+    /// `klippy_plugin/plr/noise_test.py`). Metadata, so it is carried
+    /// separately from [`Self::noise_floor`] and never substitutes for
+    /// it. The noise floor is
     /// speed-specific, so when this is present and differs from the
     /// plan's `drag_speed` by more than 20% the plan carries
     /// [`crate::plan::PlanWarning::NoiseFloorSpeedMismatch`] — a
@@ -606,6 +621,30 @@ mod tests {
             "{}",
             rejection.failures[0]
         );
+    }
+
+    /// Why the measurement/metadata split has to happen upstream.
+    ///
+    /// A machine whose `[plr]` section records only calibration METADATA
+    /// (the speed, the temperature, the sensor name) has never measured a
+    /// floor, so it must arrive here as `None` and get the
+    /// "run `PLR_NOISE_TEST` first" refusal. This layer cannot enforce that
+    /// itself: the second half shows a plausible temperature (40 °C)
+    /// validating as a noise floor, because as a NUMBER it is entirely
+    /// legitimate. Classification is therefore the only guard, and it
+    /// lives at the parse boundary (`crates/plrd/src/plrcfg.rs`,
+    /// `NOISE_FLOOR_METADATA_KEYS`).
+    #[test]
+    fn a_metadata_only_calibration_must_arrive_as_missing() {
+        let mut config = drag_config();
+        // Metadata recorded, no measurement: the honest shape.
+        config.noise_floor = None;
+        config.noise_floor_speed = Some(20.0);
+        let rejection = validate_machine(&config).unwrap_err();
+        assert_eq!(rejection.failures, vec![PrereqFailure::NoiseFloorMissing]);
+        // The shape that would have slipped through unnoticed.
+        config.noise_floor = Some(40.0);
+        assert!(validate_machine(&config).is_ok());
     }
 
     #[test]
