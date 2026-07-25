@@ -277,14 +277,32 @@ inline.
 5. **Execute**: **`PLR_RECOVER EXECUTE=1 CONFIRM=YES`** — both
    arguments required verbatim, anything less refuses (CLI:
    `plrd recover --config /etc/plrd.conf --execute --confirm`, which
-   additionally asks an interactive yes). For your first recoveries
-   prefer the CLI with `--step` — it pauses before every plan step;
-   per-step mode is deliberately CLI-only (the console protocol is
-   one-shot and has no multi-round confirmation dialogue). Supervise
-   it: the printer must already be ready and idle, the nozzle will
-   approach the part at probing temperature, and any failed
-   verification aborts and leaves the printer as-is with a transcript
-   to review.
+   additionally asks an interactive yes). The console command **returns
+   immediately** and the recovery reports as it goes; it must, because a
+   console command that waited would hold klippy's only thread and stall
+   the heaters (see
+   [the plugin README](../klippy_plugin/README.md#every-daemon-call-is-asynchronous--and-why-that-is-a-safety-property)).
+   Because it returns early it must be the **last line of any macro** you
+   run it from: every later command holds the g-code mutex plrd needs for
+   its own, starving it while the nozzle is near the part. Nothing enforces
+   that yet — plrd's ready+idle gate does not see a console-invoked macro
+   (it reads `webhooks` / `print_stats` / `virtual_sdcard` only).
+   For your first recoveries set **`debug_confirm_each_step: True`** in
+   `[plr]`: plrd then stops before every step and prints the exact
+   commands it is about to send, and you answer
+   **`PLR_RECOVER_CONTINUE`** (or `PLR_RECOVER_ABORT`) — the same pause
+   the CLI's `--step` gives you, from the console. Supervise it: the
+   printer must already be ready and idle, the nozzle will approach the
+   part at probing temperature, and any failed verification aborts and
+   leaves the printer as-is with a transcript to review.
+6. **Answer whatever plrd asks.** Any *confirmable* failure stops and
+   explains itself — what happened, why it matters, what to change — and
+   offers to continue anyway (`PLR_RECOVER_CONTINUE`) or stop
+   (`PLR_RECOVER_ABORT`). So does `confirm_z_before_resume` if you set it,
+   which is the last moment a human can compare plrd's believed Z against
+   the actual nozzle. Unanswered questions abort cleanly on plrd's own
+   `confirm_timeout_s`; that abort invalidates the Z frame, so a fresh dry
+   run is required before retrying.
 
 ### Manual fallback
 
@@ -319,9 +337,13 @@ same machinery: the console command calls the daemon's control socket,
 which runs the identical pipeline (WAL → reconstruction → stop-point
 match → contact selection → validated plan) and the identical gate
 stack — the plugin adds a client-side consent check on top, it replaces
-nothing. The one difference: the CLI's interactive TTY prompt is
-replaced by the explicit `EXECUTE=1 CONFIRM=YES` arguments, and
-`--step` (pause before every step) is CLI-only. A complete real
+nothing. The differences: the CLI's interactive TTY prompt is replaced by
+the explicit `EXECUTE=1 CONFIRM=YES` arguments; the CLI's `--step` flag is
+CLI-only, and the console equivalent is the `[plr]` key
+`debug_confirm_each_step`, which makes plrd pause before every step and
+ask over the socket (answer with `PLR_RECOVER_CONTINUE` /
+`PLR_RECOVER_ABORT`); and the console command returns as soon as the
+recovery has started rather than when it finishes. A complete real
 transcript of everything below is in the
 [walkthrough](../examples/recovery-walkthrough.md#from-evidence-to-a-plan-plrd-recover).
 

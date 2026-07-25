@@ -255,6 +255,15 @@ def test_get_status_shape_on_good_config(plugin):
         "probe_resolution": None,
         "daemon_alive": False,
         "wizard_active": False,
+        # The live recover_execute conversation (plr/recovery.py).  Local
+        # state only: get_status runs on the reactor several times a second
+        # and must never touch the control socket.
+        "recovery_state": "idle",
+        "recovery_awaiting_confirmation": False,
+        # Whether an answer can still be sent — a property of the token, not
+        # of the state, published so the console and the API carry the same
+        # information.
+        "recovery_can_answer": False,
         "clean_nozzle_macro_available": False,
         "noise_floor_rms": None,
         "noise_floor_temp": None,

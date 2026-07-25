@@ -264,15 +264,85 @@ On failure (medians disagree, or a sequence cannot reach consensus at
 all) it prints a copy-pasteable retry with `SEQUENCES` escalated and
 `VERIFY_RANGE` loosened (still capped).
 
+### Every daemon call is asynchronous — and why that is a safety property
+
+Klippy has **one thread**. It runs a single `select`/dispatch loop that
+invokes g-code handlers inline (`klippy/reactor.py:314-327`), so anything
+a handler waits for, klippy waits for: no timer fires, no file descriptor
+is serviced, and the g-code mutex the handler holds
+(`klippy/gcode.py:239-241`) is not released.
+
+That is not merely slow. Klipper's heaters compare every PWM update
+against a deadline refreshed only from the reactor
+(`MAX_MAINTHREAD_TIME = 5.0`, `klippy/extras/heaters.py:17`, :72-74,
+:138-141): a reactor stalled past it silently drops every heater to 0 %
+with its target still set, which `verify_heater` can escalate to a
+printer shutdown (`klippy/extras/verify_heater.py:86-91`). A recovery is
+exactly the window where this bites: the plan sets the bed temperature
+first and holds for the probe temperature before any motion.
+
+The MCU-side bound is tighter still: heater pins are armed with
+`MAX_HEAT_TIME = 3.0` (`heaters.py:14`, :62) and a pin left at a
+non-default value with no further update inside that window shuts the MCU
+down (`src/pwmcmds.c:45-53`). The host stays clear of *that* only because
+heater PWM is refreshed from the serial background thread rather than the
+reactor (`klippy/serialhdl.py:41-65` dispatches registered responses;
+`klippy/mcu.py:628-630` registers the ADC callback) — so a stalled
+reactor turns the heaters off rather than shutting the MCU down. Mid-print
+there is a further hazard in the same class: a reactor that stops flushing
+the motion queue and then resumes is the classic source of Klipper's
+`Timer too close`.
+
+And it deadlocks: plrd drives the machine through Moonraker's
+`printer.gcode.script`, which Moonraker forwards to klippy's API socket
+(`klippy/webhooks.py:439-448`) — so it needs the reactor and the same
+g-code mutex the blocked handler is holding.
+
+**Therefore no `PLR_*` command ever waits for plrd inside its handler.**
+Every daemon call runs on a worker thread and reports back through
+`reactor.register_async_callback` (`klippy/reactor.py:199-205`), klippy's
+own cross-thread wakeup. The visible consequences:
+
+- commands **return immediately** and print their result when it arrives,
+  so `PLR_STATUS` prints the plugin's own state first and plrd's block
+  second;
+- a failure a worker discovers arrives as an error line (`!!`) rather than
+  a command error, because a callback has no command left to fail.
+
+#### `PLR_RECOVER EXECUTE=1` must be the LAST line of any macro
+
+**Rule, not advice.** The command returns while the recovery is still
+running, and the blocker is the **g-code mutex**, not the reactor:
+`run_script` holds it for the whole script (`klippy/gcode.py:239-241`), and
+plrd needs that same mutex for every command it sends. So a macro's
+*remaining* lines keep plrd out — starving it while it has the nozzle near
+the part at probing temperature — even though they are perfectly
+well-behaved klippy code that pauses the reactor politely. (`M109`/`M190`
+block for minutes exactly that way: `reactor.pause` keeps the reactor
+free, but the mutex stays held.) Anything after `PLR_RECOVER EXECUTE=1` in
+a macro therefore delays plrd's next step by however long it takes, and
+anything that moves races plrd for the machine.
+
+Nothing enforces this today, and this document previously claimed
+otherwise: plrd's ready+idle gate does **not** catch it. That gate queries
+`webhooks`, `print_stats` and `virtual_sdcard` only
+(`crates/plrd/src/recover.rs:672-692`), and a console-invoked macro leaves
+all three in their accepted states, so the gate passes every time. The
+enforceable fix is a daemon-side change — adding `idle_timeout` to that
+gate, which the daemon already subscribes to (`crates/plrd/src/client.rs:69`)
+and whose `"Printing"` state distinguishes a macro that moves from one that
+only prints a message — and it is queued, not shipped. Until it lands, the
+rule above is the whole protection.
+
 ### `PLR_STATUS`
 
 Plugin-side state (probe method, attestation, probe resolution, live
-tunables with pending-save markers) plus the daemon's own `status`
-report over the control socket. If plrd is unreachable the plugin
-state still prints, with a clear hint
+tunables with pending-save markers, and the live recovery state) prints
+immediately; the daemon's own `status` report follows when it answers. If
+plrd is unreachable the plugin state still prints, with a clear hint
 (`systemctl status plrd`).
 
-### `PLR_RECOVER [EXECUTE=1 CONFIRM=YES] [STEP=1]`
+### `PLR_RECOVER [EXECUTE=1 CONFIRM=YES]`
 
 Power-loss recovery, driven by plrd:
 
@@ -281,11 +351,140 @@ Power-loss recovery, driven by plrd:
 - `PLR_RECOVER EXECUTE=1 CONFIRM=YES` — execute. Both arguments are
   required verbatim; anything less refuses client-side. plrd still
   enforces every gate server-side (machine validation, klippy
-  ready+idle, transcript), so the console consent is additive.
-- `STEP=1` is accepted syntax but the daemon **refuses** it over the
-  control socket (`per-step mode is CLI-only`): the one-shot socket
-  protocol has no multi-round confirmation dialogue. For a step-by-step
-  recovery use the CLI: `plrd recover --execute --confirm --step`.
+  ready+idle, transcript), so the console consent is additive. The
+  command returns as soon as plrd has been asked to start; the recovery
+  reports to the console as it goes, and stops to ask you questions (next
+  section).
+- `STEP=1` is **refused client-side**, with the remedy: the daemon
+  rejects a `step` argument over the control socket outright
+  (`per-step mode is CLI-only`), and the socket route to a step-by-step
+  recovery is the `[plr]` key `debug_confirm_each_step`, which makes plrd
+  stop and ask before **every** step (see below). `plrd recover --execute
+  --confirm --step` remains the CLI equivalent.
+
+### Answering plrd's questions: `PLR_RECOVER_CONTINUE` / `PLR_RECOVER_ABORT`
+
+A recovery is not a single request. plrd **pauses** and asks whenever it
+hits a *confirm-point*, and the plugin renders each one as a dialog whose
+two buttons fire exactly these two console commands — so the whole
+interaction is completable from a bare console on a client that renders no
+dialog at all:
+
+| command | meaning |
+| --- | --- |
+| `PLR_RECOVER_CONTINUE` | proceed despite what plrd reported |
+| `PLR_RECOVER_ABORT` | stop the recovery cleanly, here |
+
+There are three kinds of confirm-point, and the prompt asks a different
+question for each:
+
+- a **`Tier::Confirmable` diagnosis** — "continue despite this?". Every
+  such failure says WHY it stopped, SUGGESTS a fix, and offers to continue
+  anyway. When the diagnosis names an `UNSAFE_` override key, the prompt
+  *says so as a fact* and tells you it is set in `printer.cfg` while the
+  machine is idle — it is never a button.
+- **`confirm_z_before_resume`** (a `[plr]` key) — "does this look right?":
+  plrd lifts to a standoff, reports the Z it believes it is at and the
+  arithmetic behind it, and waits for you to compare it against the actual
+  nozzle. Declining invalidates the Z frame, so a fresh dry run is
+  required before any resume.
+- **`debug_confirm_each_step`** (a `[plr]` key) — "run the next step?"
+  before every step, listing that step's exact commands.
+
+Only one question is ever outstanding, and plrd runs exactly one recovery
+at a time. `PLR_STATUS` re-states the outstanding question in full —
+prompt included — and `PLR_WIZARD_START` does too rather than offering a
+new recovery over the top of it.
+
+#### What the plugin will and will not claim about the machine
+
+This is the operator contract, and it is deliberately asymmetric: the
+plugin will tell you it does not know, but it will never tell you nothing
+is happening unless it can show that. `get_status` publishes
+`recovery_state`, and the console prints the same thing from the same
+source, so the two can never disagree:
+
+| `recovery_state` | meaning | starting a new recovery |
+| --- | --- | --- |
+| `idle` | nothing known to be happening | allowed |
+| `running` | plrd is executing **this** session's recovery; its report comes to this console | refused locally |
+| `awaiting_confirmation` | plrd is paused on a question, and the plugin can still show it is live | refused locally |
+| `plrd_busy` | plrd **told us** it is executing a recovery (`busy`) that this session cannot report on or answer — positive proof the machine is under its control | allowed: plrd re-answers `busy` while it is still working |
+| `unknown` | plrd answered something that does not say what it is doing, or the plugin can no longer show a pause is live | allowed: it is the only way to find out |
+
+`recovery_awaiting_confirmation` is true only in the
+`awaiting_confirmation` row — never on the strength of a guess.
+`recovery_can_answer` is published separately, because whether an answer can
+still be **sent** is a property of the outstanding token rather than of the
+state: a question outlives the plugin's ability to vouch for it, and the
+console and the API say the same thing about it.
+
+In the two "allowed" rows the console says **do not touch the printer**, and
+the way to learn more is to try a recovery again — `PLR_WIZARD_START` (which
+keeps the dry-run review) or `PLR_RECOVER EXECUTE=1 CONFIRM=YES`. plrd
+answers `busy` if it is still working, and there is no path in the daemon to
+two concurrent recoveries. **That attempt is also the only exit from those
+two rows**, deliberately: nothing but plrd can tell this plugin the machine
+is free, so the state stands until a recovery conversation reaches a terminal
+answer. The wizard therefore still works in both rows, and carries the
+warning into its dialog rather than replacing it.
+
+If a question is still answerable in one of those rows,
+`PLR_RECOVER_CONTINUE` / `PLR_RECOVER_ABORT` still work — and starting a new
+recovery instead **abandons** it, says so, and sends `abort` to plrd for it
+so it is not left waiting out its own deadline.
+
+**"Sent" is never reported as "landed", and nothing can upgrade it.**
+Wherever the plugin sends an abort without owning the conversation — a klippy
+shutdown, or abandoning a question — it says the abort was *sent*, publishes
+`unknown`, and **stays there**. plrd's reply is read and reported (it may say
+"I am still paused at a confirm point", which you want to know) but it is
+never treated as confirmation, because `recover_confirm` only answers once
+plrd has FINISHED aborting — which includes pushing that step's cleanup
+commands through Moonraker. So on the intended success path the reply does
+not arrive inside the send window at all, and "no reply" is the rule rather
+than a failure. Only `journalctl -u plrd` showing plrd idle tells you the
+machine is free. An abort that never arrived leaves plrd paused, and it will
+run that cleanup when its own deadline expires; a console that had said
+"aborted, idle" is a machine that moves after the operator was told it was
+over.
+
+**Deadlines — two of them, and they end at different times.** plrd bounds
+an unanswered question itself and **aborts cleanly** when it expires: that
+is the safe direction and it is what you will see. Its deadline is
+`confirm_timeout_s` in `[plr]` if you set it, otherwise plrd's own default,
+which **no response reports**. So:
+
+- the plugin's dialog **wait** is longer than any deadline plrd could be
+  using (derived from the same `[plr]` value, plus named headroom), so
+  plrd's own abort always wins the race and is always what gets reported;
+- but if you did not set `confirm_timeout_s`, the plugin stops **claiming**
+  the question is live once plrd's own default has passed: `recovery_state`
+  becomes `unknown`, the console says plrd has probably aborted already, and
+  a new recovery stops being refused. The question stays answerable, because
+  plrd's reply is the only thing that can settle it.
+
+If your answer arrives after plrd gave up, plrd says so and the plugin
+reports it as the abort it is — never as a transport error. If plrd answers
+that it is no longer waiting for that answer *without* saying the recovery
+ended, the plugin says exactly that and goes to `unknown`: it will not tell
+you a recovery aborted when plrd may still be paused with the nozzle over
+the part.
+
+If klippy shuts down (M112, an MCU fault) while a question is open — or if
+one **arrives** after the shutdown, which is the likelier order — the plugin
+sends `abort` for you so plrd stops immediately rather than at its deadline,
+says it has been *sent*, and clears the dialog. It never leaves a live dialog
+on screen whose Continue button could not work. The state is then `unknown`
+and stays `unknown` (above) — no reply to that abort can make it calmer. A shutdown *during*
+execution cannot interrupt plrd: if the recovery is this session's, the
+plugin says so and its report still arrives; if plrd is executing one this
+plugin is not connected to (`plrd_busy`) it says that instead — **no report
+for that one will appear here** — and points at `journalctl -u plrd`. A shutdown does **not** stop `PLR_STATUS`,
+`PLR_RECOVER` or `PLR_WIZARD_START` from working — klippy stays up until
+`FIRMWARE_RESTART`, and that is exactly when you need to know what plrd
+thinks it is doing — but it does forbid *acting*: starting a recovery, or
+answering `continue`, are both refused until the shutdown is cleared.
 
 ### Recovery and setup wizards
 
@@ -323,9 +522,16 @@ daemon actually reports it — with two choices:
   corrupts the contact reading recovery depends on.
 - **`PLR_WIZARD_EXECUTE`** runs the plan — **the printer WILL MOVE** (all
   motion is plrd's, over the control socket; the wizard itself never
-  issues g-code). On success it reports *resuming print*; a typed failure
-  prints the remediation from the daemon's report.
-- **`PLR_WIZARD_CANCEL`** dismisses the flow and resets at any point.
+  issues g-code). It returns immediately and hands off to the same
+  recovery session `PLR_RECOVER` uses, so plrd's confirm-points appear as
+  prompts answered with `PLR_RECOVER_CONTINUE` / `PLR_RECOVER_ABORT`
+  (previous section). On success it reports *plrd has resumed the print*;
+  a typed failure prints the remediation from the daemon's report.
+- **`PLR_WIZARD_CANCEL`** dismisses the flow and resets at any point —
+  except while plrd is executing: at a confirm-point it answers `abort`
+  for you, and while a step is actually running it refuses rather than
+  resetting the plugin's view of a machine plrd is still driving (M112 is
+  the way to stop the machine now).
 
 A second `PLR_WIZARD_START` while a flow is active simply re-shows the
 current prompt; any daemon error resets the flow with a clear message.

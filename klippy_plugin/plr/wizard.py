@@ -7,7 +7,8 @@ everywhere else:
 
 * the **recovery wizard** (``PLR_WIZARD_*``) — a small state machine that
   walks an operator through a pending power-loss recovery: offer → review
-  plan → (confirm the nozzle is clean) → execute;
+  plan → (confirm the nozzle is clean) → execute → answer plrd's
+  confirm-points until it finishes;
 * the **commissioning wizard** (``PLR_SETUP_WIZARD``) — a one-shot dialog
   that reuses the exact ``PLR_SETUP`` report and adds a button per
   remaining commissioning step.
@@ -15,113 +16,79 @@ everywhere else:
 Prompts are sugar; console commands are the contract.  Every prompt this
 module emits is paired with plain-text fallback lines that name the exact
 console command which advances the flow, so a client without prompt
-support is never stuck.
+support is never stuck.  The action-line builders live in
+:mod:`plr.prompts` (with the wire format, the client-support notes and the
+portability rule) and are re-exported here.
 
-Action-prompt wire format (Mainsail "Macro Prompts" spec, supported since
-Mainsail 2.9.0):
+NO WIZARD COMMAND BLOCKS THE REACTOR.  Every daemon call this module makes
+runs on a worker thread and reports from a reactor callback
+(:mod:`plr.daemon_worker`, whose docstring carries the klippy evidence:
+a blocking socket read inside a g-code handler stalls klippy's single
+reactor thread, which switches the heaters off after ~5 s and risks an
+MCU-side shutdown after 3 s).  Handlers therefore print "asking plrd ..."
+and return; the answer arrives later, in :meth:`RecoveryWizard._offer` /
+:meth:`RecoveryWizard._plan`.
 
-    // action:prompt_begin <headline>
-    // action:prompt_text <text>
-    // action:prompt_button <label>|<gcode?>|<color?>
-    // action:prompt_footer_button <label>|<gcode?>|<color?>
-    // action:prompt_show
-    // action:prompt_end
-
-Colors: primary | secondary | info | warning | error (else a default).
-The plugin emits each action line through ``gcmd.respond_info``, which
-klippy itself prepends with the ``// `` transport prefix on every line
-(klippy/gcode.py ``respond_info``) — byte-identical to what
-``RESPOND TYPE=command MSG="action:..."`` puts on the wire
-(klippy/extras/respond.py maps TYPE=command to the ``//`` prefix).  The
-literal strings the tests assert are therefore the ``action:...`` payload
-without that prefix.
-
-NOTE — the ``[respond]`` module is NOT required for these wizards.  The
-Mainsail docs list it because their examples emit prompts from a
-``[gcode_macro]`` via the ``RESPOND`` command, which ``[respond]``
-provides; this module bypasses that by calling ``respond_info`` directly
-from plugin code.  Users need no config change.  (A prompt BUTTON that
-fires ``RESPOND ...`` would need it — which is why the buttons here fire
-``PLR_*`` commands instead.)
-
-Client support (verified July 2026): Mainsail >= 2.9.0 and KlipperScreen
-implement this full spec, including the pipe-delimited button fields.
-OctoPrint/OctoApp implement the older Action Command Prompt protocol
-(``prompt_begin`` / ``prompt_choice`` / ``prompt_button <text>`` /
-``prompt_show`` / ``prompt_end``) with NO pipe fields, gcode, or colors —
-a pipe-delimited button renders there as inert literal text, so the
-plain-console fallback is the working path on those clients.
+Because a reactor callback has no ``gcmd`` to raise on — and because an
+exception escaping one is a printer shutdown (klippy/klippy.py:170-186) —
+failures discovered by a worker are reported with
+``daemon_link.respond_error`` (klippy's own ``!!`` convention) instead of
+``gcmd.error``.  Everything decided synchronously in a handler still
+raises, so console/macro semantics are unchanged there.
 
 SAFETY INVARIANT: no wizard command ever sends motion g-code to the
 printer.  The ONLY machine motion a wizard triggers is the daemon's own
 ``recover_execute`` over the control socket; recovery prompt buttons fire
-other ``PLR_WIZARD_*`` console commands, and the setup wizard's buttons
-fire the existing ``PLR_SETUP`` / ``PLR_*_TEST`` / ``SAVE_CONFIG``
-commands (each of which owns its own consent + gates).  This module calls
-``plugin.daemon`` and ``gcmd.respond_info`` and nothing else.
+other ``PLR_*`` console commands, and the setup wizard's buttons fire the
+existing ``PLR_SETUP`` / ``PLR_*_TEST`` / ``SAVE_CONFIG`` commands (each of
+which owns its own consent + gates).  This module calls ``plugin.daemon``
+(off-reactor), ``gcode.respond_info`` and nothing else — in particular it
+never calls ``run_script``, which would queue behind plrd's own motion on
+the g-code mutex (klippy/gcode.py:239-241).
 """
 
-import collections
 import posixpath
 
 from . import daemon_link, setup_checks
+from .prompts import Prompt as _Prompt
+from .prompts import (
+    action_prompt_begin,
+    action_prompt_button,
+    action_prompt_end,
+    action_prompt_footer_button,
+    action_prompt_show,
+    action_prompt_text,
+    emit_prompt,
+)
 
 # --- recovery wizard states -----------------------------------------
 STATE_IDLE = "idle"  # no wizard in flight
+STATE_QUERY = "query"  # a plrd call is in flight for the wizard
 STATE_OFFERED = "offered"  # offer prompt shown; awaiting DRYRUN/CANCEL
 STATE_CLEAN_CHECK = "clean_check"  # clean-nozzle prompt; CONFIRM_CLEAN/CANCEL
 STATE_EXECUTE = "execute"  # execute prompt shown; EXECUTE/CANCEL
-
-
-# One prompt to render: a headline, descriptive text lines, primary
-# buttons and footer buttons (each ``(label, gcode, color)``), and the
-# plain-text fallback lines that name the advancing console command(s).
-_Prompt = collections.namedtuple(
-    "_Prompt", ["title", "texts", "buttons", "footers", "fallbacks"]
-)
+STATE_RUNNING = "running"  # handed off to plugin.recovery (its state now)
 
 _TITLE = "Power-loss recovery"
 
-
-# --- action-string builders (pure; unit-testable literals) ----------
-
-
-def _button_spec(label, gcode, color):
-    """``<label>|<gcode?>|<color?>`` with the pipes the Mainsail spec uses.
-
-    A color forces the middle field (empty gcode defaults to the label
-    on the client); gcode alone yields ``label|gcode``; label alone is
-    bare.
-    """
-    if color is not None:
-        return "|".join([label, gcode or "", color])
-    if gcode is not None:
-        return "|".join([label, gcode])
-    return label
-
-
-def action_prompt_begin(title):
-    return "action:prompt_begin %s" % (title,)
-
-
-def action_prompt_text(text):
-    return "action:prompt_text %s" % (text,)
-
-
-def action_prompt_button(label, gcode=None, color=None):
-    return "action:prompt_button %s" % (_button_spec(label, gcode, color),)
-
-
-def action_prompt_footer_button(label, gcode=None, color=None):
-    return "action:prompt_footer_button %s" % (_button_spec(label, gcode, color),)
-
-
-def action_prompt_show():
-    return "action:prompt_show"
-
-
-def action_prompt_end():
-    return "action:prompt_end"
+# Re-exported for callers (and tests) that reach for the builders here.
+__all__ = [
+    "RecoveryWizard",
+    "action_prompt_begin",
+    "action_prompt_button",
+    "action_prompt_end",
+    "action_prompt_footer_button",
+    "action_prompt_show",
+    "action_prompt_text",
+    "cmd_PLR_SETUP_WIZARD",
+    "cmd_PLR_WIZARD_CANCEL",
+    "cmd_PLR_WIZARD_CLOSE",
+    "cmd_PLR_WIZARD_CONFIRM_CLEAN",
+    "cmd_PLR_WIZARD_DRYRUN",
+    "cmd_PLR_WIZARD_EXECUTE",
+    "cmd_PLR_WIZARD_START",
+    "emit_prompt",
+]
 
 
 # --- defensive readers over the daemon response data ----------------
@@ -302,11 +269,14 @@ class RecoveryWizard:
     All state lives on the one instance the plugin holds; a second
     ``PLR_WIZARD_START`` while active re-shows the current prompt rather
     than starting a parallel flow, and any daemon error resets the flow
-    to idle.
+    to idle.  Execution itself is owned by
+    :class:`plr.recovery.RecoverySession` (shared with ``PLR_RECOVER``), so
+    the wizard hands off and then reflects that session's state.
     """
 
     def __init__(self, plugin):
         self.plugin = plugin
+        self.printer = plugin.printer
         self._state = STATE_IDLE
         self._prompt = None  # last emitted _Prompt, for re-show
 
@@ -315,45 +285,75 @@ class RecoveryWizard:
     def is_active(self):
         return self._state != STATE_IDLE
 
+    def state(self):
+        return self._state
+
     # -- emission ----------------------------------------------------
 
-    def _emit_prompt(self, gcmd, prompt):
+    def _respond(self):
+        """The console output callable.
+
+        ``gcmd.respond_info`` IS ``gcode.respond_info`` (klippy/gcode.py:32
+        wires the wrapper), so using the dispatcher directly makes handler
+        output and worker-callback output byte-identical — and it is the
+        only output path available from a callback, which has no gcmd.
+        """
+        return self.printer.lookup_object("gcode").respond_info
+
+    def _emit_prompt(self, prompt):
         """Emit one prompt as ordered action lines, then its fallback.
 
         Order is fixed and asserted by tests: begin, text*, button*,
         footer_button*, show, then the plain-text fallback line(s) that
         name the advancing console command.
         """
-        respond = gcmd.respond_info
-        respond(action_prompt_begin(prompt.title))
-        for text in prompt.texts:
-            respond(action_prompt_text(text))
-        for label, gcode, color in prompt.buttons:
-            respond(action_prompt_button(label, gcode, color))
-        for label, gcode, color in prompt.footers:
-            respond(action_prompt_footer_button(label, gcode, color))
-        respond(action_prompt_show())
-        for line in prompt.fallbacks:
-            respond(line)
+        emit_prompt(self._respond(), prompt)
 
-    def _show(self, gcmd, prompt, state):
+    def _show(self, prompt, state):
         self._prompt = prompt
         self._state = state
-        self._emit_prompt(gcmd, prompt)
+        self._emit_prompt(prompt)
 
-    def _reshow(self, gcmd):
+    def _reshow(self):
         if self._prompt is not None:
-            self._emit_prompt(gcmd, self._prompt)
+            self._emit_prompt(self._prompt)
 
     def _reset(self):
         self._state = STATE_IDLE
         self._prompt = None
+        # Drop any answer still in flight for this flow.  Without this, a
+        # PLR_WIZARD_CANCEL issued while the `status` query was outstanding
+        # would be undone the moment plrd answered: the callback would open
+        # the offer prompt again and resurrect a wizard the operator had
+        # just dismissed.
+        self.plugin.daemon_wizard.cancel()
 
-    def _fail_daemon(self, gcmd, command, err):
-        """Reset, clear any shown dialog, and raise a console error."""
+    def _fail_daemon(self, command, err):
+        """Reset, clear any shown dialog, and report a console error.
+
+        Called from worker callbacks, so it cannot raise ``gcmd.error``:
+        see the module docstring.
+        """
         self._reset()
-        gcmd.respond_info(action_prompt_end())
-        raise gcmd.error(_daemon_down_text(command, err))
+        gcode = self.printer.lookup_object("gcode")
+        gcode.respond_info(action_prompt_end())
+        daemon_link.respond_error(gcode, _daemon_down_text(command, err))
+
+    def _query(self, command, cmd, timeout, on_result):
+        """Start one wizard daemon call; raise if one is already in flight."""
+
+        def on_error(err):
+            self._fail_daemon(command, err)
+
+        if not self.plugin.daemon_wizard.call(cmd, None, timeout, on_result, on_error):
+            # `refusal_text` says which refusal it was (busy vs closed vs a
+            # thread that could not start) instead of promising a report that
+            # may never arrive.
+            raise self.printer.command_error(
+                self.plugin.daemon_wizard.refusal_text(command)
+                or "%s: plrd could not be contacted." % (command,)
+            )
+        self._state = STATE_QUERY
 
     # -- transitions -------------------------------------------------
 
@@ -361,31 +361,82 @@ class RecoveryWizard:
         """PLR_WIZARD_START — offer recovery if the daemon has one pending.
 
         A second START while a wizard is active re-shows the current
-        prompt (idempotent), never a second parallel flow.
+        prompt (idempotent), never a second parallel flow.  Returns as
+        soon as the ``status`` query is handed to a worker.
         """
+        recovery_session = self.plugin.recovery
+        # QUESTION ASKED: is there anything the operator must attend to?  A
+        # question they can still answer is the reason they ran this, so it
+        # is re-shown even when the plugin can no longer vouch for it —
+        # offering a fresh "Attempt recovery" dialog instead would bury it.
+        if recovery_session.can_answer():
+            gcmd.respond_info(
+                "PLR wizard: a recovery confirmation is still open.\n%s"
+                % ("\n".join(recovery_session.status_lines()),)
+            )
+            recovery_session.reshow(gcmd.respond_info)
+            return
+        # QUESTION ASKED: may a new recovery be started?  NOT
+        # `needs_attention()` — the two unknowable states need attention but
+        # do permit an attempt, and refusing here made them states a session
+        # could enter and never leave: the wizard would be dead for the rest
+        # of the klippy session, leaving a bare PLR_RECOVER EXECUTE=1 (which
+        # skips the dry-run review this flow exists to impose) or a firmware
+        # restart as the only ways out.
+        if self._state == STATE_RUNNING or not recovery_session.may_start_new():
+            gcmd.respond_info(
+                "PLR wizard: plrd is working on this session's recovery — not "
+                "offering a new one until it reports.\n%s"
+                % ("\n".join(recovery_session.status_lines()),)
+            )
+            return
+        if self._state == STATE_QUERY:
+            # There is nothing to re-show yet: the answer that decides what
+            # the prompt says has not arrived.  Say that, rather than
+            # claiming a re-show that emits nothing.
+            gcmd.respond_info(
+                "PLR wizard: still waiting for plrd's answer — the prompt "
+                "appears as soon as it replies."
+            )
+            return
         if self._state != STATE_IDLE:
             gcmd.respond_info(
                 "PLR wizard already in progress — re-showing the current prompt."
             )
-            self._reshow(gcmd)
+            self._reshow()
             return
-        try:
-            resp = self.plugin.daemon.call("status", timeout=daemon_link.STATUS_TIMEOUT)
-        except daemon_link.DaemonError as e:
-            self._fail_daemon(gcmd, "PLR_WIZARD_START", e)
+        gcmd.respond_info("PLR wizard: asking plrd whether a recovery is pending...")
+        self._query(
+            "PLR_WIZARD_START", "status", daemon_link.STATUS_TIMEOUT, self._offer
+        )
+
+    def _offer(self, resp):
+        """The ``status`` answer, on the reactor thread."""
         data = resp.get("data", {})
+        if not isinstance(data, dict):
+            data = {}
         # ctrlsock.rs build_status: data["pending"] is null when nothing
         # is pending, else the serialized detect.rs PendingRecovery.
         pending = _pending_recovery(data)
+        respond = self._respond()
         if pending is None:
-            gcmd.respond_info(
+            self._reset()
+            respond(
                 "PLR wizard: no power-loss recovery is pending — nothing to do.\n"
                 "If you believe a print was interrupted, check PLR_STATUS."
             )
             return
+        texts = _summarize(pending)
+        # The flow is reachable in the two unknowable states BY DESIGN (they
+        # would otherwise have no exit but a bare PLR_RECOVER EXECUTE=1), so
+        # the warning that belongs to them travels INTO the dialog rather
+        # than being replaced by it.
+        if self.plugin.recovery.needs_attention():
+            texts.extend(self.plugin.recovery.status_lines())
+        texts.append("Attempt recovery, or dismiss this prompt.")
         prompt = _Prompt(
             title=_TITLE,
-            texts=_summarize(pending) + ["Attempt recovery, or dismiss this prompt."],
+            texts=texts,
             buttons=[("Attempt recovery", "PLR_WIZARD_DRYRUN", "primary")],
             footers=[("Dismiss", "PLR_WIZARD_CANCEL", "error")],
             fallbacks=[
@@ -393,8 +444,8 @@ class RecoveryWizard:
                 "or PLR_WIZARD_CANCEL to dismiss."
             ],
         )
-        gcmd.respond_info("Power-loss recovery available.")
-        self._show(gcmd, prompt, STATE_OFFERED)
+        respond("Power-loss recovery available.")
+        self._show(prompt, STATE_OFFERED)
 
     def dryrun(self, gcmd):
         """PLR_WIZARD_DRYRUN — fetch the plan and prompt for the next step."""
@@ -403,22 +454,40 @@ class RecoveryWizard:
                 "PLR_WIZARD_DRYRUN: no recovery in progress — run "
                 "PLR_WIZARD_START first."
             )
-        try:
-            resp = self.plugin.daemon.call(
-                "recover_dryrun", timeout=daemon_link.RECOVER_TIMEOUT
+        if self._state in (STATE_QUERY, STATE_RUNNING):
+            raise gcmd.error(
+                "PLR_WIZARD_DRYRUN: the wizard is busy (%s) — wait for plrd's "
+                "report." % (self._state,)
             )
-        except daemon_link.DaemonError as e:
-            self._fail_daemon(gcmd, "PLR_WIZARD_DRYRUN", e)
-        gcmd.respond_info(resp.get("text") or "plrd returned an empty dry-run report")
+        gcmd.respond_info(
+            "PLR wizard: asking plrd for the recovery plan (no motion). This "
+            "can take a while on a large journal."
+        )
+        self._query(
+            "PLR_WIZARD_DRYRUN",
+            "recover_dryrun",
+            daemon_link.DRYRUN_TIMEOUT,
+            self._plan,
+        )
+
+    def _plan(self, resp):
+        """The ``recover_dryrun`` answer, on the reactor thread."""
+        respond = self._respond()
+        respond(resp.get("text") or "plrd returned an empty dry-run report")
         if not resp.get("ok"):
             self._reset()
-            gcmd.respond_info(action_prompt_end())
-            raise gcmd.error(
+            gcode = self.printer.lookup_object("gcode")
+            gcode.respond_info(action_prompt_end())
+            daemon_link.respond_error(
+                gcode,
                 "PLR_WIZARD_DRYRUN: plrd dry run reported failure (see the "
                 "report above); wizard reset. Fix the reported issue and run "
-                "PLR_WIZARD_START again."
+                "PLR_WIZARD_START again.",
             )
+            return
         data = resp.get("data", {})
+        if not isinstance(data, dict):
+            data = {}
         # ctrlsock.rs cmd_recover_dryrun emits the clean-nozzle flag top
         # level on every outcome (see _clean_flag).  The branch is decided
         # by BOTH the daemon flag and the plugin's own macro detection,
@@ -428,11 +497,11 @@ class RecoveryWizard:
             _clean_flag(data), self.plugin.clean_nozzle_macro_available, macro
         )
         if ask:
-            self._show_clean_check(gcmd, reason)
+            self._show_clean_check(reason)
         else:
-            self._show_execute(gcmd, auto_clean=True)
+            self._show_execute(auto_clean=True)
 
-    def _show_clean_check(self, gcmd, reason=None):
+    def _show_clean_check(self, reason=None):
         texts = [
             "Contact readings need a clean nozzle — filament or ooze on "
             "the tip skews every reading.",
@@ -450,21 +519,36 @@ class RecoveryWizard:
                 "if it is dirty run PLR_WIZARD_CANCEL and clean it first."
             ],
         )
-        self._show(gcmd, prompt, STATE_CLEAN_CHECK)
+        self._show(prompt, STATE_CLEAN_CHECK)
 
-    def _show_execute(self, gcmd, auto_clean):
+    def _show_execute(self, auto_clean):
         """Emit the execute prompt.
 
         ``auto_clean`` is only ever set when BOTH sources agree the nozzle
         gets cleaned automatically (:func:`_clean_decision`), so the copy
         can name the macro as a fact grounded in the plugin's own config
         rather than in the daemon's boolean alone.
+
+        The two confirm-point keys are announced here when set, because
+        they change what the operator is about to be asked to do — plrd
+        will stop mid-recovery and wait for them.
         """
         texts = ["Execute the recovery plan? The printer WILL MOVE."]
         if auto_clean:
             texts.append(
                 "[gcode_macro %s] is configured and plrd reports it will run "
                 "to clean the nozzle first." % (self.plugin.clean_nozzle_macro,)
+            )
+        if self.plugin.daemon_keys.get("confirm_z_before_resume") is True:
+            texts.append(
+                "[plr] confirm_z_before_resume is set: plrd will lift to a "
+                "standoff and ask you to check the nozzle height before it "
+                "resumes."
+            )
+        if self.plugin.daemon_keys.get("debug_confirm_each_step") is True:
+            texts.append(
+                "[plr] debug_confirm_each_step is set: plrd will stop and ask "
+                "before EVERY step."
             )
         prompt = _Prompt(
             title=_TITLE,
@@ -476,7 +560,7 @@ class RecoveryWizard:
                 "printer WILL MOVE), or PLR_WIZARD_CANCEL to abort."
             ],
         )
-        self._show(gcmd, prompt, STATE_EXECUTE)
+        self._show(prompt, STATE_EXECUTE)
 
     def confirm_clean(self, gcmd):
         """PLR_WIZARD_CONFIRM_CLEAN — nozzle attested clean → execute prompt."""
@@ -485,37 +569,55 @@ class RecoveryWizard:
                 "PLR_WIZARD_CONFIRM_CLEAN: not awaiting a nozzle-clean "
                 "confirmation — run PLR_WIZARD_START then PLR_WIZARD_DRYRUN."
             )
-        self._show_execute(gcmd, auto_clean=False)
+        self._show_execute(auto_clean=False)
 
     def execute(self, gcmd):
-        """PLR_WIZARD_EXECUTE — run recover_execute; end the prompt; report."""
+        """PLR_WIZARD_EXECUTE — hand off to the recovery session.
+
+        Returns as soon as plrd has been asked to start: the execution, its
+        confirm-points and its final report belong to
+        :class:`plr.recovery.RecoverySession`, which reports them from
+        reactor callbacks.  The wizard stays in STATE_RUNNING until that
+        session finishes, so ``wizard_active`` stays honest.
+        """
         if self._state != STATE_EXECUTE:
             raise gcmd.error(
                 "PLR_WIZARD_EXECUTE: not ready to execute — review the plan "
                 "with PLR_WIZARD_START then PLR_WIZARD_DRYRUN first."
             )
-        try:
-            resp = self.plugin.daemon.call(
-                "recover_execute",
-                {"confirm": True},
-                timeout=daemon_link.RECOVER_TIMEOUT,
-            )
-        except daemon_link.DaemonError as e:
-            self._fail_daemon(gcmd, "PLR_WIZARD_EXECUTE", e)
-        # The flow is over regardless of outcome: reset before reporting.
-        self._reset()
-        gcmd.respond_info(resp.get("text") or "plrd returned an empty recovery report")
-        gcmd.respond_info(action_prompt_end())
-        if resp.get("ok"):
-            gcmd.respond_info("PLR recovery complete — resuming print.")
-            return
-        raise gcmd.error(
-            "PLR recovery did not complete (see the report above for the typed "
-            "failure and how to remediate). Re-run PLR_WIZARD_START to retry."
+        # start() raises on refusal, which leaves the execute prompt in
+        # place: the operator can retry without walking the flow again.
+        self.plugin.recovery.start(
+            gcmd, "PLR_WIZARD_EXECUTE", on_finished=self._recovery_finished
         )
+        self._state = STATE_RUNNING
+        self._prompt = None
+        gcmd.respond_info(action_prompt_end())
+
+    def _recovery_finished(self):
+        """The recovery session has reported; drop back to idle."""
+        if self._state == STATE_RUNNING:
+            self._reset()
 
     def cancel(self, gcmd):
-        """PLR_WIZARD_CANCEL — dismiss the prompt and reset to idle."""
+        """PLR_WIZARD_CANCEL — dismiss the prompt and reset to idle.
+
+        A recovery that is already executing is NOT dismissed here: the
+        session refuses (or, at a confirm-point, answers ``abort``), because
+        resetting the plugin's own view while plrd still drives the machine
+        is precisely the outcome nobody can act on.
+        """
+        # QUESTION ASKED: is there anything the operator must attend to?  If
+        # so the session decides what cancelling can mean — answering abort
+        # for a question (even one it can no longer vouch for), and refusing
+        # for anything it cannot stop.
+        if self.plugin.recovery.needs_attention():
+            self.plugin.recovery.cancel(gcmd, "PLR_WIZARD_CANCEL")
+            self._reset()
+            gcmd.respond_info(
+                "PLR wizard cancelled. Run PLR_WIZARD_START to reopen recovery."
+            )
+            return
         was_active = self._state != STATE_IDLE
         self._reset()
         gcmd.respond_info(action_prompt_end())
@@ -606,7 +708,7 @@ class RecoveryWizard:
             fallbacks=fallbacks,
         )
         # A standalone dialog: emit without touching recovery state.
-        self._emit_prompt(gcmd, prompt)
+        self._emit_prompt(prompt)
 
     def close(self, gcmd):
         """PLR_WIZARD_CLOSE — dismiss whatever dialog is on screen.
@@ -614,10 +716,22 @@ class RecoveryWizard:
         Display-only: it emits ``prompt_end`` and deliberately does NOT
         touch the recovery state machine, so closing the commissioning
         dialog cannot silently abandon an in-flight recovery (dismiss that
-        with ``PLR_WIZARD_CANCEL``; ``PLR_WIZARD_START`` re-shows it).
+        with ``PLR_WIZARD_CANCEL``; ``PLR_WIZARD_START`` re-shows it).  In
+        particular it never touches an outstanding confirm-point: the token
+        lives on the recovery session, so ``PLR_RECOVER_CONTINUE`` still
+        works after the dialog is closed.
         """
         gcmd.respond_info(action_prompt_end())
-        if self.is_active():
+        # QUESTION ASKED: is there anything the operator must attend to?
+        # Closing a dialog must not drop the machine-state warning that goes
+        # with it — including in the two unknowable states, whose whole point
+        # is "do not touch the printer".
+        if self.plugin.recovery.needs_attention():
+            gcmd.respond_info(
+                "PLR: dialog closed.\n%s"
+                % ("\n".join(self.plugin.recovery.status_lines()),)
+            )
+        elif self.is_active():
             gcmd.respond_info(
                 "PLR: dialog closed. The recovery wizard is still in "
                 "progress — PLR_WIZARD_START re-shows it, PLR_WIZARD_CANCEL "

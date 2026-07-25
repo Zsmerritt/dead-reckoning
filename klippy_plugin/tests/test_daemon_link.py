@@ -80,15 +80,37 @@ def test_bounds_are_inclusive():
     )
 
 
-@pytest.mark.parametrize("seconds", [0.0, 0.01, 121.0, -5.0])
+@pytest.mark.parametrize("seconds", [0.0, 0.01, 14401.0, -5.0])
 def test_out_of_range_rejected(seconds):
     with pytest.raises(ValueError, match="out of range"):
         daemon_link.validate_timeout(seconds)
 
 
-def test_recover_timeout_is_within_bounds():
-    # The recover path uses the ceiling; the two constants must agree.
-    assert daemon_link.RECOVER_TIMEOUT <= daemon_link.MAX_TIMEOUT
+def test_every_call_timeout_is_within_bounds():
+    # Every per-command deadline must be a value `call` will accept: an
+    # out-of-band constant would turn a daemon call into a ValueError from
+    # a worker thread, which is the one place a raise helps nobody.
+    for timeout in (
+        daemon_link.PING_TIMEOUT,
+        daemon_link.STATUS_TIMEOUT,
+        daemon_link.DRYRUN_TIMEOUT,
+        daemon_link.EXECUTE_TIMEOUT,
+    ):
+        assert daemon_link.validate_timeout(timeout) == timeout
+
+
+def test_execute_timeout_outlasts_the_daemons_own_step_deadlines():
+    # plrd answers recover_execute only when the recovery pauses or
+    # finishes, and its own per-step deadlines are minutes each
+    # (crates/plrd/src/executor.rs:150-155: verify_timeout 10 s,
+    # temp_timeout 15 min).  A stock plan waits for the bed AND then the
+    # probe temperature, so the client deadline has to exceed several of
+    # those or it would manufacture a transport error while plrd is still
+    # legitimately working.  Derived from the daemon's number, in
+    # tests/test_recovery_deadlines.py, which parses it out of the Rust
+    # source; here we only pin the ordering against the other constants.
+    assert daemon_link.EXECUTE_TIMEOUT > daemon_link.DRYRUN_TIMEOUT
+    assert daemon_link.EXECUTE_TIMEOUT > 2 * 15 * 60.0
 
 
 def test_call_rejects_invalid_timeout():
@@ -267,32 +289,70 @@ class StubDaemon:
         return self.response
 
 
-def test_plr_status_reports_plugin_and_daemon(plugin, run_cmd):
+def test_plr_status_reports_plugin_and_daemon(plugin, run_cmd, pump):
     plugin.daemon = StubDaemon(
         response={"ok": True, "text": "armed\nwal: 3 segments", "data": {}}
     )
     plugin.note_pending_save("drag_speed")
     gcode = run_cmd("PLR_STATUS")
+    # The plugin's own state is printed by the HANDLER, synchronously...
     out = gcode.responses[-1]
     assert "probe_method: tap" in out
     assert "self_locking_z attested: no" in out
     assert "not measured" in out
     assert "probe_speed: 1.5" in out
     assert "drag_speed: 20 [awaiting SAVE_CONFIG]" in out
-    assert "armed" in out and "wal: 3 segments" in out
+    assert "recovery: idle" in out
+    # ...and the daemon's block arrives afterwards, from the worker.
+    assert "armed" not in out
+    assert pump() == 1
+    daemon_block = gcode.responses[-1]
+    assert "armed" in daemon_block and "wal: 3 segments" in daemon_block
     assert plugin.daemon.calls == [("status", None, daemon_link.STATUS_TIMEOUT)]
 
 
-def test_plr_status_with_daemon_down_still_reports_plugin(plugin, run_cmd):
+def test_plr_status_with_daemon_down_still_reports_plugin(plugin, run_cmd, pump):
     plugin.daemon = StubDaemon(
         error=daemon_link.DaemonError(
             "plrd not reachable at /x — is the service running? (systemctl status plrd)"
         )
     )
     gcode = run_cmd("PLR_STATUS")
-    out = gcode.responses[-1]
-    assert "probe_method: tap" in out
-    assert "not reachable" in out
+    assert "probe_method: tap" in gcode.responses[-1]
+    assert pump() == 1
+    # A failure a worker discovers becomes klippy's own '!!' error line
+    # (there is no gcmd left to raise on).
+    assert "not reachable" in gcode.raw_responses[-1]
+    assert gcode.raw_responses[-1].startswith("!! ")
+
+
+def test_plr_status_refuses_a_second_query_while_one_is_in_flight(plugin, run_cmd):
+    # One channel, one call: an operator holding the button down must not
+    # fork the conversation or spawn threads against a hung daemon.
+    release = threading.Event()
+    started = []
+
+    class Hanging:
+        def call(self, cmd, args=None, timeout=None):
+            started.append(cmd)
+            release.wait(5.0)
+            return {"ok": True, "text": "late", "data": {}}
+
+    plugin.daemon = Hanging()
+    try:
+        gcode = run_cmd("PLR_STATUS")
+        for _ in range(400):
+            if started:
+                break
+            time.sleep(0.005)
+        assert started == ["status"]
+        run_cmd("PLR_STATUS")
+        # The refusal says WHICH refusal it is (busy, not closed): promising
+        # a report that may never arrive is the failure this replaced.
+        assert "has not answered yet" in gcode.responses[-1]
+        assert started == ["status"]
+    finally:
+        release.set()
 
 
 def test_plr_status_shows_probe_resolution_and_accel_chip(
@@ -318,25 +378,27 @@ def test_plr_status_shows_probe_resolution_and_accel_chip(
 # --- PLR_RECOVER -------------------------------------------------------
 
 
-def test_recover_defaults_to_dryrun(plugin, run_cmd):
+def test_recover_defaults_to_dryrun(plugin, run_cmd, pump):
     plugin.daemon = StubDaemon(
         response={"ok": True, "text": "would resume at layer 12", "data": {}}
     )
     gcode = run_cmd("PLR_RECOVER")
-    assert plugin.daemon.calls == [
-        ("recover_dryrun", None, daemon_link.RECOVER_TIMEOUT)
-    ]
+    # The handler returns before the daemon has answered: nothing about the
+    # plan can be in the console yet.
+    assert "would resume" not in "\n".join(gcode.responses)
+    assert pump() == 1
+    assert plugin.daemon.calls == [("recover_dryrun", None, daemon_link.DRYRUN_TIMEOUT)]
     assert "would resume at layer 12" in gcode.responses[-1]
 
 
-def test_recover_dryrun_failure_prints_then_errors(plugin, run_cmd, fake_printer):
+def test_recover_dryrun_failure_prints_then_errors(plugin, run_cmd, pump):
     plugin.daemon = StubDaemon(
         response={"ok": False, "text": "machine validation failed", "data": {}}
     )
-    with pytest.raises(fake_klippy.FakeCommandError, match="dry run reported"):
-        run_cmd("PLR_RECOVER")
-    gcode = fake_printer.lookup_object("gcode")
+    gcode = run_cmd("PLR_RECOVER")
+    assert pump() == 1
     assert "machine validation failed" in gcode.responses[-1]
+    assert "dry run reported failure" in gcode.raw_responses[-1]
 
 
 def test_recover_execute_without_confirm_refuses_client_side(plugin, run_cmd):
@@ -355,51 +417,202 @@ def test_recover_execute_wrong_confirm_refuses(plugin, run_cmd, confirm):
     assert plugin.daemon.calls == []
 
 
-def test_recover_execute_with_confirm_sends_confirm_args(plugin, run_cmd):
+def test_recover_execute_asks_to_be_consulted_at_confirm_points(plugin, run_cmd, pump):
+    # THE POINT OF THE BRANCH: `on_confirm: "ask"` is what makes a
+    # Confirmable diagnosis pause instead of aborting
+    # (crates/plrd/src/ctrlsock.rs:612-627).  `step` is absent because the
+    # daemon refuses it outright (:603-605).
     plugin.daemon = StubDaemon(
-        response={"ok": True, "text": "recovery complete", "data": {}}
+        response={
+            "ok": True,
+            "text": "recovery complete",
+            "data": {"outcome": "completed", "exit": 0},
+        }
     )
     gcode = run_cmd("PLR_RECOVER", EXECUTE=1, CONFIRM="YES")
     assert plugin.daemon.calls == [
         (
             "recover_execute",
-            {"confirm": True, "step": False},
-            daemon_link.RECOVER_TIMEOUT,
+            {"confirm": True, "on_confirm": "ask"},
+            daemon_link.EXECUTE_TIMEOUT,
         )
     ]
-    assert "recovery complete" in gcode.responses[-1]
+    assert "WILL MOVE" in gcode.responses[-1]
+    assert pump() == 1
+    assert "recovery complete" in "\n".join(gcode.responses)
 
 
-def test_recover_execute_step_mode(plugin, run_cmd):
-    plugin.daemon = StubDaemon(response={"ok": True, "text": "step 1 done", "data": {}})
-    run_cmd("PLR_RECOVER", EXECUTE=1, CONFIRM="YES", STEP=1)
-    assert plugin.daemon.calls[0][1] == {"confirm": True, "step": True}
+def test_recover_execute_step_mode_refuses_and_names_the_config_key(plugin, run_cmd):
+    # STEP=1 could only ever produce plrd's `per-step mode is CLI-only`
+    # refusal (ctrlsock.rs:603-605).  Refuse locally and name the key that
+    # actually delivers per-step confirmation over the socket.
+    plugin.daemon = StubDaemon(response={"ok": True, "text": "", "data": {}})
+    with pytest.raises(
+        fake_klippy.FakeCommandError, match="debug_confirm_each_step"
+    ) as excinfo:
+        run_cmd("PLR_RECOVER", EXECUTE=1, CONFIRM="YES", STEP=1)
+    assert "not set at the moment" in str(excinfo.value)
+    assert plugin.daemon.calls == []
 
 
-def test_recover_execute_failure_errors_after_report(plugin, run_cmd, fake_printer):
-    plugin.daemon = StubDaemon(
-        response={"ok": False, "text": "transcript mismatch", "data": {}}
+def test_recover_execute_step_mode_says_when_the_key_is_already_set(
+    fake_printer, plr_config, run_cmd
+):
+    import plr as plr_pkg
+
+    plugin = plr_pkg.load_config(
+        plr_config(options={"debug_confirm_each_step": "True"})
     )
-    with pytest.raises(fake_klippy.FakeCommandError, match="recovery reported"):
-        run_cmd("PLR_RECOVER", EXECUTE=1, CONFIRM="YES")
-    gcode = fake_printer.lookup_object("gcode")
-    assert "transcript mismatch" in gcode.responses[-1]
+    plugin.daemon = StubDaemon(response={"ok": True, "text": "", "data": {}})
+    with pytest.raises(fake_klippy.FakeCommandError, match="already set"):
+        run_cmd("PLR_RECOVER", EXECUTE=1, CONFIRM="YES", STEP=1)
+    assert plugin.daemon.calls == []
 
 
-def test_recover_daemon_down_is_console_error(plugin, run_cmd):
+def test_recover_execute_failure_is_reported_from_the_worker(plugin, run_cmd, pump):
+    plugin.daemon = StubDaemon(
+        response={
+            "ok": False,
+            "text": "transcript mismatch",
+            "data": {"outcome": "aborted-or-refused", "exit": 1},
+        }
+    )
+    gcode = run_cmd("PLR_RECOVER", EXECUTE=1, CONFIRM="YES")
+    assert pump() == 1
+    joined = "\n".join(gcode.responses)
+    assert "transcript mismatch" in joined
+    assert "did not complete" in joined
+    assert plugin.recovery.state() == "idle"
+
+
+def test_recover_dryrun_daemon_down_is_reported_from_the_worker(plugin, run_cmd, pump):
     plugin.daemon = StubDaemon(
         error=daemon_link.DaemonError("plrd not reachable at /x")
     )
-    with pytest.raises(fake_klippy.FakeCommandError, match="not reachable"):
-        run_cmd("PLR_RECOVER")
+    gcode = run_cmd("PLR_RECOVER")
+    assert pump() == 1
+    assert "not reachable" in gcode.raw_responses[-1]
 
 
 # --- environment note --------------------------------------------------
 
 
 def test_report_where_socket_tests_ran():
-    # Documents (in the test log) which transport the suite exercised;
-    # the WSL parity run covers the AF_UNIX leg on Windows dev machines.
+    # Documents (in the test log) which transport the suite exercised.  The
+    # AF_UNIX leg is NOT allowed to stay permanently skipped: on a Windows
+    # dev box it is covered by running the same suite under WSL, which is
+    # part of this branch's gate record (955 passed / 1 skipped on Linux,
+    # where the one skip is the inverse no-AF_UNIX guard below).
     assert isinstance(HAS_AF_UNIX, bool)
     if not HAS_AF_UNIX and os.name != "nt":
         pytest.fail("AF_UNIX missing on a POSIX host — unexpected")
+
+
+# --- the deadline is TOTAL, not per-operation --------------------------
+
+
+def test_a_trickling_daemon_trips_the_deadline_it_was_given():
+    # `socket.settimeout` is per-operation: a daemon sending one byte at a
+    # time resets it forever, so a call given a 1-second deadline would sit
+    # there indefinitely — holding a worker thread and the plugin's
+    # single-flight slot, which is exactly what the timeout exists to bound.
+    stop = threading.Event()
+
+    def trickle(server):
+        try:
+            buf = b""
+            while b"\n" not in buf:
+                chunk = server.recv(4096)
+                if not chunk:
+                    return
+                buf += chunk
+            # One byte every 50 ms, and never the newline that ends the line.
+            while not stop.wait(0.05):
+                server.sendall(b" ")
+        except OSError:
+            pass
+        finally:
+            server.close()
+
+    def connect(path, timeout):
+        client, server = socket.socketpair()
+        client.settimeout(timeout)
+        thread = threading.Thread(target=trickle, args=(server,))
+        thread.daemon = True
+        thread.start()
+        return client
+
+    link = daemon_link.DaemonLink("/run/fake/plrd.sock", connect_factory=connect)
+    started = time.monotonic()
+    try:
+        with pytest.raises(daemon_link.DaemonError) as excinfo:
+            link.call("status", timeout=1.0)
+    finally:
+        stop.set()
+    elapsed = time.monotonic() - started
+    # Either wording is honest — whether the budget ran out between reads
+    # or inside one — and both name the deadline that was handed in.
+    message = str(excinfo.value)
+    assert "did not finish answering" in message or "did not answer" in message
+    assert "1s" in message
+    # THE PROPERTY: it gave up on ITS deadline, not on the far end's
+    # schedule.  Without a total deadline this call never returns at all,
+    # because every trickled byte re-arms the per-operation timeout.
+    assert 0.9 <= elapsed < 3.0, elapsed
+
+
+def test_a_prompt_daemon_is_unaffected_by_the_total_deadline():
+    link = canned_link(ok_bytes(text="quick"), delay=0.05)
+    assert link.call("status", timeout=1.0)["text"] == "quick"
+
+
+def test_a_flooding_daemon_trips_the_total_deadline_between_reads():
+    # The other half of the per-operation problem: a daemon streaming bytes
+    # fast enough that no single recv ever times out, and never sending the
+    # newline that ends the line.  Only a total deadline stops this.
+    stop = threading.Event()
+
+    def flood(server):
+        try:
+            buf = b""
+            while b"\n" not in buf:
+                chunk = server.recv(4096)
+                if not chunk:
+                    return
+                buf += chunk
+            while not stop.is_set():
+                server.sendall(b" " * 512)
+        except OSError:
+            pass
+        finally:
+            server.close()
+
+    def connect(path, timeout):
+        client, server = socket.socketpair()
+        client.settimeout(timeout)
+        thread = threading.Thread(target=flood, args=(server,))
+        thread.daemon = True
+        thread.start()
+        return client
+
+    link = daemon_link.DaemonLink("/run/fake/plrd.sock", connect_factory=connect)
+    started = time.monotonic()
+    try:
+        with pytest.raises(daemon_link.DaemonError) as excinfo:
+            link.call("status", timeout=0.5)
+    finally:
+        stop.set()
+    elapsed = time.monotonic() - started
+    message = str(excinfo.value)
+    assert "did not finish answering" in message or "exceeded" in message
+    assert elapsed < 3.0, elapsed
+
+
+def test_plr_recover_dryrun_refused_by_a_closed_channel_says_so(
+    plugin, run_cmd, fake_printer
+):
+    plugin.daemon = StubDaemon(response={"ok": True, "text": "", "data": {}})
+    fake_printer.send_event("klippy:disconnect")
+    with pytest.raises(fake_klippy.FakeCommandError, match="shutting down"):
+        run_cmd("PLR_RECOVER")
+    assert plugin.daemon.calls == []
