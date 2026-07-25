@@ -6,8 +6,16 @@ socket responses.  Asserts the ORDERED respond sequences (action lines +
 their plain-text fallbacks), the exact literal action strings against the
 researched Mainsail spec, every branch (clean-confirm true/false/absent),
 double-START, and daemon-down at each step (clear error + state reset).
+
+EVERY DAEMON CALL IS ASYNCHRONOUS HERE, and that is the contract under
+test: the handler hands the call to a worker thread and returns, so a
+test must ``pump`` to deliver the answer (see the ``step`` fixture).  The
+count is load-bearing — a handler that blocked would have printed its
+result before returning, and the ``calls=0`` steps assert that a command
+touched no socket at all.
 """
 
+import ast
 import os
 
 import fake_klippy
@@ -123,6 +131,24 @@ def _new_responses(gcode):
 
 
 @pytest.fixture
+def step(run_cmd, pump):
+    """Run one wizard command and deliver the worker result it started.
+
+    ``calls`` is how many plrd round trips the command hands off — 0 for
+    the commands that touch no socket.  ``pump`` asserts exactly that many
+    callbacks arrive, so an accidental extra (or missing) daemon call
+    fails the test rather than passing quietly.
+    """
+
+    def run(name, calls=1, **params):
+        gcode = run_cmd(name, **params)
+        assert pump(calls, timeout=5.0) == calls
+        return gcode
+
+    return run
+
+
+@pytest.fixture
 def plugin_with_clean_macro(fake_printer, plr_config):
     """A plugin whose config HAS the [gcode_macro CLEAN_NOZZLE] section.
 
@@ -199,12 +225,13 @@ def test_summarize_keeps_pathless_file_name():
 # --- START ------------------------------------------------------------
 
 
-def test_start_offers_recovery_with_ordered_prompt(plugin, run_cmd, fake_printer):
+def test_start_offers_recovery_with_ordered_prompt(plugin, step, fake_printer):
     plugin.daemon = FakeDaemon(responses={"status": _status_pending()})
     gcode = fake_printer.lookup_object("gcode")
     since = _new_responses(gcode)
-    run_cmd("PLR_WIZARD_START")
+    step("PLR_WIZARD_START")
     assert since() == [
+        "PLR wizard: asking plrd whether a recovery is pending...",
         "Power-loss recovery available.",
         "action:prompt_begin Power-loss recovery",
         "action:prompt_text Interrupted print: bench.gcode",
@@ -223,7 +250,7 @@ def test_start_offers_recovery_with_ordered_prompt(plugin, run_cmd, fake_printer
     assert plugin.daemon.calls == [("status", None, daemon_link.STATUS_TIMEOUT)]
 
 
-def test_start_no_pending_recovery_uses_explicit_null(plugin, run_cmd, fake_printer):
+def test_start_no_pending_recovery_uses_explicit_null(plugin, step, fake_printer):
     # build_status ALWAYS inserts "pending"; nothing-pending is a JSON
     # null VALUE, not an absent key.  Pin that exact shape.
     response = _status()
@@ -231,14 +258,14 @@ def test_start_no_pending_recovery_uses_explicit_null(plugin, run_cmd, fake_prin
     plugin.daemon = FakeDaemon(responses={"status": response})
     gcode = fake_printer.lookup_object("gcode")
     since = _new_responses(gcode)
-    run_cmd("PLR_WIZARD_START")
+    step("PLR_WIZARD_START")
     out = "\n".join(since())
     assert "no power-loss recovery is pending" in out
     assert not any(line.startswith("action:") for line in since())
     assert plugin.wizard.is_active() is False
 
 
-def test_start_absent_pending_key_treated_as_nothing(plugin, run_cmd, fake_printer):
+def test_start_absent_pending_key_treated_as_nothing(plugin, step, fake_printer):
     # Belt-and-braces: a daemon that omits the key entirely (or renames
     # it) must not be read as a pending recovery either.
     plugin.daemon = FakeDaemon(
@@ -246,39 +273,38 @@ def test_start_absent_pending_key_treated_as_nothing(plugin, run_cmd, fake_print
     )
     gcode = fake_printer.lookup_object("gcode")
     since = _new_responses(gcode)
-    run_cmd("PLR_WIZARD_START")
+    step("PLR_WIZARD_START")
     assert "no power-loss recovery is pending" in "\n".join(since())
     assert plugin.wizard.is_active() is False
 
 
-def test_start_non_object_pending_treated_as_nothing(plugin, run_cmd, fake_printer):
+def test_start_non_object_pending_treated_as_nothing(plugin, step, fake_printer):
     plugin.daemon = FakeDaemon(responses={"status": _status(pending="yes")})
     gcode = fake_printer.lookup_object("gcode")
     since = _new_responses(gcode)
-    run_cmd("PLR_WIZARD_START")
+    step("PLR_WIZARD_START")
     assert "no power-loss recovery is pending" in "\n".join(since())
     assert plugin.wizard.is_active() is False
 
 
-def test_start_empty_pending_object_still_offers_recovery(
-    plugin, run_cmd, fake_printer
-):
+def test_start_empty_pending_object_still_offers_recovery(plugin, step, fake_printer):
     # A pending object whose fields are all unreadable is STILL a pending
     # recovery — offer it with the honest generic summary.
     plugin.daemon = FakeDaemon(responses={"status": _status(pending={})})
     gcode = fake_printer.lookup_object("gcode")
     since = _new_responses(gcode)
-    run_cmd("PLR_WIZARD_START")
+    step("PLR_WIZARD_START")
     assert "action:prompt_text An interrupted print is ready to resume." in since()
     assert plugin.wizard.is_active() is True
 
 
-def test_double_start_reshows_current_prompt(plugin, run_cmd, fake_printer):
+def test_double_start_reshows_current_prompt(plugin, step, fake_printer):
     plugin.daemon = FakeDaemon(responses={"status": _status_pending()})
-    run_cmd("PLR_WIZARD_START")
+    step("PLR_WIZARD_START")
     gcode = fake_printer.lookup_object("gcode")
     since = _new_responses(gcode)
-    run_cmd("PLR_WIZARD_START")
+    # calls=0: the re-show is local, so it does not talk to plrd at all.
+    step("PLR_WIZARD_START", calls=0)
     lines = since()
     assert lines[0] == "PLR wizard already in progress — re-showing the current prompt."
     assert "action:prompt_begin Power-loss recovery" in lines
@@ -290,19 +316,20 @@ def test_double_start_reshows_current_prompt(plugin, run_cmd, fake_printer):
 # --- DRYRUN branches --------------------------------------------------
 
 
-def test_dryrun_requires_clean_shows_clean_prompt(plugin, run_cmd, fake_printer):
+def test_dryrun_requires_clean_shows_clean_prompt(plugin, step, fake_printer):
     plugin.daemon = FakeDaemon(
         responses={
             "status": _status_pending(),
             "recover_dryrun": _dryrun(requires_clean_nozzle_confirmation=True),
         }
     )
-    run_cmd("PLR_WIZARD_START")
+    step("PLR_WIZARD_START")
     gcode = fake_printer.lookup_object("gcode")
     since = _new_responses(gcode)
-    run_cmd("PLR_WIZARD_DRYRUN")
+    step("PLR_WIZARD_DRYRUN")
     lines = since()
-    assert lines[0] == "PLAN: resume bench.gcode at layer 42"
+    assert lines[0].startswith("PLR wizard: asking plrd for the recovery plan")
+    assert lines[1] == "PLAN: resume bench.gcode at layer 42"
     assert "action:prompt_begin Power-loss recovery" in lines
     assert "action:prompt_button Nozzle is clean|PLR_WIZARD_CONFIRM_CLEAN|primary" in (
         lines
@@ -318,7 +345,7 @@ def test_dryrun_requires_clean_shows_clean_prompt(plugin, run_cmd, fake_printer)
     assert plugin.daemon.calls[-1] == (
         "recover_dryrun",
         None,
-        daemon_link.RECOVER_TIMEOUT,
+        daemon_link.DRYRUN_TIMEOUT,
     )
 
 
@@ -399,14 +426,14 @@ def test_clean_decision_matrix(flag, available, expected):
         pytest.param({"plan": "nope"}, id="non-object-plan"),
     ],
 )
-def test_dryrun_asks_for_clean_confirmation(plugin, run_cmd, fake_printer, data):
+def test_dryrun_asks_for_clean_confirmation(plugin, step, fake_printer, data):
     plugin.daemon = FakeDaemon(
         responses={"status": _status_pending(), "recover_dryrun": _dryrun(**data)}
     )
-    run_cmd("PLR_WIZARD_START")
+    step("PLR_WIZARD_START")
     gcode = fake_printer.lookup_object("gcode")
     since = _new_responses(gcode)
-    run_cmd("PLR_WIZARD_DRYRUN")
+    step("PLR_WIZARD_DRYRUN")
     lines = since()
     assert "action:prompt_button Nozzle is clean|PLR_WIZARD_CONFIRM_CLEAN|primary" in (
         lines
@@ -415,18 +442,18 @@ def test_dryrun_asks_for_clean_confirmation(plugin, run_cmd, fake_printer, data)
     assert not any("will run to clean the nozzle" in line for line in lines)
 
 
-def test_dryrun_absent_flag_explains_why_it_asks(plugin, run_cmd, fake_printer):
+def test_dryrun_absent_flag_explains_why_it_asks(plugin, step, fake_printer):
     plugin.daemon = FakeDaemon(
         responses={"status": _status_pending(), "recover_dryrun": _dryrun()}
     )
-    run_cmd("PLR_WIZARD_START")
+    step("PLR_WIZARD_START")
     gcode = fake_printer.lookup_object("gcode")
     since = _new_responses(gcode)
-    run_cmd("PLR_WIZARD_DRYRUN")
+    step("PLR_WIZARD_DRYRUN")
     assert any("did not report whether the nozzle" in line for line in since())
 
 
-def test_dryrun_sources_disagree_asks_and_says_why(plugin, run_cmd, fake_printer):
+def test_dryrun_sources_disagree_asks_and_says_why(plugin, step, fake_printer):
     # plrd says cleaning is automatic, but this printer has no
     # [gcode_macro CLEAN_NOZZLE] — the conservative branch must win.
     assert plugin.clean_nozzle_macro_available is False
@@ -436,10 +463,10 @@ def test_dryrun_sources_disagree_asks_and_says_why(plugin, run_cmd, fake_printer
             "recover_dryrun": _dryrun(requires_clean_nozzle_confirmation=False),
         }
     )
-    run_cmd("PLR_WIZARD_START")
+    step("PLR_WIZARD_START")
     gcode = fake_printer.lookup_object("gcode")
     since = _new_responses(gcode)
-    run_cmd("PLR_WIZARD_DRYRUN")
+    step("PLR_WIZARD_DRYRUN")
     lines = since()
     assert "action:prompt_button Nozzle is clean|PLR_WIZARD_CONFIRM_CLEAN|primary" in (
         lines
@@ -458,17 +485,17 @@ def test_dryrun_sources_disagree_asks_and_says_why(plugin, run_cmd, fake_printer
     ],
 )
 def test_dryrun_skips_to_execute_only_when_both_sources_agree(
-    plugin_with_clean_macro, run_cmd, fake_printer, data
+    plugin_with_clean_macro, step, fake_printer, data
 ):
     plugin = plugin_with_clean_macro
     assert plugin.clean_nozzle_macro_available is True
     plugin.daemon = FakeDaemon(
         responses={"status": _status_pending(), "recover_dryrun": _dryrun(**data)}
     )
-    run_cmd("PLR_WIZARD_START")
+    step("PLR_WIZARD_START")
     gcode = fake_printer.lookup_object("gcode")
     since = _new_responses(gcode)
-    run_cmd("PLR_WIZARD_DRYRUN")
+    step("PLR_WIZARD_DRYRUN")
     lines = since()
     assert "action:prompt_text Execute the recovery plan? The printer WILL MOVE." in (
         lines
@@ -484,7 +511,7 @@ def test_dryrun_skips_to_execute_only_when_both_sources_agree(
 
 
 def test_dryrun_absent_flag_asks_even_when_macro_is_available(
-    plugin_with_clean_macro, run_cmd, fake_printer
+    plugin_with_clean_macro, step, fake_printer
 ):
     # Redundant ask costs one click; skipping when nothing cleans the
     # nozzle corrupts the reference measurement. Unknown always asks.
@@ -492,10 +519,10 @@ def test_dryrun_absent_flag_asks_even_when_macro_is_available(
     plugin.daemon = FakeDaemon(
         responses={"status": _status_pending(), "recover_dryrun": _dryrun()}
     )
-    run_cmd("PLR_WIZARD_START")
+    step("PLR_WIZARD_START")
     gcode = fake_printer.lookup_object("gcode")
     since = _new_responses(gcode)
-    run_cmd("PLR_WIZARD_DRYRUN")
+    step("PLR_WIZARD_DRYRUN")
     assert "action:prompt_button Nozzle is clean|PLR_WIZARD_CONFIRM_CLEAN|primary" in (
         since()
     )
@@ -510,41 +537,48 @@ def test_dryrun_before_start_is_error(plugin, run_cmd):
     assert plugin.daemon.calls == []
 
 
-def test_dryrun_failure_resets_and_ends_prompt(plugin, run_cmd, fake_printer):
+def test_dryrun_failure_resets_and_ends_prompt(plugin, step, fake_printer):
     plugin.daemon = FakeDaemon(
         responses={
             "status": _status_pending(),
             "recover_dryrun": _dryrun(ok=False, text="machine validation failed"),
         }
     )
-    run_cmd("PLR_WIZARD_START")
+    step("PLR_WIZARD_START")
     gcode = fake_printer.lookup_object("gcode")
     since = _new_responses(gcode)
-    with pytest.raises(fake_klippy.FakeCommandError, match="dry run reported failure"):
-        run_cmd("PLR_WIZARD_DRYRUN")
+    step("PLR_WIZARD_DRYRUN")
     lines = since()
     assert "machine validation failed" in lines
     assert "action:prompt_end" in lines
+    # A failure a worker discovers lands as klippy's own error line
+    # instead of a raise: there is no gcmd left to raise on.
+    assert "dry run reported failure" in gcode.raw_responses[-1]
     assert plugin.wizard.is_active() is False
 
 
 # --- CONFIRM_CLEAN / EXECUTE happy path -------------------------------
 
 
-def test_full_happy_path_with_clean_confirm(plugin, run_cmd, fake_printer):
+def test_full_happy_path_with_clean_confirm(plugin, step, run_cmd, pump, fake_printer):
     plugin.daemon = FakeDaemon(
         responses={
             "status": _status_pending(),
             "recover_dryrun": _dryrun(requires_clean_nozzle_confirmation=True),
-            "recover_execute": {"ok": True, "text": "recovery complete", "data": {}},
+            "recover_execute": {
+                "ok": True,
+                "text": "recovery complete",
+                "data": {"outcome": "completed", "exit": 0},
+            },
         }
     )
-    run_cmd("PLR_WIZARD_START")
-    run_cmd("PLR_WIZARD_DRYRUN")
+    step("PLR_WIZARD_START")
+    step("PLR_WIZARD_DRYRUN")
     gcode = fake_printer.lookup_object("gcode")
 
     since_confirm = _new_responses(gcode)
-    run_cmd("PLR_WIZARD_CONFIRM_CLEAN")
+    # calls=0: the clean confirmation is local; it must not touch plrd.
+    step("PLR_WIZARD_CONFIRM_CLEAN", calls=0)
     confirm_lines = since_confirm()
     assert "action:prompt_text Execute the recovery plan? The printer WILL MOVE." in (
         confirm_lines
@@ -555,21 +589,34 @@ def test_full_happy_path_with_clean_confirm(plugin, run_cmd, fake_printer):
 
     since_exec = _new_responses(gcode)
     run_cmd("PLR_WIZARD_EXECUTE")
-    exec_lines = since_exec()
-    assert exec_lines == [
+    # The handler returns with the recovery still in flight: that IS the
+    # fix.  Nothing about the outcome exists yet.
+    started = since_exec()
+    assert any("WILL MOVE" in line for line in started)
+    assert "recovery complete" not in started
+    assert plugin.wizard.state() == "running"
+    assert plugin.recovery.state() == "running"
+    assert plugin.get_status(100.0)["recovery_state"] == "running"
+
+    since_report = _new_responses(gcode)
+    assert pump() == 1
+    assert since_report() == [
         "recovery complete",
         "action:prompt_end",
-        "PLR recovery complete — resuming print.",
+        "PLR recovery complete — plrd has resumed the print.",
     ]
     assert plugin.wizard.is_active() is False
+    assert plugin.recovery.state() == "idle"
     assert plugin.daemon.calls[-1] == (
         "recover_execute",
-        {"confirm": True},
-        daemon_link.RECOVER_TIMEOUT,
+        # `on_confirm: "ask"` — the argument that makes plrd's confirm
+        # points reachable at all (ctrlsock.rs:612-627).
+        {"confirm": True, "on_confirm": "ask"},
+        daemon_link.EXECUTE_TIMEOUT,
     )
 
 
-def test_execute_typed_failure_reports_remediation(plugin, run_cmd, fake_printer):
+def test_execute_typed_failure_reports_remediation(plugin, step, fake_printer):
     plugin.daemon = FakeDaemon(
         responses={
             "status": _status_pending(),
@@ -577,37 +624,37 @@ def test_execute_typed_failure_reports_remediation(plugin, run_cmd, fake_printer
             "recover_execute": {
                 "ok": False,
                 "text": "transcript mismatch [wal_gap] — re-run plrd verify",
-                "data": {},
+                "data": {"outcome": "aborted-or-refused", "exit": 1},
             },
         }
     )
-    run_cmd("PLR_WIZARD_START")
-    run_cmd("PLR_WIZARD_DRYRUN")
+    step("PLR_WIZARD_START")
+    step("PLR_WIZARD_DRYRUN")
     # Flag absent -> the fail-safe branch asks; confirm to reach execute.
-    run_cmd("PLR_WIZARD_CONFIRM_CLEAN")
+    step("PLR_WIZARD_CONFIRM_CLEAN", calls=0)
     gcode = fake_printer.lookup_object("gcode")
     since = _new_responses(gcode)
-    with pytest.raises(fake_klippy.FakeCommandError, match="did not complete"):
-        run_cmd("PLR_WIZARD_EXECUTE")
+    step("PLR_WIZARD_EXECUTE")
     lines = since()
     assert "transcript mismatch [wal_gap] — re-run plrd verify" in lines
     assert "action:prompt_end" in lines
+    assert any("did not complete" in line for line in lines)
     assert plugin.wizard.is_active() is False
 
 
 # --- out-of-order guards ----------------------------------------------
 
 
-def test_confirm_clean_out_of_order_is_error(plugin, run_cmd):
+def test_confirm_clean_out_of_order_is_error(plugin, step, run_cmd):
     plugin.daemon = FakeDaemon(responses={"status": _status_pending()})
-    run_cmd("PLR_WIZARD_START")  # state OFFERED, not CLEAN_CHECK
+    step("PLR_WIZARD_START")  # state OFFERED, not CLEAN_CHECK
     with pytest.raises(fake_klippy.FakeCommandError, match="not awaiting"):
         run_cmd("PLR_WIZARD_CONFIRM_CLEAN")
 
 
-def test_execute_out_of_order_is_error(plugin, run_cmd):
+def test_execute_out_of_order_is_error(plugin, step, run_cmd):
     plugin.daemon = FakeDaemon(responses={"status": _status_pending()})
-    run_cmd("PLR_WIZARD_START")  # state OFFERED, not EXECUTE
+    step("PLR_WIZARD_START")  # state OFFERED, not EXECUTE
     with pytest.raises(fake_klippy.FakeCommandError, match="not ready to execute"):
         run_cmd("PLR_WIZARD_EXECUTE")
     assert not any(c[0] == "recover_execute" for c in plugin.daemon.calls)
@@ -616,9 +663,9 @@ def test_execute_out_of_order_is_error(plugin, run_cmd):
 # --- CANCEL -----------------------------------------------------------
 
 
-def test_cancel_active_ends_prompt_and_resets(plugin, run_cmd, fake_printer):
+def test_cancel_active_ends_prompt_and_resets(plugin, step, run_cmd, fake_printer):
     plugin.daemon = FakeDaemon(responses={"status": _status_pending()})
-    run_cmd("PLR_WIZARD_START")
+    step("PLR_WIZARD_START")
     gcode = fake_printer.lookup_object("gcode")
     since = _new_responses(gcode)
     run_cmd("PLR_WIZARD_CANCEL")
@@ -641,52 +688,57 @@ def test_cancel_when_idle_is_benign(plugin, run_cmd, fake_printer):
 # --- daemon-down at each step -----------------------------------------
 
 
-def test_daemon_down_at_start(plugin, run_cmd, fake_printer):
+def test_daemon_down_at_start(plugin, step, fake_printer):
     plugin.daemon = FakeDaemon(
         errors={"status": daemon_link.DaemonError("plrd not reachable at /x")}
     )
     gcode = fake_printer.lookup_object("gcode")
     since = _new_responses(gcode)
-    with pytest.raises(fake_klippy.FakeCommandError, match="not reachable"):
-        run_cmd("PLR_WIZARD_START")
+    step("PLR_WIZARD_START")
     assert "action:prompt_end" in since()
+    assert "not reachable" in gcode.raw_responses[-1]
     assert plugin.wizard.is_active() is False
 
 
-def test_daemon_down_at_dryrun(plugin, run_cmd, fake_printer):
+def test_daemon_down_at_dryrun(plugin, step, fake_printer):
     plugin.daemon = FakeDaemon(
         responses={"status": _status_pending()},
         errors={"recover_dryrun": daemon_link.DaemonError("plrd timed out")},
     )
-    run_cmd("PLR_WIZARD_START")
+    step("PLR_WIZARD_START")
     gcode = fake_printer.lookup_object("gcode")
     since = _new_responses(gcode)
-    with pytest.raises(fake_klippy.FakeCommandError, match="timed out"):
-        run_cmd("PLR_WIZARD_DRYRUN")
+    step("PLR_WIZARD_DRYRUN")
     assert "action:prompt_end" in since()
+    assert "timed out" in gcode.raw_responses[-1]
     assert plugin.wizard.is_active() is False
 
 
-def test_daemon_down_at_execute(plugin, run_cmd, fake_printer):
+def test_daemon_down_at_execute(plugin, step, fake_printer):
     plugin.daemon = FakeDaemon(
         responses={"status": _status_pending(), "recover_dryrun": _dryrun()},
         errors={"recover_execute": daemon_link.DaemonError("plrd closed connection")},
     )
-    run_cmd("PLR_WIZARD_START")
-    run_cmd("PLR_WIZARD_DRYRUN")
-    run_cmd("PLR_WIZARD_CONFIRM_CLEAN")
+    step("PLR_WIZARD_START")
+    step("PLR_WIZARD_DRYRUN")
+    step("PLR_WIZARD_CONFIRM_CLEAN", calls=0)
     gcode = fake_printer.lookup_object("gcode")
     since = _new_responses(gcode)
-    with pytest.raises(fake_klippy.FakeCommandError, match="closed connection"):
-        run_cmd("PLR_WIZARD_EXECUTE")
-    assert "action:prompt_end" in since()
+    step("PLR_WIZARD_EXECUTE")
+    lines = since()
+    assert "action:prompt_end" in lines
+    # Losing contact mid-execute is NOT reported as "the recovery failed":
+    # plrd does not need this plugin in order to keep going.
+    joined = "\n".join(lines)
+    assert "closed connection" in joined
+    assert "may still be executing" in joined
     assert plugin.wizard.is_active() is False
 
 
 # --- graceful degradation: every prompt's fallback names a command ----
 
 
-def test_every_prompt_fallback_names_next_command(plugin, run_cmd, fake_printer):
+def test_every_prompt_fallback_names_next_command(plugin, step, fake_printer):
     plugin.daemon = FakeDaemon(
         responses={
             "status": _status_pending(),
@@ -703,36 +755,85 @@ def test_every_prompt_fallback_names_next_command(plugin, run_cmd, fake_printer)
         return [ln for ln in lines[idx + 1 :] if not ln.startswith("action:")]
 
     since = _new_responses(gcode)
-    run_cmd("PLR_WIZARD_START")
+    step("PLR_WIZARD_START")
     assert any("PLR_WIZARD_DRYRUN" in ln for ln in fallback_lines(since()))
 
     since = _new_responses(gcode)
-    run_cmd("PLR_WIZARD_DRYRUN")
+    step("PLR_WIZARD_DRYRUN")
     assert any("PLR_WIZARD_CONFIRM_CLEAN" in ln for ln in fallback_lines(since()))
 
     since = _new_responses(gcode)
-    run_cmd("PLR_WIZARD_CONFIRM_CLEAN")
+    step("PLR_WIZARD_CONFIRM_CLEAN", calls=0)
     assert any("PLR_WIZARD_EXECUTE" in ln for ln in fallback_lines(since()))
 
 
 # --- no motion g-code ever leaves the wizard --------------------------
 
 
-def test_wizard_never_sends_motion_gcode():
-    # The wizard's only machine-motion path is the daemon's recover_execute;
-    # it must never run_script/dispatch g-code or command the toolhead.
-    src = open(
-        os.path.join(os.path.dirname(wizard.__file__), "wizard.py"), encoding="utf-8"
-    ).read()
-    for forbidden in (
+# The four modules that make up the recovery UI.  None of them may send
+# motion: the ONLY machine motion in the flow is plrd's own, over the
+# control socket.
+_UI_MODULES = ("wizard.py", "recovery.py", "confirm_ui.py", "prompts.py")
+
+
+def _module_path(name):
+    return os.path.join(os.path.dirname(wizard.__file__), name)
+
+
+def _identifiers(path):
+    """Every attribute/name IDENTIFIER a module uses, from its AST.
+
+    Parsed rather than grepped so prose in a docstring cannot trip the
+    check (these modules discuss ``run_script`` at length, precisely
+    because they must never call it) and so a real call cannot hide from
+    it inside a concatenated string.
+    """
+    tree = ast.parse(open(path, encoding="utf-8").read())
+    names = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Attribute):
+            names.add(node.attr)
+        elif isinstance(node, ast.Name):
+            names.add(node.id)
+    return names
+
+
+def _lookup_object_targets(path):
+    """The literal printer objects a module resolves."""
+    tree = ast.parse(open(path, encoding="utf-8").read())
+    targets = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        name = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", "")
+        if name != "lookup_object" or not node.args:
+            continue
+        first = node.args[0]
+        targets.add(first.value if isinstance(first, ast.Constant) else "<non-literal>")
+    return targets
+
+
+@pytest.mark.parametrize("module", _UI_MODULES)
+def test_recovery_ui_never_sends_motion_gcode(module):
+    forbidden = {
+        # G-code dispatch of any kind.  run_script would ALSO take the
+        # g-code mutex (klippy/gcode.py:239-241) and queue behind plrd's
+        # own motion, which is why not even a harmless M117 belongs here.
         "run_script",
         "run_script_from_command",
+        # Direct toolhead commands.
         "manual_move",
-        'lookup_object("toolhead")',
-        "lookup_object('toolhead')",
         "get_position",
-    ):
-        assert forbidden not in src, forbidden
+        "set_position",
+        "dwell",
+        "wait_moves",
+    }
+    used = _identifiers(_module_path(module))
+    assert not (used & forbidden), sorted(used & forbidden)
+    # The only printer object the recovery UI may resolve is the g-code
+    # dispatcher, and only for its OUTPUT calls.
+    assert _lookup_object_targets(_module_path(module)) <= {"gcode"}
 
 
 # --- PLR_SETUP_WIZARD -------------------------------------------------
@@ -835,22 +936,20 @@ def test_wizard_close_emits_prompt_end(plugin, run_cmd, fake_printer):
     assert since() == ["action:prompt_end", "PLR: dialog closed."]
 
 
-def test_wizard_close_does_not_abandon_an_active_recovery(
-    plugin, run_cmd, fake_printer
-):
+def test_wizard_close_does_not_abandon_an_active_recovery(plugin, step, fake_printer):
     # Closing the dialog is display-only: an in-flight recovery survives,
     # so a stray Close cannot silently drop the operator out of the flow.
     plugin.daemon = FakeDaemon(responses={"status": _status_pending()})
-    run_cmd("PLR_WIZARD_START")
+    step("PLR_WIZARD_START")
     gcode = fake_printer.lookup_object("gcode")
     since = _new_responses(gcode)
-    run_cmd("PLR_WIZARD_CLOSE")
+    step("PLR_WIZARD_CLOSE", calls=0)
     lines = since()
     assert lines[0] == "action:prompt_end"
     assert any("still in progress" in ln for ln in lines)
     assert plugin.wizard.is_active() is True
     # ...and START re-shows it rather than starting a second flow.
-    run_cmd("PLR_WIZARD_START")
+    step("PLR_WIZARD_START", calls=0)
     assert plugin.daemon.calls == [("status", None, daemon_link.STATUS_TIMEOUT)]
 
 
@@ -866,18 +965,24 @@ def test_wizard_close_does_not_abandon_an_active_recovery(
     ],
 )
 def test_every_recovery_terminal_path_emits_prompt_end(
-    plugin, run_cmd, fake_printer, terminal
+    plugin, step, run_cmd, pump, fake_printer, terminal
 ):
     plugin.daemon = FakeDaemon(
         responses={
             "status": _status_pending(),
             "recover_dryrun": _dryrun(requires_clean_nozzle_confirmation=True),
-            "recover_execute": {"ok": True, "text": "done", "data": {}},
+            "recover_execute": {
+                "ok": True,
+                "text": "done",
+                "data": {"outcome": "completed", "exit": 0},
+            },
         }
     )
-    run_cmd("PLR_WIZARD_START")
+    step("PLR_WIZARD_START")
     gcode = fake_printer.lookup_object("gcode")
     since = _new_responses(gcode)
     for command in terminal:
         run_cmd(command)
+        # Deliver whatever that step handed off (0 for the local ones).
+        pump(0, timeout=1.0)
     assert "action:prompt_end" in since()

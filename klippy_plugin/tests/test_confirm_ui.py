@@ -1,0 +1,344 @@
+"""Rendering of plrd's confirm-points: the three-part message, per kind.
+
+The requirement these tests hold the line on is stated three ways and all
+three must be visible to the operator: say WHY the recovery stopped,
+SUGGEST a fix, and OFFER to continue anyway.  Every fixture here is built
+from the producer (tests/confirm_fixtures.py cites the Rust for each
+field), and the defensive cases feed the renderer things a REAL wire
+message could carry — nulls, absent keys, wrong types — never invented
+shapes.
+"""
+
+import confirm_fixtures as fx
+import pytest
+
+from plr import confirm_ui
+
+DEADLINE = "If nothing answers, plrd aborts the recovery cleanly."
+
+
+def texts(data, deadline=DEADLINE):
+    return list(confirm_ui.confirm_prompt(data, deadline).texts)
+
+
+def joined(data, deadline=DEADLINE):
+    return "\n".join(texts(data, deadline))
+
+
+# --- the three-part requirement ---------------------------------------
+
+
+@pytest.mark.parametrize(
+    "data",
+    [
+        pytest.param(fx.pause_data(), id="diagnosis"),
+        pytest.param(fx.z_height_pause()["data"], id="z-height"),
+        pytest.param(fx.step_debug_pause()["data"], id="step-debug"),
+    ],
+)
+def test_every_kind_says_why_suggests_a_fix_and_offers_to_continue(data):
+    prompt = confirm_ui.confirm_prompt(data, DEADLINE)
+    body = "\n".join(prompt.texts)
+    # WHY
+    assert "Why: " in body
+    assert data["diagnosis"]["why"][:30] in body
+    # SUGGEST
+    assert "Suggested fix: " in body
+    assert data["diagnosis"]["suggested_fix"][:25] in body
+    # OFFER — as a button AND as a console command, because the console is
+    # the floor: a client that renders no dialog must still be able to act.
+    assert prompt.buttons == [("Continue anyway", "PLR_RECOVER_CONTINUE", "warning")]
+    assert prompt.footers == [("Abort recovery", "PLR_RECOVER_ABORT", "error")]
+    fallback = "\n".join(prompt.fallbacks)
+    assert "PLR_RECOVER_CONTINUE" in fallback
+    assert "PLR_RECOVER_ABORT" in fallback
+
+
+def test_the_question_distinguishes_the_three_confirm_kinds():
+    # The three ConfirmKinds ask three different things
+    # (crates/plrd/src/executor.rs:159-180), and conflating them is how an
+    # operator answers the wrong question.
+    assert "look right" in confirm_ui.question("z-height")
+    assert "Run the next step?" in confirm_ui.question("step-debug")
+    assert "Continue despite this?" in confirm_ui.question("diagnosis")
+    # Three distinct sentences, not one with cosmetic edits.
+    assert (
+        len(
+            {
+                confirm_ui.question(kind)
+                for kind in ("z-height", "step-debug", "diagnosis")
+            }
+        )
+        == 3
+    )
+
+
+def test_an_unknown_kind_still_asks_and_admits_it_does_not_know():
+    # A daemon that grows a fourth kind must not produce a prompt that
+    # claims to know what it is asking.
+    text = confirm_ui.question("teleport-check")
+    assert "did not report which kind" in text
+    prompt = confirm_ui.confirm_prompt(fx.pause_data(kind="teleport-check"), None)
+    assert prompt.buttons  # it still offers both answers
+    assert prompt.footers
+
+
+# --- the diagnosis body ------------------------------------------------
+
+
+def test_numbers_are_rendered_from_the_typed_fields():
+    data = fx.pause_data(
+        diag=fx.diagnosis(
+            measured=fx.measured("purge_z", -0.25, "mm"),
+            expected=fx.expected("purge_z", 0.0, None, "mm"),
+        )
+    )
+    body = joined(data)
+    assert "Measured: purge_z = -0.25 mm" in body
+    assert "Expected: purge_z >= 0 mm" in body
+
+
+def test_a_closed_band_and_a_point_band_read_naturally():
+    band = joined(
+        fx.pause_data(diag=fx.diagnosis(expected=fx.expected("t", 55.0, 65.0, "C")))
+    )
+    assert "Expected: t [55, 65] C" in band
+    point = joined(
+        fx.pause_data(
+            diag=fx.diagnosis(expected=fx.expected("standoff", 0.6, 0.6, "mm"))
+        )
+    )
+    assert "Expected: standoff 0.6 mm" in point
+    upper = joined(
+        fx.pause_data(diag=fx.diagnosis(expected=fx.expected("t", None, 65.0, "C")))
+    )
+    assert "Expected: t <= 65 C" in upper
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        pytest.param(None, id="null"),
+        pytest.param("hot", id="string"),
+        pytest.param(True, id="bool"),
+        pytest.param(float("nan"), id="nan"),
+        pytest.param(float("inf"), id="inf"),
+    ],
+)
+def test_an_unusable_measurement_is_omitted_not_fabricated(value):
+    body = joined(
+        fx.pause_data(diag=fx.diagnosis(measured=fx.measured("purge_z", value, "mm")))
+    )
+    assert "Measured:" not in body
+    # ...and the parts that matter are still there.
+    assert "Why: " in body and "Suggested fix: " in body
+
+
+def test_a_null_measured_and_expected_are_simply_absent():
+    # Serde emits both as explicit nulls when the diagnosis carries no
+    # numbers (the common case), which must not read as "0".
+    body = joined(fx.pause_data())
+    assert "Measured:" not in body
+    assert "Expected:" not in body
+    assert "0" not in body.split("Why: ")[0]
+
+
+def test_an_override_key_is_reported_as_a_config_edit_never_a_button():
+    data = fx.pause_data(
+        diag=fx.diagnosis(override_key="UNSAFE_allow_purge_z_below_bed")
+    )
+    prompt = confirm_ui.confirm_prompt(data, DEADLINE)
+    body = "\n".join(prompt.texts)
+    assert "UNSAFE_allow_purge_z_below_bed" in body
+    assert "printer.cfg" in body and "[plr]" in body
+    # THE RULE: no control anywhere in the dialog fires or names the
+    # override — the escape hatch is an edit made while nothing is at stake
+    # (crates/plr-recovery/src/diagnosis.rs:22-42).
+    for label, gcode, _color in list(prompt.buttons) + list(prompt.footers):
+        assert "UNSAFE" not in label
+        assert "UNSAFE" not in (gcode or "")
+    assert "UNSAFE" not in "\n".join(prompt.fallbacks)
+
+
+def test_no_override_key_means_no_override_sentence():
+    assert "override" not in joined(fx.pause_data()).lower()
+
+
+@pytest.mark.parametrize(
+    "diag",
+    [
+        pytest.param(None, id="null"),
+        pytest.param("something went wrong", id="string"),
+        pytest.param([], id="list"),
+        pytest.param(42, id="number"),
+    ],
+)
+def test_an_unreadable_diagnosis_still_asks_and_says_it_is_unexplained(diag):
+    # FAIL-SAFE: the daemon is paused either way.  Rendering nothing, or
+    # auto-answering, are both worse than telling the operator that the
+    # explanation did not arrive and letting them decide.
+    prompt = confirm_ui.confirm_prompt(fx.pause_data(diag=diag), DEADLINE)
+    body = "\n".join(prompt.texts)
+    assert "no readable explanation" in body
+    assert "Why: unknown" in body
+    assert "prefer Abort" in body
+    assert "Suggested fix: " in body
+    assert prompt.buttons and prompt.footers
+
+
+@pytest.mark.parametrize("field", ["why", "suggested_fix"])
+def test_a_missing_why_or_fix_is_named_rather_than_dropped(field):
+    diag = fx.diagnosis()
+    del diag[field]
+    body = joined(fx.pause_data(diag=diag))
+    assert "Why: " in body
+    assert "Suggested fix: " in body
+    assert "did not" in body
+
+
+@pytest.mark.parametrize("value", [None, "", "   ", 7, {}])
+def test_an_empty_prose_field_is_treated_as_missing(value):
+    diag = fx.diagnosis(why=value)
+    body = joined(fx.pause_data(diag=diag))
+    assert "Why: plrd did not report a reason." in body
+
+
+def test_a_missing_code_and_what_are_both_reported_honestly():
+    diag = fx.diagnosis()
+    del diag["what"]
+    assert "What: drag_temp_below_floor (plrd sent no description)" in joined(
+        fx.pause_data(diag=diag)
+    )
+    del diag["code"]
+    assert "What: plrd sent neither a code nor a description." in joined(
+        fx.pause_data(diag=diag)
+    )
+
+
+@pytest.mark.parametrize(
+    "tier,expected_text",
+    [
+        pytest.param("hard", "tier 'hard'", id="hard"),
+        pytest.param("advisory", "tier 'advisory'", id="advisory"),
+        pytest.param(None, "tier 'unreported'", id="missing"),
+    ],
+)
+def test_a_tier_other_than_confirmable_is_flagged_as_unexpected(tier, expected_text):
+    # Only Tier::Confirmable reaches a confirm-point (executor.rs:785-811
+    # routes Hard to a refusal instead).  Anything else means the plugin and
+    # the daemon disagree, and the operator is told so rather than
+    # reassured.
+    body = joined(fx.pause_data(diag=fx.diagnosis(tier=tier)))
+    assert expected_text in body
+    assert "Prefer Abort" in body
+
+
+def test_the_confirmable_tier_adds_no_noise():
+    assert "unexpected for a confirmation" not in joined(fx.pause_data())
+
+
+# --- per-kind detail ---------------------------------------------------
+
+
+def test_z_height_detail_reports_the_height_and_its_derivation():
+    body = joined(fx.z_height_pause(live_z=0.62, target_z=0.6)["data"])
+    assert "Toolhead is standing off at Z = 0.62 mm." in body
+    assert "Standoff target was Z = 0.6 mm." in body
+    assert "z_prev_top" in body
+
+
+def test_z_height_without_a_live_readback_says_to_judge_by_eye():
+    # executor.rs:909 makes the live readback best-effort: a failed status
+    # query reports null rather than turning a confirmation into an abort.
+    pause = fx.z_height_pause()
+    pause["data"]["detail"]["live_toolhead_z"] = None
+    body = joined(pause["data"])
+    assert "could not read the live toolhead Z" in body
+    assert "judge the standoff by eye" in body
+
+
+def test_step_debug_detail_lists_the_commands_about_to_be_sent():
+    body = joined(fx.step_debug_pause(commands=["M140 S60", "M104 S150"])["data"])
+    assert "Commands about to be sent: M140 S60; M104 S150" in body
+    assert "Verified afterwards: heater_bed.temperature within 60 +/- 2" in body
+
+
+def test_step_debug_truncates_a_pathological_command_list_and_counts_it():
+    commands = ["G1 X%d" % i for i in range(20)]
+    body = joined(fx.step_debug_pause(commands=commands)["data"])
+    assert "G1 X11" in body
+    assert "G1 X12" not in body
+    assert "(and 8 more command(s)" in body
+
+
+def test_a_step_that_only_verifies_says_so():
+    body = joined(fx.step_debug_pause(commands=[])["data"])
+    assert "sends no commands" in body
+
+
+def test_a_diagnosis_pause_reports_what_raised_it():
+    assert "Raised by: pre-flight" in joined(fx.pause_data())
+
+
+@pytest.mark.parametrize("detail", [None, "nope", 7, []])
+def test_an_unreadable_detail_never_breaks_the_prompt(detail):
+    body = joined(fx.pause_data(detail=detail))
+    assert "Why: " in body and "Suggested fix: " in body
+
+
+# --- where the pause happened -----------------------------------------
+
+
+def test_the_prompt_says_which_step_and_phase_paused():
+    assert confirm_ui.where_line(9, "z-confirm-standoff", "z-height") == (
+        "Paused at step 9 [z-confirm-standoff] (z-height confirmation)"
+    )
+
+
+@pytest.mark.parametrize("step", [None, "nine", 9.5, True])
+def test_an_unreadable_step_number_is_not_invented(step):
+    line = confirm_ui.where_line(step, "bed-heat", "step-debug")
+    assert "unreported step" in line
+    assert "9" not in line
+
+
+def test_a_missing_phase_and_kind_degrade_to_something_honest():
+    assert confirm_ui.where_line(4, None, None) == (
+        "Paused at step 4 (unspecified confirmation)"
+    )
+
+
+# --- the deadline sentence --------------------------------------------
+
+
+def test_the_deadline_sentence_is_included_when_given_and_omitted_otherwise():
+    assert DEADLINE in texts(fx.pause_data())
+    assert DEADLINE not in texts(fx.pause_data(), deadline=None)
+
+
+# --- the envelope -----------------------------------------------------
+
+
+def test_the_title_names_the_flow_and_the_prompt_is_ordered():
+    prompt = confirm_ui.confirm_prompt(fx.pause_data(), DEADLINE)
+    assert prompt.title == "Power-loss recovery — confirmation needed"
+    # Where, then the question, then the explanation: the operator reads
+    # what is being asked before the detail behind it.
+    assert prompt.texts[0].startswith("Paused at step")
+    assert prompt.texts[1] == confirm_ui.question("diagnosis")
+
+
+@pytest.mark.parametrize("data", [None, "nope", [], 7])
+def test_a_non_object_data_map_still_produces_an_answerable_prompt(data):
+    prompt = confirm_ui.confirm_prompt(data, DEADLINE)
+    assert prompt.buttons and prompt.footers
+    assert "no readable explanation" in "\n".join(prompt.texts)
+
+
+def test_no_prompt_promises_an_image():
+    # No client renders images in an action prompt; promising one is a lie
+    # the operator cannot check.
+    prompt = confirm_ui.confirm_prompt(fx.z_height_pause()["data"], DEADLINE)
+    body = "\n".join(list(prompt.texts) + list(prompt.fallbacks)).lower()
+    for word in ("image", "photo", "picture", "screenshot", "webcam"):
+        assert word not in body

@@ -100,3 +100,21 @@ def run_cmd(fake_printer):
         return gcode
 
     return run
+
+
+@pytest.fixture
+def pump(fake_printer):
+    """Deliver pending worker results, as the reactor thread would.
+
+    Every daemon call the plugin makes runs on a worker thread and comes
+    back through ``reactor.register_async_callback``
+    (plr/daemon_worker.py), so a test that drives a command must then pump
+    once per outstanding call — which is itself the shape of the fix: the
+    handler returned before the answer existed.  ``pump(0)`` asserts
+    nothing was delivered without waiting for anything.
+    """
+
+    def run(expected=1, timeout=5.0):
+        return fake_printer.reactor.pump_async(expected, timeout)
+
+    return run

@@ -47,10 +47,12 @@ from . import (
     calibration_meta,
     daemon_keys,
     daemon_link,
+    daemon_worker,
     drag_calibrate,
     drag_probe,
     noise_test,
     probe_test,
+    recovery,
     setup_checks,
     touch_sequence,
     tunables,
@@ -89,6 +91,19 @@ class PLRPlugin:
         self.wal_dir = config.get("wal_dir", "/var/lib/plrd/wal")
         self.control_socket = config.get("control_socket", "/var/lib/plrd/plrd.sock")
         self.daemon = daemon_link.DaemonLink(self.control_socket)
+        # Off-reactor call channels.  EVERY daemon call goes through one of
+        # these: a blocking socket read inside a g-code handler stalls
+        # klippy's single reactor thread, which switches the heaters off
+        # within ~5 s and risks an MCU-side shutdown after 3 s (the full
+        # evidence, with klippy line numbers, is in plr/daemon_worker.py).
+        # One channel per independent conversation, so a console query can
+        # never be refused by — or interfere with — a live recovery.
+        self.daemon_query = daemon_worker.AsyncDaemon(
+            self.printer, lambda: self.daemon, "query"
+        )
+        self.daemon_wizard = daemon_worker.AsyncDaemon(
+            self.printer, lambda: self.daemon, "wizard"
+        )
         # --- tunables (schema + ranges live in tunables.TUNABLES) ---
         self.tunables = tunables.load_from_config(config)
         # --- [plr] options plrd consumes that this plugin only DECLARES --
@@ -209,6 +224,12 @@ class PLRPlugin:
         # --- daemon_alive cache for get_status ----------------------
         self._daemon_alive = False
         self._daemon_alive_checked = None
+        # --- recovery execution (single in-flight, shared) -----------
+        # Owns the live recover_execute conversation, its confirm-point
+        # loop and the single-flight guard.  BOTH entry points use this one
+        # instance — PLR_RECOVER EXECUTE=1 and PLR_WIZARD_EXECUTE — so a
+        # second attempt from either is refused by the same guard.
+        self.recovery = recovery.RecoverySession(self)
         # --- recovery/setup wizard state (single in-flight wizard) --
         # Holds the prompt-driven recovery state machine; get_status
         # surfaces wizard_active from it.
@@ -238,7 +259,16 @@ class PLRPlugin:
     cmd_PLR_STATUS_help = "Report plr plugin state and plrd daemon status"
     cmd_PLR_RECOVER_help = (
         "Power-loss recovery via plrd: dry run by default; "
-        "EXECUTE=1 CONFIRM=YES executes"
+        "EXECUTE=1 CONFIRM=YES executes (returns immediately; plrd reports "
+        "to the console as it goes)"
+    )
+    cmd_PLR_RECOVER_CONTINUE_help = (
+        "Answer plrd's outstanding recovery confirmation with 'continue' — "
+        "the recovery proceeds despite what it reported"
+    )
+    cmd_PLR_RECOVER_ABORT_help = (
+        "Answer plrd's outstanding recovery confirmation with 'abort' — the "
+        "recovery stops cleanly"
     )
     cmd_PLR_NOISE_TEST_help = (
         "Measure the accel-chip noise floor (requires START=1; moves the "
@@ -291,6 +321,11 @@ class PLRPlugin:
             ("PLR_NOISE_TEST", noise_test.cmd_PLR_NOISE_TEST),
             ("PLR_DRAG_PROBE", drag_probe.cmd_PLR_DRAG_PROBE),
             ("PLR_DRAG_CALIBRATE", drag_calibrate.cmd_PLR_DRAG_CALIBRATE),
+            # -- confirm-point answers (recovery.py; two lines, kept
+            # contiguous so a concurrent branch's addition to this table
+            # stays a trivial merge) --
+            ("PLR_RECOVER_CONTINUE", recovery.cmd_PLR_RECOVER_CONTINUE),
+            ("PLR_RECOVER_ABORT", recovery.cmd_PLR_RECOVER_ABORT),
             ("PLR_WIZARD_START", wizard.cmd_PLR_WIZARD_START),
             ("PLR_WIZARD_DRYRUN", wizard.cmd_PLR_WIZARD_DRYRUN),
             ("PLR_WIZARD_CONFIRM_CLEAN", wizard.cmd_PLR_WIZARD_CONFIRM_CLEAN),
@@ -490,6 +525,13 @@ class PLRPlugin:
             # mid-run, and whether the clean-nozzle step will auto-run a
             # macro (server config permitting) or ask for confirmation.
             "wizard_active": self.wizard.is_active(),
+            # The live recover_execute conversation (plr/recovery.py):
+            # "idle" / "running" / "awaiting_confirmation", with the flag a
+            # UI needs to know an operator answer is being waited on.  Read
+            # from local state only — get_status runs several times a second
+            # on the reactor and must never touch the control socket.
+            "recovery_state": self.recovery.state(),
+            "recovery_awaiting_confirmation": self.recovery.is_awaiting(),
             "clean_nozzle_macro_available": self.clean_nozzle_macro_available,
             "noise_floor_rms": self.noise_floor_rms,
             "noise_floor_temp": self.noise_floor_temp,

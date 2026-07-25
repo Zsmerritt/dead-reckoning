@@ -14,6 +14,8 @@ cites the klippy shape it mirrors.
 
 import collections
 import math
+import threading
+import time
 
 _SENTINEL = object()
 
@@ -304,7 +306,7 @@ class FakeConfig:
 
 
 class FakeReactor:
-    """Stands in for klippy's reactor: deterministic monotonic clock.
+    """Stands in for klippy's reactor: clock, timers, async callbacks.
 
     ``auto_advance`` (seconds) is added to ``now`` after each
     ``monotonic()`` read, so a test can drive wall-clock elapsed time
@@ -313,11 +315,37 @@ class FakeReactor:
     makes those reads march forward deterministically.  Default 0.0
     keeps monotonic() a stable clock (every existing caller reads a
     constant value).
+
+    DISPATCH GLUE, NOT A REACTOR.  ``register_async_callback`` /
+    ``register_timer`` mirror the SHAPES klippy offers
+    (klippy/reactor.py:195-220 for the callback pair and its self-pipe
+    wakeup, :151-189 for timers) so plugin code can be driven from tests,
+    but nothing here reproduces klippy's single-threaded dispatch: queued
+    callbacks run only when a test calls :meth:`pump_async`, on the
+    TEST's thread.  The claim that matters — that a g-code handler never
+    holds the reactor while a daemon call blocks — cannot be proven
+    against a fake that has no loop, so it is proven against a real
+    select() loop instead (tests/reactor_harness.py).
+
+    Klippy's own contract, which this honours: ``register_async_callback``
+    is callable from ANY thread, the callback runs later on the reactor
+    thread and takes ``eventtime``; a timer callback takes ``eventtime``
+    and RETURNS its next waketime (``NEVER`` to stop).
     """
+
+    # klippy/reactor.py:8-9 (_NOW / _NEVER).
+    NOW = 0.0
+    NEVER = 9999999999999999.0
 
     def __init__(self, start=100.0, auto_advance=0.0):
         self.now = start
         self.auto_advance = auto_advance
+        # Async callbacks queued from other threads, plus the event a test
+        # waits on (standing in for klippy's self-pipe wakeup).
+        self._async_lock = threading.Lock()
+        self._async_queue = []
+        self._async_event = threading.Event()
+        self.timers = []
 
     def monotonic(self):
         value = self.now
@@ -327,9 +355,79 @@ class FakeReactor:
     def advance(self, seconds):
         self.now += seconds
 
+    # -- async callbacks (klippy/reactor.py:199-220) -------------------
+
+    def register_async_callback(self, callback, waketime=NOW):
+        with self._async_lock:
+            self._async_queue.append(callback)
+            self._async_event.set()
+
+    def pending_async(self):
+        with self._async_lock:
+            return len(self._async_queue)
+
+    def pump_async(self, expected=1, timeout=5.0):
+        """Wait for ``expected`` queued callbacks, then run all of them.
+
+        Returns the number invoked.  The wait is real (the callbacks come
+        from real worker threads); the dispatch is not — see the class
+        docstring.  A timeout returns what arrived, so a test asserting
+        "nothing was delivered" states that with ``expected=0``.
+        """
+        deadline = time.time() + timeout
+        while True:
+            with self._async_lock:
+                ready = len(self._async_queue)
+            if ready >= expected or time.time() >= deadline:
+                break
+            self._async_event.wait(0.01)
+            self._async_event.clear()
+        with self._async_lock:
+            batch = self._async_queue
+            self._async_queue = []
+            self._async_event.clear()
+        for callback in batch:
+            callback(self.monotonic())
+        return len(batch)
+
+    # -- timers (klippy/reactor.py:151-189) ---------------------------
+
+    def register_timer(self, callback, waketime=NEVER):
+        timer = FakeTimer(callback, waketime)
+        self.timers.append(timer)
+        return timer
+
+    def update_timer(self, timer, waketime):
+        timer.waketime = waketime
+
+    def unregister_timer(self, timer):
+        if timer in self.timers:
+            self.timers.remove(timer)
+
+    def run_due_timers(self):
+        """Fire every timer whose waketime has passed; return how many.
+
+        klippy's ``_check_timers`` re-arms a timer from its callback's
+        return value (klippy/reactor.py:172-189); so does this.
+        """
+        fired = 0
+        for timer in list(self.timers):
+            if timer.waketime <= self.now:
+                timer.waketime = timer.callback(self.now)
+                fired += 1
+        return fired
+
+
+class FakeTimer:
+    """Mirrors klippy's ReactorTimer (klippy/reactor.py:16-20)."""
+
+    def __init__(self, callback, waketime):
+        self.callback = callback
+        self.waketime = waketime
+
 
 class FakePrinter:
-    """Stands in for klippy's Printer: object registry + events."""
+    """Stands in for klippy's Printer: object registry + events + state."""
 
     command_error = FakeCommandError  # klippy/klippy.py Printer.command_error
 
@@ -337,6 +435,10 @@ class FakePrinter:
         self.objects = {}
         self.event_handlers = {}
         self.reactor = FakeReactor()
+        # klippy/klippy.py:55-56 Printer.is_shutdown reports the latched
+        # shutdown state; invoke_shutdown (:204-220) sets it and then runs
+        # the klippy:shutdown handlers.
+        self.in_shutdown_state = False
         # klippy/klippy.py: Printer.get_start_args returns the dict main()
         # built, which carries 'software_version' (util.get_git_version()).
         # Defaults to a realistic git-describe string; tests set it to {}
@@ -369,6 +471,29 @@ class FakePrinter:
     def register_event_handler(self, event, callback):
         self.event_handlers.setdefault(event, []).append(callback)
 
+    def send_event(self, event, *params):
+        # klippy/klippy.py:226-227.
+        return [cb(*params) for cb in self.event_handlers.get(event, [])]
+
+    def is_shutdown(self):
+        # klippy/klippy.py:55-56.
+        return self.in_shutdown_state
+
+    def invoke_shutdown(self, msg="test shutdown"):
+        """Latch the shutdown state, then run the handlers, as klippy does.
+
+        Mirrors klippy/klippy.py:204-220 including the ORDER (state first,
+        handlers second) and the fact that a handler raising does not stop
+        the others.  klippy additionally runs them inside
+        ``reactor.assert_no_pause()``; nothing here can pause, so the
+        guarantee this harness offers is the order and the latch.
+        """
+        if self.in_shutdown_state:
+            return
+        self.in_shutdown_state = True
+        for cb in list(self.event_handlers.get("klippy:shutdown", [])):
+            cb()
+
 
 class FakeGCodeCommand:
     """Stands in for klippy's GCodeCommand (klippy/gcode.py:24-96)."""
@@ -382,7 +507,10 @@ class FakeGCodeCommand:
         self._command = command
         self._commandline = commandline
         self._params = dict(params)
+        # klippy/gcode.py:31-33 wires both wrappers straight through to the
+        # dispatcher, which is why plugin code may use either one.
         self.respond_info = gcode.respond_info
+        self.respond_raw = gcode.respond_raw
 
     def get_command(self):
         return self._command
@@ -460,6 +588,7 @@ class FakeGCode:
         self.commands = {}
         self.command_help = {}
         self.responses = []
+        self.raw_responses = []
 
     def register_command(self, name, func, desc=None):
         if func is not None and name in self.commands:
@@ -476,6 +605,12 @@ class FakeGCode:
 
     def respond_info(self, msg, log=True):
         self.responses.append(msg)
+
+    def respond_raw(self, msg):
+        # klippy/gcode.py:247-249 — the raw output path respond_info builds
+        # on, and the one klippy uses for the '!!' error prefix
+        # (klippy/gcode.py:255-263, klippy/extras/respond.py:8-12).
+        self.raw_responses.append(msg)
 
 
 class FakeConfigfile:
