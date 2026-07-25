@@ -1995,9 +1995,11 @@ mod tests {
     /// has been serialised, let alone acknowledged by the fake's
     /// WebSocket task. Asserting on `fake.gcode_sent()` the instant the
     /// file appears is therefore not a race that is *usually* won — it is
-    /// an assertion about an event that has not been waited for at all. It
-    /// failed 122 times in 480 runs under CPU load, always with
-    /// `["SET_IDLE_TIMEOUT TIMEOUT=86400"]` as the observed history: the
+    /// an assertion about an event that has not been waited for at all.
+    /// Measured on Linux, 24 cores, 24 concurrent copies of the test plus
+    /// 24 busy-loop load processes: **18 failures in 2000 runs** before this
+    /// helper, **0 in 2000** after, and every failure printed the same
+    /// history — `["M115", "SET_IDLE_TIMEOUT TIMEOUT=86400"]` — i.e. the
     /// declare simply had not been sent yet.
     ///
     /// The fix is to wait for the observable the assertion is about. A

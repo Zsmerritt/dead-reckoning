@@ -304,9 +304,11 @@ impl Confirmer for SocketConfirmer {
 ///   it.** Every critical section here is straight-line code over
 ///   `bool`/`String`/`Instant` with no `await` and no I/O inside it, held
 ///   for tens of nanoseconds. It is a `std::sync::Mutex` precisely so that
-///   holding it across an `await` is not expressible: the guard is not
-///   `Send`, so any attempt to would fail to compile in the async
-///   functions here.
+///   holding it across an `await` is not expressible here: the guard is
+///   `!Send`, and every async context that touches it is `Send`-bounded —
+///   connections are spawned tasks, and [`Confirmer::confirm`] returns a
+///   boxed `Send` future — so such a hold is a compile error rather than a
+///   review finding.
 /// * **No lock cycle.** The execute path takes `session` then this; the
 ///   status path takes this alone. There is no path that takes them in the
 ///   other order.
@@ -1962,6 +1964,25 @@ mod tests {
             "{paused}"
         );
         assert_eq!(paused["data"]["confirm_kind"], json!("z-height"));
+        // BACKWARD COMPATIBILITY. Every key an older plugin reads is still
+        // present with the same meaning; the deadline fields are purely
+        // additive, and a client that ignores them behaves exactly as it
+        // did. Asserted as a list so removing or renaming one fails here
+        // rather than in somebody's console during a recovery.
+        for key in [
+            "outcome",
+            "resume_token",
+            "confirm_kind",
+            "step",
+            "phase",
+            "diagnosis",
+            "detail",
+        ] {
+            assert!(
+                paused["data"].get(key).is_some(),
+                "the frozen `awaiting_confirmation` key {key} went missing: {paused}"
+            );
+        }
         // The diagnosis is the same JSON object as every other diagnosis.
         let d = &paused["data"]["diagnosis"];
         assert_eq!(d["code"], json!("z_confirm_before_resume"));
@@ -2412,6 +2433,17 @@ mod tests {
         // This is the plugin defect being deleted: with nothing reported,
         // a client assumed the band ceiling (3600 s) and went on claiming a
         // confirmation was live for ~50 minutes after the daemon aborted.
+        //
+        // What this proves and what it does not. It proves the end-to-end
+        // truth — the reported deadline is the enforced one, and once it has
+        // passed the socket says "not awaiting" while the daemon really has
+        // aborted. It does NOT exercise the read-time expiry derivation:
+        // 900 ms after a 300 ms deadline the execution task has finished and
+        // dropped its lease, so the answer would be the same with the
+        // derivation removed (verified by mutation). The derivation is
+        // pinned by `a_published_pause_expires_by_the_clock_not_by_being_told`,
+        // which can place the clock where a live task with a lapsed pause
+        // cannot be arranged deterministically here.
         let (path, wal_dir, _fake) =
             spawn_confirm_server("state-lapsed", &[("confirm_z_before_resume", json!(true))]).await;
         let paused = roundtrip(&path, EXECUTE_ASK).await;

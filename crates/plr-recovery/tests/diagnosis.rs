@@ -33,8 +33,8 @@ use plr_recovery::diagnosis::{Diagnose, Tier};
 use plr_recovery::machine::PrereqFailure;
 use plr_recovery::preflight::{BoundsViolation, PlanRejection, ViolationKind};
 use plr_recovery::{
-    PlanConfig, PlanWarning, RecoveryError, ACCEL_MAX, ACCEL_MIN, CONFIRM_TIMEOUT_MAX_S,
-    CONFIRM_TIMEOUT_MIN_S, UNSAFE_PURGE_Z_BELOW_BED,
+    PlanConfig, PlanWarning, RecoveryError, ACCEL_MAX, ACCEL_MIN, CONFIRM_TIMEOUT_DEFAULT_S,
+    CONFIRM_TIMEOUT_MAX_S, CONFIRM_TIMEOUT_MIN_S, UNSAFE_PURGE_Z_BELOW_BED,
 };
 
 /// Every [`RecoveryError`] variant, with the tier it must carry.
@@ -699,7 +699,11 @@ fn the_confirm_timeout_is_bounded_on_both_sides() {
             Some(CONFIRM_TIMEOUT_MAX_S)
         );
     }
-    for ok in [CONFIRM_TIMEOUT_MIN_S, 600.0, CONFIRM_TIMEOUT_MAX_S] {
+    for ok in [
+        CONFIRM_TIMEOUT_MIN_S,
+        CONFIRM_TIMEOUT_DEFAULT_S,
+        CONFIRM_TIMEOUT_MAX_S,
+    ] {
         PlanConfig {
             confirm_timeout_s: Some(ok),
             ..PlanConfig::default()
@@ -709,6 +713,38 @@ fn the_confirm_timeout_is_bounded_on_both_sides() {
     }
     // Absent is always fine: the daemon's default stays in force.
     assert_eq!(PlanConfig::default().confirm_timeout_s, None);
+}
+
+/// The default that applies when the key is absent must be a value the key
+/// itself would have accepted, strictly inside the band.
+///
+/// Two reasons this lives here and not only in `plrd`. It is `plr-recovery`
+/// that *quotes* the default back at the operator in the
+/// `confirm_timeout_out_of_range` fix text, so a default outside the band
+/// would print advice the same validator rejects. And `plrd` is excluded
+/// from the Windows gate entirely (`--exclude plrd`), so a divergence
+/// introduced on a Windows machine would be structurally invisible until
+/// the Linux run; this test is in the default members and always runs.
+#[test]
+fn the_confirm_timeout_default_sits_strictly_inside_its_own_band() {
+    assert!(
+        CONFIRM_TIMEOUT_DEFAULT_S > CONFIRM_TIMEOUT_MIN_S,
+        "the default must leave room below it: {CONFIRM_TIMEOUT_DEFAULT_S} vs \
+         {CONFIRM_TIMEOUT_MIN_S}"
+    );
+    assert!(
+        CONFIRM_TIMEOUT_DEFAULT_S < CONFIRM_TIMEOUT_MAX_S,
+        "the default must leave room above it: {CONFIRM_TIMEOUT_DEFAULT_S} vs \
+         {CONFIRM_TIMEOUT_MAX_S}"
+    );
+    // And it must be a legal setting, not merely a number in range: the
+    // validator is the authority on that, so ask it.
+    PlanConfig {
+        confirm_timeout_s: Some(CONFIRM_TIMEOUT_DEFAULT_S),
+        ..PlanConfig::default()
+    }
+    .validate()
+    .unwrap_or_else(|e| panic!("the default must be a settable value: {e:?}"));
 }
 
 /// A Hard refusal with `override_key: None` is refused no matter what

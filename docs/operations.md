@@ -666,6 +666,40 @@ slow (a long pipeline run on a big WAL can push `recover_dryrun`
 toward its 120 s budget on slow media — prune old segments, see
 [disk sizing](#disk-sizing-and-write-load)).
 
+**`recover: REFUSED — could not confirm exclusive g-code access …` or
+`… the printer stopped being idle while dead-reckoning was waiting for
+Klipper's g-code mutex …`.**
+Something other than dead-reckoning was running g-code when the recovery
+started, and it still was when the recovery tried to take over. Klipper
+holds its g-code mutex for the whole body of a `[gcode_macro]`, so this
+fires most often when `PLR_RECOVER` is called from a macro that has more
+commands after it — the daemon cannot send anything until that macro
+finishes, and by then the machine is not the machine it checked. Nothing
+was sent but a read-only `M115`, which changes nothing.
+
+Fixes, in order of preference: run `PLR_RECOVER` directly rather than from
+a macro; if it must live in a macro, make it the **last** command in the
+body; and check nothing else (a console command, a `[delayed_gcode]`, a
+bed mesh) is mid-run. If the message names a timeout, the mutex was never
+released at all within 30 s — look for a macro that is itself waiting on
+the daemon, or a klippy stuck inside somebody else's script
+(`journalctl -u klipper -n 100`).
+
+**Is a recovery still running / still waiting for me?**
+Ask the daemon, do not start one to find out:
+
+```
+printf '{"cmd": "recover_state"}\n' | socat - UNIX-CONNECT:/var/lib/plrd/plrd.sock
+```
+
+It reports `executing`, `awaiting_confirmation`, the outstanding
+`resume_token`, and `confirm_expires_in_s` — how long the daemon will still
+wait before it aborts the pause by itself. It is read-only: it cannot
+start, answer or cancel anything. A confirmation whose deadline has passed
+reads as `awaiting_confirmation: false` with `confirm_expired: true`, which
+means the recovery has already aborted (and the Z frame will be marked
+unknown — re-run a dry run before resuming).
+
 **Control-socket permissions (mode 0666) — and how to tighten them.**
 The daemon deliberately creates `/var/lib/plrd/plrd.sock` world-writable:
 the stock install runs plrd as root while klippy — the socket's one
@@ -677,6 +711,10 @@ narrow and gated: `recover_execute` demands an explicit confirm, still
 passes machine validation, the klippy-ready + printer-idle gate, and
 transcript-or-refuse, and can only ever execute the deterministic
 pipeline plan — there is no arbitrary-G-code or configuration surface.
+`recover_state` widens the *readable* surface (it will hand out the
+outstanding confirm-point's resume token), but not the mutating one: the
+token is a correlation identifier, never an authenticator, and anyone who
+can read it could already have sent `recover_execute` on the same socket.
 On a multi-user host, tighten it: run plrd as the klippy user (systemd
 `User=`), or add a drop-in with
 `ExecStartPost=chgrp <group> %S/plrd/plrd.sock` + `chmod 0660` (plrd
