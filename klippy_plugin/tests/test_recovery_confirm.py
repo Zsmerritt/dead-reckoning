@@ -572,7 +572,7 @@ def test_status_shows_the_outstanding_question_and_how_to_answer_it(
     since = responses_since(gcode)
     run("PLR_STATUS")
     body = "\n".join(since())
-    assert "recovery: AWAITING CONFIRMATION" in body
+    assert "recovery: AWAITING CONFIRMATION — question 1 of this recovery" in body
     assert "Paused at step 9 [z-confirm-standoff] (z-height confirmation)" in body
     assert "PLR_RECOVER_CONTINUE" in body and "PLR_RECOVER_ABORT" in body
 
@@ -772,3 +772,59 @@ def test_an_exception_in_the_expiry_handler_never_escapes(
     # printer shutdown (klippy/klippy.py:170-186).
     assert reactor.run_due_timers() == 1
     assert reactor.timers[0].waketime == reactor.NEVER
+
+
+def test_a_broken_completion_listener_cannot_take_klippy_down(
+    plugin, run, run_cmd, pump
+):
+    # The wizard registers a listener so it can drop back to idle.  A
+    # listener that raises must not become a printer shutdown by way of the
+    # reactor callback that called it (klippy/klippy.py:170-186).
+    plugin.daemon = ScriptedDaemon({"recover_execute": [fx.completed()]})
+
+    def boom():
+        raise RuntimeError("listener exploded")
+
+    gcmd = fake_klippy.FakeGCodeCommand(
+        plugin.printer.lookup_object("gcode"), "X", "X", {}
+    )
+    plugin.recovery.start(gcmd, "TEST", on_finished=boom)
+    assert pump() == 1
+    assert plugin.recovery.state() == "idle"
+
+
+def test_shutdown_then_disconnect_is_handled_once(plugin, run, fake_printer):
+    # klippy sends klippy:disconnect on every exit as well as shutting down
+    # (klippy/klippy.py:186-198), so both handlers fire in one teardown.
+    plugin.daemon = ScriptedDaemon(
+        {"recover_execute": [fx.pause()], "recover_confirm": [fx.aborted()]}
+    )
+    execute(plugin, run)
+    fake_printer.invoke_shutdown("Manual stop (M112)")
+    fake_printer.send_event("klippy:disconnect")
+    for _ in range(400):
+        if plugin.daemon.answers():
+            break
+        time.sleep(0.005)
+    # Exactly one abort, not two.
+    assert plugin.daemon.answers() == ["abort"]
+
+
+def test_a_failing_shutdown_abort_is_contained(plugin, run, fake_printer, caplog):
+    # The detached abort is best-effort: plrd's own deadline is the backstop,
+    # so a failure there must not raise on a thread nobody is watching.
+    plugin.daemon = ScriptedDaemon(
+        {
+            "recover_execute": [fx.pause()],
+            "recover_confirm": [daemon_link.DaemonError("plrd is gone")],
+        }
+    )
+    execute(plugin, run)
+    fake_printer.invoke_shutdown("Manual stop (M112)")
+    for _ in range(400):
+        if plugin.daemon.tokens():
+            break
+        time.sleep(0.005)
+    assert plugin.daemon.tokens() == ["plrc-17bd4c0f9a2-3"]
+    time.sleep(0.05)
+    assert plugin.recovery.state() == "idle"

@@ -218,7 +218,10 @@ class RecoverySession:
                 "recovery: RUNNING (started by %s) — plrd is driving the "
                 "machine; watch the console for its report" % (self._source,)
             ]
-        lines = ["recovery: AWAITING CONFIRMATION (started by %s)" % (self._source,)]
+        lines = [
+            "recovery: AWAITING CONFIRMATION — question %d of this recovery "
+            "(started by %s)" % (self._pauses, self._source)
+        ]
         if isinstance(self._data, dict):
             lines.append(
                 "  %s"
