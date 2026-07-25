@@ -20,11 +20,20 @@
 //!    the last preceding segment, which contributes a candidate.
 //! 2. **Extension.** From the last context's file offset and g-code
 //!    state, [`plr_gcode::simulate`] runs for
-//!    `extension_horizon + max(0, t_b - t_anchor)` seconds of simulated
-//!    motion (the catch-up term covers contexts that lag the committed
-//!    boundary). Because the simulator's per-line accounting is a
-//!    documented lower bound on real durations, the horizon covers at
-//!    least that much real machine time.
+//!    `extension_horizon + max(0, wal_eval_end - t_ext_start)` seconds
+//!    of simulated motion, where `t_ext_start` is the print time at
+//!    which the machine **begins executing the first simulated line**
+//!    ([`extension_start_time`]) — *not* the anchor snapshot's capture
+//!    time. The two differ by seconds whenever the g-code reader stalls
+//!    on one long move: the frontier then sits still while the queued
+//!    move executes, so the snapshot records a file position whose
+//!    motion started long before the snapshot itself. Measuring from the
+//!    capture time spends the horizon re-simulating already-executed
+//!    motion and under-covers the window (the bug behind proptest seed
+//!    `9938d965…`). Because the simulator's per-line accounting is a
+//!    documented lower bound on real durations, simulating
+//!    `T - t_ext_start` seconds consumes at least every line the machine
+//!    could have executed by real time `T`.
 //! 3. **Z is exact.** The extension's Z candidates come from
 //!    [`plr_gcode::scan_z_events`] over exactly the consumed lines — a
 //!    byte-faithful replay with no timing model. Combined with the WAL
@@ -46,7 +55,7 @@
 //! *processed*. The primary path recovers those pairs **exactly** by
 //! replaying the file from the offset-window floor context through the
 //! extension end and recording the g-code-frame E after every line
-//! ([`file_frame_e`]'s replay). Because the interpreter is
+//! ([`window_e_intervals`]'s replay). Because the interpreter is
 //! deterministic, this reconstructs the frame of every candidate line —
 //! including frames created *and* replaced between two context flushes
 //! (e.g. `G92 E0` + retract processed in one burst right after a
@@ -56,6 +65,13 @@
 //! run or cannot reach the window end does the computation fall back to
 //! unioning the WAL-internal interval converted under recent context
 //! frames, flagged [`Degradation::e_file_frames_incomplete`].
+//!
+//! The same replay carries the **Klipper-internal** E envelope, which is
+//! unioned into `e_internal` alongside the trapq evaluation. That covers
+//! lines inside the offset window whose trapq rows never reached the
+//! durable WAL — 0.5 s dump batching can drop rows for lines the
+//! interpreter had already processed — which neither the WAL span nor
+//! the anchor-started extension can see.
 //!
 //! # File-offset window
 //!
@@ -280,6 +296,13 @@ pub struct Degradation {
     /// replaced between two context flushes. Treat `e_file` as
     /// best-effort in this state.
     pub e_file_frames_incomplete: bool,
+    /// No durable trapq row precedes the anchor context, so the
+    /// extension's simulated clock could not be placed on the print-time
+    /// axis from motion evidence (see [`extension_start_time`]); the
+    /// horizon fell back to the anchor's own capture time and `t_a`. If
+    /// the anchor's processing frontier had stalled on a long move, the
+    /// extension may under-cover the far end of the window.
+    pub extension_start_unanchored: bool,
     /// No context old enough to predate `t_a - max_processing_lead`
     /// exists; the offset-window floor fell back to the oldest known
     /// frontier and may be optimistic.
@@ -377,11 +400,18 @@ pub fn compute_stop_set(
         ..Degradation::default()
     };
 
-    let extension = run_extension(anchor, window, file_tail, config, &mut degradation)?;
+    let extension = run_extension(
+        timeline,
+        anchor,
+        window,
+        wal_eval_end,
+        file_tail,
+        config,
+        &mut degradation,
+    )?;
     let floor = floor_context(timeline, window, anchor, config, &mut degradation);
 
-    let mut e_internal = wal_e;
-    let mut e_file = file_frame_e(
+    let (mut e_file, replayed_internal_e) = window_e_intervals(
         timeline,
         window,
         anchor,
@@ -392,6 +422,7 @@ pub fn compute_stop_set(
         config,
         &mut degradation,
     );
+    let mut e_internal = union_opt(wal_e, replayed_internal_e);
     if let Some(ext) = &extension {
         z_candidates.extend(ext.z.iter().cloned());
         if let Some(ext_xy) = ext.xy {
@@ -662,11 +693,61 @@ struct ExtensionResult {
     e_file: Option<Interval>,
 }
 
+/// Print time at which the extension's **first simulated move begins
+/// executing** — the origin of the simulated clock, and therefore of the
+/// horizon.
+///
+/// The extension starts at the anchor context's processing frontier `F`.
+/// The machine reaches `F` only after finishing every move produced by
+/// lines before `F`, at a print time this function lower-bounds:
+///
+/// * `trapq_end_time_journaled_by(anchor.mono_ns)` — every line up to
+///   `F` was processed by the anchor's capture time, so its trapq row
+///   was journaled by then; the newest such row's end time is exactly
+///   when motion preceding `F` completes. Batching delay can only drop
+///   rows from this set, which lowers the value — conservative.
+/// * `anchor_pt` — the anchor's own capture time. When the interpreter
+///   is reading ahead normally (the usual case) execution has not
+///   reached `F` yet, so this is a valid (looser) bound.
+/// * `t_a` — a floor for the degenerate case where the WAL holds no
+///   trapq row before the anchor at all.
+///
+/// The minimum of what is available is used. Getting this wrong in the
+/// *late* direction is a containment bug, not an efficiency loss: when a
+/// frontier stalls on one long move (Klipper's reader blocks while
+/// `buffer_time_high` of motion is queued) `F` can correspond to an
+/// execution time seconds *earlier* than the snapshot that recorded it,
+/// and a horizon measured from the snapshot time is then spent
+/// re-simulating already-executed motion. That was a real containment
+/// hole for internal E — see the checked-in proptest regression seed
+/// `9938d965…`.
+fn extension_start_time(
+    timeline: &WalTimeline,
+    window: &StopWindow,
+    anchor: &Context,
+    anchor_pt: Option<f64>,
+    degradation: &mut Degradation,
+) -> f64 {
+    let journaled = timeline.trapq_end_time_journaled_by(anchor.mono_ns);
+    if journaled.is_none() {
+        degradation.extension_start_unanchored = true;
+    }
+    // `t_a` is both the third bound and the seed of the fold, so the
+    // result is finite even when neither other source is available.
+    [journaled, anchor_pt]
+        .into_iter()
+        .flatten()
+        .filter(|pt| pt.is_finite())
+        .fold(window.t_a, f64::min)
+}
+
 /// Runs the forward extension; `Ok(None)` when it cannot run (no
 /// `virtual_sdcard` state or no file tail), flagged on `degradation`.
 fn run_extension(
+    timeline: &WalTimeline,
     anchor: &Context,
     window: &StopWindow,
+    wal_eval_end: f64,
     file_tail: Option<&FileTail<'_>>,
     config: &ReconstructConfig,
     degradation: &mut Degradation,
@@ -686,12 +767,17 @@ fn run_extension(
     let anchor_state = anchor_state_from_context(&anchor.gcode)?;
 
     let anchor_pt = window.mono_ns_to_print_time(anchor.mono_ns);
-    let catchup = if let Some(pt) = anchor_pt {
-        (window.t_b - pt).max(0.0)
-    } else {
+    if anchor_pt.is_none() {
         degradation.anchor_time_unknown = true;
-        (window.t_b - window.t_a).max(0.0)
-    };
+    }
+    let start_pt = extension_start_time(timeline, window, anchor, anchor_pt, degradation);
+    // The simulated clock starts when the machine begins the first
+    // simulated line, at print time `start_pt`; the latest possible stop
+    // is `wal_eval_end + extension_horizon`. Simulated per-line
+    // durations are documented lower bounds on real durations, so
+    // simulating this many seconds consumes at least every line the
+    // machine could have executed by then.
+    let catchup = (wal_eval_end - start_pt).max(0.0);
     let catchup = if catchup.is_finite() { catchup } else { 0.0 };
     let horizon = config.extension_horizon + catchup;
 
@@ -886,28 +972,35 @@ fn floor_context<'a>(
     })
 }
 
-/// File-frame E over the whole candidate window.
+/// Both E intervals over the whole candidate window: file-frame
+/// ("g-code") E and the replay's Klipper-internal E.
 ///
 /// Primary (exact) path: replay the file from the **floor context**
-/// through the extension end, recording the g-code-frame E after every
-/// line. The interpreter is deterministic, so this reconstructs the
-/// exact `(base_e, extrude_factor)` frame of *every* line in the offset
+/// through the extension end, recording both E frames after every line.
+/// The interpreter is deterministic, so this reconstructs the exact
+/// `(base_e, extrude_factor)` frame of *every* line in the offset
 /// window — including frames created and replaced between two context
 /// flushes (e.g. `G92 E0` + retract processed in a burst after a
 /// dwell), which no snapshot ever captured. Consecutive per-line values
-/// bracket every mid-line E because E moves monotonically within a line
-/// under a fixed frame.
+/// bracket every mid-line E in both frames because E moves
+/// monotonically within a line (one `G1` sets one E target).
 ///
-/// Fallback (when the replay cannot run or cannot reach the window
-/// end — no file tail, tail not covering the floor, malformed floor
-/// snapshot, line budget, unparseable line): union the WAL-internal
-/// interval converted under every recent context frame, flagged
-/// [`Degradation::e_file_frames_incomplete`] because a frame that
-/// lived entirely between two flushes is unrecoverable without the
+/// The internal-E envelope matters independently of the file frame: it
+/// covers lines in the offset window whose **trapq rows never reached
+/// the durable WAL** (0.5 s dump batching can drop rows for lines that
+/// were already processed), which neither the WAL span nor the
+/// anchor-started extension can see.
+///
+/// Fallback for the file frame (when the replay cannot run or cannot
+/// reach the window end — no file tail, tail not covering the floor,
+/// malformed floor snapshot, line budget, unparseable line): union the
+/// WAL-internal interval converted under every recent context frame,
+/// flagged [`Degradation::e_file_frames_incomplete`] because a frame
+/// that lived entirely between two flushes is unrecoverable without the
 /// file. The fallback is also unioned in when the floor itself is
 /// uncertain, since the replay may then start past in-window motion.
 #[allow(clippy::too_many_arguments)] // one cohesive assembly step; a param struct would just rename the call site
-fn file_frame_e(
+fn window_e_intervals(
     timeline: &WalTimeline,
     window: &StopWindow,
     anchor: &Context,
@@ -917,7 +1010,7 @@ fn file_frame_e(
     wal_e: Option<Interval>,
     config: &ReconstructConfig,
     degradation: &mut Degradation,
-) -> Option<Interval> {
+) -> (Option<Interval>, Option<Interval>) {
     let end_offset = extension
         .and_then(|e| e.summary.resume_offset)
         .or_else(|| anchor.virtual_sdcard.as_ref().map(|v| v.file_position));
@@ -927,20 +1020,20 @@ fn file_frame_e(
     };
     let context_fallback =
         || wal_e.and_then(|iv| convert_e_to_file_frame(iv, timeline, window, anchor, config));
-    if let Some((interval, reached_end)) = replay {
-        let complete = reached_end && floor.is_some_and(|f| !f.uncertain);
-        if complete {
-            Some(interval)
-        } else {
-            if !reached_end {
-                degradation.e_file_frames_incomplete = true;
-            }
-            union_opt(Some(interval), context_fallback())
-        }
-    } else {
+    let Some(replay) = replay else {
         degradation.e_file_frames_incomplete = true;
-        context_fallback()
-    }
+        return (context_fallback(), None);
+    };
+    let complete = replay.reached_end && floor.is_some_and(|f| !f.uncertain);
+    let file = if complete {
+        Some(replay.file)
+    } else {
+        if !replay.reached_end {
+            degradation.e_file_frames_incomplete = true;
+        }
+        union_opt(Some(replay.file), context_fallback())
+    };
+    (file, Some(replay.internal))
 }
 
 /// Replays file bytes from the floor context's offset up to
@@ -953,7 +1046,7 @@ fn replay_file_e(
     end_offset: u64,
     tail: &FileTail<'_>,
     config: &ReconstructConfig,
-) -> Option<(Interval, bool)> {
+) -> Option<ReplayedE> {
     let tail_end = tail.base_offset.saturating_add(tail.bytes.len() as u64);
     if floor.file_position < tail.base_offset || floor.file_position > tail_end {
         return None;
@@ -963,24 +1056,39 @@ fn replay_file_e(
     #[allow(clippy::cast_possible_truncation)]
     let skip = (floor.file_position - tail.base_offset) as usize;
     let bytes = tail.bytes.get(skip..).unwrap_or(&[]);
-    let mut interval = Interval::point(state.gcode_position()[3]);
+    let mut file = Interval::point(state.gcode_position()[3]);
+    let mut internal = Interval::point(state.last_position[3]);
     let mut position = floor.file_position;
     let mut budget = config.sim.max_lines.unwrap_or(usize::MAX);
+    let mut truncated = false;
     for line in LineIter::new(bytes, floor.file_position) {
         if line.span.start >= end_offset {
             break;
         }
-        if budget == 0 {
-            return Some((interval, false));
+        if budget == 0 || state.apply(&line).is_err() {
+            truncated = true;
+            break;
         }
         budget -= 1;
-        if state.apply(&line).is_err() {
-            return Some((interval, false));
-        }
-        interval.expand(state.gcode_position()[3]);
+        file.expand(state.gcode_position()[3]);
+        internal.expand(state.last_position[3]);
         position = line.span.end;
     }
-    Some((interval, position >= end_offset || position >= tail_end))
+    Some(ReplayedE {
+        file,
+        internal,
+        reached_end: !truncated && (position >= end_offset || position >= tail_end),
+    })
+}
+
+/// Per-line E envelopes recovered by replaying the offset window.
+struct ReplayedE {
+    /// G-code-frame ("file") E across every replayed line.
+    file: Interval,
+    /// Klipper-internal (trapq-frame) E across every replayed line.
+    internal: Interval,
+    /// Whether the replay actually reached the window end.
+    reached_end: bool,
 }
 
 /// Converts a Klipper-internal E interval to the file frame by unioning
@@ -1141,6 +1249,175 @@ mod tests {
         ];
         records.extend(extra);
         records
+    }
+
+    /// Regression for the internal-E containment hole (proptest seed
+    /// 9938d965…): the anchor context's processing frontier is stalled
+    /// on ONE long move, so the frontier's execution time sits seconds
+    /// behind the snapshot that recorded it. Sizing the extension
+    /// horizon from the snapshot's capture time spends the whole budget
+    /// re-simulating already-executed motion and leaves everything the
+    /// machine really did afterwards outside the reported E interval.
+    #[test]
+    fn extension_horizon_starts_where_the_stalled_frontier_executes() {
+        // File: one 212 mm move (4.24 s at 50 mm/s) at the frontier,
+        // then four short extruding moves of 10 mm (0.2 s each).
+        let text = concat!(
+            "G1 X200 Y200 E5 F3000
+",
+            "G1 X210 Y200 E6
+",
+            "G1 X220 Y200 E7
+",
+            "G1 X230 Y200 E8
+",
+            "G1 X240 Y200 E9
+",
+        );
+        // Durable trapq for the motion PRECEDING the frontier: journaled
+        // at mono 10 s, executing until print time 16.0. This is the
+        // print time at which the frontier's first line starts.
+        let preceding = trapq_segment_xyz(
+            "toolhead",
+            10.0,
+            6.0,
+            [0.0, 0.0, 0.2],
+            [1.0, 0.0, 0.0],
+            20.0,
+            10_000_000_000,
+        );
+        let gcode = WalGcodeState {
+            speed_factor: 1.0,
+            speed: 3000.0,
+            extrude_factor: 1.0,
+            absolute_coordinates: true,
+            absolute_extrude: true,
+            homing_origin: vec![0.0; 4],
+            position: vec![50.0, 50.0, 0.2, 4.0],
+            gcode_position: vec![50.0, 50.0, 0.2, 4.0],
+        };
+        // Heartbeat/commit at 20.0/20.1; the anchor context is captured
+        // at 20.0 but its frontier began executing at 16.0.
+        let records = base_records(
+            20.0,
+            20.1,
+            vec![
+                WalRecord::TrapqSegment(preceding),
+                WalRecord::Context(context_with_gcode(20_000_000_000, 0, gcode)),
+            ],
+        );
+        let timeline = ingest_records(records);
+        let window = compute_stop_window(&timeline, None, &cfg()).unwrap();
+        let tail = FileTail {
+            base_offset: 0,
+            bytes: text.as_bytes(),
+        };
+        let set = compute_stop_set(&timeline, &window, Some(&tail), &cfg()).unwrap();
+        let ext = set.extension.clone().expect("extension ran");
+
+        // Horizon origin is the frontier's execution start (16.0), not
+        // the snapshot time (20.0): 2.0 + (20.1 - 16.0) = 6.1 s.
+        assert!(
+            (ext.horizon - 6.1).abs() < 1e-9,
+            "horizon {} should be measured from the stalled frontier",
+            ext.horizon
+        );
+        // The old formula (2.0 + (t_b - anchor_pt) = 2.1 s) could not
+        // even finish the 4.24 s move; the corrected one reaches the
+        // short moves after it.
+        assert!(
+            ext.lines_consumed >= 3,
+            "consumed only {} lines",
+            ext.lines_consumed
+        );
+        let e = set.e_internal.expect("internal E interval");
+        // E after the long move is 5; the short moves take it to 7+.
+        assert!(e.contains(5.0, 1e-9), "e_internal {e:?}");
+        assert!(
+            e.contains(7.0, 1e-9),
+            "e_internal {e:?} misses motion the machine had time to execute"
+        );
+        assert!(!set.degradation.extension_start_unanchored);
+    }
+
+    #[test]
+    fn extension_start_is_flagged_unanchored_without_trapq_evidence() {
+        // No trapq row precedes the anchor: nothing places the frontier
+        // on the print-time axis, so the horizon falls back and says so.
+        let records = base_records(
+            20.0,
+            20.1,
+            vec![WalRecord::Context(context_at(20_000_000_000, 0))],
+        );
+        let timeline = ingest_records(records);
+        let window = compute_stop_window(&timeline, None, &cfg()).unwrap();
+        let tail = FileTail {
+            base_offset: 0,
+            bytes: b"G1 X60 Y50 E1 F3000
+",
+        };
+        let set = compute_stop_set(&timeline, &window, Some(&tail), &cfg()).unwrap();
+        assert!(set.degradation.extension_start_unanchored);
+    }
+
+    /// The floor-context replay also carries internal E, which covers
+    /// lines in the offset window whose trapq rows never reached the
+    /// durable WAL (0.5 s dump batching drops rows for already-processed
+    /// lines). Neither the WAL span nor the anchor-started extension can
+    /// see those.
+    #[test]
+    fn internal_e_covers_window_lines_whose_trapq_rows_were_lost() {
+        // Floor context at offset 0 (pt 5.0, old enough for t_a 10.0
+        // with a 3 s processing lead); anchor at offset 40 with no trapq
+        // row for the retract on lines 1-2, which the WAL never got.
+        let text = concat!(
+            "G1 X60 Y50 E101 F3000
+", // bytes  0..22
+            "G1 E100.2
+", // bytes 22..32
+            "G1 E101
+", // bytes 32..40
+            "G1 X70 Y50 E102
+", // bytes 40..56
+        );
+        let floor_gcode = WalGcodeState {
+            speed_factor: 1.0,
+            speed: 3000.0,
+            extrude_factor: 1.0,
+            absolute_coordinates: true,
+            absolute_extrude: true,
+            homing_origin: vec![0.0; 4],
+            position: vec![50.0, 50.0, 0.2, 100.0],
+            gcode_position: vec![50.0, 50.0, 0.2, 100.0],
+        };
+        let anchor_gcode = WalGcodeState {
+            position: vec![60.0, 50.0, 0.2, 101.0],
+            gcode_position: vec![60.0, 50.0, 0.2, 101.0],
+            ..floor_gcode.clone()
+        };
+        let records = base_records(
+            10.0,
+            10.1,
+            vec![
+                WalRecord::Context(context_with_gcode(5_000_000_000, 0, floor_gcode)),
+                WalRecord::Context(context_with_gcode(10_000_000_000, 40, anchor_gcode)),
+            ],
+        );
+        let timeline = ingest_records(records);
+        assert!(
+            timeline.extruder_segments.is_empty(),
+            "this test models lost extruder rows"
+        );
+        let window = compute_stop_window(&timeline, None, &cfg()).unwrap();
+        let tail = FileTail {
+            base_offset: 0,
+            bytes: text.as_bytes(),
+        };
+        let set = compute_stop_set(&timeline, &window, Some(&tail), &cfg()).unwrap();
+        let e = set.e_internal.expect("internal E interval");
+        // The retract bottom (internal E 100.2) exists only in the file.
+        assert!(e.contains(100.2, 1e-9), "e_internal {e:?}");
+        assert!(e.contains(102.0, 1e-9), "e_internal {e:?}");
     }
 
     #[test]
