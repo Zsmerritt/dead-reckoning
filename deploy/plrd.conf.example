@@ -90,7 +90,22 @@ control_socket = /var/lib/plrd/plrd.sock
 #
 # RECOVERY-UX KEYS — these also live in printer.cfg's [plr] section (NOT
 # here), each parsed tolerantly and re-validated by plrd against a hard
-# band; an out-of-band value REFUSES recovery (never silently clamped):
+# band; an out-of-band value REFUSES recovery (never silently clamped).
+#
+# WHO CHECKS WHAT, for every [plr] key on this page. The plr Klipper
+# plugin DECLARES each of them — it must, because klippy refuses to START
+# on a config option no module reads, and builds the option map plrd
+# reads from exactly those reads — but it checks only the type (and that
+# a number is finite). It does not re-state the bands below. That is
+# deliberate: plrd is the single authority on every band, so a bad value
+# boots the printer and is refused later by plrd, naming the key and
+# explaining the physics. Two components enforcing one limit is how you
+# get a config that neither side will let you use.
+# So: an out-of-band value here is a REFUSED RECOVERY, not a dead
+# printer. The plugin reports the values it read for these keys in its
+# klippy status object under `daemon_config` (an unset key reads null,
+# meaning plrd's own default applies), so you can check what the daemon
+# will see before you need it.
 #   max_probe_nozzle_temp  hard ceiling for ANY contact op, C  [80,160] (150)
 #                          Clamps the probe band to
 #                          [probe_temp_min, min(probe_temp_max, this)];
@@ -326,13 +341,22 @@ control_socket = /var/lib/plrd/plrd.sock
 #                          enough, and visible enough to you in advance,
 #                          to be worth an escape hatch at all.
 #
-#                          !! NOT USABLE YET. Klipper refuses to start on
-#                          a config option no module reads, and the plr
-#                          plugin does not yet declare this key (nor
-#                          several others below). Setting it today gives
-#                          you a printer that will not boot. A plugin fix
-#                          is in flight; until it lands, this escape
-#                          hatch is documented but unreachable.
+#                          TYPE IT EXACTLY AS SPELLED HERE, in the [plr]
+#                          section of printer.cfg. Klipper's config parser
+#                          lowercases option names, so the daemon receives
+#                          it as unsafe_allow_purge_z_below_bed and
+#                          accepts either spelling — the screaming prefix
+#                          is for you, not for the parser.
+#
+#                          Nothing else needs doing: the plr Klipper
+#                          plugin DECLARES this key (klippy refuses to
+#                          START on a config option no module reads, and
+#                          only publishes options a module actually read),
+#                          and it deliberately does NOT judge the value —
+#                          it checks that it parses as a boolean and
+#                          passes it on. plrd stays the sole judge of what
+#                          the override permits, so there is no second
+#                          gate that can disagree with this one.
 #
 # Every OTHER Hard refusal — the machine prerequisites, a non-finite
 # number, an unknown Z span, an out-of-bounds itinerary, a temperature

@@ -73,6 +73,33 @@ attestation staged by `PLR_SETUP ACCEPT_SELF_LOCKING_Z=1`),
 `noise_floor_speed` / `noise_floor_temp` (measured by `PLR_NOISE_TEST`),
 and `drag_sensitivity` (staged by `PLR_DRAG_CALIBRATE`).
 
+### Recovery-UX keys the daemon owns
+
+`[plr]` also carries the recovery-UX keys the plugin never uses itself —
+the consensus-touch tunables (`touch_samples`, `touch_sample_range`,
+`touch_retract`, `touch_accel`), the reheat park (`reheat_park_x/y`,
+`reheat_park_delta_z`, `pre_home_z_lift`), the purge
+(`purge_enable`, `purge_macro`, `purge_amount`, `purge_x/y/z`,
+`purge_speed`, `purge_retract`), `drag_nozzle_temp`, the acceleration
+overrides (`recovery_accel`, `accel_home`, `accel_travel`, `accel_probe`,
+`accel_entry`), the confirm-points (`confirm_z_before_resume`,
+`debug_confirm_each_step`, `confirm_timeout_s`) and the one hard-refusal
+escape hatch `UNSAFE_allow_purge_z_below_bed`. Each is documented — with
+its band, its default and the physics behind it — in
+[`deploy/plrd.conf.example`](../deploy/plrd.conf.example); `plrd` reads
+them and is the sole authority on their values.
+
+The plugin still has to **declare** every one of them (`plr/daemon_keys.py`):
+klippy refuses to start on a `[plr]` option no module read, and it builds
+the option map `plrd` reads from exactly those reads — so a missing
+declaration is both a printer that will not boot and a value the daemon
+could never see. The plugin checks only the type (and that a number is
+finite) and does not re-state `plrd`'s bands, so an out-of-band value
+boots the printer and is refused later by `plrd` with a diagnosis naming
+the key. `get_status` reports them under `daemon_config` (an unset key
+reads `null`, meaning `plrd`'s own default applies) so you can see exactly
+what the daemon will see.
+
 ### Calibration stamping and three-tier validation
 
 Every persisted calibration value is stamped, at the moment it is staged,

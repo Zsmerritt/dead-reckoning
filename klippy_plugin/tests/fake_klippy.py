@@ -47,6 +47,28 @@ class FakeConfig:
     (mirroring how every ConfigWrapper shares one fileconfig,
     klippy/configfile.py:119-121 ``getsection``).  ``sections`` maps
     section name -> dict of raw option strings.
+
+    OPTION-NAME CASE.  klippy parses printer.cfg with a
+    ``configparser.RawConfigParser`` (klippy/configfile.py:170-176) and
+    does not override ``optionxform``, so configparser LOWERCASES every
+    option name as the file is read, and a lookup by any casing finds the
+    same option.  Option names here are lowercased on both sides for the
+    same reason — otherwise a test would "prove" a mixed-case key like
+    ``UNSAFE_allow_purge_z_below_bed`` works only for the exact spelling
+    the test happened to use.  SECTION names keep their case (configparser
+    does not transform them; ``[gcode_macro CLEAN_NOZZLE]`` is
+    case-sensitive), matching ``has_section`` / ``get_prefix_sections``.
+
+    ACCESS TRACKING.  Every getter records the option it read into a
+    registry shared by all wrappers from one root, mirroring
+    ``ConfigWrapper._get_wrapper``'s ``access_tracking``
+    (klippy/configfile.py:29-60) including its two subtleties: a PRESENT
+    option records its PARSED value (line 46-47), and an ABSENT option
+    records the default ONLY when that default is not ``None``
+    (lines 31-36).  That map is what klippy turns into
+    ``configfile.settings`` for status consumers
+    (klippy/configfile.py:447-450) AND what it validates the config
+    against — see :meth:`unused_options`.
     """
 
     error = FakeConfigError
@@ -56,11 +78,18 @@ class FakeConfig:
         self._name = name
         self._file_sections = dict(sections) if sections is not None else {}
         for key in list(self._file_sections):
-            self._file_sections[key] = dict(self._file_sections[key])
+            self._file_sections[key] = {
+                option.lower(): value
+                for option, value in self._file_sections[key].items()
+            }
         if options is not None:
-            self._file_sections.setdefault(name, {}).update(options)
+            self._file_sections.setdefault(name, {}).update(
+                {option.lower(): value for option, value in options.items()}
+            )
         self._options = self._file_sections.get(name, {})
         self._wrappers = {name: self}
+        # (section.lower(), option.lower()) -> value, as klippy keys it.
+        self._access = {}
 
     def get_printer(self):
         return self._printer
@@ -68,10 +97,76 @@ class FakeConfig:
     def get_name(self):
         return self._name
 
-    def get(self, option, default=_SENTINEL):
-        if option in self._options:
-            return self._options[option]
+    def _note_access(self, option, value):
+        self._access[(self._name.lower(), option.lower())] = value
+
+    def accessed_options(self, section=None):
+        """The option names recorded as accessed in ``section``.
+
+        The fake's equivalent of reading ``configfile.settings[section]``
+        back (klippy/configfile.py:447-452).
+        """
+        name = (section if section is not None else self._name).lower()
+        return {option for sect, option in self._access if sect == name}
+
+    def accessed_settings(self, section=None):
+        """``{option: recorded value}`` for ``section`` — the typed view
+        plrd parses out of ``configfile.settings``."""
+        name = (section if section is not None else self._name).lower()
+        return {
+            option: value
+            for (sect, option), value in self._access.items()
+            if sect == name
+        }
+
+    def unused_options(self, section=None):
+        """Options present in ``section`` that no getter claimed.
+
+        klippy's ``ConfigValidate.check_unused``
+        (klippy/configfile.py:424-441) raises
+        ``"Option '%s' is not valid in section '%s'"`` for each of these
+        during startup (``Klippy._read_config``, klippy/klippy.py:127), so
+        a non-empty result here is a printer that will not boot.
+
+        Scoped to ONE section rather than the whole config on purpose: in
+        a real klippy every other section is claimed by the klippy module
+        that owns it, and this harness has no such modules — only the
+        ``[plr]`` section is this plugin's responsibility.
+
+        klippy additionally EXEMPTS options that came from the SAVE_CONFIG
+        autosave block (klippy/configfile.py:426-427), which this harness
+        does not model: every option here is treated as file-written,
+        which is the strict case and the one that fails to boot.
+        """
+        name = (section if section is not None else self._name).lower()
+        accessed = self.accessed_options(name)
+        return sorted(
+            option
+            for option in self._file_sections.get(
+                section if section is not None else self._name, {}
+            )
+            if option not in accessed
+        )
+
+    def get(self, option, default=_SENTINEL, note_valid=True):
+        # ``note_valid=False`` suppresses access recording, exactly as
+        # klippy/configfile.py:61-63 threads it into _get_wrapper: a read
+        # that is not a claim on the option (the calibration fingerprint
+        # enumerates sections it does not own).  klippy accepts the same
+        # keyword on the typed getters; the plugin never uses it there, so
+        # this harness does not offer it there — a future caller gets a
+        # loud TypeError rather than a silently ignored flag.
+        key = option.lower()
+        if key in self._options:
+            value = self._options[key]
+            if note_valid:
+                self._note_access(key, value)
+            return value
         if default is not _SENTINEL:
+            # klippy/configfile.py:33-35 — an absent option records its
+            # default only when the default is not None.
+            if note_valid and default is not None:
+                self._note_access(key, default)
             return default
         raise self.error(
             "Option '%s' in section '%s' must be specified" % (option, self._name)
@@ -85,7 +180,7 @@ class FakeConfig:
         # provided default as-is, unparsed and unbounded (configfile.py
         # lines 31-36); get() already raised if there was no default.
         raw = self.get(option, default)
-        if option not in self._options:
+        if option.lower() not in self._options:
             return raw
         try:
             value = parser(raw)
@@ -93,6 +188,12 @@ class FakeConfig:
             raise self.error(
                 "Unable to parse option '%s' in section '%s'" % (option, self._name)
             ) from None
+        # klippy records the PARSED value, not the raw string
+        # (klippy/configfile.py:46-47), which is what makes
+        # configfile.settings a typed map — and typed is exactly what
+        # plrd's parser requires of it.  Recorded before the bound checks,
+        # as klippy does (lines 46-59).
+        self._note_access(option, value)
         if minval is not None and value < minval:
             raise self.error(
                 "Option '%s' in section '%s' must have minimum of %s"
@@ -171,6 +272,10 @@ class FakeConfig:
             wrapper._file_sections = self._file_sections
             wrapper._options = self._file_sections.get(section, {})
             wrapper._wrappers = self._wrappers
+            # One access registry per root, as klippy passes one
+            # access_tracking dict to every wrapper
+            # (klippy/configfile.py:119-121).
+            wrapper._access = self._access
             self._wrappers[section] = wrapper
         return self._wrappers[section]
 
@@ -190,6 +295,11 @@ class FakeConfig:
         # klippy/configfile.py:127-129: every option in THIS section whose
         # name starts with prefix (""=all), in file order.  Used by
         # calibration_meta to enumerate a section for fingerprinting.
+        #
+        # Records NO access, exactly as klippy does not: enumerating a
+        # section never satisfies check_unused, which is precisely why the
+        # plugin cannot lean on it to claim the [plr] options plrd
+        # consumes (see plr/daemon_keys.py).
         return [o for o in self._options if o.startswith(prefix)]
 
 
