@@ -546,6 +546,12 @@ class PLRPlugin:
             "recovery_state": self.recovery.state(),
             "recovery_awaiting_confirmation": self.recovery.state()
             == recovery.STATE_AWAITING,
+            # Whether an answer can still be SENT — a property of the token,
+            # not of the state (a question outlives the plugin's ability to
+            # vouch for it).  Published because the CONSOLE says it, and the
+            # two surfaces must carry the same information or a UI hides
+            # buttons the console is still offering.
+            "recovery_can_answer": self.recovery.can_answer(),
             "clean_nozzle_macro_available": self.clean_nozzle_macro_available,
             "noise_floor_rms": self.noise_floor_rms,
             "noise_floor_temp": self.noise_floor_temp,

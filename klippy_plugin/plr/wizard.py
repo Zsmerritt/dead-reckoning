@@ -376,10 +376,17 @@ class RecoveryWizard:
             )
             recovery_session.reshow(gcmd.respond_info)
             return
-        if self._state == STATE_RUNNING or recovery_session.needs_attention():
+        # QUESTION ASKED: may a new recovery be started?  NOT
+        # `needs_attention()` — the two unknowable states need attention but
+        # do permit an attempt, and refusing here made them states a session
+        # could enter and never leave: the wizard would be dead for the rest
+        # of the klippy session, leaving a bare PLR_RECOVER EXECUTE=1 (which
+        # skips the dry-run review this flow exists to impose) or a firmware
+        # restart as the only ways out.
+        if self._state == STATE_RUNNING or not recovery_session.may_start_new():
             gcmd.respond_info(
-                "PLR wizard: plrd may still be working — not offering a new "
-                "recovery until that is resolved.\n%s"
+                "PLR wizard: plrd is working on this session's recovery — not "
+                "offering a new one until it reports.\n%s"
                 % ("\n".join(recovery_session.status_lines()),)
             )
             return
@@ -419,9 +426,17 @@ class RecoveryWizard:
                 "If you believe a print was interrupted, check PLR_STATUS."
             )
             return
+        texts = _summarize(pending)
+        # The flow is reachable in the two unknowable states BY DESIGN (they
+        # would otherwise have no exit but a bare PLR_RECOVER EXECUTE=1), so
+        # the warning that belongs to them travels INTO the dialog rather
+        # than being replaced by it.
+        if self.plugin.recovery.needs_attention():
+            texts.extend(self.plugin.recovery.status_lines())
+        texts.append("Attempt recovery, or dismiss this prompt.")
         prompt = _Prompt(
             title=_TITLE,
-            texts=_summarize(pending) + ["Attempt recovery, or dismiss this prompt."],
+            texts=texts,
             buttons=[("Attempt recovery", "PLR_WIZARD_DRYRUN", "primary")],
             footers=[("Dismiss", "PLR_WIZARD_CANCEL", "error")],
             fallbacks=[

@@ -160,29 +160,66 @@ STATE_PLRD_BUSY = "plrd_busy"
 # standoff and the heaters at target.
 STATE_UNKNOWN = "unknown"
 
+# HOW ALARMING EACH STATE IS — the ordering the transition guard enforces.
+#
+# Not "how bad" but "how much of the machine may be moving without this
+# plugin being able to say so".  Moving UP this scale is always allowed:
+# evidence that the machine may be busy needs no permission.  Moving DOWN
+# — publishing something calmer — requires the caller to name its reason,
+# which is what :meth:`RecoverySession._transition` enforces and what makes
+# the four rounds of "published idle while plrd drove the machine" bugs
+# unwriteable rather than merely absent.
+#
+# `running` and `awaiting_confirmation` sit at the SAME level on purpose:
+# both mean "plrd is engaged with THIS session and we have a live
+# conversation", and the confirm loop moves between them freely in both
+# directions (pause -> answer -> pause).
+_ALARM = {
+    STATE_IDLE: 0,  # demonstrable: nothing is in flight
+    STATE_RUNNING: 1,  # demonstrable: plrd is engaged, and talking to us
+    STATE_AWAITING: 1,
+    STATE_PLRD_BUSY: 2,  # demonstrable: plrd is engaged, but not with us
+    STATE_UNKNOWN: 3,  # nothing is demonstrable
+}
+
 # The outcomes that mean NOTHING IS LEFT RUNNING, enumerated from the
 # producer rather than assumed: crates/plrd/src/ctrlsock.rs `outcome_tag`
-# (:587-595) for the non-plan pipeline results, :826-833 for the final
-# execution report, and the `error_response` tags at :602-611 (`refused`)
-# and :617-627 (`malformed`).
+# (:587-595) for the non-plan pipeline results and :826-833 for the final
+# execution report, plus the `error_response` tag at :602-611 (`refused`).
 #
-# `error` is deliberately NOT here.  The tag covers both "pipeline task
-# failed" (nothing was sent) and "execution task failed" (:834 — the
-# execution task did not even return, so its abort cleanup never ran and
-# the machine may be mid-motion).  One tag, two opposite machine states, so
-# it takes the conservative branch like everything else unrecognized.
+# TWO TAGS ARE DELIBERATELY EXCLUDED, for the same reason:
+#
+# * `error` — covers both "pipeline task failed" (nothing was sent) and
+#   "execution task failed" (:834: the execution task did not even return,
+#   so its abort cleanup never ran and the machine may be mid-motion);
+# * `malformed` — `cmd_recover_confirm` returns it at :740-751, BEFORE
+#   `session.outstanding.take()`, so plrd is still paused at the confirm
+#   point with the nozzle where it left it.  On `recover_execute` the same
+#   tag means nothing ran (:617-627).
+#
+# One tag, two opposite machine states, so both take the conservative
+# branch.  The rule is the tag has to prove the machine is free, not merely
+# be a failure.
 TERMINAL_OUTCOMES = frozenset(
     [
         "completed",
         "aborted-or-refused",
         "refused",
-        "malformed",
         "clean-shutdown",
         "machine-rejected",
         "manual-fallback",
         "not-possible",
     ]
 )
+
+# Terminal AND provably nothing-happened, because plrd rejected the request
+# before it dispatched anything: `unknown-cmd` (ctrlsock.rs:371) and
+# `oversized` (:324, sent from `read_request_line` before dispatch).  Split
+# out from the set above because they deserve their own sentence — a plugin
+# newer than its daemon hits `unknown-cmd` on every attempt, and telling
+# that operator "DO NOT touch the printer" would be both wrong and the
+# reason they stop believing the warnings.
+PROTOCOL_REFUSAL_OUTCOMES = frozenset(["unknown-cmd", "oversized"])
 
 # --- the deadline interlock (see the module docstring) -----------------
 
@@ -291,6 +328,9 @@ class RecoverySession:
         self._async = daemon_worker.AsyncDaemon(
             self.printer, lambda: plugin.daemon, "recovery"
         )
+        # The initial value is the only direct assignment: there is no
+        # prior state to compare against, and `_transition` is what every
+        # later change goes through.
         self._state = STATE_IDLE
         self._token = None
         self._data = None  # the outstanding pause's data map, for re-show
@@ -308,6 +348,50 @@ class RecoverySession:
         self.printer.register_event_handler(
             "klippy:disconnect", self._handle_disconnect
         )
+
+    # -- introspection ------------------------------------------------
+
+    # -- the one writer -----------------------------------------------
+
+    def _transition(self, state, reason=None):
+        """THE ONLY place ``_state`` is assigned.  Enforces the asymmetry.
+
+        Moving toward MORE alarming (:data:`_ALARM`) needs nothing: evidence
+        that the machine may be busy is always publishable.  Moving toward
+        CALMER requires ``reason`` — a short phrase naming the evidence — and
+        a call that omits it is REFUSED: the more alarming state stands and
+        the mistake is logged.
+
+        This exists because four review rounds found the same bug in four
+        different places: a write site that published a calmer state than
+        the evidence supported.  Reads were made safe last round (one
+        authority, no second mapping) while fifteen writes stayed free to
+        invent any value, so the invariant was still enforced by author
+        vigilance — which had already failed four times.  Now the vigilance
+        is mechanical: ``tests/test_recovery_confirm.py`` asserts by AST
+        that nothing outside this method assigns ``_state``, and asserts
+        that an unreasoned calming transition is refused at runtime.
+        """
+        current = self._state
+        if state == current:
+            return
+        if _ALARM[state] < _ALARM[current] and not reason:
+            # Refuse, do not raise: this runs on the reactor, and the safe
+            # direction is to keep publishing the alarm.
+            logger.error(
+                "plr: refusing to publish %r over %r with no stated reason "
+                "(recovery state may only get calmer for a named reason)",
+                state,
+                current,
+            )
+            return
+        logger.info(
+            "plr: recovery state %r -> %r%s",
+            current,
+            state,
+            " (%s)" % (reason,) if reason else "",
+        )
+        self._state = state
 
     # -- introspection ------------------------------------------------
 
@@ -490,28 +574,16 @@ class RecoverySession:
                 "may still be executing that recovery — check PLR_STATUS and "
                 "the plrd log (journalctl -u plrd) before retrying." % (source,)
             )
-        # A kept question is ABANDONED here, not silently dropped.  The
-        # doubtful branch promises the operator that CONTINUE/ABORT still
-        # work; starting a new recovery destroys that, so it says so and
-        # tells plrd to drop the question rather than leaving it paused
-        # against its own deadline.
-        abandoned = self._token
-        if abandoned is not None:
-            self._abort_detached(abandoned)
-            gcmd.respond_info(
-                "%s: abandoning the confirmation that was still open — "
-                "'abort' has been sent to plrd for it, so it stops rather "
-                "than waiting out its deadline. %s / %s will no longer answer "
-                "it." % (source, CMD_CONTINUE, CMD_ABORT)
-            )
-            self._end_dialog()
+        # THE STATE IS NOT TOUCHED UNTIL THE LAUNCH SUCCEEDS.  There is
+        # nothing to roll back, which is what makes the old bug unwriteable:
+        # `may_start_new()` admits `plrd_busy` and `unknown`, so a rollback
+        # to `idle` published "nothing is happening" over positive evidence
+        # that plrd was executing — on the very command this plugin
+        # advertises as the probe for those states.  Nothing can interleave
+        # here: the callbacks arrive through the reactor, which is this
+        # thread.
         self._source = source
         self._on_finished = on_finished
-        self._pauses = 0
-        self._token = None
-        self._data = None
-        self._answering = None
-        self._state = STATE_RUNNING
         started = self._async.call(
             "recover_execute",
             # `on_confirm: "ask"` is the whole point of this branch; `step`
@@ -522,13 +594,34 @@ class RecoverySession:
             self._on_error,
         )
         if not started:
-            self._state = STATE_IDLE
             # `refusal_text` says WHICH refusal it was — busy, closed, or a
-            # thread that could not be created — instead of guessing.
+            # worker thread that could not be created — instead of guessing.
+            # The published state, and any kept question, are exactly as they
+            # were: nothing was started, so nothing is claimed.
             raise gcmd.error(
                 self._async.refusal_text(source)
                 or "%s: plrd could not be contacted; nothing was started." % (source,)
             )
+        self._pauses = 0
+        self._data = None
+        self._answering = None
+        # A kept question is ABANDONED here — after the launch is real, never
+        # before — and out loud.  The doubtful branch promises the operator
+        # that CONTINUE/ABORT still work; starting a new recovery destroys
+        # that, so it says so and asks plrd to drop the question rather than
+        # leaving it paused against its own deadline.
+        abandoned = self._token
+        self._token = None
+        if abandoned is not None:
+            self._abort_detached(abandoned, what="the abandoned question")
+            gcmd.respond_info(
+                "%s: abandoning the confirmation that was still open. An "
+                "'abort' for it has been SENT to plrd (the reply is not read, "
+                "so it is not confirmed); %s / %s will no longer answer it."
+                % (source, CMD_CONTINUE, CMD_ABORT)
+            )
+            self._end_dialog()
+        self._transition(STATE_RUNNING, reason="plrd accepted a new recover_execute")
         # Conditional on purpose: plrd has not answered yet and may refuse
         # (it is entitled to say `busy`, or that the machine does not
         # validate), so the first line the operator reads must not assert
@@ -583,7 +676,20 @@ class RecoverySession:
         # longer outstanding as far as this plugin is concerned, so a
         # double-click cannot answer twice.
         self._token = None
-        self._state = STATE_RUNNING
+        # N1, justified here: republishing `running` over a DOWNGRADED
+        # question is a positive claim the plugin cannot prove — plrd may
+        # have aborted the question an hour ago.  It is accepted because it
+        # is bounded and self-correcting: the answer is already on its way to
+        # plrd, whose reply arrives on this same channel and adjudicates
+        # within one round trip (`unknown-token` -> back to `unknown`, a
+        # pause -> `awaiting`, a terminal tag -> `idle`).  Publishing
+        # `unknown` instead would say "nothing is being asked of plrd" while
+        # a request is in flight, which is a different lie.
+        self._transition(
+            STATE_RUNNING,
+            reason="an answer for the outstanding question is in flight; "
+            "plrd's reply adjudicates",
+        )
         self._answering = answer
         self._disarm_timer()
         started = self._async.call(
@@ -599,7 +705,7 @@ class RecoverySession:
             self._token = token
             # Back to whatever it was — NOT unconditionally AWAITING, which
             # would re-assert a liveness the downgrade had withdrawn.
-            self._state = was
+            self._transition(was, reason="the answer was never sent")
             self._answering = None
             self._arm_timer()
             raise gcmd.error(
@@ -685,6 +791,20 @@ class RecoverySession:
         if outcome == "unknown-token":
             self._unknown_token(response)
             return
+        if outcome in PROTOCOL_REFUSAL_OUTCOMES:
+            # plrd rejected the REQUEST before dispatching anything, so
+            # nothing happened and nothing is running.  Its own sentence,
+            # because "DO NOT touch the printer" would be both wrong and the
+            # reason an operator stops believing the warnings.
+            self._finish(
+                response,
+                "plrd rejected the request itself (%s), so nothing was started "
+                "and the printer was not touched. That usually means this "
+                "plugin is NEWER than the plrd it is talking to — update plrd "
+                "(and check 'plrd --version' against the plugin's)." % (outcome,),
+                reason="plrd rejected the request before dispatching anything",
+            )
+            return
         if outcome in TERMINAL_OUTCOMES:
             self._finish(response, self._final_note(response, outcome))
             return
@@ -694,11 +814,13 @@ class RecoverySession:
             # completion under a name this plugin does not know yet.
             self._finish(response, self._final_note(response, outcome))
             return
-        # Anything else — including `error`, whose one tag covers both "the
-        # pipeline task failed before anything was sent" and "the execution
-        # task did not return, so its cleanup never ran" (ctrlsock.rs:834) —
-        # is unresolved.  A protocol addition must not be able to make this
-        # plugin claim a finish it cannot see.
+        # Anything else is unresolved — including `error` (ctrlsock.rs:834:
+        # one tag for "the pipeline failed before anything was sent" and "the
+        # execution task never returned, so its cleanup never ran") and
+        # `malformed` (:740-751 returns it BEFORE `session.outstanding.take()`,
+        # so plrd may be standing at a confirm point right now).  A protocol
+        # addition must not be able to make this plugin claim a finish it
+        # cannot see.
         self._unresolved(
             response,
             "plrd answered %r, which this plugin cannot classify, so what it "
@@ -718,7 +840,8 @@ class RecoverySession:
         self._answering = None
         self._token = None
         self._data = None
-        self._state = STATE_PLRD_BUSY
+        # Toward alarming: never needs a reason.
+        self._transition(STATE_PLRD_BUSY)
         self._disarm_timer()
         text = response.get("text")
         if isinstance(text, str) and text.strip():
@@ -778,7 +901,8 @@ class RecoverySession:
         self._answering = None
         self._token = None
         self._data = None
-        self._state = STATE_UNKNOWN
+        # Toward alarming: never needs a reason.
+        self._transition(STATE_UNKNOWN)
         self._disarm_timer()
         text = response.get("text")
         if isinstance(text, str) and text.strip():
@@ -839,11 +963,9 @@ class RecoverySession:
             # handler covers a pause outstanding AT shutdown; this covers one
             # arriving later, which is the likelier order: plrd was mid-step
             # when the M112 landed.)
-            self._abort_detached(token)
             self._answering = None
             self._token = None
             self._data = None
-            self._state = STATE_IDLE
             self._disarm_timer()
             text = response.get("text")
             if isinstance(text, str) and text.strip():
@@ -851,17 +973,18 @@ class RecoverySession:
             self._end_dialog()
             self._respond(
                 "PLR recovery: plrd stopped to ask a question, but klippy is "
-                "shut down and the recovery cannot continue — 'abort' has been "
-                "sent to plrd for it, so it stops now rather than waiting out "
-                "its deadline. Clear the shutdown (FIRMWARE_RESTART), then "
-                "start again with a fresh dry run."
+                "shut down so the recovery cannot continue. Clear the shutdown "
+                "(FIRMWARE_RESTART), then start again with a fresh dry run."
             )
+            self._abort_shutdown_pause(token)
             self._notify_finished()
             return
         self._answering = None
         self._token = token
         self._data = data
-        self._state = STATE_AWAITING
+        self._transition(
+            STATE_AWAITING, reason="plrd reported a confirm-point we can answer"
+        )
         self._pauses += 1
         # The daemon's own paused report first (it carries the plan prefix
         # and the diagnosis in full), then the dialog.
@@ -874,11 +997,11 @@ class RecoverySession:
         )
         self._arm_timer()
 
-    def _finish(self, response, note):
+    def _finish(self, response, note, reason="plrd reported a terminal outcome"):
         self._answering = None
         self._token = None
         self._data = None
-        self._state = STATE_IDLE
+        self._transition(STATE_IDLE, reason=reason)
         self._disarm_timer()
         text = response.get("text")
         if isinstance(text, str) and text.strip():
@@ -914,8 +1037,9 @@ class RecoverySession:
         self._token = None
         self._data = None
         # UNKNOWN, not idle: a transport failure says nothing about whether
-        # plrd is still driving the machine.
-        self._state = STATE_UNKNOWN
+        # plrd is still driving the machine.  Toward alarming, so no reason
+        # is required.
+        self._transition(STATE_UNKNOWN)
         self._disarm_timer()
         self._end_dialog()
         self._respond(
@@ -986,7 +1110,9 @@ class RecoverySession:
         # here — there is no second surface left to disagree.
         try:
             if self._state == STATE_AWAITING:
-                self._state = STATE_UNKNOWN
+                # Toward alarming: the plugin has stopped being able to show
+                # the question is live.
+                self._transition(STATE_UNKNOWN)
                 self._end_dialog()
                 self._respond(
                     "PLR recovery: this confirmation has been open longer than "
@@ -1015,7 +1141,11 @@ class RecoverySession:
                 self._answering = None
                 self._token = None
                 self._data = None
-                self._state = STATE_IDLE
+                self._transition(
+                    STATE_IDLE,
+                    reason="the wait outlasted every deadline plrd could be "
+                    "using, so its clean abort has happened",
+                )
                 self._disarm_claim_timer()
                 self._end_dialog()
                 self._respond(
@@ -1050,37 +1180,43 @@ class RecoverySession:
         if self._closed:
             return
         token = self._token
-        was_running = self._state in (STATE_RUNNING, STATE_PLRD_BUSY)
+        state = self._state
         self._answering = None
         self._token = None
         self._data = None
         self._disarm_timer()
         if token is not None:
-            self._state = STATE_IDLE
-            self._abort_detached(token)
-            self._respond(
-                "PLR recovery: klippy stopped while plrd was waiting for a "
-                "confirmation. The answer 'abort' has been sent to plrd so it "
-                "stops now rather than at its deadline; it invalidates the Z "
-                "frame, so a fresh dry run is required before any resume."
-            )
+            self._abort_shutdown_pause(token)
             self._end_dialog()
             # Tell the listener, or the wizard sits in its "running" state
             # for the rest of the klippy session reporting a recovery that
             # is over — the wedged-UI failure this branch exists to remove.
             self._notify_finished()
             return
-        if was_running:
-            # plrd is mid-execution and cannot be interrupted from here; its
-            # own commands will start failing against a shut-down printer
-            # and it will abort.  Say so, and stay RUNNING so its report is
-            # still delivered and no second recovery starts meanwhile.
+        if state == STATE_RUNNING:
+            # plrd is mid-execution on THIS session's channel and cannot be
+            # interrupted from here; its own commands will start failing
+            # against a shut-down printer and it will abort.  Say so, and
+            # stay RUNNING so its report is still delivered and no second
+            # recovery starts meanwhile.
             self._respond(
                 "PLR recovery: klippy stopped while plrd was EXECUTING the "
                 "recovery. plrd cannot be interrupted from here; its commands "
                 "will start failing and it will abort by itself. Its report "
                 "still appears here — wait for it, and do not touch the "
                 "printer until it arrives."
+            )
+        elif state == STATE_PLRD_BUSY:
+            # NOT the same case: no call of ours is in flight, so no report
+            # is coming to this console.  Telling the operator to wait for
+            # one would be telling them to wait forever.
+            self._respond(
+                "PLR recovery: klippy stopped while plrd was executing a "
+                "recovery this plugin is not connected to. NO report for it "
+                "will appear here — its commands will start failing against "
+                "the shut-down printer and it will abort by itself. Watch "
+                "'journalctl -u plrd', and do not touch the printer until it "
+                "has stopped."
             )
 
     def _handle_disconnect(self):
@@ -1097,20 +1233,71 @@ class RecoverySession:
         self._answering = None
         self._token = None
         self._data = None
-        self._state = STATE_IDLE
+        # Teardown: nothing this session publishes can be read again, and the
+        # next klippy run builds a fresh session.  Calmer with a reason, so
+        # the guard is satisfied by intent rather than by accident.
+        self._transition(
+            STATE_IDLE, reason="klippy is tearing down; this session is over"
+        )
         self._disarm_timer()
         if token is not None:
-            self._abort_detached(token)
+            self._abort_detached(token, what="the outstanding question")
         self._notify_finished()
 
-    def _abort_detached(self, token):
-        """Fire-and-forget ``recover_confirm ... abort``; the reply is dropped.
+    def _abort_shutdown_pause(self, token):
+        """Abort a question klippy can no longer answer, and say only that.
+
+        Used from both shutdown paths (a pause outstanding AT the shutdown,
+        and one ARRIVING after it).  The state goes to UNKNOWN, not idle:
+        sending an abort is not the same as knowing it landed, and if it did
+        not, plrd is still paused and will run the aborting step's cleanup
+        commands when its own deadline expires — into a klippy the operator
+        has since restarted.  ``_abort_detached`` upgrades this to ``idle``
+        if and when plrd confirms.
+        """
+        self._transition(STATE_UNKNOWN)
+        self._abort_detached(token, what="the confirmation klippy interrupted")
+        self._respond(
+            "PLR recovery: klippy stopped while plrd was waiting for a "
+            "confirmation. An 'abort' for it has been SENT to plrd so it stops "
+            "now rather than at its deadline — this line does NOT mean it "
+            "landed; the console says so separately when plrd confirms.\n"
+            "Until then, treat plrd as still paused: DO NOT touch the printer, "
+            "and check 'journalctl -u plrd'. An abort invalidates the Z frame, "
+            "so a fresh dry run is required before any resume."
+        )
+
+    def _abort_detached(self, token, what="the outstanding question"):
+        """Send ``recover_confirm ... abort`` from a detached thread.
 
         Deliberately NOT an :class:`~plr.daemon_worker.AsyncDaemon` call:
-        that channel is closed by now, and there is nothing left on the
-        reactor that could act on a reply.
+        this is used from ``klippy:shutdown`` (which must not block or pause)
+        and from teardown, where the channel is closed.
+
+        THE REPLY IS NOT WAITED FOR, and that used to be reported as
+        success.  plrd applies the answer the moment it arrives
+        (ctrlsock.rs:776, before ``drive_session``), so the SEND is what
+        matters — but a send that never connected is exactly the case where
+        plrd stays paused and the machine moves later.  So the outcome is
+        marshalled back to the reactor when there is still a reactor to
+        marshal it to, and only a real success publishes anything calmer.
+
+        The deadline covers connect+send, not the reply: ``recover_confirm``
+        only returns when the recovery next pauses or finishes, so waiting
+        for it would log a false failure on the SUCCESSFUL path — a
+        traceback in klippy.log, the first file anybody reads when
+        diagnosing exactly this.
         """
         link = self.plugin.daemon
+        reactor = self.reactor
+
+        def deliver(outcome, detail):
+            try:
+                reactor.register_async_callback(
+                    lambda eventtime: self._abort_reported(outcome, detail, what)
+                )
+            except Exception:
+                logger.info("plr: no reactor left to report the %s abort to", what)
 
         def run():
             try:
@@ -1119,14 +1306,57 @@ class RecoverySession:
                     {"token": token, "answer": ANSWER_ABORT},
                     timeout=daemon_link.STATUS_TIMEOUT,
                 )
-            except Exception:
-                # Nobody is listening and nothing can be done: plrd's own
-                # deadline remains the backstop.
-                logger.exception("plr: shutdown abort of the recovery failed")
+            except daemon_link.DaemonError as e:
+                message = str(e)
+                if "did not answer" in message or "did not finish answering" in message:
+                    # Expected on the SUCCESSFUL path: the answer was
+                    # delivered and plrd is now busy aborting, so it will not
+                    # reply until that finishes.  Not a failure, and not a
+                    # traceback.
+                    logger.info(
+                        "plr: %s abort was sent; plrd did not reply within the "
+                        "send window, which is the normal case",
+                        what,
+                    )
+                    deliver(True, None)
+                    return
+                logger.warning("plr: %s abort may not have landed: %s", what, e)
+                deliver(False, message)
+                return
+            except Exception as e:
+                logger.exception("plr: %s abort failed", what)
+                deliver(False, "%s: %s" % (type(e).__name__, e))
+                return
+            deliver(True, None)
 
         thread = threading.Thread(target=run, name="plr-abort")
         thread.daemon = True
         thread.start()
+
+    def _abort_reported(self, ok, detail, what):
+        """The detached abort's outcome, on the reactor.  Never raises."""
+        try:
+            if ok:
+                self._respond(
+                    "PLR recovery: plrd accepted the abort for %s. Nothing of "
+                    "this recovery is outstanding." % (what,)
+                )
+                if self._token is None:
+                    self._transition(
+                        STATE_IDLE, reason="plrd accepted the abort we sent"
+                    )
+                return
+            self._respond(
+                "PLR recovery: the abort for %s could NOT be delivered to plrd "
+                "(%s).\n"
+                "Assume plrd is STILL PAUSED: it will run that step's cleanup "
+                "commands when its own deadline expires, which may be after you "
+                "clear the shutdown. DO NOT touch the printer; check "
+                "'journalctl -u plrd' and stop plrd there if it must not "
+                "continue." % (what, detail)
+            )
+        except Exception:
+            logger.exception("plr: cannot report the %s abort outcome", what)
 
 
 # --- console command entry points (wired in plr.plugin) --------------

@@ -413,15 +413,35 @@ source, so the two can never disagree:
 | `unknown` | plrd answered something that does not say what it is doing, or the plugin can no longer show a pause is live | allowed: it is the only way to find out |
 
 `recovery_awaiting_confirmation` is true only in the
-`awaiting_confirmation` row — never on the strength of a guess. In the two
-right-hand "allowed" rows the console says **do not touch the printer**,
-and the way to learn more is to run `PLR_RECOVER EXECUTE=1 CONFIRM=YES`
-again: plrd refuses it with `busy` if it is still working, and there is no
-path in the daemon to two concurrent recoveries. If a question is still
-answerable in one of those rows, `PLR_RECOVER_CONTINUE` /
-`PLR_RECOVER_ABORT` still work — and starting a new recovery instead
-**abandons** it, says so, and sends `abort` to plrd for it so it is not
-left waiting out its own deadline.
+`awaiting_confirmation` row — never on the strength of a guess.
+`recovery_can_answer` is published separately, because whether an answer can
+still be **sent** is a property of the outstanding token rather than of the
+state: a question outlives the plugin's ability to vouch for it, and the
+console and the API say the same thing about it.
+
+In the two "allowed" rows the console says **do not touch the printer**, and
+the way to learn more is to try a recovery again — `PLR_WIZARD_START` (which
+keeps the dry-run review) or `PLR_RECOVER EXECUTE=1 CONFIRM=YES`. plrd
+answers `busy` if it is still working, and there is no path in the daemon to
+two concurrent recoveries. **That attempt is also the only exit from those
+two rows**, deliberately: nothing but plrd can tell this plugin the machine
+is free, so the state stands until a recovery conversation reaches a terminal
+answer. The wizard therefore still works in both rows, and carries the
+warning into its dialog rather than replacing it.
+
+If a question is still answerable in one of those rows,
+`PLR_RECOVER_CONTINUE` / `PLR_RECOVER_ABORT` still work — and starting a new
+recovery instead **abandons** it, says so, and sends `abort` to plrd for it
+so it is not left waiting out its own deadline.
+
+**"Sent" is never reported as "landed".** Wherever the plugin sends an abort
+without waiting for the reply — a klippy shutdown, or abandoning a question —
+it says the abort was *sent*, publishes `unknown`, and reports success only
+once plrd has actually confirmed it (which is also the only thing that
+publishes anything calmer). An abort that never arrived leaves plrd paused,
+and it will run that step's cleanup commands when its own deadline expires;
+a console that had already said "aborted, idle" is a machine that moves after
+the operator was told it was over.
 
 **Deadlines — two of them, and they end at different times.** plrd bounds
 an unanswered question itself and **aborts cleanly** when it expires: that
@@ -446,12 +466,15 @@ you a recovery aborted when plrd may still be paused with the nozzle over
 the part.
 
 If klippy shuts down (M112, an MCU fault) while a question is open — or if
-one **arrives** after the shutdown, which is the likelier order — the
-plugin answers `abort` for you so plrd stops immediately rather than at its
-deadline, tells you it did, and clears the dialog. It never leaves a live
-dialog on screen whose Continue button could not work. A shutdown *during*
-execution cannot interrupt plrd; the plugin says so and waits for plrd's
-own report, which still arrives. A shutdown does **not** stop `PLR_STATUS`,
+one **arrives** after the shutdown, which is the likelier order — the plugin
+sends `abort` for you so plrd stops immediately rather than at its deadline,
+says it has been *sent*, and clears the dialog. It never leaves a live dialog
+on screen whose Continue button could not work. Until plrd confirms that
+abort the state is `unknown`, not `idle` (above). A shutdown *during*
+execution cannot interrupt plrd: if the recovery is this session's, the
+plugin says so and its report still arrives; if plrd is executing one this
+plugin is not connected to (`plrd_busy`) it says that instead — **no report
+for that one will appear here** — and points at `journalctl -u plrd`. A shutdown does **not** stop `PLR_STATUS`,
 `PLR_RECOVER` or `PLR_WIZARD_START` from working — klippy stays up until
 `FIRMWARE_RESTART`, and that is exactly when you need to know what plrd
 thinks it is doing — but it does forbid *acting*: starting a recovery, or

@@ -139,6 +139,10 @@ class AsyncDaemon:
         self._in_flight_cmd = None
         self._in_flight_until = None
         self._in_flight_generation = 0
+        # A LOCAL failure (thread creation) is not the daemon's fault, and
+        # saying "plrd could not be contacted" at the moment the operator is
+        # deciding whether the machine is live blames the wrong component.
+        self._thread_failed = False
         # klippy lifecycle: `klippy:disconnect` is the teardown event —
         # klippy/klippy.py:195 sends it on every exit and restart, as the
         # run loop unwinds — so after it no callback may run.  A SHUTDOWN
@@ -173,6 +177,14 @@ class AsyncDaemon:
             closed, busy = self._closed, self._busy
             dropped = self._in_flight_generation != self._generation
             cmd, until = self._in_flight_cmd, self._in_flight_until
+            thread_failed = self._thread_failed
+        if thread_failed and not busy:
+            return (
+                "%s: this plugin could not start a worker thread, so plrd was "
+                "never contacted — the fault is local (memory pressure on the "
+                "host), not the daemon's, and nothing about the machine has "
+                "changed. Check klippy.log and free some memory." % (command,)
+            )
         if closed:
             return "%s: klippy is shutting down, so nothing was asked of plrd." % (
                 command,
@@ -208,6 +220,7 @@ class AsyncDaemon:
             if self._closed or self._busy:
                 return False
             self._busy = True
+            self._thread_failed = False
             generation = self._generation
             self._in_flight_cmd = cmd
             self._in_flight_generation = generation
@@ -234,6 +247,7 @@ class AsyncDaemon:
                 self._busy = False
                 self._in_flight_cmd = None
                 self._in_flight_until = None
+                self._thread_failed = True
             logger.exception("plr: cannot start the %s worker thread", self.label)
             return False
         return True
