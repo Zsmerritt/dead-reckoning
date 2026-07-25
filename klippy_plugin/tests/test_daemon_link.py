@@ -347,7 +347,9 @@ def test_plr_status_refuses_a_second_query_while_one_is_in_flight(plugin, run_cm
             time.sleep(0.005)
         assert started == ["status"]
         run_cmd("PLR_STATUS")
-        assert "already in flight" in gcode.responses[-1]
+        # The refusal says WHICH refusal it is (busy, not closed): promising
+        # a report that may never arrive is the failure this replaced.
+        assert "has not answered yet" in gcode.responses[-1]
         assert started == ["status"]
     finally:
         release.set()
@@ -501,3 +503,113 @@ def test_report_where_socket_tests_ran():
     assert isinstance(HAS_AF_UNIX, bool)
     if not HAS_AF_UNIX and os.name != "nt":
         pytest.fail("AF_UNIX missing on a POSIX host — unexpected")
+
+
+# --- the deadline is TOTAL, not per-operation --------------------------
+
+
+def test_a_trickling_daemon_trips_the_deadline_it_was_given():
+    # `socket.settimeout` is per-operation: a daemon sending one byte at a
+    # time resets it forever, so a call given a 1-second deadline would sit
+    # there indefinitely — holding a worker thread and the plugin's
+    # single-flight slot, which is exactly what the timeout exists to bound.
+    stop = threading.Event()
+
+    def trickle(server):
+        try:
+            buf = b""
+            while b"\n" not in buf:
+                chunk = server.recv(4096)
+                if not chunk:
+                    return
+                buf += chunk
+            # One byte every 50 ms, and never the newline that ends the line.
+            while not stop.wait(0.05):
+                server.sendall(b" ")
+        except OSError:
+            pass
+        finally:
+            server.close()
+
+    def connect(path, timeout):
+        client, server = socket.socketpair()
+        client.settimeout(timeout)
+        thread = threading.Thread(target=trickle, args=(server,))
+        thread.daemon = True
+        thread.start()
+        return client
+
+    link = daemon_link.DaemonLink("/run/fake/plrd.sock", connect_factory=connect)
+    started = time.monotonic()
+    try:
+        with pytest.raises(daemon_link.DaemonError) as excinfo:
+            link.call("status", timeout=1.0)
+    finally:
+        stop.set()
+    elapsed = time.monotonic() - started
+    # Either wording is honest — whether the budget ran out between reads
+    # or inside one — and both name the deadline that was handed in.
+    message = str(excinfo.value)
+    assert "did not finish answering" in message or "did not answer" in message
+    assert "1s" in message
+    # THE PROPERTY: it gave up on ITS deadline, not on the far end's
+    # schedule.  Without a total deadline this call never returns at all,
+    # because every trickled byte re-arms the per-operation timeout.
+    assert 0.9 <= elapsed < 3.0, elapsed
+
+
+def test_a_prompt_daemon_is_unaffected_by_the_total_deadline():
+    link = canned_link(ok_bytes(text="quick"), delay=0.05)
+    assert link.call("status", timeout=1.0)["text"] == "quick"
+
+
+def test_a_flooding_daemon_trips_the_total_deadline_between_reads():
+    # The other half of the per-operation problem: a daemon streaming bytes
+    # fast enough that no single recv ever times out, and never sending the
+    # newline that ends the line.  Only a total deadline stops this.
+    stop = threading.Event()
+
+    def flood(server):
+        try:
+            buf = b""
+            while b"\n" not in buf:
+                chunk = server.recv(4096)
+                if not chunk:
+                    return
+                buf += chunk
+            while not stop.is_set():
+                server.sendall(b" " * 512)
+        except OSError:
+            pass
+        finally:
+            server.close()
+
+    def connect(path, timeout):
+        client, server = socket.socketpair()
+        client.settimeout(timeout)
+        thread = threading.Thread(target=flood, args=(server,))
+        thread.daemon = True
+        thread.start()
+        return client
+
+    link = daemon_link.DaemonLink("/run/fake/plrd.sock", connect_factory=connect)
+    started = time.monotonic()
+    try:
+        with pytest.raises(daemon_link.DaemonError) as excinfo:
+            link.call("status", timeout=0.5)
+    finally:
+        stop.set()
+    elapsed = time.monotonic() - started
+    message = str(excinfo.value)
+    assert "did not finish answering" in message or "exceeded" in message
+    assert elapsed < 3.0, elapsed
+
+
+def test_plr_recover_dryrun_refused_by_a_closed_channel_says_so(
+    plugin, run_cmd, fake_printer
+):
+    plugin.daemon = StubDaemon(response={"ok": True, "text": "", "data": {}})
+    fake_printer.send_event("klippy:disconnect")
+    with pytest.raises(fake_klippy.FakeCommandError, match="shutting down"):
+        run_cmd("PLR_RECOVER")
+    assert plugin.daemon.calls == []

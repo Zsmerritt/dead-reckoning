@@ -307,11 +307,32 @@ own cross-thread wakeup. The visible consequences:
   so `PLR_STATUS` prints the plugin's own state first and plrd's block
   second;
 - a failure a worker discovers arrives as an error line (`!!`) rather than
-  a command error, because a callback has no command left to fail;
-- **do not chain other commands after `PLR_RECOVER EXECUTE=1` in a
-  macro**: it returns while the recovery is still running. plrd's own
-  ready+idle gate will refuse a recovery started while a macro is running,
-  but the console is the supported way to run one.
+  a command error, because a callback has no command left to fail.
+
+#### `PLR_RECOVER EXECUTE=1` must be the LAST line of any macro
+
+**Rule, not advice.** The command returns while the recovery is still
+running, and the blocker is the **g-code mutex**, not the reactor:
+`run_script` holds it for the whole script (`klippy/gcode.py:239-241`), and
+plrd needs that same mutex for every command it sends. So a macro's
+*remaining* lines keep plrd out — starving it while it has the nozzle near
+the part at probing temperature — even though they are perfectly
+well-behaved klippy code that pauses the reactor politely. (`M109`/`M190`
+block for minutes exactly that way: `reactor.pause` keeps the reactor
+free, but the mutex stays held.) Anything after `PLR_RECOVER EXECUTE=1` in
+a macro therefore delays plrd's next step by however long it takes, and
+anything that moves races plrd for the machine.
+
+Nothing enforces this today, and this document previously claimed
+otherwise: plrd's ready+idle gate does **not** catch it. That gate queries
+`webhooks`, `print_stats` and `virtual_sdcard` only
+(`crates/plrd/src/recover.rs:672-692`), and a console-invoked macro leaves
+all three in their accepted states, so the gate passes every time. The
+enforceable fix is a daemon-side change — adding `idle_timeout` to that
+gate, which the daemon already subscribes to (`crates/plrd/src/client.rs:69`)
+and whose `"Printing"` state distinguishes a macro that moves from one that
+only prints a message — and it is queued, not shipped. Until it lands, the
+rule above is the whole protection.
 
 ### `PLR_STATUS`
 

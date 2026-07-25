@@ -309,18 +309,23 @@ def test_answer_rejects_an_answer_plrd_would_not_accept(plugin):
 def test_a_pause_with_no_usable_token_is_reported_as_unanswerable(
     plugin, run, fake_printer
 ):
-    # FAIL-SAFE: without a token there is no way to answer, so the plugin
-    # must not pretend either outcome — plrd aborts on its own deadline.
+    # FAIL-SAFE: without a token there is no way to answer, and plrd is
+    # STILL PAUSED holding the machine.  So: not answerable, not "aborted",
+    # and NOT reported as idle.
     plugin.daemon = ScriptedDaemon({"recover_execute": [fx.pause(token=None)]})
     gcode = fake_printer.lookup_object("gcode")
     since = responses_since(gcode)
     execute(plugin, run)
     body = "\n".join(since())
     assert "no usable resume token" in body
-    assert "aborts the recovery on its own deadline" in body
+    assert "still paused" in body
+    assert "DO NOT touch the printer" in body
     assert "action:prompt_end" in since()
-    assert plugin.recovery.state() == "idle"
+    assert plugin.recovery.state() == "unknown"
     assert plugin.recovery.is_awaiting() is False
+    # ...and a retry is permitted, because plrd's `busy` is the only
+    # observation available.
+    assert plugin.recovery.is_active() is False
 
 
 @pytest.mark.parametrize("token", ["", 7, [], {}])
@@ -332,7 +337,7 @@ def test_a_malformed_token_is_treated_the_same_way(plugin, run, fake_printer, to
     assert "no usable resume token" in "\n".join(since())
 
 
-def test_the_daemons_timeout_abort_is_rendered_as_an_abort_not_an_error(
+def test_only_the_timed_out_unknown_token_is_rendered_as_an_abort(
     plugin, run, fake_printer
 ):
     # plrd's confirm deadline expired between the question and the answer,
@@ -377,7 +382,71 @@ def test_a_response_with_no_data_map_is_not_classified_as_success(
     body = "\n".join(since())
     assert "no data" in body
     assert "PLR recovery complete" not in body
-    assert plugin.recovery.state() == "idle"
+    # Unclassifiable says nothing about whether plrd is still executing, so
+    # it is UNKNOWN — never idle.
+    assert plugin.recovery.state() == "unknown"
+
+
+@pytest.mark.parametrize(
+    "text,expected_state,claims_abort",
+    [
+        # ctrlsock.rs:776-784 — the ONE case that means the recovery ended.
+        pytest.param(
+            "the confirmation timed out before the answer arrived; the "
+            "recovery aborted",
+            "idle",
+            True,
+            id="timed-out-aborted",
+        ),
+        # :755-760 — no execution at all: plrd is not saying what happened.
+        pytest.param(
+            "no execution is awaiting confirmation; the token is unknown or expired",
+            "unknown",
+            False,
+            id="no-session",
+        ),
+        # :761-766 — plrd is EXECUTING.  Claiming an abort here is the
+        # "believing a recovery aborted while it is still running" failure.
+        pytest.param(
+            "the execution is running but not awaiting confirmation; the "
+            "token is expired",
+            "unknown",
+            False,
+            id="still-running",
+        ),
+        # :767-775 — the question was PUT BACK, so plrd is still paused with
+        # the nozzle at standoff and the heaters at target.
+        pytest.param(
+            "that token does not match the outstanding confirmation",
+            "unknown",
+            False,
+            id="still-paused",
+        ),
+        pytest.param("", "unknown", False, id="no-text-at-all"),
+    ],
+)
+def test_unknown_token_tells_the_truth_for_each_of_its_four_causes(
+    plugin, run, fake_printer, text, expected_state, claims_abort
+):
+    plugin.daemon = ScriptedDaemon(
+        {
+            "recover_execute": [fx.pause()],
+            "recover_confirm": [fx.unknown_token(text=text)],
+        }
+    )
+    gcode = fake_printer.lookup_object("gcode")
+    execute(plugin, run)
+    since = responses_since(gcode)
+    run("PLR_RECOVER_CONTINUE")
+    body = "\n".join(since())
+    assert plugin.recovery.state() == expected_state
+    if claims_abort:
+        assert "the recovery aborted" in body
+    else:
+        assert "aborted" not in body
+        assert "may still be executing, or still paused" in body
+        assert "DO NOT touch the printer" in body
+        assert "safe as a probe" in body
 
 
 def test_an_empty_report_still_says_something(plugin, run, fake_printer):
@@ -416,6 +485,8 @@ def test_a_refusal_says_nothing_was_sent(plugin, run, fake_printer):
 
 
 def test_losing_contact_never_claims_the_recovery_failed(plugin, run, fake_printer):
+    # A transport failure says nothing about what plrd is doing, so the
+    # state must be UNKNOWN rather than idle (checked below).
     plugin.daemon = ScriptedDaemon(
         {
             "recover_execute": [
@@ -430,11 +501,12 @@ def test_losing_contact_never_claims_the_recovery_failed(plugin, run, fake_print
     assert "lost contact with plrd" in body
     assert "may still be executing" in body
     assert "M112" in body
-    # It also does not claim success, and it releases the local slot so the
+    # It also does not claim success, and it releases the local guard so the
     # DAEMON's own busy refusal (ctrlsock.rs:631-645) is the authority on a
-    # second attempt.
+    # second attempt — while still not reporting "idle".
     assert "complete" not in body
-    assert plugin.recovery.state() == "idle"
+    assert plugin.recovery.state() == "unknown"
+    assert plugin.recovery.is_active() is False
 
 
 def test_losing_contact_while_a_question_is_open_says_the_dialog_is_dead(
@@ -454,7 +526,7 @@ def test_losing_contact_while_a_question_is_open_says_the_dialog_is_dead(
     assert "may or may not have reached plrd" in body
     assert "can no longer be answered from here" in body
     assert "action:prompt_end" in since()
-    assert plugin.recovery.state() == "idle"
+    assert plugin.recovery.state() == "unknown"
 
 
 def test_an_exception_in_a_reactor_callback_never_escapes(
@@ -504,21 +576,59 @@ def test_a_shutdown_at_a_confirm_point_aborts_the_recovery_and_clears_the_dialog
     assert plugin.recovery.is_awaiting() is False
 
 
-def test_a_shutdown_with_no_question_open_sends_nothing_and_still_closes_down(
+def test_a_shutdown_during_a_running_recovery_says_so_and_still_reports(
     plugin, run_cmd, fake_printer
 ):
-    plugin.daemon = ScriptedDaemon({"recover_execute": [fx.completed()]})
+    # A shutdown cannot interrupt plrd, so the operator is told what will
+    # actually happen — and plrd's report is still delivered, because a
+    # shutdown is not teardown (klippy stays up until FIRMWARE_RESTART).
+    plugin.daemon = ScriptedDaemon({"recover_execute": [fx.aborted()]})
     run_cmd("PLR_RECOVER", EXECUTE=1, CONFIRM="YES")
+    gcode = fake_printer.lookup_object("gcode")
+    since = responses_since(gcode)
     fake_printer.invoke_shutdown("Manual stop (M112)")
+    body = "\n".join(since())
+    assert "klippy stopped while plrd was EXECUTING" in body
+    assert "do not touch the printer" in body
     assert plugin.daemon.answers() == []
-    # The worker's answer is dropped rather than delivered to a shut-down
-    # printer: a worker thread must never touch one.
+    # Still RUNNING: a second recovery must not start while plrd finishes.
+    assert plugin.recovery.state() == "running"
     assert fake_printer.reactor.pump_async(1, timeout=2.0) == 1
+    assert any("ABORTED" in line for line in gcode.responses)
     assert plugin.recovery.state() == "idle"
-    assert not any(
-        "plan complete" in line
-        for line in plugin.printer.lookup_object("gcode").responses
+
+
+def test_a_shutdown_leaves_the_query_paths_working(plugin, run_cmd, pump, fake_printer):
+    # REGRESSION GUARD: before this fix, a shutdown closed every channel and
+    # PLR_STATUS promised a daemon block that never arrived — at exactly the
+    # moment the operator has hit M112 and most needs to know what plrd
+    # thinks it is doing.
+    plugin.daemon = ScriptedDaemon(
+        {"status": [{"ok": True, "text": "plrd armed", "data": {}}]}
     )
+    fake_printer.invoke_shutdown("Manual stop (M112)")
+    gcode = fake_printer.lookup_object("gcode")
+    since = responses_since(gcode)
+    run_cmd("PLR_STATUS")
+    assert pump() == 1
+    body = "\n".join(since())
+    assert "plrd armed" in body
+    assert "already in flight" not in body
+
+
+def test_a_disconnect_is_terminal_for_the_channels(plugin, run_cmd, fake_printer):
+    plugin.daemon = ScriptedDaemon(
+        {"status": [{"ok": True, "text": "plrd armed", "data": {}}]}
+    )
+    fake_printer.send_event("klippy:disconnect")
+    gcode = fake_printer.lookup_object("gcode")
+    since = responses_since(gcode)
+    run_cmd("PLR_STATUS")
+    body = "\n".join(since())
+    # No fabricated in-flight query: it says what is actually happening.
+    assert "shutting down" in body
+    assert "already in flight" not in body
+    assert fake_printer.reactor.pending_async() == 0
 
 
 def test_no_recovery_can_be_started_after_a_shutdown(plugin, run_cmd, fake_printer):
@@ -863,3 +973,204 @@ def test_a_shutdown_mid_recovery_does_not_leave_the_wizard_wedged(
     assert plugin.recovery.state() == "idle"
     assert plugin.wizard.is_active() is False
     assert plugin.get_status(100.0)["wizard_active"] is False
+
+
+# --- the liveness downgrade (MAJOR 5) ---------------------------------
+
+
+def test_after_plrds_default_deadline_the_plugin_stops_asserting_liveness(
+    plugin, run, fake_printer
+):
+    # The default install sets no confirm_timeout_s, so the plugin waits the
+    # ceiling (3630 s) but plrd's real deadline is 600 s.  For the 50 minutes
+    # in between it must NOT keep telling everyone a question is live.
+    assert plugin.daemon_keys.get("confirm_timeout_s") is None
+    plugin.daemon = ScriptedDaemon({"recover_execute": [fx.pause()]})
+    reactor = fake_printer.reactor
+    gcode = fake_printer.lookup_object("gcode")
+    execute(plugin, run)
+    assert plugin.recovery.state() == "awaiting_confirmation"
+    assert plugin.get_status(100.0)["recovery_awaiting_confirmation"] is True
+
+    since = responses_since(gcode)
+    reactor.advance(recovery.DAEMON_CONFIRM_DEFAULT_S + recovery.CONFIRM_HEADROOM_S)
+    assert reactor.run_due_timers() >= 1
+    body = "\n".join(since())
+    assert "longer than plrd's own default deadline" in body
+    assert "may well have aborted" in body
+    assert "Nothing was answered on your behalf" in body
+    assert "action:prompt_end" in since()
+
+    # What it now reports: unknown, not awaiting.
+    assert plugin.recovery.state() == "unknown"
+    status = plugin.get_status(100.0)
+    assert status["recovery_state"] == "unknown"
+    assert status["recovery_awaiting_confirmation"] is False
+    # A fresh recovery is no longer refused on the strength of the guess...
+    assert plugin.recovery.is_active() is False
+    # ...but the answer commands still work, because plrd's reply is the
+    # only thing that can actually settle it.
+    assert plugin.recovery.is_awaiting() is True
+
+
+def test_a_late_answer_is_still_attempted_after_the_downgrade(
+    plugin, run, fake_printer
+):
+    plugin.daemon = ScriptedDaemon(
+        {"recover_execute": [fx.pause()], "recover_confirm": [fx.completed()]}
+    )
+    reactor = fake_printer.reactor
+    execute(plugin, run)
+    reactor.advance(recovery.DAEMON_CONFIRM_DEFAULT_S + recovery.CONFIRM_HEADROOM_S)
+    reactor.run_due_timers()
+    run("PLR_RECOVER_CONTINUE")
+    # The token was kept: plrd got the answer and adjudicated.
+    assert plugin.daemon.answers() == ["continue"]
+    assert plugin.recovery.state() == "idle"
+
+
+def test_a_fresh_recovery_is_allowed_after_the_downgrade(plugin, run, run_cmd, pump):
+    plugin.daemon = ScriptedDaemon({"recover_execute": [fx.pause(), fx.busy()]})
+    reactor = plugin.printer.get_reactor()
+    execute(plugin, run)
+    with pytest.raises(fake_klippy.FakeCommandError, match="WAITING FOR YOUR ANSWER"):
+        run_cmd("PLR_RECOVER", EXECUTE=1, CONFIRM="YES")
+    reactor.advance(recovery.DAEMON_CONFIRM_DEFAULT_S + recovery.CONFIRM_HEADROOM_S)
+    reactor.run_due_timers()
+    # Now permitted — and plrd itself adjudicates, answering `busy` if it is
+    # in fact still paused.
+    run_cmd("PLR_RECOVER", EXECUTE=1, CONFIRM="YES")
+    assert pump() == 1
+    assert [c[0] for c in plugin.daemon.calls] == ["recover_execute", "recover_execute"]
+
+
+def test_a_known_deadline_asserts_liveness_right_up_to_it(
+    fake_printer, plr_config, run_cmd, pump
+):
+    # With confirm_timeout_s set there is nothing to be doubtful about, so no
+    # downgrade fires before the wait expires.
+    plugin = confirm_timeout_plugin(fake_printer, plr_config, "120")
+    plugin.daemon = ScriptedDaemon({"recover_execute": [fx.pause()]})
+    reactor = fake_printer.reactor
+    run_cmd("PLR_RECOVER", EXECUTE=1, CONFIRM="YES")
+    assert pump() == 1
+    reactor.advance(119.0)
+    assert reactor.run_due_timers() == 0
+    assert plugin.recovery.state() == "awaiting_confirmation"
+    assert plugin.get_status(100.0)["recovery_awaiting_confirmation"] is True
+
+
+def test_the_dialog_says_the_question_may_be_stale_when_it_is_re_shown(
+    plugin, run, fake_printer
+):
+    # A re-shown doubtful question must not repeat the confident deadline
+    # sentence: by then the honest statement is "plrd has probably aborted
+    # this already".
+    plugin.daemon = ScriptedDaemon(
+        {
+            "recover_execute": [fx.pause()],
+            "status": [{"ok": True, "text": "plrd armed", "data": {}}],
+        }
+    )
+    reactor = fake_printer.reactor
+    execute(plugin, run)
+    reactor.advance(recovery.DAEMON_CONFIRM_DEFAULT_S + recovery.CONFIRM_HEADROOM_S)
+    reactor.run_due_timers()
+    gcode = fake_printer.lookup_object("gcode")
+    since = responses_since(gcode)
+    run("PLR_STATUS")
+    body = "\n".join(since())
+    assert "past plrd's own default deadline" in body
+    assert "probably aborted the recovery already" in body
+    # ...and PLR_WIZARD_START now offers a FRESH recovery rather than
+    # re-showing a question it cannot vouch for; plrd adjudicates.
+    assert plugin.recovery.is_active() is False
+
+
+# --- re-showing the question (MINOR) ----------------------------------
+
+
+def test_plr_status_re_shows_the_outstanding_question(plugin, run, run_cmd, pump):
+    # On a console-first client the pause scrolls away, and the
+    # why/fix/offer message is otherwise emitted exactly once.  An operator
+    # who cannot see it again is an operator clicking Continue blind.
+    plugin.daemon = ScriptedDaemon(
+        {
+            "recover_execute": [fx.z_height_pause()],
+            "status": [{"ok": True, "text": "plrd armed", "data": {}}],
+        }
+    )
+    execute(plugin, run)
+    gcode = plugin.printer.lookup_object("gcode")
+    since = responses_since(gcode)
+    run("PLR_STATUS")
+    lines = since()
+    body = "\n".join(lines)
+    assert "The outstanding recovery question, again:" in lines
+    # The whole three-part message, not just a pointer to it.
+    assert "action:prompt_begin Power-loss recovery — confirmation needed" in lines
+    assert "Why: " in body
+    assert "Suggested fix: " in body
+    assert "action:prompt_button Continue anyway|PLR_RECOVER_CONTINUE|warning" in lines
+    assert "Z was derived as: " in body
+
+
+def test_wizard_start_re_shows_the_outstanding_question(plugin, run, run_cmd):
+    plugin.daemon = ScriptedDaemon({"recover_execute": [fx.pause()]})
+    execute(plugin, run)
+    gcode = plugin.printer.lookup_object("gcode")
+    since = responses_since(gcode)
+    run_cmd("PLR_WIZARD_START")
+    lines = since()
+    assert "action:prompt_show" in lines
+    assert any("PLR_RECOVER_CONTINUE" in line for line in lines)
+
+
+def test_plr_status_re_shows_nothing_when_nothing_is_outstanding(plugin, run_cmd, pump):
+    plugin.daemon = ScriptedDaemon(
+        {"status": [{"ok": True, "text": "plrd armed", "data": {}}]}
+    )
+    gcode = plugin.printer.lookup_object("gcode")
+    since = responses_since(gcode)
+    run_cmd("PLR_STATUS")
+    assert pump() == 1
+    assert not any(line.startswith("action:") for line in since())
+    assert plugin.recovery.reshow() is False
+
+
+def test_status_lines_for_the_unknown_state_tell_the_operator_what_to_do(
+    plugin, run, fake_printer
+):
+    plugin.daemon = ScriptedDaemon(
+        {"recover_execute": [{"ok": True, "text": "??", "data": None}]}
+    )
+    execute(plugin, run)
+    assert plugin.recovery.state() == "unknown"
+    lines = plugin.recovery.status_lines()
+    body = "\n".join(lines)
+    assert "recovery: UNKNOWN" in body
+    assert "DO NOT touch the printer" in body
+    assert "journalctl -u plrd" in body
+    assert "safe as a probe" in body
+    # PLR_STATUS shows the same thing.
+    gcode = fake_printer.lookup_object("gcode")
+    since = responses_since(gcode)
+    run("PLR_STATUS")
+    assert "recovery: UNKNOWN" in "\n".join(since())
+
+
+def test_an_exception_in_the_claim_downgrade_never_escapes(
+    plugin, run, fake_printer, monkeypatch
+):
+    plugin.daemon = ScriptedDaemon({"recover_execute": [fx.pause()]})
+    reactor = fake_printer.reactor
+    execute(plugin, run)
+
+    def boom(_msg):
+        raise RuntimeError("respond exploded")
+
+    monkeypatch.setattr(plugin.recovery, "_respond", boom)
+    reactor.advance(recovery.DAEMON_CONFIRM_DEFAULT_S + recovery.CONFIRM_HEADROOM_S)
+    # A raise here would reach klippy's reactor loop, which turns it into a
+    # printer shutdown (klippy/klippy.py:170-186).
+    assert reactor.run_due_timers() >= 1

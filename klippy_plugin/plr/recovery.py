@@ -89,6 +89,34 @@ timed out before the answer arrived; the recovery aborted"
 transport error.  When P does fire, all it does is stop the plugin from
 claiming a recovery is still in flight; it never claims to have continued
 or stopped anything itself.
+
+**The wait and the claim end at different times.**  Keeping P at the
+ceiling is right — a wait shorter than plrd's real deadline would tell the
+operator a live question is dead — but on the common configuration
+(``confirm_timeout_s`` unset) plrd's real deadline is 600 s while P is
+3630 s.  Asserting ``awaiting_confirmation`` for the 50 minutes in
+between, and refusing new recoveries all the while, would be a guess
+dressed as a fact.  So there is a second, earlier stage: at
+:func:`claim_deadline` the pause is marked DOUBTFUL — the plugin says plrd
+has probably aborted already, publishes :data:`STATE_UNKNOWN` instead of
+``awaiting_confirmation``, and stops refusing a fresh recovery — while
+still keeping the token, because a late answer is worth attempting and
+plrd's own reply is the only thing that can actually settle it.  The
+observation that would remove the guess entirely (a session-liveness
+query) does not exist: ``build_status`` takes only the config
+(ctrlsock.rs:387) and never sees ``CtrlState.session``, so ``status``
+cannot report whether an execution is paused.  That is a required daemon
+follow-up, not a nice-to-have.
+
+**A SHUTDOWN IS NOT TEARDOWN.**  ``klippy:shutdown`` leaves the object
+graph intact and the reactor running — klippy stays up until
+``FIRMWARE_RESTART`` — so this session keeps reporting through it, and so
+do the query channels: an operator who has just hit M112 because a
+recovery looked wrong is exactly the operator who needs ``PLR_STATUS`` to
+work.  What a shutdown forbids is *acting*: starting a recovery, or
+answering ``continue``, are both refused while ``printer.is_shutdown()``.
+Only ``klippy:disconnect`` (klippy/klippy.py:195, sent as the run loop
+unwinds) is terminal.
 """
 
 import logging
@@ -110,6 +138,15 @@ ANSWER_ABORT = "abort"
 STATE_IDLE = "idle"
 STATE_RUNNING = "running"  # plrd is executing; nothing to answer
 STATE_AWAITING = "awaiting_confirmation"  # a pause is outstanding
+# plrd answered in a way that does not say what it is doing now, or the
+# plugin can no longer show that a pause is live.  Reported as its own
+# state because "idle" would be a claim — and a false one — while plrd may
+# still be paused with the nozzle at standoff and the heaters at target.
+# `is_active()` is False for it ON PURPOSE: the plugin cannot resolve the
+# ambiguity, but plrd can, so a fresh `recover_execute` is permitted and
+# ITS answer (`busy`, or a real run) is the observation nobody else can
+# provide (crates/plrd/src/ctrlsock.rs:631-645).
+STATE_UNKNOWN = "unknown"
 
 # --- the deadline interlock (see the module docstring) -----------------
 
@@ -130,6 +167,27 @@ CONFIRM_HEADROOM_S = 30.0
 # project has been bitten by.  An upper bound cannot diverge; it can only
 # become loose.
 DAEMON_CONFIRM_CEILING_S = 3600.0
+
+# plrd's OWN default deadline (crates/plr-recovery/src/build.rs:324-328
+# CONFIRM_TIMEOUT_DEFAULT_S, matching DEFAULT_CONFIRM_TIMEOUT at
+# crates/plrd/src/executor.rs:136-143), used for ONE purpose: to know when
+# the plugin has stopped being able to claim a pause is live.
+#
+# It is emphatically NOT used as the plugin's wait — that stays the ceiling
+# above, because a wait shorter than plrd's real deadline is the worse
+# direction (it would tell the operator a live question is dead).  What it
+# bounds is the CLAIM: once this much has passed with no answer, on a
+# printer that never set `confirm_timeout_s`, plrd has almost certainly
+# aborted already, and asserting `awaiting_confirmation` for another 50
+# minutes — refusing new recoveries all the while — would be a fabrication.
+# tests/test_recovery_deadlines.py parses the value out of the Rust and
+# fails if this copy drifts from it; the safe direction if it ever does is
+# for this number to be too SMALL (an earlier downgrade), never too large.
+DAEMON_CONFIRM_DEFAULT_S = 600.0
+
+# Confidence in the outstanding pause.
+_LIVE = "live"  # inside every deadline plrd could be using
+_DOUBTFUL = "doubtful"  # past plrd's default: it may have aborted
 
 
 def daemon_confirm_deadline(configured):
@@ -154,6 +212,21 @@ def prompt_deadline(configured):
     """The plugin's local prompt deadline: strictly longer than plrd's."""
     deadline, _exact = daemon_confirm_deadline(configured)
     return deadline + CONFIRM_HEADROOM_S
+
+
+def claim_deadline(configured):
+    """When the plugin must stop CLAIMING the pause is live, or ``None``.
+
+    ``None`` when the operator set ``confirm_timeout_s``: the plugin then
+    knows plrd's deadline exactly, so :func:`prompt_deadline` is both the
+    end of the claim and the end of the wait.  Otherwise it is plrd's own
+    default plus the same headroom — the point past which "awaiting
+    confirmation" would be a guess dressed as a fact.
+    """
+    _deadline, exact = daemon_confirm_deadline(configured)
+    if exact:
+        return None
+    return DAEMON_CONFIRM_DEFAULT_S + CONFIRM_HEADROOM_S
 
 
 def deadline_text(configured):
@@ -194,25 +267,74 @@ class RecoverySession:
         self._on_finished = None
         self._pauses = 0
         self._timer = None
+        self._claim_timer = None
+        self._confidence = _LIVE
         self._closed = False
-        self.printer.register_event_handler("klippy:shutdown", self._handle_stop)
-        self.printer.register_event_handler("klippy:disconnect", self._handle_stop)
+        # A SHUTDOWN is not teardown: klippy stays up until
+        # FIRMWARE_RESTART, so the session must keep answering questions
+        # about itself (and must not act).  Only `disconnect` is terminal.
+        self.printer.register_event_handler("klippy:shutdown", self._handle_shutdown)
+        self.printer.register_event_handler(
+            "klippy:disconnect", self._handle_disconnect
+        )
 
     # -- introspection ------------------------------------------------
 
     def state(self):
+        """The state to publish.
+
+        A doubtful pause reports :data:`STATE_UNKNOWN`, not
+        ``awaiting_confirmation``: past plrd's own default deadline the
+        plugin cannot show the question is still live, and publishing a
+        liveness it cannot demonstrate is how a UI ends up telling an
+        operator to answer something that stopped existing 40 minutes ago.
+        """
+        if self._state == STATE_AWAITING and self._confidence == _DOUBTFUL:
+            return STATE_UNKNOWN
         return self._state
 
     def is_active(self):
+        """Whether a NEW recovery must be refused locally.
+
+        False for both idle and the two unknowable states: when the plugin
+        cannot tell what plrd is doing, plrd is the authority — it refuses
+        with ``busy`` if it really is still working, which is the only
+        observation available (see :data:`STATE_UNKNOWN`).
+        """
+        if self._state == STATE_UNKNOWN:
+            return False
+        if self._state == STATE_AWAITING and self._confidence == _DOUBTFUL:
+            return False
         return self._state != STATE_IDLE
 
     def is_awaiting(self):
+        """Whether an answer can still be sent for the outstanding pause.
+
+        Stays True while doubtful: the token is kept until the full wait
+        expires, so a late answer is still ATTEMPTED and plrd's own typed
+        reply decides — which is strictly better than refusing locally on a
+        guess.  What the doubtful case changes is what the plugin CLAIMS,
+        not what it lets the operator try.
+        """
         return self._state == STATE_AWAITING and self._token is not None
+
+    def is_awaiting_confirmed(self):
+        """``is_awaiting`` restricted to what the plugin can demonstrate."""
+        return self.is_awaiting() and self._confidence == _LIVE
 
     def status_lines(self):
         """Lines for ``PLR_STATUS`` — always safe, never a daemon call."""
         if self._state == STATE_IDLE:
             return ["recovery: idle"]
+        if self._state == STATE_UNKNOWN:
+            return [
+                "recovery: UNKNOWN — plrd did not say what it is doing now, "
+                "and this plugin cannot tell.",
+                "  It may still be executing or paused. DO NOT touch the "
+                "printer; check 'journalctl -u plrd'.",
+                "  PLR_RECOVER EXECUTE=1 CONFIRM=YES is safe as a probe: plrd "
+                "refuses with 'busy' if it is still working.",
+            ]
         if self._state == STATE_RUNNING:
             return [
                 "recovery: RUNNING (started by %s) — plrd is driving the "
@@ -235,6 +357,33 @@ class RecoverySession:
             )
         lines.append("  answer with %s or %s" % (CMD_CONTINUE, CMD_ABORT))
         return lines
+
+    def reshow(self, respond=None):
+        """Re-emit the outstanding question, prompt and all.
+
+        The operator has to be able to get the question back: on a
+        console-first client the pause scrolls away, and the three-part
+        why/fix/offer message is otherwise shown exactly once, at emission.
+        Somebody who cannot see it any more is somebody clicking Continue
+        blind.  Called from PLR_STATUS and PLR_WIZARD_START — explicit
+        operator actions, never a poll.
+        """
+        if not self.is_awaiting() or not isinstance(self._data, dict):
+            return False
+        prompts.emit_prompt(
+            respond or self._gcode().respond_info,
+            confirm_ui.confirm_prompt(self._data, self._deadline_text()),
+        )
+        return True
+
+    def _deadline_text(self):
+        if self._confidence == _DOUBTFUL:
+            return (
+                "This question is past plrd's own default deadline, so plrd "
+                "has probably aborted the recovery already — answering may "
+                "simply report that."
+            )
+        return deadline_text(self.plugin.daemon_keys.get("confirm_timeout_s"))
 
     # -- output -------------------------------------------------------
 
@@ -263,17 +412,17 @@ class RecoverySession:
         Raises ``gcmd.error`` when one is already in flight (from either
         entry point) or when klippy is not in a state to run one.
         """
-        if self._closed or self.printer.is_shutdown():
+        if self._closed or self._async.is_closed() or self.printer.is_shutdown():
             raise gcmd.error(
-                "%s: klippy is shut down — clear the shutdown "
-                "(FIRMWARE_RESTART) before attempting a recovery." % (source,)
+                "%s: klippy is shut down or shutting down — clear the "
+                "shutdown (FIRMWARE_RESTART) before attempting a recovery." % (source,)
             )
         if self.is_active():
             raise gcmd.error(self._busy_message(source))
-        # A worker still holding the channel with no session state means a
-        # previous conversation was abandoned (transport error) and its
-        # thread has not unblocked yet.  Refusing here is the safe
-        # direction: plrd may still be executing that recovery.
+        # A worker still holding the channel means a previous conversation
+        # was abandoned (a transport error, or a cancelled flow whose orphan
+        # has not unblocked).  Refusing is the safe direction: plrd may
+        # still be executing that recovery.
         if self._async.is_busy():
             raise gcmd.error(
                 "%s: the previous plrd conversation has not finished. plrd "
@@ -285,6 +434,8 @@ class RecoverySession:
         self._pauses = 0
         self._token = None
         self._data = None
+        self._answering = None
+        self._confidence = _LIVE
         self._state = STATE_RUNNING
         started = self._async.call(
             "recover_execute",
@@ -297,22 +448,25 @@ class RecoverySession:
         )
         if not started:
             self._state = STATE_IDLE
+            # `refusal_text` says WHICH refusal it was — busy, closed, or a
+            # thread that could not be created — instead of guessing.
             raise gcmd.error(
-                "%s: another plrd conversation is already in flight; nothing "
-                "was started." % (source,)
+                self._async.refusal_text(source)
+                or "%s: plrd could not be contacted; nothing was started." % (source,)
             )
         gcmd.respond_info(
             "%s: plrd is executing the recovery — THE PRINTER WILL MOVE.\n"
             "This command returns immediately; the recovery runs in plrd and "
-            "reports here as it goes. Do not send other commands to the "
-            "printer until it reports.\n"
+            "reports here as it goes. Send NOTHING else to the printer until "
+            "it reports: every command you send holds the g-code mutex plrd "
+            "needs for its own, so it must be the last line of any macro.\n"
             "If plrd stops to ask you something, a prompt appears and the "
             "console names the exact command to answer it (%s / %s)."
             % (source, CMD_CONTINUE, CMD_ABORT)
         )
 
     def _busy_message(self, source):
-        if self.is_awaiting():
+        if self.is_awaiting_confirmed():
             return (
                 "%s: a recovery is already in flight and is WAITING FOR YOUR "
                 "ANSWER — run %s to continue it or %s to stop it. Run "
@@ -399,13 +553,11 @@ class RecoverySession:
         if self.is_awaiting():
             self.answer(gcmd, ANSWER_ABORT, source)
             return True
-        if self._state == STATE_RUNNING:
-            raise gcmd.error(
-                "%s: plrd is executing the recovery and it cannot be "
-                "cancelled from here. It stops by itself on any failed "
-                "verification; use M112 if the machine must stop NOW." % (source,)
-            )
-        return False
+        raise gcmd.error(
+            "%s: plrd is executing the recovery and it cannot be cancelled "
+            "from here. It stops by itself on any failed verification; use "
+            "M112 if the machine must stop NOW." % (source,)
+        )
 
     # -- the confirm loop ---------------------------------------------
 
@@ -415,19 +567,84 @@ class RecoverySession:
             return
         data = response.get("data")
         if not isinstance(data, dict):
-            # A response with no data map cannot be classified.  Report it
-            # verbatim and stop believing anything about the recovery.
-            self._finish(
+            # A response with no data map cannot be classified: it says
+            # nothing about whether plrd is still executing.  Report it
+            # verbatim and go to UNKNOWN rather than to idle.
+            self._unresolved(
                 response,
-                "plrd sent a response with no data; treat the report above as "
-                "the whole story and check 'journalctl -u plrd'.",
+                "plrd sent a response with no data, so what it is doing now "
+                "is unknown.",
             )
             return
         outcome = data.get("outcome")
         if outcome == "awaiting_confirmation":
             self._pause(response, data)
             return
+        if outcome == "unknown-token":
+            self._unknown_token(response)
+            return
         self._finish(response, self._final_note(response, outcome))
+
+    def _unknown_token(self, response):
+        """plrd's ``unknown-token``, which has FOUR causes — not one.
+
+        crates/plrd/src/ctrlsock.rs:755-784 emits the same tag for:
+
+        1. no session at all (:755-760) — plrd is idle;
+        2. a session running but not awaiting (:761-766) — plrd is EXECUTING;
+        3. a token that is not the outstanding one (:767-775) — and it puts
+           the question BACK (``session.outstanding = Some(outstanding)``),
+           so plrd is STILL PAUSED and still answerable;
+        4. the pause timed out between the lookup and the send (:776-784) —
+           plrd aborted.
+
+        Only (4) means "the recovery is over".  Telling that story for (2)
+        or (3) would leave an operator believing a recovery aborted while
+        the nozzle sits at standoff with the heaters at target — the exact
+        failure this branch exists to remove.  So the text plrd sent is
+        what distinguishes them, and anything not provably (4) takes the
+        conservative branch: no abort claimed, and NOT idle.
+        """
+        text = response.get("text")
+        text = text if isinstance(text, str) else ""
+        if "timed out before the answer arrived" in text:
+            self._finish(
+                response,
+                "plrd is no longer waiting for that answer — its own "
+                "confirmation deadline expired first and the recovery "
+                "aborted (that abort is the safe direction, and plrd "
+                "invalidates the Z frame exactly as a decline would). "
+                "Re-run PLR_WIZARD_START for a fresh dry run.",
+            )
+            return
+        self._unresolved(
+            response,
+            "plrd is not waiting for THAT answer any more, and it did not say "
+            "the recovery ended: it may still be executing, or still paused "
+            "on a different question.",
+        )
+
+    def _unresolved(self, response, headline):
+        """Terminal for this plugin, unresolved for the machine."""
+        self._answering = None
+        self._token = None
+        self._data = None
+        self._confidence = _LIVE
+        self._state = STATE_UNKNOWN
+        self._disarm_timer()
+        text = response.get("text")
+        if isinstance(text, str) and text.strip():
+            self._respond(text)
+        self._end_dialog()
+        self._respond(
+            "PLR recovery: %s\n"
+            "DO NOT touch the printer and do not assume it has stopped. Check "
+            "PLR_STATUS and 'journalctl -u plrd'; use M112 if the machine must "
+            "stop NOW. Running PLR_RECOVER EXECUTE=1 CONFIRM=YES again is safe "
+            "as a probe — plrd refuses with 'busy' if it is still working."
+            % (headline,)
+        )
+        self._notify_finished()
 
     def _final_note(self, response, outcome):
         if response.get("ok") is True:
@@ -436,17 +653,6 @@ class RecoverySession:
             return (
                 "plrd already has a recovery in flight, so this attempt "
                 "changed nothing. Wait for that one to report."
-            )
-        if outcome == "unknown-token":
-            # ctrlsock.rs:755-784: no execution awaiting, or the pause
-            # timed out between the question and the answer.  Either way
-            # plrd is not waiting on us any more.
-            return (
-                "plrd is no longer waiting for that answer — its own "
-                "confirmation deadline expired first and the recovery "
-                "aborted (that abort is the safe direction, and plrd "
-                "invalidates the Z frame exactly as a decline would). "
-                "Re-run PLR_WIZARD_START for a fresh dry run."
             )
         if outcome == "refused":
             return (
@@ -462,19 +668,20 @@ class RecoverySession:
     def _pause(self, response, data):
         token = data.get("resume_token")
         if not isinstance(token, str) or not token:
-            # plrd is paused and there is no way to answer it.  It will
-            # abort on its own deadline; say so plainly rather than
-            # pretending either outcome.
-            self._finish(
+            # plrd is PAUSED and there is no way to answer it: it is still
+            # holding the machine until its own deadline.  Unresolved, not
+            # finished.
+            self._unresolved(
                 response,
                 "plrd paused for a confirmation but sent no usable resume "
-                "token, so it cannot be answered from here. It aborts the "
-                "recovery on its own deadline — do not touch the printer "
-                "until it reports, then re-run PLR_WIZARD_START.",
+                "token, so it cannot be answered from here — it is still "
+                "paused, and aborts on its own deadline.",
             )
             return
+        self._answering = None
         self._token = token
         self._data = data
+        self._confidence = _LIVE
         self._state = STATE_AWAITING
         self._pauses += 1
         # The daemon's own paused report first (it carries the plan prefix
@@ -482,16 +689,17 @@ class RecoverySession:
         text = response.get("text")
         if isinstance(text, str) and text.strip():
             self._respond(text)
-        prompt = confirm_ui.confirm_prompt(
-            data, deadline_text(self.plugin.daemon_keys.get("confirm_timeout_s"))
+        prompts.emit_prompt(
+            self._gcode().respond_info,
+            confirm_ui.confirm_prompt(data, self._deadline_text()),
         )
-        prompts.emit_prompt(self._gcode().respond_info, prompt)
         self._arm_timer()
 
     def _finish(self, response, note):
         self._answering = None
         self._token = None
         self._data = None
+        self._confidence = _LIVE
         self._state = STATE_IDLE
         self._disarm_timer()
         text = response.get("text")
@@ -527,7 +735,10 @@ class RecoverySession:
         self._answering = None
         self._token = None
         self._data = None
-        self._state = STATE_IDLE
+        self._confidence = _LIVE
+        # UNKNOWN, not idle: a transport failure says nothing about whether
+        # plrd is still driving the machine.
+        self._state = STATE_UNKNOWN
         self._disarm_timer()
         self._end_dialog()
         self._respond(
@@ -550,28 +761,75 @@ class RecoverySession:
         )
         self._notify_finished()
 
-    # -- local deadline (see the module docstring) --------------------
+    # -- local deadlines (see the module docstring) --------------------
+    #
+    # TWO stages, because the wait and the claim end at different times:
+    #
+    #   * the CLAIM ends at `claim_deadline` — only when the plugin does
+    #     not know plrd's deadline — after which the pause is reported as
+    #     doubtful and stops refusing a fresh recovery;
+    #   * the WAIT ends at `prompt_deadline`, which strictly outlasts every
+    #     deadline plrd could be using, after which the token is dropped.
 
     def _arm_timer(self):
-        waketime = self.reactor.monotonic() + prompt_deadline(
-            self.plugin.daemon_keys.get("confirm_timeout_s")
-        )
+        configured = self.plugin.daemon_keys.get("confirm_timeout_s")
+        now = self.reactor.monotonic()
+        waketime = now + prompt_deadline(configured)
         if self._timer is None:
             self._timer = self.reactor.register_timer(self._on_expiry, waketime)
         else:
             self.reactor.update_timer(self._timer, waketime)
+        claim = claim_deadline(configured)
+        if claim is None:
+            self._disarm_claim_timer()
+            return
+        if self._claim_timer is None:
+            self._claim_timer = self.reactor.register_timer(
+                self._on_claim_expiry, now + claim
+            )
+        else:
+            self.reactor.update_timer(self._claim_timer, now + claim)
 
     def _disarm_timer(self):
         if self._timer is not None:
             self.reactor.update_timer(self._timer, self.reactor.NEVER)
+        self._disarm_claim_timer()
+
+    def _disarm_claim_timer(self):
+        if self._claim_timer is not None:
+            self.reactor.update_timer(self._claim_timer, self.reactor.NEVER)
+
+    def _on_claim_expiry(self, eventtime):
+        # Reactor timer callback: MUST NOT raise (klippy/klippy.py:170-186).
+        try:
+            if self._state == STATE_AWAITING and self._confidence == _LIVE:
+                self._confidence = _DOUBTFUL
+                self._end_dialog()
+                self._respond(
+                    "PLR recovery: this confirmation has been open longer than "
+                    "plrd's own default deadline, so plrd may well have aborted "
+                    "the recovery already — this plugin cannot tell, because "
+                    "plrd does not report the deadline it is using.\n"
+                    "Nothing was answered on your behalf and %s / %s still "
+                    "work: plrd's reply will say whether it moved on. Check "
+                    "PLR_STATUS, or re-run PLR_WIZARD_START for a fresh dry "
+                    "run. A new recovery is no longer refused on the strength "
+                    "of this question." % (CMD_CONTINUE, CMD_ABORT)
+                )
+        except Exception:
+            logger.exception("plr: recovery confirm-claim handler failed")
+        return self.reactor.NEVER
 
     def _on_expiry(self, eventtime):
         # Reactor timer callback: MUST NOT raise (klippy/klippy.py:170-186).
         try:
             if self._state == STATE_AWAITING:
+                self._answering = None
                 self._token = None
                 self._data = None
+                self._confidence = _LIVE
                 self._state = STATE_IDLE
+                self._disarm_claim_timer()
                 self._end_dialog()
                 self._respond(
                     "PLR recovery: the confirmation went unanswered past "
@@ -587,26 +845,32 @@ class RecoverySession:
 
     # -- klippy lifecycle ---------------------------------------------
 
-    def _handle_stop(self):
-        """``klippy:shutdown`` / ``klippy:disconnect`` mid-recovery.
+    def _handle_shutdown(self):
+        """``klippy:shutdown`` mid-recovery — M112, or an MCU fault.
 
-        Runs inside ``reactor.assert_no_pause()`` for a shutdown
-        (klippy/klippy.py:210), so: no waiting, no g-code, nothing that
-        can pause.  An outstanding pause is answered ``abort`` from a
-        detached thread — plrd applies the answer the moment it arrives
-        (ctrlsock.rs:776), so nobody has to read the reply — which ends
-        the recovery now instead of at plrd's deadline.  An M112 or an MCU
-        shutdown at a confirm-point is exactly this path.
+        NOT teardown: klippy stays up until ``FIRMWARE_RESTART``, so this
+        session keeps working (and keeps reporting) afterwards.  What it
+        must not do is act — ``start`` and a ``continue`` answer are both
+        gated on ``printer.is_shutdown()``.
+
+        Runs inside ``reactor.assert_no_pause()`` (klippy/klippy.py:210), so:
+        no waiting, no g-code, nothing that can pause.  An outstanding pause
+        is answered ``abort`` from a detached thread — plrd applies the
+        answer the moment it arrives (ctrlsock.rs:776), so nobody has to
+        read the reply — which ends the recovery now instead of at plrd's
+        deadline.
         """
         if self._closed:
             return
-        self._closed = True
         token = self._token
+        was_running = self._state == STATE_RUNNING
+        self._answering = None
         self._token = None
         self._data = None
-        self._state = STATE_IDLE
+        self._confidence = _LIVE
         self._disarm_timer()
         if token is not None:
+            self._state = STATE_IDLE
             self._abort_detached(token)
             self._respond(
                 "PLR recovery: klippy stopped while plrd was waiting for a "
@@ -615,11 +879,43 @@ class RecoverySession:
                 "frame, so a fresh dry run is required before any resume."
             )
             self._end_dialog()
-        # Tell the listener too, or the wizard sits in its "running" state
-        # for the rest of the klippy session (a shutdown does not tear the
-        # plugin down — klippy stays up until FIRMWARE_RESTART), reporting a
-        # recovery that is over.  That is the wedged-UI failure this whole
-        # branch exists to remove.
+            # Tell the listener, or the wizard sits in its "running" state
+            # for the rest of the klippy session reporting a recovery that
+            # is over — the wedged-UI failure this branch exists to remove.
+            self._notify_finished()
+            return
+        if was_running:
+            # plrd is mid-execution and cannot be interrupted from here; its
+            # own commands will start failing against a shut-down printer
+            # and it will abort.  Say so, and stay RUNNING so its report is
+            # still delivered and no second recovery starts meanwhile.
+            self._respond(
+                "PLR recovery: klippy stopped while plrd was EXECUTING the "
+                "recovery. plrd cannot be interrupted from here; its commands "
+                "will start failing and it will abort by itself. Its report "
+                "still appears here — wait for it, and do not touch the "
+                "printer until it arrives."
+            )
+
+    def _handle_disconnect(self):
+        """``klippy:disconnect`` — real teardown (exit or restart).
+
+        klippy/klippy.py:195 sends this as the run loop unwinds, so nothing
+        may be delivered to the reactor again.  An outstanding question is
+        still worth aborting for plrd's sake.
+        """
+        if self._closed:
+            return
+        self._closed = True
+        token = self._token
+        self._answering = None
+        self._token = None
+        self._data = None
+        self._confidence = _LIVE
+        self._state = STATE_IDLE
+        self._disarm_timer()
+        if token is not None:
+            self._abort_detached(token)
         self._notify_finished()
 
     def _abort_detached(self, token):

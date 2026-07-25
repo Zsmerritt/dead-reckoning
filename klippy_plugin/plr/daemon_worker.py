@@ -75,18 +75,30 @@ than the bug being fixed:
 * **One call in flight per channel.**  A second ``call`` while one is
   outstanding is refused (returns False) instead of spawning threads: an
   operator holding down a button must not be able to fork the
-  conversation, or exhaust threads against a hung daemon.
+  conversation, or exhaust threads against a hung daemon.  Cancelling
+  does NOT free the slot early — the orphaned worker still holds a socket
+  and an fd until its own deadline expires, so the slot stays taken until
+  its result comes back to be dropped.  Freeing it on cancel would let a
+  looping macro start one worker per iteration against a hung daemon.
 * **No exception ever escapes a reactor callback.**  klippy treats one as
   fatal: an exception out of a reactor callback lands in
   ``Printer.run``'s handler, which logs "Unhandled exception during run"
   and calls ``invoke_shutdown`` (klippy/klippy.py:170-186).  Every
   delivery is wrapped, and a broken callback becomes a console error
   instead of a shutdown.
-* **Nothing from a stale or post-shutdown call is ever delivered.**  A
+* **Nothing from a stale or post-teardown call is ever delivered.**  A
   worker cannot be killed while blocked in ``recv``, so it is orphaned
   instead: its result is dropped by generation number, and after
-  ``klippy:shutdown`` / ``klippy:disconnect`` no callback runs at all —
-  a worker thread must never touch a printer that has gone away.
+  ``klippy:disconnect`` no callback runs at all — a worker thread must
+  never touch a printer that has gone away.
+
+  ``klippy:shutdown`` is deliberately NOT terminal here.  A shutdown
+  leaves the object graph intact and the reactor running (klippy stays up
+  until ``FIRMWARE_RESTART``), and that is exactly the moment an operator
+  most needs ``PLR_STATUS`` to still tell them what plrd thinks it is
+  doing — so channels keep working through it.  What must not happen
+  during a shutdown is *acting*: the recovery session refuses to start or
+  continue one (plr/recovery.py, gated on ``printer.is_shutdown()``).
 * **Threads are daemon threads.**  klippy restarts by re-running in the
   same process (``Printer.run``'s ``run_result``, klippy/klippy.py:186-198),
   and must be able to exit while a socket read is still blocked.
@@ -121,12 +133,11 @@ class AsyncDaemon:
         self._busy = False
         self._generation = 0
         self._closed = False
-        # klippy lifecycle: after either event the printer object graph is
-        # going away (shutdown state, or the run loop is unwinding —
-        # klippy/klippy.py:195 sends klippy:disconnect on every exit and
-        # restart), so no callback may run.
-        printer.register_event_handler("klippy:shutdown", self._handle_stop)
-        printer.register_event_handler("klippy:disconnect", self._handle_stop)
+        # klippy lifecycle: `klippy:disconnect` is the teardown event —
+        # klippy/klippy.py:195 sends it on every exit and restart, as the
+        # run loop unwinds — so after it no callback may run.  A SHUTDOWN
+        # is not teardown and does not close the channel (module docs).
+        printer.register_event_handler("klippy:disconnect", self._handle_disconnect)
 
     # -- state -------------------------------------------------------
 
@@ -137,6 +148,27 @@ class AsyncDaemon:
     def is_closed(self):
         with self._lock:
             return self._closed
+
+    def refusal_text(self, command):
+        """Why a :meth:`call` would be refused right now, or ``None``.
+
+        Exists so no caller has to GUESS: reporting "a query is already in
+        flight" when the truth is "this channel is closed" promises the
+        operator a report that will never arrive, at the moment they most
+        need the truth.  Every call site renders this string.
+        """
+        with self._lock:
+            closed, busy = self._closed, self._busy
+        if closed:
+            return "%s: klippy is shutting down, so nothing was asked of plrd." % (
+                command,
+            )
+        if busy:
+            return (
+                "%s: a plrd conversation on this channel has not answered "
+                "yet; its report will appear when it does." % (command,)
+            )
+        return None
 
     # -- the one entry point -----------------------------------------
 
@@ -162,22 +194,38 @@ class AsyncDaemon:
             name="plr-%s" % (self.label,),
         )
         thread.daemon = True
-        thread.start()
+        try:
+            thread.start()
+        except RuntimeError:
+            # Thread creation can fail outright (a memory-pressured Pi is
+            # the realistic case).  Leaving `_busy` set would refuse every
+            # later attempt for the rest of the session, and letting this
+            # escape a g-code handler would be worse still: klippy turns a
+            # non-CommandError out of a handler into invoke_shutdown
+            # (klippy/gcode.py:231-235), so the recovery command itself
+            # would shut the printer down.
+            with self._lock:
+                self._busy = False
+            logger.exception("plr: cannot start the %s worker thread", self.label)
+            return False
         return True
 
     def cancel(self):
-        """Drop whatever is in flight: its result will never be delivered.
+        """Abandon whatever is in flight: its result will never be delivered.
 
-        The worker thread itself cannot be interrupted (it is inside a
-        blocking ``recv``), so it is orphaned and its answer discarded.
-        The channel is immediately free for a new call, which is safe
-        because plrd — not this plugin — is the authority on whether a
-        second recovery may start (``recover_execute`` answers ``busy``,
-        crates/plrd/src/ctrlsock.rs:631-645).
+        The worker thread cannot be interrupted (it is inside a blocking
+        ``recv``), so it is orphaned: the generation bump means its answer
+        is dropped when it arrives.
+
+        The slot is NOT freed here.  The orphan still holds a socket and an
+        fd until its own deadline expires, and freeing the slot would let a
+        caller start one worker per cancel — 200 cancels, 200 live workers
+        — against a daemon that never answers, which is precisely what the
+        single-flight rule exists to prevent.  The slot frees itself when
+        the orphan's result comes back to be discarded.
         """
         with self._lock:
             self._generation += 1
-            self._busy = False
 
     # -- worker thread ------------------------------------------------
 
@@ -224,8 +272,10 @@ class AsyncDaemon:
         # (klippy/klippy.py:170-186).
         with self._lock:
             stale = self._closed or generation != self._generation
-            if not stale:
-                self._busy = False
+            # The worker is finished either way, so the slot frees here and
+            # ONLY here — that is what bounds orphaned workers to one per
+            # channel (see `cancel`).
+            self._busy = False
         if stale:
             logger.info(
                 "plr: dropping stale %s result (klippy stopped or flow cancelled)",
@@ -247,12 +297,12 @@ class AsyncDaemon:
 
     # -- lifecycle ----------------------------------------------------
 
-    def _handle_stop(self):
-        # klippy:shutdown runs inside reactor.assert_no_pause()
-        # (klippy/klippy.py:210), so this must not pause and must not
-        # block: taking a lock held only for microseconds by workers is
-        # fine, spawning threads is fine, waiting for anything is not.
+    def _handle_disconnect(self):
+        # Teardown: the reactor is unwinding, so nothing may be delivered
+        # to it again.  Must not block or wait (a lock held for
+        # microseconds by workers is fine).  `_busy` is left alone: no
+        # further call can start anyway, and the orphan's own deadline
+        # ends it.
         with self._lock:
             self._closed = True
             self._generation += 1
-            self._busy = False

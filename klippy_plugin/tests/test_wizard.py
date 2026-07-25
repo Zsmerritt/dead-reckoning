@@ -1027,3 +1027,130 @@ def test_a_second_start_while_the_query_is_in_flight_does_not_fork_it(
     assert len([c for c in plugin.daemon.calls if c[0] == "status"]) == 1
     # ...and the one answer still opens the flow.
     assert plugin.wizard.state() == "offered"
+
+
+# --- the execute prompt announces the confirm-point keys --------------
+
+
+@pytest.mark.parametrize(
+    "key,expected",
+    [
+        pytest.param(
+            "confirm_z_before_resume",
+            "confirm_z_before_resume is set",
+            id="z-height",
+        ),
+        pytest.param(
+            "debug_confirm_each_step",
+            "debug_confirm_each_step is set",
+            id="step-debug",
+        ),
+    ],
+)
+def test_the_execute_prompt_says_when_plrd_will_stop_and_ask(
+    fake_printer, plr_config, step, key, expected
+):
+    # These two [plr] keys change what the operator is about to be asked to
+    # DO — plrd will stop mid-recovery and wait — so the execute prompt has
+    # to say so before they press it.
+    fake_printer.add_object("toolhead", fake_klippy.FakeToolhead())
+    fake_printer.add_object("idle_timeout", fake_klippy.FakeIdleTimeout())
+    plugin = plr.load_config(plr_config(options={key: "True"}))
+    plugin.daemon = FakeDaemon(
+        responses={"status": _status_pending(), "recover_dryrun": _dryrun()}
+    )
+    gcode = fake_printer.lookup_object("gcode")
+    step("PLR_WIZARD_START")
+    step("PLR_WIZARD_DRYRUN")
+    since = _new_responses(gcode)
+    step("PLR_WIZARD_CONFIRM_CLEAN", calls=0)
+    lines = since()
+    assert any(expected in line for line in lines), lines
+    assert "action:prompt_button Execute|PLR_WIZARD_EXECUTE|primary" in lines
+
+
+def test_the_execute_prompt_says_nothing_about_keys_that_are_unset(plugin, step):
+    plugin.daemon = FakeDaemon(
+        responses={"status": _status_pending(), "recover_dryrun": _dryrun()}
+    )
+    gcode = plugin.printer.lookup_object("gcode")
+    step("PLR_WIZARD_START")
+    step("PLR_WIZARD_DRYRUN")
+    since = _new_responses(gcode)
+    step("PLR_WIZARD_CONFIRM_CLEAN", calls=0)
+    joined = "\n".join(since())
+    assert "confirm_z_before_resume" not in joined
+    assert "debug_confirm_each_step" not in joined
+
+
+def test_a_wizard_query_refused_by_a_closed_channel_says_so(
+    plugin, run_cmd, fake_printer
+):
+    # The uncovered false-message line: a closed channel must not be
+    # reported as "still waiting for plrd's previous answer".
+    plugin.daemon = FakeDaemon(responses={"status": _status_pending()})
+    fake_printer.send_event("klippy:disconnect")
+    with pytest.raises(fake_klippy.FakeCommandError, match="shutting down") as excinfo:
+        run_cmd("PLR_WIZARD_START")
+    assert "previous answer" not in str(excinfo.value)
+    assert plugin.daemon.calls == []
+
+
+def test_a_wizard_query_refused_because_the_channel_is_busy_says_that(
+    plugin, run_cmd, pump
+):
+    plugin.daemon = FakeDaemon(responses={"status": _status_pending()})
+    run_cmd("PLR_WIZARD_START")
+    # A DRYRUN while the status query is still outstanding hits the same
+    # guard, and must name the real reason.
+    plugin.wizard._state = wizard.STATE_OFFERED
+    with pytest.raises(fake_klippy.FakeCommandError, match="has not answered yet"):
+        run_cmd("PLR_WIZARD_DRYRUN")
+    assert pump() == 1
+
+
+@pytest.mark.parametrize("bad", [None, "nope", 7, []])
+def test_a_non_object_data_field_is_treated_as_empty(plugin, step, bad):
+    # `data` is always an object from the daemon (ctrlsock.rs), but a
+    # renamed/re-typed field must read as "nothing pending" rather than
+    # crashing a reactor callback (which klippy turns into a shutdown).
+    plugin.daemon = FakeDaemon(
+        responses={"status": {"ok": True, "text": "", "data": bad}}
+    )
+    gcode = plugin.printer.lookup_object("gcode")
+    since = _new_responses(gcode)
+    step("PLR_WIZARD_START")
+    assert "no power-loss recovery is pending" in "\n".join(since())
+    assert plugin.wizard.is_active() is False
+
+
+@pytest.mark.parametrize("bad", [None, "nope", 7, []])
+def test_a_non_object_dryrun_data_field_takes_the_conservative_branch(
+    plugin, step, bad
+):
+    plugin.daemon = FakeDaemon(
+        responses={
+            "status": _status_pending(),
+            "recover_dryrun": {"ok": True, "text": "PLAN", "data": bad},
+        }
+    )
+    gcode = plugin.printer.lookup_object("gcode")
+    step("PLR_WIZARD_START")
+    since = _new_responses(gcode)
+    step("PLR_WIZARD_DRYRUN")
+    # Unreadable flag -> ask about the nozzle (plr/wizard.py _clean_decision).
+    assert "action:prompt_button Nozzle is clean|PLR_WIZARD_CONFIRM_CLEAN|primary" in (
+        since()
+    )
+
+
+def test_dryrun_while_the_status_query_is_still_out_is_refused(plugin, run_cmd, pump):
+    # The wizard's own state guard, distinct from the channel's: DRYRUN
+    # before the offer exists has nothing to dry-run against.
+    plugin.daemon = FakeDaemon(responses={"status": _status_pending()})
+    run_cmd("PLR_WIZARD_START")
+    assert plugin.wizard.state() == "query"
+    with pytest.raises(fake_klippy.FakeCommandError, match="the wizard is busy"):
+        run_cmd("PLR_WIZARD_DRYRUN")
+    assert pump() == 1
+    assert [c[0] for c in plugin.daemon.calls] == ["status"]

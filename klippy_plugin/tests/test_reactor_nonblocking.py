@@ -69,6 +69,7 @@ class Harness:
     """A plugin wired into the MiniReactor with a real plrd socket."""
 
     def __init__(self, tmp_path, plrd, options=None):
+        self.plrd = plrd
         self.reactor = MiniReactor()
         self.gcode = MiniGCode()
         self.printer = fake_klippy.FakePrinter()
@@ -125,6 +126,9 @@ class Harness:
             "the operator command never ran"
         )
 
+    def release_daemon(self):
+        self.plrd.close()
+
     def push_from_daemon(self, script, timeout=2.0):
         """Have plrd push g-code at klippy, turning the loop while it waits.
 
@@ -143,6 +147,17 @@ class Harness:
         return result[0] if result else None
 
     def close(self):
+        # Join the plugin's workers before the reactor's sockets go away:
+        # a worker that reports into a torn-down harness produces a
+        # traceback at interpreter exit that belongs to no test.
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            alive = [t for t in threading.enumerate() if t.name.startswith("plr-")]
+            if not alive:
+                break
+            for thread in alive:
+                thread.join(timeout=0.05)
+            self.reactor.poll_once(0.0)
         self.reactor.close()
 
 
@@ -156,6 +171,10 @@ def harness(tmp_path):
         return h
 
     yield build
+    # Close the servers FIRST: that releases every hung client so the
+    # workers unblock, which is what makes the join below terminate.
+    for h in made:
+        h.release_daemon()
     for h in made:
         h.close()
 
@@ -383,10 +402,11 @@ def test_a_blocking_call_in_a_handler_stalls_the_reactor_past_the_mcu_watchdog(
     AFTER the handler has failed — the machine moving after the operator
     was told the recovery failed.
     """
-    # Deliberately just over klippy's MCU heater watchdog, to keep the test
-    # short while crossing the threshold that matters.  The shipped code
-    # used RECOVER_TIMEOUT = 120 s here, i.e. 40x this.
-    blocking_timeout = KLIPPER_MAX_HEAT_TIME + 0.2
+    # Crosses MAX_MAINTHREAD_TIME (5 s) — the bound a reactor stall really
+    # does trip, after the correction in this file's docstring — while
+    # staying short enough for a test.  The shipped code used
+    # RECOVER_TIMEOUT = 120 s here, i.e. 23x this.
+    blocking_timeout = KLIPPER_MAX_MAINTHREAD_TIME + 0.2
     holder = [None]
     pushed = []
     # Deliberately half the handler's block, so the push provably gives up
@@ -418,12 +438,15 @@ def test_a_blocking_call_in_a_handler_stalls_the_reactor_past_the_mcu_watchdog(
     try:
         h.operator("PLR_RECOVER_BLOCKING")
 
-        # THE DEFECT, MEASURED: one handler held klippy's only thread for
-        # longer than the MCU's heater watchdog.
-        assert h.reactor.max_stall > KLIPPER_MAX_HEAT_TIME, (
-            "expected a stall past klippy's %.1fs MCU heater watchdog, "
-            "measured %.3fs" % (KLIPPER_MAX_HEAT_TIME, h.reactor.max_stall)
+        # THE DEFECT, MEASURED: one handler held klippy's only thread past
+        # the deadline that silently switches every heater off
+        # (klippy/extras/heaters.py:17, :72-74, :138-141) — and well past
+        # the strictest published bound, the MCU's 3 s.
+        assert h.reactor.max_stall > KLIPPER_MAX_MAINTHREAD_TIME, (
+            "expected a stall past klippy's %.1fs main-thread deadline, "
+            "measured %.3fs" % (KLIPPER_MAX_MAINTHREAD_TIME, h.reactor.max_stall)
         )
+        assert h.reactor.max_stall > KLIPPER_MAX_HEAT_TIME
         # plrd's script did not run while the handler was blocked...
         for _ in range(400):
             if pushed:

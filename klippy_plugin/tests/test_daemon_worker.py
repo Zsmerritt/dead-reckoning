@@ -134,22 +134,66 @@ def test_a_cancelled_calls_answer_is_dropped(fake_printer, channel):
     daemon.call("status", None, 1.0, on_result, on_error)
     link.entered.wait(2.0)
     daemon.cancel()
-    assert daemon.is_busy() is False
+    # The slot is NOT freed by cancelling: the orphan still holds a socket
+    # until its own deadline, so a second call would be a second thread.
+    assert daemon.is_busy() is True
+    assert daemon.call("status", None, 1.0, on_result, on_error) is False
     release.set()
     # The worker still finishes and still hands its result to the reactor —
-    # it cannot be interrupted mid-recv — but the callback is not run.
+    # it cannot be interrupted mid-recv — but the callback is not run, and
+    # THAT is where the slot frees.
     assert fake_printer.reactor.pump_async(1, timeout=2.0) == 1
     assert results == [] and errors == []
+    assert daemon.is_busy() is False
 
 
-def test_nothing_is_delivered_after_klippy_shuts_down(fake_printer, channel):
+def test_cancelling_in_a_loop_cannot_pile_up_workers(fake_printer, channel):
+    # The amplifier: `wizard._reset()` cancels on every dismissal, so a
+    # looping macro would otherwise start one worker per iteration against a
+    # daemon that never answers.
+    release = threading.Event()
+    link = Link(block=release)
+    daemon = channel(link)
+    results, errors, on_result, on_error = collect()
+    try:
+        assert daemon.call("status", None, 1.0, on_result, on_error) is True
+        link.entered.wait(2.0)
+        started = 1
+        for _ in range(200):
+            daemon.cancel()
+            if daemon.call("status", None, 1.0, on_result, on_error):
+                started += 1
+        assert started == 1, "200 cancel/start cycles started %d workers" % (started,)
+        assert len([t for t in threading.enumerate() if t.name == "plr-test"]) == 1
+    finally:
+        release.set()
+    fake_printer.reactor.pump_async(1, timeout=2.0)
+
+
+def test_a_shutdown_does_not_close_the_channel(fake_printer, channel):
+    # A SHUTDOWN is not teardown: klippy stays up until FIRMWARE_RESTART,
+    # and that is exactly when an operator needs PLR_STATUS to still tell
+    # them what plrd thinks it is doing.  Treating it as terminal made
+    # PLR_STATUS / PLR_RECOVER / PLR_WIZARD_START permanently promise a
+    # report that would never arrive — a regression from before this branch.
+    daemon = channel(Link(response={"ok": True, "text": "still here", "data": {}}))
+    fake_printer.invoke_shutdown("Manual stop (M112)")
+    assert daemon.is_closed() is False
+    assert daemon.refusal_text("PLR_STATUS") is None
+    results, errors, on_result, on_error = collect()
+    assert daemon.call("status", None, 1.0, on_result, on_error) is True
+    assert fake_printer.reactor.pump_async(1, timeout=2.0) == 1
+    assert [r["text"] for r in results] == ["still here"]
+
+
+def test_nothing_is_delivered_after_klippy_disconnects(fake_printer, channel):
     release = threading.Event()
     link = Link(block=release)
     daemon = channel(link)
     results, errors, on_result, on_error = collect()
     daemon.call("status", None, 1.0, on_result, on_error)
     link.entered.wait(2.0)
-    fake_printer.invoke_shutdown("Manual stop (M112)")
+    fake_printer.send_event("klippy:disconnect")
     assert daemon.is_closed() is True
     release.set()
     assert fake_printer.reactor.pump_async(1, timeout=2.0) == 1
@@ -159,19 +203,34 @@ def test_nothing_is_delivered_after_klippy_shuts_down(fake_printer, channel):
     assert daemon.call("status", None, 1.0, on_result, on_error) is False
 
 
-def test_a_disconnect_closes_the_channel_too(fake_printer, channel):
+def test_a_closed_channel_says_so_instead_of_claiming_it_is_busy(fake_printer, channel):
+    # BLOCKER: every call site reads `call() is False` and must be able to
+    # tell "closed" from "busy", or it invents an in-flight query.
     daemon = channel(Link())
     fake_printer.send_event("klippy:disconnect")
-    assert daemon.is_closed() is True
+    text = daemon.refusal_text("PLR_STATUS")
+    assert text is not None
+    assert "shutting down" in text
+    assert "in flight" not in text
+
+
+def test_a_busy_channel_says_busy(fake_printer, channel):
+    release = threading.Event()
+    daemon = channel(Link(block=release))
     results, errors, on_result, on_error = collect()
-    assert daemon.call("status", None, 1.0, on_result, on_error) is False
+    try:
+        daemon.call("status", None, 1.0, on_result, on_error)
+        text = daemon.refusal_text("PLR_STATUS")
+        assert text is not None and "has not answered yet" in text
+    finally:
+        release.set()
+    fake_printer.reactor.pump_async(1, timeout=2.0)
 
 
-def test_both_lifecycle_events_are_idempotent(fake_printer, channel):
+def test_disconnect_is_idempotent(fake_printer, channel):
     daemon = channel(Link())
     fake_printer.send_event("klippy:disconnect")
     fake_printer.send_event("klippy:disconnect")
-    fake_printer.invoke_shutdown("later")
     assert daemon.is_closed() is True
 
 
@@ -226,6 +285,29 @@ def test_a_dead_reactor_cannot_break_a_worker(fake_printer, channel):
     assert results == [] and errors == []
 
 
+def test_a_thread_that_cannot_start_frees_the_slot_and_refuses_cleanly(
+    fake_printer, channel, monkeypatch
+):
+    # A memory-pressured Pi can fail thread creation.  Leaving `_busy` set
+    # would refuse every later attempt for the rest of the session, and
+    # letting the RuntimeError escape a g-code handler would make klippy
+    # shut the printer down (klippy/gcode.py:231-235).
+    daemon = channel(Link())
+
+    def refuse(self):
+        raise RuntimeError("can't start new thread")
+
+    monkeypatch.setattr(threading.Thread, "start", refuse)
+    results, errors, on_result, on_error = collect()
+    assert daemon.call("status", None, 1.0, on_result, on_error) is False
+    assert daemon.is_busy() is False
+    monkeypatch.undo()
+    # ...and the channel still works afterwards.
+    assert daemon.call("status", None, 1.0, on_result, on_error) is True
+    assert fake_printer.reactor.pump_async(1, timeout=2.0) == 1
+    assert len(results) == 1
+
+
 def test_worker_threads_are_daemon_threads(fake_printer, channel):
     # klippy restarts by re-running in the same process
     # (klippy/klippy.py:186-198) and must be able to exit while a socket
@@ -260,10 +342,12 @@ def test_the_link_is_resolved_per_call_not_captured(fake_printer):
     assert [r["text"] for r in results] == ["first", "second"]
 
 
-def test_the_channel_registers_for_both_lifecycle_events(fake_printer, channel):
+def test_the_channel_registers_only_for_teardown(fake_printer, channel):
     channel(Link())
-    for event in ("klippy:shutdown", "klippy:disconnect"):
-        assert fake_printer.event_handlers.get(event), event
+    assert fake_printer.event_handlers.get("klippy:disconnect")
+    # Deliberately NOT klippy:shutdown — see
+    # test_a_shutdown_does_not_close_the_channel.
+    assert not fake_printer.event_handlers.get("klippy:shutdown")
 
 
 def test_the_fake_reactor_pump_reports_what_it_ran(fake_printer):
@@ -326,10 +410,25 @@ def _link_call_sites():
     return sorted(set(sites))
 
 
+def _blocking_methods():
+    """Every blocking public method on the shipped DaemonLink.
+
+    Derived from the class, not listed: ``ping`` is also blocking, the
+    earlier guard missed it, and the next method somebody adds must not need
+    this test updated in order to be covered.
+    """
+    return {
+        name
+        for name in vars(daemon_link.DaemonLink)
+        if not name.startswith("__") and callable(getattr(daemon_link.DaemonLink, name))
+    }
+
+
 def _link_calls_in(source):
     """The enclosing function name of every blocking link call in ``source``."""
     import ast
 
+    blocking = _blocking_methods()
     tree = ast.parse(source)
     # Each function's line span, so a call can be attributed to the
     # function that contains it (the innermost one wins).
@@ -343,7 +442,7 @@ def _link_calls_in(source):
         if not isinstance(node, ast.Call):
             continue
         func = node.func
-        if not isinstance(func, ast.Attribute) or func.attr != "call":
+        if not isinstance(func, ast.Attribute) or func.attr not in blocking:
             continue
         receiver = func.value
         if isinstance(receiver, ast.Attribute):
@@ -385,18 +484,40 @@ def test_only_the_worker_and_the_detached_abort_call_the_daemon_link():
     ]
 
 
-def test_the_call_site_scan_really_catches_a_call_in_a_handler():
-    # Proof that the guard above is not vacuous: the exact shape this branch
-    # removed — a blocking link call inside a g-code handler — is found, and
-    # the non-blocking channel call that replaced it is not.
-    reintroduced = (
-        "def cmd_PLR_RECOVER(plugin, gcmd):\n"
-        "    resp = plugin.daemon.call('recover_execute', {}, timeout=120.0)\n"
-        "    gcmd.respond_info(resp['text'])\n"
-    )
-    assert _link_calls_in(reintroduced) == ["cmd_PLR_RECOVER"]
+@pytest.mark.parametrize(
+    "body",
+    [
+        pytest.param("    plugin.daemon.call('status', {}, timeout=5.0)", id="call"),
+        pytest.param("    self.daemon.call('status')", id="self-call"),
+        pytest.param("    link.call('status')", id="local-link"),
+        pytest.param("    self.get_link().call('status')", id="get_link"),
+        # THE SHAPES THE FIRST VERSION OF THIS GUARD MISSED: ping() blocks
+        # exactly as call() does, because it IS a call() underneath.
+        pytest.param("    alive = plugin.daemon.ping()", id="ping"),
+        pytest.param("    if self.daemon.ping():\n        pass", id="self-ping"),
+    ],
+)
+def test_the_call_site_scan_catches_every_blocking_shape(body):
+    # Proof the guard is not vacuous: each shape below, inside a g-code
+    # handler, is the defect this branch removed, and each must be found.
+    source = "def cmd_PLR_RECOVER(plugin, gcmd):\n%s\n" % (body,)
+    assert _link_calls_in(source) == ["cmd_PLR_RECOVER"], source
+
+
+def test_the_scan_ignores_the_non_blocking_channel():
+    # The AsyncDaemon channels also expose `call`, and theirs is the SAFE
+    # path: it starts a worker and returns.
     fixed = (
         "def cmd_PLR_RECOVER(plugin, gcmd):\n"
         "    plugin.daemon_query.call('recover_dryrun', None, 1.0, ok, err)\n"
+        "    plugin.daemon_wizard.call('status', None, 1.0, ok, err)\n"
+        "    self._async.call('recover_confirm', {}, 1.0, ok, err)\n"
     )
     assert _link_calls_in(fixed) == []
+
+
+def test_ping_is_covered_by_the_derived_method_set():
+    # If DaemonLink's blocking surface stops being derivable, the guard
+    # silently narrows to nothing.
+    methods = _blocking_methods()
+    assert {"call", "ping"} <= methods, methods

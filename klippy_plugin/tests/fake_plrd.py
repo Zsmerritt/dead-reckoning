@@ -27,6 +27,8 @@ import json
 import socket
 import threading
 
+from plr import daemon_link
+
 
 class FakePlrd:
     """A threaded, loopback plrd control socket with scripted responses."""
@@ -37,6 +39,7 @@ class FakePlrd:
         self.on_request = on_request
         self.hang = hang
         self.requests = []
+        self._open = []
         self._lock = threading.Lock()
         self._listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self._listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -51,19 +54,60 @@ class FakePlrd:
     # -- lifecycle ----------------------------------------------------
 
     def close(self):
+        """Release every waiting client, then stop listening.
+
+        Hung connections are ANSWERED on the way out rather than dropped, so
+        the plugin's worker threads unblock immediately and a test can join
+        them.  Otherwise a worker sitting on a 3600-second recovery deadline
+        outlives the test and reports into a torn-down harness at
+        interpreter exit — which is how a leaked traceback appears after the
+        summary line.
+        """
         self._stop.set()
+        with self._lock:
+            waiting, self._open = self._open, []
+        for conn in waiting:
+            try:
+                conn.sendall(
+                    (
+                        json.dumps(
+                            {
+                                "ok": False,
+                                "text": "fake plrd shutting down",
+                                "data": {"outcome": "error"},
+                            }
+                        )
+                        + "\n"
+                    ).encode("utf-8")
+                )
+            except OSError:
+                pass
         try:
             self._listener.close()
         except OSError:
             pass
+        # The released connections are left for their handler threads to
+        # close, so the client gets a chance to read the line first.
 
     def connect_factory(self):
-        """A ``DaemonLink`` connect_factory pointing at this server."""
+        """A ``DaemonLink`` connect_factory pointing at this server.
+
+        Mirrors the production ``_default_connect`` (plr/daemon_link.py) in
+        the one behaviour that matters here: a failed connect is a
+        ``DaemonError``, not a bare ``OSError``, so the plugin's error path
+        is the one under test rather than its unexpected-exception path.
+        """
 
         def connect(path, timeout):
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             sock.settimeout(timeout)
-            sock.connect(self.address)
+            try:
+                sock.connect(self.address)
+            except OSError:
+                sock.close()
+                raise daemon_link.DaemonError(
+                    "plrd not reachable at %s (fake)" % (self.address,)
+                ) from None
             return sock
 
         return connect
@@ -100,7 +144,9 @@ class FakePlrd:
                 self.on_request(cmd, args)
             if self.hang:
                 # Alive, connected, never answering: the client's own
-                # deadline is the only exit.
+                # deadline is the only exit — until `close` releases it.
+                with self._lock:
+                    self._open.append(conn)
                 self._stop.wait()
                 return
             if self.delay:

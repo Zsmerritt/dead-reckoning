@@ -37,6 +37,31 @@ this plugin promises an image: no client renders one.
 
 import collections
 
+# The action protocol is LINE-oriented, and ``respond_info`` splits its
+# argument on newlines and prefixes each line with ``// ``
+# (klippy/gcode.py:250-254).  So a ``\n`` inside a prompt text or a button
+# label does not "wrap": it emits a second ``// `` line that no client can
+# parse as part of the action, shredding the dialog from that point on.
+#
+# Prompt content is not all ours — it carries plrd's diagnosis prose
+# (``what`` / ``why`` / ``suggested_fix``), and plr/confirm_ui.py
+# deliberately renders whatever arrives, including from a future daemon
+# whose text is multi-line.  Every string that becomes part of an action
+# line therefore passes through :func:`one_line` first.
+_LINE_BREAKS = ("\r\n", "\r", "\n", " ", " ")
+
+
+def one_line(text):
+    """Collapse anything that would break an action line into one line."""
+    if not isinstance(text, str):
+        return text
+    for token in _LINE_BREAKS:
+        text = text.replace(token, " ")
+    # Tabs are legal but make the console output ragged; collapse runs of
+    # whitespace so a wrapped source string reads as one sentence.
+    return " ".join(text.split())
+
+
 # One prompt to render: a headline, descriptive text lines, primary
 # buttons and footer buttons (each ``(label, gcode, color)``), and the
 # plain-text fallback lines that name the advancing console command(s).
@@ -52,6 +77,8 @@ def button_spec(label, gcode, color):
     on the client); gcode alone yields ``label|gcode``; label alone is
     bare.
     """
+    label = one_line(label)
+    gcode = one_line(gcode)
     if color is not None:
         return "|".join([label, gcode or "", color])
     if gcode is not None:
@@ -60,11 +87,11 @@ def button_spec(label, gcode, color):
 
 
 def action_prompt_begin(title):
-    return "action:prompt_begin %s" % (title,)
+    return "action:prompt_begin %s" % (one_line(title),)
 
 
 def action_prompt_text(text):
-    return "action:prompt_text %s" % (text,)
+    return "action:prompt_text %s" % (one_line(text),)
 
 
 def action_prompt_button(label, gcode=None, color=None):
@@ -104,5 +131,8 @@ def emit_prompt(respond, prompt):
     for label, gcode, color in prompt.footers:
         respond(action_prompt_footer_button(label, gcode, color))
     respond(action_prompt_show())
+    # Fallbacks are plain console text, NOT action lines: a newline in one
+    # is harmless there (respond_info just emits two `// ` lines), so they
+    # are passed through unmodified.
     for line in prompt.fallbacks:
         respond(line)

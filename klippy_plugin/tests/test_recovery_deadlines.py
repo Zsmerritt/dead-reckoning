@@ -96,6 +96,40 @@ def test_the_extraction_is_not_vacuous():
 # --- the interlock ----------------------------------------------------
 
 
+def test_the_plugins_copy_of_the_daemon_default_matches_the_daemon():
+    # The plugin needs plrd's DEFAULT for one thing only: knowing when it can
+    # no longer claim a pause is live (recovery.claim_deadline).  It is a copy,
+    # so it is checked against the source; the safe direction if it ever
+    # drifts is TOO SMALL (an earlier downgrade), never too large.
+    values = daemon_confirm_constants()
+    assert recovery.DAEMON_CONFIRM_DEFAULT_S == values["default_s"]
+    assert recovery.DAEMON_CONFIRM_DEFAULT_S <= recovery.DAEMON_CONFIRM_CEILING_S
+
+
+def test_the_claim_ends_long_before_the_wait_on_a_default_install():
+    # MAJOR: with confirm_timeout_s unset, the wait is the ceiling (3630 s)
+    # while plrd's real deadline is 600 s.  The wait stays long — shortening
+    # it could tell the operator a live question is dead — but the CLAIM must
+    # not: 50 minutes of asserting `awaiting_confirmation`, and refusing new
+    # recoveries, would be a fabrication.
+    claim = recovery.claim_deadline(None)
+    wait = recovery.prompt_deadline(None)
+    assert claim is not None
+    assert claim < wait
+    assert claim == recovery.DAEMON_CONFIRM_DEFAULT_S + recovery.CONFIRM_HEADROOM_S
+    # It still outlasts plrd's own default, so an operator answering just
+    # inside plrd's deadline is never told the question expired.
+    assert claim > daemon_confirm_constants()["default_s"]
+
+
+@pytest.mark.parametrize("configured", [30.0, 600.0, 3600.0])
+def test_a_known_deadline_needs_no_downgrade(configured):
+    # When the operator set confirm_timeout_s the plugin knows plrd's
+    # deadline exactly, so there is nothing to be doubtful about: the wait
+    # IS the claim.
+    assert recovery.claim_deadline(configured) is None
+
+
 def test_the_ceiling_is_the_daemons_own_band_maximum():
     values = daemon_confirm_constants()
     assert recovery.DAEMON_CONFIRM_CEILING_S == values["max_s"]

@@ -255,6 +255,11 @@ inline.
    console command that waited would hold klippy's only thread and stall
    the heaters (see
    [the plugin README](../klippy_plugin/README.md#every-daemon-call-is-asynchronous--and-why-that-is-a-safety-property)).
+   Because it returns early it must be the **last line of any macro** you
+   run it from: every later command holds the g-code mutex plrd needs for
+   its own, starving it while the nozzle is near the part. Nothing enforces
+   that yet — plrd's ready+idle gate does not see a console-invoked macro
+   (it reads `webhooks` / `print_stats` / `virtual_sdcard` only).
    For your first recoveries set **`debug_confirm_each_step: True`** in
    `[plr]`: plrd then stops before every step and prints the exact
    commands it is about to send, and you answer

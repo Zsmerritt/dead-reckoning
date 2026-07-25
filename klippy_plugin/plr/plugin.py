@@ -98,6 +98,12 @@ class PLRPlugin:
         # evidence, with klippy line numbers, is in plr/daemon_worker.py).
         # One channel per independent conversation, so a console query can
         # never be refused by — or interfere with — a live recovery.
+        # PLR_STATUS gets its own: sharing with the dry run would let a
+        # 300-second pipeline query lock out the one command an operator
+        # reaches for when they want to know what is going on.
+        self.daemon_status = daemon_worker.AsyncDaemon(
+            self.printer, lambda: self.daemon, "status"
+        )
         self.daemon_query = daemon_worker.AsyncDaemon(
             self.printer, lambda: self.daemon, "query"
         )
@@ -526,12 +532,19 @@ class PLRPlugin:
             # macro (server config permitting) or ask for confirmation.
             "wizard_active": self.wizard.is_active(),
             # The live recover_execute conversation (plr/recovery.py):
-            # "idle" / "running" / "awaiting_confirmation", with the flag a
-            # UI needs to know an operator answer is being waited on.  Read
-            # from local state only — get_status runs several times a second
-            # on the reactor and must never touch the control socket.
+            # "idle" / "running" / "awaiting_confirmation" / "unknown", with
+            # the flag a UI needs to know an operator answer is being waited
+            # on.  Read from local state only — get_status runs several times
+            # a second on the reactor and must never touch the control
+            # socket.
+            #
+            # The flag reports only what the plugin can DEMONSTRATE is still
+            # live: past plrd's own default deadline, on a printer that never
+            # set confirm_timeout_s, the plugin cannot show the question
+            # still exists, so it stops asserting that it does (the state
+            # goes to "unknown" for the same reason).
             "recovery_state": self.recovery.state(),
-            "recovery_awaiting_confirmation": self.recovery.is_awaiting(),
+            "recovery_awaiting_confirmation": self.recovery.is_awaiting_confirmed(),
             "clean_nozzle_macro_available": self.clean_nozzle_macro_available,
             "noise_floor_rms": self.noise_floor_rms,
             "noise_floor_temp": self.noise_floor_temp,

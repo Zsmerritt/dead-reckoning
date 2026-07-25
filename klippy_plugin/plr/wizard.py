@@ -346,9 +346,12 @@ class RecoveryWizard:
             self._fail_daemon(command, err)
 
         if not self.plugin.daemon_wizard.call(cmd, None, timeout, on_result, on_error):
+            # `refusal_text` says which refusal it was (busy vs closed vs a
+            # thread that could not start) instead of promising a report that
+            # may never arrive.
             raise self.printer.command_error(
-                "%s: the wizard is still waiting for plrd's previous answer; "
-                "try again in a moment." % (command,)
+                self.plugin.daemon_wizard.refusal_text(command)
+                or "%s: plrd could not be contacted." % (command,)
             )
         self._state = STATE_QUERY
 
@@ -366,6 +369,9 @@ class RecoveryWizard:
                 "PLR wizard: a recovery is already in flight.\n%s"
                 % ("\n".join(self.plugin.recovery.status_lines()),)
             )
+            # If plrd is waiting on an answer, put the question back on
+            # screen: that is what the operator came here for.
+            self.plugin.recovery.reshow(gcmd.respond_info)
             return
         if self._state == STATE_QUERY:
             # There is nothing to re-show yet: the answer that decides what
@@ -576,9 +582,10 @@ class RecoveryWizard:
         resetting the plugin's own view while plrd still drives the machine
         is precisely the outcome nobody can act on.
         """
-        if self.plugin.recovery.is_active():
-            # Raises for a running (unanswerable) recovery; answers abort
-            # for an outstanding confirm-point.
+        if self.plugin.recovery.is_awaiting() or self.plugin.recovery.is_active():
+            # Raises for a running (unanswerable) recovery; answers abort for
+            # an outstanding confirm-point — including one the plugin can no
+            # longer show is live, where plrd's own reply adjudicates.
             self.plugin.recovery.cancel(gcmd, "PLR_WIZARD_CANCEL")
             self._reset()
             gcmd.respond_info(

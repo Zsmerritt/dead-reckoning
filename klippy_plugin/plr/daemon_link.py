@@ -48,6 +48,7 @@ printer shutdown (klippy/klippy.py:170-186).
 
 import json
 import socket
+import time
 
 # Timeouts per call type (seconds).  These are spent on worker threads, so
 # they are sized for what plrd legitimately takes, not for what a console
@@ -93,6 +94,12 @@ def validate_timeout(seconds, minimum=MIN_TIMEOUT, maximum=MAX_TIMEOUT):
     fails spuriously, and an unbounded one would hold a worker thread —
     and with it this plugin's single-flight slot — forever against a
     daemon that is alive but never answers.
+
+    The bound is a TOTAL deadline for the call, not a per-operation one.
+    ``socket.settimeout`` alone would not give that: it applies to each
+    individual ``recv``, so a daemon trickling one byte at a time would
+    reset it forever and never trip it.  :meth:`DaemonLink.call` therefore
+    tracks the deadline itself (see :meth:`DaemonLink._read_line`).
     """
     seconds = float(seconds)
     if seconds < minimum or seconds > maximum:
@@ -140,13 +147,18 @@ class DaemonLink:
         Returns ``{"ok": bool, "text": str, "data": dict}`` after
         validating the frame.  Raises DaemonError on connect failure,
         timeout, oversized/truncated response, or malformed JSON.
+
+        ``timeout`` is the TOTAL deadline for the whole exchange, enforced
+        against the monotonic clock — not merely handed to
+        ``settimeout``, which would restart on every packet.
         """
         timeout = validate_timeout(timeout)
         request = json.dumps({"cmd": cmd, "args": args or {}}) + "\n"
+        deadline = time.monotonic() + timeout
         sock = self._connect(self.socket_path, timeout)
         try:
             sock.sendall(request.encode("utf-8"))
-            line = self._read_line(sock, cmd)
+            line = self._read_line(sock, cmd, deadline, timeout)
         except socket.timeout:
             raise DaemonError(
                 "plrd did not answer '%s' within %.0fs at %s"
@@ -160,10 +172,28 @@ class DaemonLink:
             sock.close()
         return self._parse_response(line, cmd)
 
-    def _read_line(self, sock, cmd):
+    def _read_line(self, sock, cmd, deadline=None, timeout=None):
+        """Read one ``\\n``-terminated line, bounded by a TOTAL deadline.
+
+        ``socket.settimeout`` is per-operation: a daemon that sends one
+        byte per second resets it on every ``recv`` and would hold this
+        worker thread — and the plugin's single-flight slot — forever.  So
+        the remaining budget is recomputed before each read and the socket
+        is re-armed with it, which makes the caller's ``timeout`` mean what
+        its name says.
+        """
         chunks = []
         total = 0
         while True:
+            if deadline is not None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0.0:
+                    raise DaemonError(
+                        "plrd did not finish answering '%s' within %.0fs at "
+                        "%s (it sent %d byte(s) and stopped)"
+                        % (cmd, timeout or 0.0, self.socket_path, total)
+                    )
+                sock.settimeout(remaining)
             chunk = sock.recv(4096)
             if not chunk:
                 raise DaemonError(
@@ -274,15 +304,25 @@ def cmd_PLR_STATUS(plugin, gcmd):
 
     lines.append("plrd (%s):" % (socket_path,))
     # Start the query BEFORE announcing it, so the announcement is true:
-    # either a report is coming, or the console says why it is not.
-    if plugin.daemon_query.call("status", None, STATUS_TIMEOUT, on_result, on_error):
+    # either a report is coming, or the console says exactly why it is not.
+    # `refusal_text` distinguishes busy from closed — promising a report that
+    # can never arrive is the one thing this must not do.
+    if plugin.daemon_status.call("status", None, STATUS_TIMEOUT, on_result, on_error):
         lines.append("  asking the daemon (its report follows)...")
     else:
         lines.append(
-            "  a plrd query is already in flight; its report will appear "
-            "when it answers."
+            "  %s"
+            % (
+                plugin.daemon_status.refusal_text("PLR_STATUS")
+                or "the daemon could not be contacted.",
+            )
         )
     gcmd.respond_info("\n".join(lines))
+    if plugin.recovery.is_awaiting():
+        # The operator asked what is going on and there is an unanswered
+        # question: show it again rather than leaving them to scroll for it.
+        gcmd.respond_info("The outstanding recovery question, again:")
+        plugin.recovery.reshow(gcmd.respond_info)
 
 
 def cmd_PLR_RECOVER(plugin, gcmd):
@@ -341,7 +381,8 @@ def cmd_PLR_RECOVER(plugin, gcmd):
             "recover_dryrun", None, DRYRUN_TIMEOUT, on_result, on_error
         ):
             raise gcmd.error(
-                "PLR_RECOVER: a plrd query is already in flight; wait for it to report."
+                plugin.daemon_query.refusal_text("PLR_RECOVER")
+                or "PLR_RECOVER: plrd could not be contacted."
             )
         return
     confirm = gcmd.get("CONFIRM", "")

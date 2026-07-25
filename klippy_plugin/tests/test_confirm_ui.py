@@ -12,7 +12,7 @@ shapes.
 import confirm_fixtures as fx
 import pytest
 
-from plr import confirm_ui
+from plr import confirm_ui, prompts
 
 DEADLINE = "If nothing answers, plrd aborts the recovery cleanly."
 
@@ -342,3 +342,57 @@ def test_no_prompt_promises_an_image():
     body = "\n".join(list(prompt.texts) + list(prompt.fallbacks)).lower()
     for word in ("image", "photo", "picture", "screenshot", "webcam"):
         assert word not in body
+
+
+# --- the action protocol is line-oriented -----------------------------
+
+
+def test_a_newline_in_daemon_prose_cannot_shred_the_prompt():
+    # `respond_info` splits on newlines and prefixes each line with `// `
+    # (klippy/gcode.py:250-254), so a `\n` inside an action line emits a
+    # second `// ` line no client can parse — from there the dialog is
+    # gone.  The prose is plrd's, and confirm_ui deliberately renders
+    # whatever arrives, so the collapse happens at the one choke point.
+    data = fx.pause_data(
+        diag=fx.diagnosis(
+            what="first line\nsecond line",
+            why="why line one\r\nwhy line two",
+            suggested_fix="fix\tone\nfix two",
+        )
+    )
+    emitted = []
+    prompts.emit_prompt(emitted.append, confirm_ui.confirm_prompt(data, DEADLINE))
+    action_lines = [line for line in emitted if line.startswith("action:")]
+    assert action_lines, emitted
+    for line in action_lines:
+        assert "\n" not in line
+        assert "\r" not in line
+    # ...and the words survive, just on one line.
+    body = "\n".join(action_lines)
+    assert "first line second line" in body
+    assert "why line one why line two" in body
+
+
+@pytest.mark.parametrize(
+    "raw,expected",
+    [
+        pytest.param("plain", "plain", id="plain"),
+        pytest.param("two\nlines", "two lines", id="lf"),
+        pytest.param("two\r\nlines", "two lines", id="crlf"),
+        pytest.param("two\rlines", "two lines", id="cr"),
+        pytest.param("wide\u2028break", "wide break", id="line-separator"),
+        pytest.param("tab\tsplit", "tab split", id="tab"),
+        pytest.param("  padded  ", "padded", id="padding"),
+        pytest.param(None, None, id="non-string-passes-through"),
+    ],
+)
+def test_one_line_collapses_everything_that_would_break_a_line(raw, expected):
+    assert prompts.one_line(raw) == expected
+
+
+def test_button_fields_are_collapsed_too():
+    # A label or a gcode string with a newline would break the pipe fields
+    # as well; nothing in the plugin does that today, but the label text is
+    # one edit away from being built from daemon prose.
+    line = prompts.action_prompt_button("two\nwords", "PLR_X\nY", "primary")
+    assert line == "action:prompt_button two words|PLR_X Y|primary"
