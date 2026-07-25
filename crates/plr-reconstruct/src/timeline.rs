@@ -27,7 +27,11 @@
 //!   recovery; a tail [`MarkerKind::SocketLost`] without a subsequent
 //!   `Resubscribed` is classification evidence; subscription gaps and
 //!   [`MarkerKind::ExclusionUpdateLost`] are noted for honest
-//!   degradation. Markers are kept in append order in
+//!   degradation; a tail [`MarkerKind::RecorderStopped`] records that the
+//!   *daemon* stopped on purpose, which changes nothing about the
+//!   reconstruction and only licenses suppressing an announcement (see
+//!   [`WalTimeline::recorder_stopped_tail`]). Markers are kept in append
+//!   order in
 //!   [`WalTimeline::markers`] so later stages can ask *when* an event
 //!   happened relative to other records.
 //! * Every finite heartbeat is kept, sorted, in
@@ -85,6 +89,14 @@ pub enum IngestNote {
     /// [`crate::exclude`] for how this defeats conclusiveness.
     ExclusionUpdateLost {
         /// Host-monotonic time of the dropped update (ns).
+        mono_ns: u64,
+    },
+    /// The daemon journaled that it was shutting down gracefully. The
+    /// print's fate after this instant is unknown; see
+    /// [`WalTimeline::recorder_stopped_tail`] for exactly what that
+    /// licenses (suppressing an announcement, nothing more).
+    RecorderStopped {
+        /// Host-monotonic time of the graceful stop (ns).
         mono_ns: u64,
     },
     /// A marker written by a newer format revision was preserved as
@@ -148,6 +160,25 @@ pub struct WalTimeline {
     /// daemon outlived Klipper's API socket — classification evidence
     /// for a klippy shutdown with power retained.
     pub socket_lost_tail: Option<u64>,
+    /// `mono_ns` of a [`MarkerKind::RecorderStopped`] that ends the log
+    /// (no motion record after it): **the recorder stopped on purpose, so
+    /// this log says nothing about how the print ended.**
+    ///
+    /// Deliberately *not* folded into [`clean_shutdown`](Self::clean_shutdown)
+    /// and deliberately *not* a [`crate::window::CrashClass`]: a graceful
+    /// daemon stop is not a deliberate end of the *print*, and the print
+    /// may well have died afterwards with nothing left running to record
+    /// it. The reconstruction is therefore computed exactly as it would be
+    /// without this marker, and every downstream consumer keeps its full
+    /// ability to plan and execute a recovery.
+    ///
+    /// What it licenses is one thing only: **suppressing an unsolicited
+    /// announcement.** A daemon that finds this at the end of the previous
+    /// session's log must not tell the operator "your print died" — the
+    /// honest statement is "the recorder stopped; the print's fate is
+    /// unknown" — and it must not retract a pending-recovery offer either,
+    /// because it has learned nothing that contradicts one.
+    pub recorder_stopped_tail: Option<u64>,
     /// `mono_ns` of the newest motion record (trapq segment or stepper
     /// range); `None` when the WAL holds no motion at all.
     pub last_motion_mono_ns: Option<u64>,
@@ -222,6 +253,7 @@ pub fn ingest(scan: &RecoveryScan, heartbeat: Option<&HeartbeatRecovery>) -> Wal
     let mut clean_marker_idx: Option<usize> = None;
     let mut socket_lost: Option<(usize, u64)> = None;
     let mut resubscribed_idx: Option<usize> = None;
+    let mut recorder_stopped: Option<(usize, u64)> = None;
 
     for (idx, scanned) in scan.records.iter().enumerate() {
         if !scanned.record.values_are_finite() {
@@ -271,6 +303,14 @@ pub fn ingest(scan: &RecoveryScan, heartbeat: Option<&HeartbeatRecovery>) -> Wal
                             mono_ns: marker.mono_ns,
                         });
                     }
+                    // Recorded, never allowed to change the
+                    // reconstruction: see `recorder_stopped_tail`.
+                    MarkerKind::RecorderStopped => {
+                        recorder_stopped = Some((idx, marker.mono_ns));
+                        notes.push(IngestNote::RecorderStopped {
+                            mono_ns: marker.mono_ns,
+                        });
+                    }
                     MarkerKind::Unknown => notes.push(IngestNote::UnknownMarker {
                         mono_ns: marker.mono_ns,
                     }),
@@ -311,6 +351,13 @@ pub fn ingest(scan: &RecoveryScan, heartbeat: Option<&HeartbeatRecovery>) -> Wal
         .filter(|(idx, _)| resubscribed_idx.is_none_or(|r| r < *idx))
         .map(|(_, mono)| mono);
 
+    // RecorderStopped is tail evidence on the same terms: motion after it
+    // means the recorder came back and kept working, so the marker no
+    // longer describes how this log ends.
+    let recorder_stopped_tail = recorder_stopped
+        .filter(|(idx, _)| last_motion_idx.is_none_or(|m| *idx > m))
+        .map(|(_, mono)| mono);
+
     if !scan.end.is_expected_after_power_loss() {
         notes.push(IngestNote::UnexpectedScanEnd);
     }
@@ -339,6 +386,7 @@ pub fn ingest(scan: &RecoveryScan, heartbeat: Option<&HeartbeatRecovery>) -> Wal
         heartbeats: all_heartbeats,
         clean_shutdown,
         socket_lost_tail,
+        recorder_stopped_tail,
         last_motion_mono_ns: last_motion_mono,
         scan_end: scan.end.clone(),
         notes,
@@ -546,6 +594,44 @@ mod tests {
             marker(9, MarkerKind::SocketLost),
         ]);
         assert_eq!(ingest(&lost_again, None).socket_lost_tail, Some(9));
+    }
+
+    /// `RecorderStopped` is tail evidence on the same terms as
+    /// `SocketLost`, and it must NOT make the log read as clean: a
+    /// graceful daemon stop says nothing about how the print ended.
+    #[test]
+    fn recorder_stopped_is_tail_evidence_but_never_a_clean_shutdown() {
+        let tail = scan_of(vec![
+            WalRecord::TrapqSegment(trapq_segment("toolhead", 1.0, 0.5, 1)),
+            marker(9, MarkerKind::RecorderStopped),
+        ]);
+        let timeline = ingest(&tail, None);
+        assert_eq!(timeline.recorder_stopped_tail, Some(9));
+        assert!(
+            !timeline.clean_shutdown,
+            "a recorder stop is not a deliberate END OF PRINT"
+        );
+        assert!(timeline
+            .notes
+            .iter()
+            .any(|n| matches!(n, IngestNote::RecorderStopped { mono_ns: 9 })));
+
+        // Motion after it means the recorder came back: no longer tail
+        // evidence.
+        let superseded = scan_of(vec![
+            marker(9, MarkerKind::RecorderStopped),
+            WalRecord::TrapqSegment(trapq_segment("toolhead", 2.0, 0.5, 10)),
+        ]);
+        assert_eq!(ingest(&superseded, None).recorder_stopped_tail, None);
+
+        // It does not disturb the socket-loss classification either.
+        let both = scan_of(vec![
+            marker(8, MarkerKind::SocketLost),
+            marker(9, MarkerKind::RecorderStopped),
+        ]);
+        let timeline = ingest(&both, None);
+        assert_eq!(timeline.socket_lost_tail, Some(8));
+        assert_eq!(timeline.recorder_stopped_tail, Some(9));
     }
 
     #[test]

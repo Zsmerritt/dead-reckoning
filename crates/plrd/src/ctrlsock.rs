@@ -587,6 +587,10 @@ async fn cmd_recover_dryrun(state: &CtrlState) -> Value {
 fn outcome_tag(outcome: &PipelineOutcome) -> &'static str {
     match outcome {
         PipelineOutcome::CleanShutdown => "clean-shutdown",
+        // A distinct tag: the console UI must be able to say "the print
+        // finished" rather than "the log ended cleanly", which is false
+        // for a print whose host died during the cooldown.
+        PipelineOutcome::Complete(_) => "complete",
         PipelineOutcome::MachineRejected(_) => "machine-rejected",
         PipelineOutcome::ManualFallback(_) => "manual-fallback",
         PipelineOutcome::NotPossible(_) => "not-possible",
@@ -876,6 +880,7 @@ fn outcome_diagnoses(outcome: &PipelineOutcome) -> Option<Value> {
                 .collect(),
         )),
         PipelineOutcome::CleanShutdown
+        | PipelineOutcome::Complete(_)
         | PipelineOutcome::ManualFallback(_)
         | PipelineOutcome::NotPossible(_)
         | PipelineOutcome::Plan(_) => None,
@@ -1049,6 +1054,7 @@ mod tests {
             file_size: Some(1000),
             percent: Some(50.0),
             crash_class: "HostDeathOrPowerLoss".to_owned(),
+            frame_invalid: false,
         };
         crate::detect::write_pending(&config.wal_dir, &pending).unwrap();
         let (path, _state) = spawn_server("status", config);

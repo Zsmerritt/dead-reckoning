@@ -105,6 +105,7 @@ pub fn wal_context(transforms: TransformObservations) -> Context {
         virtual_sdcard: Some(VirtualSdState {
             file_path: "/tmp/part.gcode".to_owned(),
             file_position: 60,
+            file_size: None,
         }),
         gcode: GcodeState {
             speed_factor: 1.0,
@@ -132,6 +133,7 @@ pub fn wal_context(transforms: TransformObservations) -> Context {
             speed: 0.5,
         }],
         exclude: None,
+        print_state: None,
     }
 }
 
@@ -148,6 +150,7 @@ pub fn timeline(context: Context, clean_shutdown: bool) -> WalTimeline {
         heartbeats: vec![],
         clean_shutdown,
         socket_lost_tail: None,
+        recorder_stopped_tail: None,
         last_motion_mono_ns: None,
         scan_end: ScanEnd::CleanEof,
         notes: vec![],

@@ -32,6 +32,12 @@
 //!   width, edge margin, drag run). The selector filters on it; a
 //!   manual-jog UI validates hand-picked points against the same
 //!   [`structure::StructuralAnalysis`].
+//! * [`work::remaining_work`] — answers *"is there anything left to
+//!   print?"*: the completion gate. A finished print stops ~14.5 KB
+//!   short of EOF because of the slicer's config-block footer, so no
+//!   percentage can decide this; only a content test can. It may only
+//!   ever answer "complete" on positive proof — every way of not
+//!   knowing is a [`work::WorkUnknown`].
 //!
 //! # Totality
 //!
@@ -47,6 +53,7 @@ pub mod contact;
 pub mod matcher;
 pub mod model;
 pub mod structure;
+pub mod work;
 
 pub use contact::{
     select_contact_zone, select_contact_zone_detailed, ContactConfig, ContactError, ContactOutcome,
@@ -64,4 +71,8 @@ pub use structure::{
     assess_contact_point, BoundingBox, ClearRun, ContactMode, CriterionCheck, FootprintTrace,
     Island, StructuralAnalysis, StructuralAssessment, StructuralCriterion, StructuralOutcome,
     StructuralVerdict, TraceStatus,
+};
+pub use work::{
+    remaining_work, AnchorFrame, ExclusionOracle, ModeAxis, RemainingWork, WorkUnknown,
+    MAX_NAMED_COMMANDS,
 };

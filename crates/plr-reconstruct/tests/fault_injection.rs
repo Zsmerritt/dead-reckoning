@@ -445,6 +445,7 @@ fn context_record(pt: f64, file_position: u64, state: &GcodeState) -> WalRecord 
         virtual_sdcard: Some(VirtualSdState {
             file_path: FILE_PATH.to_owned(),
             file_position,
+            file_size: None,
         }),
         gcode: wal_gcode_state(state),
         transforms: TransformObservations {
@@ -458,6 +459,7 @@ fn context_record(pt: f64, file_position: u64, state: &GcodeState) -> WalRecord 
         heaters: Vec::new(),
         fans: Vec::new(),
         exclude: None,
+        print_state: None,
     })
 }
 

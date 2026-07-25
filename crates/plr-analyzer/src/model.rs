@@ -173,6 +173,19 @@ pub struct SimMove {
     /// Layer active when the move executed (`None` before the first
     /// deposition of the file/window).
     pub layer: Option<u32>,
+    /// `exclude_object` object active when the move executed, as
+    /// Klipper stores it (upper-cased), or `None` outside any
+    /// `EXCLUDE_OBJECT_START`/`EXCLUDE_OBJECT_END` bracket — which is
+    /// also what a file with no object annotations at all yields.
+    ///
+    /// Deposition attributed to no object (skirt, brim, prime line,
+    /// wipe tower) must be treated as **work that cannot be cancelled**:
+    /// `None` means "not attributable", never "excluded".
+    ///
+    /// `#[serde(default)]` so a serialized model written before this
+    /// field existed still decodes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub object: Option<String>,
     /// Set when the move is one chord of an arc decomposition.
     pub arc: Option<ArcSegmentInfo>,
     /// Per-axis reliability of `start` (false after G28 until an
@@ -377,6 +390,7 @@ pub fn build_layer_model(
         lines_consumed: 0,
     };
     let mut current_type: Option<String> = None;
+    let mut current_object: Option<String> = None;
     let mut pending_annotation_z: Option<f64> = None;
     for line in LineIter::new(data, base_offset) {
         match line.comment().and_then(plr_gcode::Comment::annotation) {
@@ -387,6 +401,7 @@ pub fn build_layer_model(
             Some(Annotation::Z(z)) => pending_annotation_z = Some(z),
             Some(Annotation::LayerChange | Annotation::Layer(_)) | None => {}
         }
+        apply_object_bracket(&line, &mut current_object);
         match st.apply(&line) {
             Err(error) => {
                 model.stop = ModelStop::LineError {
@@ -402,6 +417,7 @@ pub fn build_layer_model(
                         &mut model,
                         planned,
                         current_type.as_deref(),
+                        current_object.as_deref(),
                         &mut pending_annotation_z,
                         config,
                     );
@@ -412,12 +428,50 @@ pub fn build_layer_model(
     model
 }
 
+/// Tracks the `exclude_object` bracket around a line.
+///
+/// `EXCLUDE_OBJECT_START NAME=<name>` opens an object and
+/// `EXCLUDE_OBJECT_END` closes it, mirroring
+/// `klippy/extras/exclude_object.py` (`cmd_EXCLUDE_OBJECT_START` /
+/// `cmd_EXCLUDE_OBJECT_END`). Names are upper-cased exactly as Klipper
+/// does (`name.upper()` in both `cmd_EXCLUDE_OBJECT_DEFINE` and
+/// `cmd_EXCLUDE_OBJECT_START`), so they compare directly against the
+/// journaled `excluded_objects` list.
+///
+/// `EXCLUDE_OBJECT_END` closes whatever is open regardless of its
+/// optional `NAME=`: Klipper's handler ignores a mismatched name beyond
+/// logging, and a nesting disagreement must not leave an object open
+/// forever. A `START` with no usable `NAME=` closes the previous bracket
+/// without opening a new one — the following deposition is then
+/// unattributed, which is the conservative answer (see
+/// [`SimMove::object`]).
+///
+/// This is bracket *tracking* only; the state machine still treats both
+/// commands as no-ops, so replay stays byte-exact.
+fn apply_object_bracket(line: &plr_gcode::Line, current: &mut Option<String>) {
+    let Some(command) = line.command() else {
+        return;
+    };
+    match command.name.as_str() {
+        "EXCLUDE_OBJECT_START" => {
+            *current = command
+                .get("NAME")
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
+                .map(str::to_uppercase);
+        }
+        "EXCLUDE_OBJECT_END" => *current = None,
+        _ => {}
+    }
+}
+
 /// Record one planned move into the model, opening a layer when a
 /// deposition lands beyond `z_epsilon` of the current layer's Z.
 fn record_move(
     model: &mut LayerModel,
     planned: &plr_gcode::PlannedMove,
     current_type: Option<&str>,
+    current_object: Option<&str>,
     pending_annotation_z: &mut Option<f64>,
     config: &ModelConfig,
 ) {
@@ -482,6 +536,7 @@ fn record_move(
         span: planned.span,
         kind,
         layer: model.layers.last().map(|l| l.index),
+        object: current_object.map(str::to_owned),
         arc: planned.arc_segment,
         start_known: planned.start_known,
         end_known: planned.end_known,

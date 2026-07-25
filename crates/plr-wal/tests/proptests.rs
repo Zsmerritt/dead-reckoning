@@ -138,10 +138,13 @@ prop_compose! {
     fn arb_context()(
         mono_ns in any::<u64>(),
         virtual_sdcard in prop::option::of(
-            (".{0,20}", any::<u64>()).prop_map(|(file_path, file_position)| VirtualSdState {
-                file_path,
-                file_position,
-            })
+            (".{0,20}", any::<u64>(), prop::option::of(any::<u64>())).prop_map(
+                |(file_path, file_position, file_size)| VirtualSdState {
+                    file_path,
+                    file_position,
+                    file_size,
+                }
+            )
         ),
         gcode in arb_gcode(),
         transforms in arb_transforms(),
@@ -154,8 +157,14 @@ prop_compose! {
             0..4,
         ),
         exclude in prop::option::of(arb_exclude_state().prop_map(Box::new)),
+        // Arbitrary text, not just the six Klipper states: the field is
+        // stored verbatim, so the round trip must survive anything the
+        // printer might report.
+        print_state in prop::option::of(".{0,12}"),
     ) -> Context {
-        Context { mono_ns, virtual_sdcard, gcode, transforms, heaters, fans, exclude }
+        Context {
+            mono_ns, virtual_sdcard, gcode, transforms, heaters, fans, exclude, print_state,
+        }
     }
 }
 

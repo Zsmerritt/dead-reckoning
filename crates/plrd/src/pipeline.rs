@@ -120,6 +120,17 @@ pub struct PlanBundle {
 pub enum PipelineOutcome {
     /// The WAL ends with a deliberate print end; nothing to recover.
     CleanShutdown,
+    /// The WAL tail is unclean, but the print had **no printing work
+    /// left**: it finished, and at most its end sequence did not run.
+    /// Nothing to recover.
+    ///
+    /// Reported separately from [`CleanShutdown`](Self::CleanShutdown)
+    /// because the cause differs and the operator-facing wording has to:
+    /// "the WAL ends with a clean print end" is false here — the log ends
+    /// torn. What is true is "the print finished". Conflating the two would
+    /// tell an operator whose printer lost power during the cooldown that
+    /// their log ended cleanly, which it did not.
+    Complete(Box<CompletionReport>),
     /// Machine prerequisites failed (all failures listed). Fatal for
     /// both dry-run and execute.
     MachineRejected(MachineRejection),
@@ -130,6 +141,43 @@ pub enum PipelineOutcome {
     NotPossible(String),
     /// A validated plan.
     Plan(Box<PlanBundle>),
+}
+
+/// Why a print needed no recovery even though its log ended uncleanly.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CompletionReport {
+    /// Absolute path of the print file.
+    pub file: String,
+    /// The offset the gate tested at (`stop_set.file_window.start`).
+    pub tested_offset: u64,
+    /// Size of the print file, bytes.
+    pub file_size: u64,
+    /// What the replay found after [`tested_offset`](Self::tested_offset).
+    pub work: plr_analyzer::RemainingWork,
+}
+
+impl CompletionReport {
+    /// Bytes of the file after the tested offset — the near-constant
+    /// 14–18 KB slicer footer a percentage would have read as progress.
+    #[must_use]
+    pub fn trailing_bytes(&self) -> u64 {
+        self.file_size.saturating_sub(self.tested_offset)
+    }
+
+    /// The end-sequence commands that did not run, if any.
+    ///
+    /// **Never offer to execute these.** An end macro routinely homes,
+    /// drops the bed, or moves Z, and none of the envelope or pre-flight
+    /// analysis that guards a recovery plan applies to an opaque macro
+    /// body. Naming them is the whole value.
+    #[must_use]
+    pub fn unrun_commands(&self) -> &[String] {
+        match &self.work {
+            plr_analyzer::RemainingWork::EndSequenceOnly { commands } => commands,
+            plr_analyzer::RemainingWork::Extrusion { .. }
+            | plr_analyzer::RemainingWork::Nothing => &[],
+        }
+    }
 }
 
 /// Runs the full pipeline, narrating progress to `out`. `Err` only for
@@ -476,11 +524,36 @@ fn plan_from_recovery(
     file_bytes: &[u8],
     say: &mut dyn FnMut(&str),
 ) -> PipelineOutcome {
-    let (model, base_offset) = match anchored_model(recovery, file_bytes, say) {
-        Ok(pair) => pair,
+    let AnchoredModel {
+        model,
+        base_offset,
+        anchor,
+    } = match anchored_model(recovery, file_path, file_bytes, say) {
+        Ok(anchored) => anchored,
         Err(outcome) => return outcome,
     };
     let stop_set = &recovery.stop_set;
+
+    match completion_check(recovery, &model, base_offset, anchor, file_path, file_bytes) {
+        CompletionCheck::Complete(report) => {
+            narrate_completion(&report, say);
+            return PipelineOutcome::Complete(Box::new(report));
+        }
+        // The WAL's byte offsets no longer address this file, so a resume
+        // plan built from them would seek into content we never recorded.
+        // Refuse outright rather than plan against a stale offset.
+        CompletionCheck::OffsetsInvalid(reason) => {
+            say(&format!("pipeline: {reason}"));
+            return PipelineOutcome::NotPossible(reason);
+        }
+        CompletionCheck::CarryOn(reason) => {
+            if let Some(reason) = reason {
+                say(&format!(
+                    "pipeline: completion gate cannot suppress: {reason}"
+                ));
+            }
+        }
+    }
 
     let Some(evidence) = stop_evidence(stop_set, base_offset) else {
         return PipelineOutcome::ManualFallback(
@@ -499,30 +572,11 @@ fn plan_from_recovery(
         match_result.candidates.len()
     ));
 
-    let resume = match select_resume_target(&model, &match_result) {
-        Ok(resume) => resume,
-        Err(reason) => {
-            return PipelineOutcome::ManualFallback(format!("no safe resume point: {reason:?}"))
-        }
-    };
-    let Some(resume_layer) = resume.layer else {
-        return PipelineOutcome::ManualFallback(
-            "resume point has no layer attribution; contact selection impossible".to_owned(),
-        );
-    };
-    let crash_xy = [evidence.x.midpoint(), evidence.y.midpoint()];
-    let contact = match select_contact_zone(&model, resume_layer, crash_xy, contact_config) {
-        Ok(outcome) => outcome,
-        Err(e) => return PipelineOutcome::ManualFallback(format!("contact selection failed: {e}")),
-    };
-    if let ContactOutcome::Candidates(candidates) = &contact {
-        say(&format!(
-            "pipeline: {} probe candidate(s); best at ({:.2}, {:.2})",
-            candidates.len(),
-            candidates.first().map_or(f64::NAN, |c| c.point[0]),
-            candidates.first().map_or(f64::NAN, |c| c.point[1]),
-        ));
-    }
+    let (resume, contact) =
+        match resume_and_contact(&model, &match_result, &evidence, contact_config, say) {
+            Ok(pair) => pair,
+            Err(outcome) => return outcome,
+        };
 
     // usize conversion validated by `anchored_model`.
     let base_usize = usize::try_from(base_offset).unwrap_or(usize::MAX);
@@ -660,31 +714,169 @@ fn finalize_recovery_file(
     })
 }
 
+/// Picks the resume target and the probe contact zone, narrating the
+/// candidate count. `Err` carries the manual-fallback outcome.
+fn resume_and_contact(
+    model: &plr_analyzer::LayerModel,
+    match_result: &plr_analyzer::MatchResult,
+    evidence: &StopEvidence,
+    contact_config: &ContactConfig,
+    say: &mut dyn FnMut(&str),
+) -> Result<(plr_recovery::ResumeTarget, ContactOutcome), PipelineOutcome> {
+    let resume = select_resume_target(model, match_result).map_err(|reason| {
+        PipelineOutcome::ManualFallback(format!("no safe resume point: {reason:?}"))
+    })?;
+    let Some(resume_layer) = resume.layer else {
+        return Err(PipelineOutcome::ManualFallback(
+            "resume point has no layer attribution; contact selection impossible".to_owned(),
+        ));
+    };
+    let crash_xy = [evidence.x.midpoint(), evidence.y.midpoint()];
+    let contact = select_contact_zone(model, resume_layer, crash_xy, contact_config)
+        .map_err(|e| PipelineOutcome::ManualFallback(format!("contact selection failed: {e}")))?;
+    if let ContactOutcome::Candidates(candidates) = &contact {
+        say(&format!(
+            "pipeline: {} probe candidate(s); best at ({:.2}, {:.2})",
+            candidates.len(),
+            candidates.first().map_or(f64::NAN, |c| c.point[0]),
+            candidates.first().map_or(f64::NAN, |c| c.point[1]),
+        ));
+    }
+    Ok((resume, contact))
+}
+
+/// Narrates a completion into the pipeline report.
+fn narrate_completion(report: &CompletionReport, say: &mut dyn FnMut(&str)) {
+    say(&format!(
+        "pipeline: the print is COMPLETE — no extrusion remains after byte {} of {} \
+         ({} trailing bytes are the slicer footer); nothing to resume",
+        report.tested_offset,
+        report.file_size,
+        report.trailing_bytes(),
+    ));
+    if !report.unrun_commands().is_empty() {
+        say(&format!(
+            "pipeline: these end-sequence commands did not run: {} (NOT offered — an end \
+             macro homes and moves Z, and none of the envelope or pre-flight analysis \
+             applies to it)",
+            report.unrun_commands().join(" ")
+        ));
+    }
+}
+
+/// What the pipeline should do about the completion gate's answer.
+enum CompletionCheck {
+    /// The print finished; report it and stop.
+    Complete(CompletionReport),
+    /// The WAL's offsets do not address the file on disk. Nothing derived
+    /// from them is usable, including a resume plan.
+    OffsetsInvalid(String),
+    /// Carry on planning. `Some(reason)` when the gate could not answer and
+    /// that is worth narrating; `None` when work simply remains.
+    CarryOn(Option<String>),
+}
+
+/// The completion gate, run here as well as in boot detection — because a
+/// stale `pending_recovery.json`, a manual `plrd recover`, or the wizard can
+/// all reach this point for a print that in fact finished.
+///
+/// Without it the planner declines with `NoResumeDeposition` (correctly —
+/// there is no deposition left to resume at) and that surfaces as a
+/// *failure* telling the operator to fix a reported issue, for a print that
+/// simply ran to the end.
+///
+/// Every precondition lives in `detect::completion_verdict`, which is the
+/// only way to reach a `Complete` answer from either path. This function
+/// supplies inputs and does not decide which checks apply — see that
+/// function's "One gate, two call sites" for why that is structural rather
+/// than stylistic.
+fn completion_check(
+    recovery: &RecoveryReconstruction,
+    model: &plr_analyzer::LayerModel,
+    base_offset: u64,
+    anchor: &plr_wal::Context,
+    file_path: &str,
+    file_bytes: &[u8],
+) -> CompletionCheck {
+    let Some(window) = recovery.stop_set.file_window.as_ref() else {
+        return CompletionCheck::CarryOn(None);
+    };
+    // `anchored_model` already validated this conversion.
+    let base_usize = usize::try_from(base_offset).unwrap_or(usize::MAX);
+    let Some(tail) = file_bytes.get(base_usize..) else {
+        return CompletionCheck::CarryOn(None);
+    };
+    let file_size = file_bytes.len() as u64;
+    match crate::detect::completion_verdict(&crate::detect::GateInputs {
+        anchor,
+        model: crate::detect::ModelSource::Built(model),
+        tail,
+        base_offset,
+        tested_offset: window.start,
+        file_size,
+        exclusions: &recovery.exclusions,
+    }) {
+        crate::detect::GateVerdict::Complete(work) => CompletionCheck::Complete(CompletionReport {
+            file: file_path.to_owned(),
+            tested_offset: window.start,
+            file_size,
+            work,
+        }),
+        crate::detect::GateVerdict::MustNotSuppress(refusal) => {
+            let reason = refusal.reason();
+            if refusal.invalidates_offsets() {
+                CompletionCheck::OffsetsInvalid(
+                    reason.unwrap_or_else(|| "the print file changed".to_owned()),
+                )
+            } else {
+                CompletionCheck::CarryOn(reason)
+            }
+        }
+    }
+}
+
+/// The replay of the print file, and the context it started from.
+pub(crate) struct AnchoredModel<'a> {
+    /// The layer model over `[base_offset, EOF)`.
+    pub model: plr_analyzer::LayerModel,
+    /// Stream offset the model begins at (the anchor's file position).
+    pub base_offset: u64,
+    /// **The context the model was actually replayed from.**
+    ///
+    /// Carried rather than re-derived. `detect::GateInputs::anchor` requires
+    /// the context the model was built from, because the extruder-frame
+    /// trust check reads its mode flags and the identity check reads its
+    /// journaled file size — and a second, independent selection can return
+    /// a different context with different flags, which would make the gate
+    /// check a frame the replay never used. Keeping the reference makes that
+    /// a structural guarantee instead of an assumption.
+    pub anchor: &'a plr_wal::Context,
+}
+
 /// Selects the anchor context and replays the file into a layer model.
 /// `Err` carries the early outcome.
-fn anchored_model(
-    recovery: &RecoveryReconstruction,
+fn anchored_model<'a>(
+    recovery: &'a RecoveryReconstruction,
+    file_path: &str,
     file_bytes: &[u8],
     say: &mut dyn FnMut(&str),
-) -> Result<(plr_analyzer::LayerModel, u64), PipelineOutcome> {
-    // Anchor context: the newest context at or before the offset floor
-    // (its interpreter state seeds the replay); fall back to the oldest
-    // context naming the file.
+) -> Result<AnchoredModel<'a>, PipelineOutcome> {
+    // Anchor context: the newest context at or before the offset floor whose
+    // `virtual_sdcard` names *this* print file; falling back to the oldest
+    // such context. Shared with boot detection (`detect::anchor_context`) so
+    // that exactly one selection feeds both the replay and the completion
+    // gate — see `AnchoredModel::anchor`.
+    //
+    // The name match is a tightening over the previous name-blind selection:
+    // a context describing a different print could otherwise supply both the
+    // interpreter state the replay used and the journaled size the gate's
+    // identity check compared against.
     let floor = recovery.stop_set.file_window.as_ref().map(|w| w.start);
-    let contexts = &recovery.timeline.contexts;
-    let anchor = contexts
-        .iter()
-        .rev()
-        .find(|c| {
-            c.virtual_sdcard
-                .as_ref()
-                .is_some_and(|v| floor.is_none_or(|f| v.file_position <= f))
-        })
-        .or_else(|| contexts.iter().find(|c| c.virtual_sdcard.is_some()));
-    let Some(anchor) = anchor else {
-        return Err(PipelineOutcome::NotPossible(
-            "no WAL context carries virtual_sdcard state".to_owned(),
-        ));
+    let Some(anchor) = crate::detect::anchor_context(&recovery.timeline.contexts, file_path, floor)
+    else {
+        return Err(PipelineOutcome::NotPossible(format!(
+            "no WAL context names {file_path}"
+        )));
     };
     let base_offset = anchor
         .virtual_sdcard
@@ -719,7 +911,11 @@ fn anchored_model(
         "pipeline: layer model from byte {base_offset}: {} layers",
         model.layers.len()
     ));
-    Ok((model, base_offset))
+    Ok(AnchoredModel {
+        model,
+        base_offset,
+        anchor,
+    })
 }
 
 /// Maps the possible-stop set onto the matcher's evidence contract.
@@ -1122,6 +1318,7 @@ G1 X60 Y60 E0.02
             virtual_sdcard: Some(VirtualSdState {
                 file_path: file_path.to_owned(),
                 file_position: crash_offset(),
+                file_size: None,
             }),
             gcode: GcodeState {
                 speed_factor: 1.0,
@@ -1156,6 +1353,7 @@ G1 X60 Y60 E0.02
                 speed: 0.5,
             }],
             exclude: None,
+            print_state: None,
         }
     }
 
@@ -1415,6 +1613,204 @@ G1 X60 Y60 E0.02
             output.contains("machine prerequisites validated"),
             "{output}"
         );
+    }
+
+    /// **D1 in the pipeline.** A print that finished must not be planned
+    /// for. Without the gate the planner declines with
+    /// `NoResumeDeposition` and the operator is told to fix a reported
+    /// issue — for a print that simply ran to the end.
+    /// Writes a *finished* print into the fixture: `MODEL_TEXT` plus an end
+    /// sequence plus a config block, with both contexts inside the footer, so
+    /// the completion gate would answer `Complete` unless a precondition
+    /// stops it. Returns the footer's offset and the file's size.
+    ///
+    /// `journaled_size` is what the WAL claims `virtual_sdcard.file_size`
+    /// was; `truncate_to` optionally shortens the file on disk afterwards.
+    fn write_finished_print(
+        dir: &std::path::Path,
+        journaled_size: Option<u64>,
+        truncate_to: Option<usize>,
+    ) -> (u64, u64) {
+        let gcode_path = dir.join("part.gcode");
+        let footer = "M107\nM104 S0\nM140 S0\nG1 E-0.8 F2100\nG1 Z10 F600\nM84\n";
+        let mut text = MODEL_TEXT.to_owned();
+        let footer_at = text.len() as u64;
+        text.push_str(footer);
+        for i in 0..300 {
+            use std::fmt::Write as _;
+            let _ = writeln!(text, "; some_config_key_{i} = 0");
+        }
+        if let Some(len) = truncate_to {
+            text.truncate(len);
+        }
+        std::fs::write(&gcode_path, text.as_bytes()).unwrap();
+        let mut writer = WalWriter::create(Vec::new(), &SegmentHeader::new(1, 1)).unwrap();
+        writer.append(&WalRecord::Heartbeat(heartbeat())).unwrap();
+        for position in [footer_at, footer_at + footer.len() as u64] {
+            let mut ctx = crash_context(gcode_path.to_str().unwrap());
+            if position == footer_at {
+                ctx.mono_ns = 1_000_000_000;
+            }
+            if let Some(vsd) = &mut ctx.virtual_sdcard {
+                vsd.file_position = position.min(text.len() as u64);
+                vsd.file_size = journaled_size;
+            }
+            writer.append(&WalRecord::Context(ctx)).unwrap();
+        }
+        std::fs::write(dir.join("wal-000001.plr"), writer.into_inner()).unwrap();
+        (footer_at, text.len() as u64)
+    }
+
+    /// **The re-slice probe.** An operator re-slices under the same filename
+    /// before running recovery — the ordinary iteration loop — so the path
+    /// still resolves but the content is different and `file_position` indexes
+    /// into bytes we never saw. `plrd recover` must not answer "nothing to
+    /// recover"; it must say the file changed.
+    ///
+    /// This is the operator's primary tool, and an earlier revision of this
+    /// branch enforced the identity check only in boot detection, so this
+    /// path suppressed silently. See `detect::completion_verdict`.
+    #[test]
+    fn a_re_sliced_file_is_not_reported_complete_by_the_recover_path() {
+        let (dir, config) = fixture("reslice");
+        // The WAL claims a much larger file than the one on disk.
+        let (_, on_disk) = write_finished_print(&dir, Some(512_004), None);
+        assert_ne!(on_disk, 512_004);
+        let (outcome, output) = run(&config);
+        // Not merely "not complete": the WAL's offsets no longer address this
+        // file, so a resume plan built from them would seek into content we
+        // never recorded. The outcome must be the REFUSAL, not the planner's
+        // `ManualFallback("no safe resume point: NoResumeDeposition")` — that
+        // is the phantom-issue failure this feature exists to stop.
+        let PipelineOutcome::NotPossible(reason) = &outcome else {
+            panic!("expected NotPossible, got {outcome:?}\n{output}");
+        };
+        assert!(reason.contains("512004"), "{reason}");
+        assert!(reason.contains("re-sliced"), "{reason}");
+        assert!(
+            output.contains("512004"),
+            "the reason must be narrated: {output}"
+        );
+    }
+
+    /// The other direction of the same denial: a print that is genuinely
+    /// recoverable must NOT be refused. A widened `invalidates_offsets` would
+    /// deny a resumable print, which is the expensive mistake.
+    #[test]
+    fn a_recoverable_print_is_not_denied_by_the_identity_check() {
+        let (_dir, config) = fixture("identity-ok");
+        // `fixture` writes a mid-print WAL whose contexts journal no size at
+        // all, so the identity check has nothing to object to.
+        let (outcome, output) = run(&config);
+        assert!(
+            matches!(outcome, PipelineOutcome::Plan(_)),
+            "a recoverable print must still plan: {outcome:?}\n{output}"
+        );
+    }
+
+    /// **The truncation probe.** A file truncated at the stop offset, with no
+    /// journaled size to compare against. Zero bytes of remainder is zero
+    /// evidence — and answering `Complete` here would print the
+    /// self-refuting "0 trailing bytes are the slicer footer", when a footer
+    /// is 14-18 KB.
+    #[test]
+    fn a_file_truncated_at_the_stop_offset_is_not_reported_complete() {
+        let (dir, config) = fixture("truncated");
+        // Truncate to exactly the footer offset, and journal no size at all.
+        let footer_at = MODEL_TEXT.len();
+        let (_, on_disk) = write_finished_print(&dir, None, Some(footer_at));
+        assert_eq!(on_disk, footer_at as u64);
+        let (outcome, output) = run(&config);
+        assert!(
+            !matches!(outcome, PipelineOutcome::Complete(_)),
+            "an empty remainder must never report completion: {outcome:?}\n{output}"
+        );
+        assert!(
+            !output.contains("0 trailing bytes"),
+            "the self-refuting line must never be printed: {output}"
+        );
+    }
+
+    /// The same finished print, unperturbed, still reports `Complete` — so
+    /// the two probes above are testing the preconditions and not merely a
+    /// broken fixture.
+    #[test]
+    fn the_probe_scaffolding_still_reports_a_genuine_completion() {
+        let (dir, config) = fixture("probe-control");
+        // Journal the size the file actually has: identity holds.
+        let (footer_at, on_disk) = write_finished_print(&dir, None, None);
+        let (_, again) = write_finished_print(&dir, Some(on_disk), None);
+        assert_eq!(again, on_disk);
+        let (outcome, output) = run(&config);
+        let PipelineOutcome::Complete(report) = outcome else {
+            panic!("expected Complete, got {outcome:?}\n{output}");
+        };
+        assert_eq!(report.tested_offset, footer_at);
+        assert!(report.trailing_bytes() > 6_000);
+    }
+
+    #[test]
+    fn a_finished_print_reaches_no_recovery_instead_of_a_failure() {
+        let (dir, config) = fixture("complete");
+        // Append a footer and point the crash context at its first byte:
+        // the print reached the end of its deposition.
+        let gcode_path = dir.join("part.gcode");
+        let footer = "M107
+M104 S0
+M140 S0
+G1 E-0.8 F2100
+G1 Z10 F600
+M84
+";
+        let mut text = MODEL_TEXT.to_owned();
+        let footer_at = text.len() as u64;
+        text.push_str(footer);
+        // Plus a config block, as every slicer writes.
+        for i in 0..300 {
+            use std::fmt::Write as _;
+            let _ = writeln!(text, "; some_config_key_{i} = 0");
+        }
+        std::fs::write(&gcode_path, text.as_bytes()).unwrap();
+        let mut writer = WalWriter::create(Vec::new(), &SegmentHeader::new(1, 1)).unwrap();
+        writer.append(&WalRecord::Heartbeat(heartbeat())).unwrap();
+        // Both contexts sit inside the footer: the reader had already
+        // dispatched every depositing line and was working through the
+        // end g-code when the host died. `file_window.start` is the
+        // newest context provably behind execution, so it lands in the
+        // footer whichever branch `floor_context` takes.
+        let mut early = crash_context(gcode_path.to_str().unwrap());
+        early.mono_ns = 1_000_000_000;
+        if let Some(vsd) = &mut early.virtual_sdcard {
+            vsd.file_position = footer_at;
+        }
+        writer.append(&WalRecord::Context(early)).unwrap();
+        let mut done = crash_context(gcode_path.to_str().unwrap());
+        if let Some(vsd) = &mut done.virtual_sdcard {
+            vsd.file_position = footer_at + footer.len() as u64;
+        }
+        writer.append(&WalRecord::Context(done)).unwrap();
+        std::fs::write(dir.join("wal-000001.plr"), writer.into_inner()).unwrap();
+
+        let (outcome, output) = run(&config);
+        let PipelineOutcome::Complete(report) = outcome else {
+            panic!(
+                "expected Complete, got {outcome:?}
+{output}"
+            );
+        };
+        assert_eq!(report.tested_offset, footer_at);
+        assert!(
+            report.trailing_bytes() > 6_000,
+            "{}",
+            report.trailing_bytes()
+        );
+        assert_eq!(report.unrun_commands()[0], "M107");
+        assert!(output.contains("is COMPLETE"), "{output}");
+        assert!(output.contains("did not run: M107"), "{output}");
+        assert!(output.contains("NOT offered"), "{output}");
+        // `recover.rs` renders this outcome accurately (exit 0, and no
+        // claim that the log ended cleanly): see
+        // `recover::tests::non_plan_outcomes_map_to_exit_codes`.
     }
 
     #[test]
