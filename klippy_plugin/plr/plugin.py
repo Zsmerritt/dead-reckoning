@@ -16,6 +16,13 @@ The drag-oracle commands (PLR_NOISE_TEST / PLR_DRAG_PROBE) are
 registered here already and route into the scaffold modules, so the
 drag milestone only fills in those modules — no re-wiring.
 
+The ``[plr]`` section is a SHARED surface: plrd reads it from klippy's
+``configfile.settings``, which klippy builds only from options a module
+actually accessed — and klippy REFUSES TO START on an option nobody
+accessed (klippy/configfile.py:424-441).  So this module also declares
+the recovery-UX keys plrd consumes but the plugin never uses; see
+``plr/daemon_keys.py``, and do not "clean up" reads that look unused.
+
 SAVE_CONFIG-persisted state (written via ``configfile.set`` under
 section "plr", read back from the autosave block on restart as plain
 config options — klippy/configfile.py:311-324):
@@ -38,6 +45,7 @@ import time
 
 from . import (
     calibration_meta,
+    daemon_keys,
     daemon_link,
     drag_calibrate,
     drag_probe,
@@ -83,6 +91,19 @@ class PLRPlugin:
         self.daemon = daemon_link.DaemonLink(self.control_socket)
         # --- tunables (schema + ranges live in tunables.TUNABLES) ---
         self.tunables = tunables.load_from_config(config)
+        # --- [plr] options plrd consumes that this plugin only DECLARES --
+        # THESE READS EXIST SO KLIPPY WILL BOOT.  klippy refuses to start
+        # on an option in a configured section that no module read
+        # (klippy/configfile.py:424-441 check_unused, called from
+        # klippy/klippy.py:127), and the same access map is what becomes
+        # configfile.settings — the only place plrd can see [plr] from.
+        # Nothing in this plugin uses the values; deleting a read as
+        # "dead" breaks every printer.cfg that sets that option.
+        # daemon_keys.py's module docstring has the full mechanism, the
+        # loose-vs-strict validation boundary, and the reason the defaults
+        # are None; tests/test_daemon_keys.py fails if a key plrd consumes
+        # stops being read here.
+        self.daemon_keys = daemon_keys.load_from_config(config)
         # --- contact-operation nozzle-temperature gate --------------
         # FROZEN [plr] key shared with plrd: every command that can bring
         # the nozzle to the part refuses while the nozzle (current OR
@@ -485,4 +506,16 @@ class PLRPlugin:
             "calibration_status": {
                 group: result.tier for group, result in self.calibrations.items()
             },
+            # The [plr] options plrd consumes that this plugin only
+            # declares (plr/daemon_keys.py), exactly as configured: a
+            # ``None`` means the operator did not set the key, so it never
+            # enters configfile.settings and plrd applies ITS OWN default
+            # — deliberately not filled in here, because a plugin-side
+            # default published as if the operator wrote it is a second
+            # source of truth.  Surfaced so PLR_SETUP / a future
+            # PLR_VALIDATE can show what the daemon will see without
+            # anyone having to parse printer.cfg a second time.  Values are
+            # loosely validated (right type, finite) and NOT range-checked
+            # here; plrd owns every band.
+            "daemon_config": dict(self.daemon_keys),
         }

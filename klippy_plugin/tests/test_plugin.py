@@ -7,6 +7,7 @@ import fake_klippy
 import pytest
 
 import plr
+from plr import daemon_keys
 from plr.plugin import PLRPlugin
 
 ALL_COMMANDS = [
@@ -263,6 +264,12 @@ def test_get_status_shape_on_good_config(plugin):
         "last_touch_result": None,
         "calibrations_valid": True,
         "calibration_status": {"noise_floor": "unset", "probe_resolution": "unset"},
+        # The [plr] options plrd consumes that the plugin only declares so
+        # klippy will boot (plr/daemon_keys.py).  None throughout here:
+        # good_sections() sets none of them, and an unset key must stay
+        # unset so plrd's own default applies.  Contents are pinned by
+        # tests/test_daemon_keys.py against plrd's parser.
+        "daemon_config": {key: None for key in daemon_keys.DAEMON_KEYS},
     }
 
 

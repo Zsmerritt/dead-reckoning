@@ -228,10 +228,29 @@ def _config_to_sections(config):
     """Extract the calibration-relevant sections from a klippy ConfigWrapper.
 
     Reads every option of each relevant section via
-    ``get_prefix_options("")`` + ``get`` (the ConfigWrapper API,
-    klippy/configfile.py); this marks those options accessed, which is benign
-    (their owning modules access them anyway) and, for the ``[plr]`` autosave
-    keys, is exactly what keeps klippy's unused-option check quiet."""
+    ``get_prefix_options("")`` + ``get(..., note_valid=False)`` (the
+    ConfigWrapper API, klippy/configfile.py:61-63,127-129).
+
+    ``note_valid=False`` MATTERS AND IS NOT AN OPTIMIZATION.  A plain
+    ``get`` records the option's RAW STRING into klippy's access map
+    (klippy/configfile.py:46-47), and that map is what becomes
+    ``configfile.settings`` — the typed view plrd parses the ``[plr]``
+    section out of.  Enumerating ``[plr]`` for the hash therefore used to
+    OVERWRITE every already-recorded typed value with its string form, and
+    plrd hard-errors on a string where it expects a number or a bool
+    (``crates/plrd/src/plrcfg.rs`` ``opt_f64`` / ``opt_bool``): on a
+    stamped-calibration machine that reached this code, a configured
+    ``purge_amount`` made plrd refuse the whole section, and
+    ``UNSAFE_allow_purge_z_below_bed`` arrived as ``"True"`` — a bool read
+    of which is ``None``, i.e. the one escape hatch in the system failing
+    silently CLOSED.  Hashing must not publish values.
+
+    Suppressing the record is safe for klippy's unused-option check
+    (klippy/configfile.py:424-441): the ``[plr]`` options are all claimed
+    explicitly by the plugin (``plr/plugin.py``, ``plr/tunables.py``,
+    ``plr/daemon_keys.py``) and autosaved options are exempt anyway
+    (klippy/configfile.py:426-427), while the other sections enumerated
+    here belong to klippy's own modules, which claim them themselves."""
     sections = {}
     for wrapper in config.get_prefix_sections("stepper_z"):
         name = wrapper.get_name()
@@ -248,7 +267,13 @@ def _config_to_sections(config):
 
 
 def _section_options(wrapper):
-    return {option: wrapper.get(option) for option in wrapper.get_prefix_options("")}
+    # note_valid=False: a hash input is not a claim on the option, and must
+    # not overwrite the typed value in configfile.settings.  See
+    # _config_to_sections' docstring.
+    return {
+        option: wrapper.get(option, note_valid=False)
+        for option in wrapper.get_prefix_options("")
+    }
 
 
 def fingerprint_from_config(config, group):
