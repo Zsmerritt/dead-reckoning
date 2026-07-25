@@ -1650,9 +1650,12 @@ mod tests {
             e_file: None,
             file_window: window,
             extension: None,
-            // `..Default::default()` (every flag clear) so that adding a
-            // degradation flag upstream cannot break this fixture; the
-            // fields this test actually cares about stay explicit.
+            // `..Degradation::default()` (every flag clear) so that adding
+            // a degradation flag upstream cannot break this fixture. The
+            // two fields kept explicit are not read by `stop_evidence`;
+            // they are spelled out because they define the "healthy set"
+            // baseline these tests start from, and a reader should not
+            // have to know `Degradation::default()` to see it.
             degradation: Degradation {
                 confidence: Confidence::PerLine,
                 observation_gap: false,

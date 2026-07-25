@@ -50,12 +50,25 @@ pub struct ReconstructConfig {
     /// Forward-simulation horizon, seconds of simulated motion beyond
     /// the committed boundary. The unreceived tail after power loss is
     /// at most ~0.5 s of dump batching plus ~1 s of trapq planning
-    /// ahead; 2 s covers it with margin. The effective horizon passed to
-    /// the simulator is `extension_horizon + max(0, t_b - t_anchor)` so
-    /// a stale context still simulates through the committed span.
-    /// Because [`plr_gcode::simulate`]'s per-line time accounting is a
-    /// documented *lower bound* on real durations, the horizon covers at
-    /// least this much real machine time.
+    /// ahead; 2 s covers it with margin.
+    ///
+    /// The effective horizon passed to the simulator is
+    /// `extension_horizon + max(0, wal_eval_end - t_ext_start)`, where
+    /// `t_ext_start` is the print time at which the machine *begins
+    /// executing* the extension's first line — not the anchor snapshot's
+    /// capture time, which can postdate it by seconds when the g-code
+    /// reader stalls on a long move (see
+    /// [`crate::stopset::extension_start_time`]). The catch-up term
+    /// makes a stale or stalled context still simulate through the
+    /// committed span.
+    ///
+    /// [`plr_gcode::simulate`]'s per-line time accounting is a documented
+    /// *lower bound* on real durations except for the first move, whose
+    /// duration it can overestimate by up to one acceleration ramp
+    /// (~0.1 s at Klipper-typical limits) because the window starts from
+    /// zero velocity. Raising this value buys margin over that ramp;
+    /// lowering it below ~0.5 s makes the ramp a significant fraction of
+    /// the horizon.
     pub extension_horizon: f64,
     /// Kinematic limits and line budget for the forward simulation. The
     /// `max_duration` field is overridden by the computed horizon; the

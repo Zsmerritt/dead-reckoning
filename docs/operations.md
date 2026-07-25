@@ -160,6 +160,14 @@ This is the possible-stop set:
   - `observation_gap: true` — a subscription gap or socket loss overlaps
     the window (disk stall, Klipper restart); WAL candidates inside it may
     be missing and containment leans on the extension.
+  - `extension_start_unanchored: true` — no durable trapq row precedes the
+    anchor context, so the extension's horizon was anchored on the
+    reader-lead bound (`t_a` minus `max_processing_lead`) instead of on
+    measured motion. **Coverage is preserved** — this is not a reason to
+    distrust the set or to refuse a resume; it is normal for a stop early in
+    a print, before the first motion rows became durable. Treat it as a
+    prompt to sanity-check `max_processing_lead` against the machine if the
+    reported window looks implausibly narrow.
   - `confidence: PerLayer` — match only at layer granularity; automatic
     resume would be refused (`MatchTooCoarse`), manual recovery indicated.
 
