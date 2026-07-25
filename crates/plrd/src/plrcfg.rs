@@ -78,6 +78,63 @@ pub const LIVE_CONFIG_HASH: &str = "live:[plr]";
 /// The name of the primary MCU in Klipper (`[mcu]`).
 const PRIMARY_MCU: &str = "mcu";
 
+/// The prefix the plugin's `PLR_NOISE_TEST` autosaves the whole
+/// noise-floor calibration group under (`klippy_plugin/plr/noise_test.py`).
+/// Parsing sweeps by prefix rather than by name because the concrete
+/// measurement names are the plugin's to choose — see
+/// [`NOISE_FLOOR_METADATA_KEYS`] for the one thing the sweep must know.
+const NOISE_FLOOR_PREFIX: &str = "noise_floor_";
+
+/// Drag speed the noise floor was measured at, mm/s — METADATA.
+const NOISE_FLOOR_SPEED: &str = "noise_floor_speed";
+
+/// Nozzle/chamber temperature the noise floor was measured at, °C —
+/// METADATA.
+const NOISE_FLOOR_TEMP: &str = "noise_floor_temp";
+
+/// Name of the klippy sensor object the temperature covariate reads —
+/// METADATA, and a STRING.
+const NOISE_FLOOR_TEMP_SENSOR: &str = "noise_floor_temp_sensor";
+
+/// The `noise_floor_*` options that describe a noise-floor calibration
+/// rather than *being* one.
+///
+/// **This is the one place a `noise_floor_*` key gets classified.** Every
+/// other option carrying the [`NOISE_FLOOR_PREFIX`] is treated as a
+/// MEASUREMENT: swept by prefix, required to be a number, and entered into
+/// [`PlrSettings::noise_floor`] — where a non-empty map is precisely what
+/// "this machine has a calibrated noise floor" means
+/// ([`PlrSettings::representative_noise_floor`]). Adding a
+/// `noise_floor_*` key on the plugin side therefore needs exactly one
+/// decision here, and getting it wrong breaks in one of two ways that both
+/// showed up in the plugin audit:
+///
+/// * **Metadata swept in as a measurement** makes an UNCALIBRATED machine
+///   look calibrated. `noise_floor_temp` is only the temperature the
+///   baseline was captured at (staged by `PLR_NOISE_TEST` only when
+///   `noise_floor_temp_sensor` is configured), so a machine carrying it
+///   alone had "a noise floor" that was really a thermometer reading —
+///   and the `NoiseFloorMissing` refusal that would have told the
+///   operator to run `PLR_NOISE_TEST` never fired.
+/// * **A non-numeric option swept in at all** refuses the whole `[plr]`
+///   section. `noise_floor_temp_sensor` is a klippy sensor *name*
+///   (`config.get`, `klippy_plugin/plr/plugin.py`), so the sweep's
+///   `as_f64` demand made a DOCUMENTED, operator-facing key
+///   (`klippy_plugin/README.md`, `docs/install.md`) fail parsing with
+///   `[plr] noise_floor_temp_sensor is not a number` — costing the
+///   operator recovery entirely for configuring the temperature
+///   covariate.
+///
+/// Classification, not typing, is the guard: a plausible temperature
+/// (40 °C) is a perfectly valid noise-floor *number*, so no range check
+/// downstream could have caught the first case. The metadata plrd itself
+/// consumes is read by name afterwards ([`NOISE_FLOOR_SPEED`]); the rest
+/// belongs to the plugin's drag oracle
+/// (`klippy_plugin/plr/drag_probe.py`) and plrd only needs to not choke
+/// on it.
+const NOISE_FLOOR_METADATA_KEYS: [&str; 3] =
+    [NOISE_FLOOR_SPEED, NOISE_FLOOR_TEMP, NOISE_FLOOR_TEMP_SENSOR];
+
 /// The typed `[plr]` section, parsed from `configfile.settings.plr`.
 ///
 /// `probe_method` is required; every other key falls back to the same
@@ -194,14 +251,23 @@ pub struct PlrSettings {
     /// Every autosaved `noise_floor_*` **measurement** (the plugin's
     /// `PLR_NOISE_TEST` writes `noise_floor_rms` /
     /// `noise_floor_still_rms` / `noise_floor_peak`). Non-empty means
-    /// the noise floor is calibrated. `noise_floor_speed` is metadata,
-    /// not a measurement, and is carried separately — it must never
-    /// make an uncalibrated machine look calibrated.
+    /// the noise floor is calibrated.
+    ///
+    /// The `noise_floor_*` options that are metadata *about* the
+    /// measurements — [`NOISE_FLOOR_METADATA_KEYS`] — are excluded by
+    /// name and never appear here: metadata must never make an
+    /// uncalibrated machine look calibrated.
     pub noise_floor: BTreeMap<String, f64>,
     /// OPTIONAL: drag speed the noise floor was measured at, mm/s
-    /// (`noise_floor_speed`, staged by the plugin's `PLR_NOISE_TEST`;
-    /// absent — a calibration from before the key existed — means no
-    /// speed check, tolerant back-compat).
+    /// ([`NOISE_FLOOR_SPEED`] — metadata, staged by the plugin's
+    /// `PLR_NOISE_TEST`; absent — a calibration from before the key
+    /// existed — means no speed check, tolerant back-compat).
+    ///
+    /// The other two metadata keys are not mirrored into a field because
+    /// plrd consumes neither: `noise_floor_temp` /
+    /// `noise_floor_temp_sensor` feed the plugin's own drag oracle
+    /// (`klippy_plugin/plr/drag_probe.py`), which applies the
+    /// temperature covariate on the Klipper side.
     pub noise_floor_speed: Option<f64>,
     /// Per-group calibration fingerprint stamp for the noise-floor group
     /// (`cal_fingerprint_noise_floor`, staged by `PLR_NOISE_TEST` /
@@ -226,6 +292,26 @@ fn opt_f64(section: &Map<String, Value>, key: &str, default: f64) -> Result<f64,
         None => Ok(default),
         Some(v) => v
             .as_f64()
+            .ok_or_else(|| format!("[plr] {key} is not a number: {v}")),
+    }
+}
+
+/// Reads an OPTIONAL number STRICTLY: absent is `None`, wrong-typed is a
+/// hard error.
+///
+/// The strict direction is right for a calibration value plrd actually
+/// CONSUMES (`noise_floor_speed` feeds the speed-mismatch warning): a
+/// value plrd cannot read faithfully must refuse, never be silently
+/// dropped as if the calibration had never recorded it. It cannot fire on
+/// a booting printer anyway — the plugin parses the same option with
+/// `getfloat` (`klippy_plugin/plr/plugin.py`), so a non-numeric value
+/// never leaves klippy.
+fn strict_number(section: &Map<String, Value>, key: &str) -> Result<Option<f64>, String> {
+    match section.get(key) {
+        None => Ok(None),
+        Some(v) => v
+            .as_f64()
+            .map(Some)
             .ok_or_else(|| format!("[plr] {key} is not a number: {v}")),
     }
 }
@@ -256,30 +342,31 @@ fn opt_opt_f64(section: &Map<String, Value>, key: &str) -> Option<f64> {
 
 /// Reads an `UNSAFE_`-prefixed boolean, tolerating either case.
 ///
-/// # KNOWN GAP: this key does not reach plrd yet
-///
-/// `configfile.settings` only carries options a klippy module actually
-/// **accessed** while loading the config
-/// (`ConfigValidate._build_status_settings` builds it from the
-/// access-tracking map — see the module docs). The Klipper plugin does
-/// not read this option, so it never appears here at all; and worse,
-/// klippy's own `check_unused` REFUSES TO START for a config carrying an
-/// option no module claimed. An operator who follows the documentation
-/// and sets `UNSAFE_allow_purge_z_below_bed` currently gets a printer
-/// that will not boot, not an escape hatch.
-///
-/// That is a plugin-side defect affecting this key and roughly sixteen
-/// pre-existing `[plr]` keys, and it is being fixed separately: the
-/// plugin must declare every option plrd consumes. This function is
-/// correct for the moment it does — nothing here needs to change then.
-///
-/// # Why both spellings are accepted
+/// # Why both spellings are accepted — and why the lowercase one is what
+/// actually arrives
 ///
 /// The documented spelling is `UNSAFE_allow_purge_z_below_bed`, because
-/// the screaming prefix is the whole point of the naming. Klipper
-/// lowercases option names, so once the plugin declares the option it
-/// will arrive lowercased. Accepting both means the documented spelling
-/// keeps working whichever way the plugin ends up declaring it.
+/// the screaming prefix is the whole point of the naming. What reaches
+/// plrd is `unsafe_allow_purge_z_below_bed`, whatever the operator typed:
+/// klippy parses printer.cfg with a `configparser.RawConfigParser` and
+/// does NOT override `optionxform` (`klippy/configfile.py:170-176`), so
+/// option names are LOWERCASED on read; and `access_tracking` — the map
+/// `configfile.settings` is built from — is keyed lowercased regardless
+/// (`klippy/configfile.py:34,47`).
+/// The lowercase fallback below is therefore not belt-and-braces, it is
+/// the branch that carries every real machine; the exact-case lookup is
+/// the belt. Pinned from the Klipper side by
+/// `klippy_plugin/tests/test_daemon_keys.py::
+/// test_unsafe_override_reaches_the_daemon_in_any_casing`, which asserts
+/// the documented, lowercase, and mangled-case spellings all land as the
+/// same lowercase option.
+///
+/// The plugin declares this key (like every other option plrd consumes),
+/// so a `[plr]` section that sets it boots and the value arrives:
+/// klippy's `check_unused` refuses to start only for an option NO module
+/// claimed, and that whole class of gap is now guarded on the plugin side
+/// by `test_klippy_accepts_every_key_plrd_consumes`, which derives its
+/// expected key set from this very file.
 ///
 /// Tolerant like the other FROZEN keys: absent OR wrong-typed is
 /// `false`. That direction is deliberate — a malformed override must
@@ -319,24 +406,27 @@ impl PlrSettings {
                 "[plr] probe_method {probe_method:?} is not tap, load_cell, or adxl_drag"
             ));
         }
+        // Sweep the noise-floor MEASUREMENTS by prefix, skipping exactly
+        // the keys classified as metadata (NOISE_FLOOR_METADATA_KEYS —
+        // read there for why both halves of this matter). Anything else
+        // carrying the prefix is a measurement and must be a number: an
+        // unreadable measurement cannot be quietly dropped, because a
+        // machine whose only remaining measurement was dropped would then
+        // look uncalibrated in a way no message explains.
         let mut noise_floor = BTreeMap::new();
-        let mut noise_floor_speed = None;
         for (key, value) in plr {
-            if let Some(_suffix) = key.strip_prefix("noise_floor_") {
-                let number = value
-                    .as_f64()
-                    .ok_or_else(|| format!("[plr] {key} is not a number: {value}"))?;
-                // The calibration speed is metadata about the
-                // measurements, not a measurement: keep it out of the
-                // calibrated-floor map (an uncalibrated machine with
-                // only a speed recorded must still refuse drag).
-                if key == "noise_floor_speed" {
-                    noise_floor_speed = Some(number);
-                } else {
-                    noise_floor.insert(key.clone(), number);
-                }
+            if !key.starts_with(NOISE_FLOOR_PREFIX)
+                || NOISE_FLOOR_METADATA_KEYS.contains(&key.as_str())
+            {
+                continue;
             }
+            let number = value
+                .as_f64()
+                .ok_or_else(|| format!("[plr] {key} is not a number: {value}"))?;
+            noise_floor.insert(key.clone(), number);
         }
+        // The one metadata key plrd consumes, read by name.
+        let noise_floor_speed = strict_number(plr, NOISE_FLOOR_SPEED)?;
         let probe_resolution = match plr.get("probe_resolution") {
             None => None,
             Some(v) => Some(
@@ -428,6 +518,10 @@ impl PlrSettings {
     /// else the first `noise_floor_*` key in sorted order. The exact
     /// key set firms up with the plugin's `PLR_NOISE_TEST`; validation
     /// only needs "calibrated, finite, positive".
+    ///
+    /// That "first key in sorted order" fallback is why
+    /// [`NOISE_FLOOR_METADATA_KEYS`] has to be exact: any metadata that
+    /// reached the map could be handed out here as the noise floor.
     #[must_use]
     pub fn representative_noise_floor(&self) -> Option<f64> {
         self.noise_floor
@@ -1561,6 +1655,115 @@ pub(crate) mod tests {
         assert!(rejection
             .failures
             .contains(&PrereqFailure::NoiseFloorMissing));
+    }
+
+    /// The temperature covariate must not cost the operator recovery.
+    ///
+    /// `noise_floor_temp_sensor` is a klippy sensor NAME (a string) and is
+    /// documented for operators (`klippy_plugin/README.md`,
+    /// `docs/install.md`). Before [`super::NOISE_FLOOR_METADATA_KEYS`]
+    /// existed, the `noise_floor_*` prefix sweep demanded a number from it
+    /// and the whole `[plr]` section failed to parse with
+    /// `[plr] noise_floor_temp_sensor is not a number: "temperature_sensor
+    /// chamber"` — i.e. configuring a documented feature disabled recovery
+    /// entirely.
+    #[test]
+    fn temp_sensor_metadata_parses_alongside_real_measurements() {
+        let (snapshot, plr) = parse_fixture(&[
+            ("probe_method", json!("adxl_drag")),
+            ("accel_chip", json!("adxl345")),
+            ("noise_floor_rms", json!(118.0)),
+            ("noise_floor_still_rms", json!(31.0)),
+            ("noise_floor_speed", json!(20.0)),
+            ("noise_floor_temp", json!(40.0)),
+            (
+                "noise_floor_temp_sensor",
+                json!("temperature_sensor chamber"),
+            ),
+        ]);
+        // Only the measurements are in the calibrated-floor map.
+        assert_eq!(
+            plr.noise_floor.keys().collect::<Vec<_>>(),
+            vec!["noise_floor_rms", "noise_floor_still_rms"]
+        );
+        assert_eq!(plr.representative_noise_floor(), Some(118.0));
+        assert_eq!(plr.noise_floor_speed, Some(20.0));
+        // ... and the machine is fully calibrated, temperature covariate
+        // and all.
+        let (machine, notes) =
+            machine_from_settings(&snapshot.settings, &snapshot.config, &plr, true);
+        assert_eq!(machine.noise_floor, Some(118.0));
+        assert_eq!(machine.noise_floor_speed, Some(20.0));
+        assert!(validate_machine(&machine).is_ok(), "{notes:?}");
+    }
+
+    /// A recorded TEMPERATURE is not a noise floor.
+    ///
+    /// `PLR_NOISE_TEST` stages `noise_floor_temp` only as the temperature
+    /// the baseline was captured at. A machine carrying it alone has never
+    /// measured a floor, so it must fall through to the same
+    /// `NoiseFloorMissing` refusal an untouched machine gets — not present
+    /// 40 °C as a calibration. Nothing downstream could catch this: 40.0
+    /// is a perfectly valid noise-floor number.
+    #[test]
+    fn temperature_only_is_not_a_calibrated_noise_floor() {
+        let (snapshot, plr) = parse_fixture(&[
+            ("probe_method", json!("adxl_drag")),
+            ("accel_chip", json!("adxl345")),
+            ("noise_floor_temp", json!(40.0)),
+            ("noise_floor_temp_sensor", json!("extruder")),
+        ]);
+        assert!(plr.noise_floor.is_empty());
+        assert_eq!(plr.representative_noise_floor(), None);
+        let (machine, _) = machine_from_settings(&snapshot.settings, &snapshot.config, &plr, true);
+        assert_eq!(machine.noise_floor, None);
+        let rejection = validate_machine(&machine).unwrap_err();
+        assert_eq!(
+            rejection.failures,
+            vec![PrereqFailure::NoiseFloorMissing],
+            "temperature-only must read as uncalibrated"
+        );
+        assert!(
+            rejection.failures[0]
+                .to_string()
+                .contains("run PLR_NOISE_TEST first"),
+            "{}",
+            rejection.failures[0]
+        );
+    }
+
+    /// The sweep still types every UNCLASSIFIED `noise_floor_*` key: a
+    /// measurement plrd cannot read is a hard error, metadata or not.
+    #[test]
+    fn a_non_numeric_measurement_still_refuses_the_section() {
+        for (key, value) in [
+            ("noise_floor_rms", json!("loud")),
+            // A key the plugin has not written yet: unclassified means
+            // measurement, so it is typed like one.
+            ("noise_floor_p95", json!("loud")),
+        ] {
+            let result = query_result(
+                configfile_status(&[("probe_method", json!("adxl_drag")), (key, value)]),
+                plr_object(),
+            );
+            let snapshot = KlippySnapshot::from_query_result(&result).unwrap();
+            let err = PlrSettings::parse(snapshot.plr_section().unwrap()).unwrap_err();
+            assert_eq!(err, format!("[plr] {key} is not a number: \"loud\""));
+        }
+    }
+
+    /// Every classified key must actually be reachable by the sweep it is
+    /// meant to exempt: an entry without the prefix would be a silent
+    /// no-op, and the key it names would go back to being swept as a
+    /// measurement.
+    #[test]
+    fn every_metadata_key_carries_the_noise_floor_prefix() {
+        for key in super::NOISE_FLOOR_METADATA_KEYS {
+            assert!(
+                key.starts_with(super::NOISE_FLOOR_PREFIX),
+                "{key} cannot be exempted from a sweep it never reaches"
+            );
+        }
     }
 
     #[test]
