@@ -844,7 +844,7 @@ pub(crate) mod e2e_tests {
     use crate::config::{Config, MachineSection, MachineZStepper};
     use plr_wal::{
         Context, FanTarget, GcodeState, Heartbeat, HeaterTarget, SegmentHeader,
-        TransformObservations, VirtualSdState, WalRecord, WalWriter,
+        TransformObservations, TrapqSegment, VirtualSdState, WalRecord, WalWriter,
     };
     use std::path::PathBuf;
 
@@ -1171,6 +1171,38 @@ G1 X60 Y60 E0.02
         }
     }
 
+    /// One durable trapq row for the motion that precedes the crash
+    /// context's processing frontier, ending exactly at the heartbeat's
+    /// print time.
+    ///
+    /// Realism, and load-bearing: a production WAL is mostly trapq rows —
+    /// Klipper journals one per planned move — so a scan that carries a
+    /// mid-file `Context` but *no* motion row cannot occur. Without a row
+    /// journaled before the anchor context, `plr-reconstruct` cannot
+    /// place the frontier on the print-time axis from motion evidence and
+    /// falls back to the reader-lead bound (`t_a` minus
+    /// `max_processing_lead`), which correctly assumes execution may lag
+    /// the frontier by seconds and so widens the extension horizon — and
+    /// with it the offset candidate window, past what the matcher can
+    /// resolve per line. With this row the fixture exercises the anchored
+    /// path production actually takes.
+    fn preceding_motion() -> TrapqSegment {
+        TrapqSegment {
+            mono_ns: 4_500_000_000,
+            queue: "toolhead".to_owned(),
+            print_time: 9.5,
+            duration: 0.5,
+            start_velocity: 20.0,
+            acceleration: 0.0,
+            start_x: 20.0,
+            start_y: 30.0,
+            start_z: 0.2,
+            x_r: 1.0,
+            y_r: 0.0,
+            z_r: 0.0,
+        }
+    }
+
     /// Builds a WAL dir + print file + config primed to reach a plan.
     pub(crate) fn fixture(tag: &str) -> (PathBuf, Config) {
         let dir = temp_dir(tag);
@@ -1178,6 +1210,9 @@ G1 X60 Y60 E0.02
         std::fs::write(&gcode_path, MODEL_TEXT.as_bytes()).unwrap();
         let mut writer = WalWriter::create(Vec::new(), &SegmentHeader::new(1, 1)).unwrap();
         writer.append(&WalRecord::Heartbeat(heartbeat())).unwrap();
+        writer
+            .append(&WalRecord::TrapqSegment(preceding_motion()))
+            .unwrap();
         // An early context (before any deposition) anchors the layer
         // model so it covers layer 0 — contact selection probes layer
         // N−1, which must exist in the modeled window.
