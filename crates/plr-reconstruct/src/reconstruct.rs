@@ -150,6 +150,17 @@ pub fn reconstruct(
 /// For a superseded epoch a later boot overwrote the file, so the
 /// timestamp must fall strictly within the epoch's observed span.
 /// With no epoch (empty scan) nothing is admitted.
+///
+/// This is a `mono_ns`-interval test, not a proof of epoch *identity*:
+/// `CLOCK_MONOTONIC` resets each boot, so a *different* boot whose uptime
+/// happens to land inside the crash epoch's span would also pass. That is
+/// only reachable for a superseded epoch (a later boot ran at least as
+/// long as the crash boot had by the crash) and merely re-admits a
+/// heartbeat/receive-seq reading close in uptime — the interval bounds it
+/// near the crash epoch either way. Closing it fully would require
+/// threading a per-segment epoch identity (e.g. `created_wall_ns`) into
+/// the sidecars, which the WAL format does not carry; documented here
+/// rather than papered over.
 fn epoch_admits(epoch: Option<&EpochSpan>, is_newest: bool, mono_ns: u64) -> bool {
     match epoch {
         Some(e) if is_newest => mono_ns >= e.min_mono_ns,
@@ -312,32 +323,6 @@ mod tests {
     }
 
     #[test]
-    fn firmware_restart_backstop_isolates_without_a_marker() {
-        // A torn SocketLost: only the print_time collapse survives, mono
-        // continuous. The print-time backstop must still isolate.
-        let mut records = vec![
-            WalRecord::Heartbeat(heartbeat_at(10 * S, 60_000.0)),
-            WalRecord::Context(context_at(10 * S, 25_000)),
-            WalRecord::TrapqSegment(trapq_segment("toolhead", 60_000.0, 0.5, 10 * S)),
-            WalRecord::StepperRange(stepper_range("stepper_z", 60_000.0, 10 * S)),
-        ];
-        for r in crash_epoch_records() {
-            records.push(shift_mono(r, 100 * S));
-        }
-        let full = scan_of(records);
-        let got = recover(&full);
-        assert!(got.window.t_b < 100.0, "t_b poisoned: {}", got.window.t_b);
-        assert!(got.stop_set.degradation.cross_epoch_evidence_discarded);
-        assert!(matches!(
-            select_crash_epoch(&full)
-                .crash_epoch()
-                .unwrap()
-                .boundary_before,
-            Some(EpochBoundaryKind::PrintTimeReset { .. })
-        ));
-    }
-
-    #[test]
     fn out_of_epoch_heartbeat_file_cannot_set_t_a() {
         // A post-crash idle boot rewrote the heartbeat file, so its newest
         // sample belongs to a LATER epoch. It must not become t_a for the
@@ -381,22 +366,33 @@ mod tests {
         );
     }
 
-    /// HAZARD PIN: a firmware restart whose `SocketLost` marker was torn
-    /// away AND that happened within the first
-    /// [`crate::epoch::PRINT_TIME_RESET_MIN_REGRESSION_S`] seconds of the
-    /// pre-restart session is NOT partitioned — the `print_time` regression
-    /// is below the backstop threshold. The residual poison is bounded by
-    /// that threshold (a few seconds), well inside the extension horizon.
-    /// Closing this hole means lowering the threshold (accepting more
-    /// false splits); if you do, INVERT this assertion.
+    /// HAZARD PIN: a same-boot firmware restart with NO `SocketLost`
+    /// marker (mono continuous, `print_time` reset to ~0) is NOT
+    /// partitioned on the print-time axis — there is no print-time
+    /// delimiter at all. This is the deliberate cost of deleting the
+    /// print-time backstop (which had zero true positives and false-fired
+    /// on the reference capture; see `crate::epoch` docs).
+    ///
+    /// Why it is safe rather than merely bounded: `SocketLost` rides the
+    /// marker path, which is never dropped under WAL backpressure (unlike
+    /// `Context` records — the reason `ExclusionUpdateLost` exists). The
+    /// only way it is absent for a real restart is a torn tail AT the
+    /// marker, and a torn tail can only be the newest segment's (rotation
+    /// fsyncs before opening a successor). No durable record can follow
+    /// the tear, so there is no post-restart session to isolate — the log
+    /// ends in the pre-restart session, already the newest epoch. This
+    /// synthetic input (records continuing past a marker-less reset) is a
+    /// shape the writer cannot produce; it is pinned so that if a future
+    /// print-time delimiter is added, this assertion must be INVERTED and
+    /// the argument above re-examined.
     #[test]
-    fn hazard_marker_less_restart_under_threshold_is_not_partitioned() {
+    fn hazard_marker_less_restart_is_not_partitioned() {
         let mut records = vec![
-            // Pre-restart session only 3 s in (below the 5 s backstop).
-            WalRecord::Heartbeat(heartbeat_at(10 * S, 3.0)),
-            WalRecord::TrapqSegment(trapq_segment("toolhead", 3.0, 0.2, 10 * S)),
+            WalRecord::Heartbeat(heartbeat_at(10 * S, 60_000.0)),
+            WalRecord::TrapqSegment(trapq_segment("toolhead", 60_000.0, 0.2, 10 * S)),
+            WalRecord::Context(context_at(10 * S, 25_000)),
         ];
-        // Restart resets print_time to ~0, no marker, mono continuous.
+        // Restart resets print_time to ~0, NO marker, mono continuous.
         records.push(WalRecord::Heartbeat(heartbeat_at(11 * S, 0.1)));
         records.push(WalRecord::Context(context_at(11 * S, 100)));
         records.push(WalRecord::TrapqSegment(trapq_segment(
@@ -408,7 +404,7 @@ mod tests {
         let got = recover(&scan_of(records));
         assert!(
             !got.stop_set.degradation.cross_epoch_evidence_discarded,
-            "a sub-threshold marker-less restart is a known, bounded residual"
+            "a marker-less restart has no print-time delimiter (see doc)"
         );
     }
 

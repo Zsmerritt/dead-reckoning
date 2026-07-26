@@ -402,12 +402,6 @@ fn report_epochs(w: &mut Report<'_>, merged: &RecoveryScan) {
             EpochBoundaryKind::FirmwareRestart {
                 socket_lost_mono_ns,
             } => format!("firmware restart (SocketLost at mono {socket_lost_mono_ns} ns)"),
-            EpochBoundaryKind::PrintTimeReset {
-                last_print_time,
-                next_print_time,
-            } => format!(
-                "firmware restart, no marker (print_time {last_print_time:.3} -> {next_print_time:.3} s)"
-            ),
         };
         w.line(&format!("  epoch boundary: {desc}"));
     }

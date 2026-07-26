@@ -35,37 +35,65 @@
 //! row at `print_time ≈ 104,492 s` set `wal_eval_end`) over a bed-sized
 //! XY region.
 //!
-//! # The delimiters (and which is authoritative)
+//! # The delimiters
 //!
-//! | Boundary | Primary signal | Backstop |
-//! |----------|----------------|----------|
-//! | Reboot   | a **new segment** (frame offset restarts low in the merged stream) whose `mono_ns` regressed ≥ [`REBOOT_MONO_REGRESSION_NS`] | — (a reboot journals no marker: the daemon died, and the next process starts with `lost_after_subscribe == false`, so no `Resubscribed` either — `plrd::client::run_client`) |
-//! | Firmware restart | [`MarkerKind::SocketLost`] marker (`plrd::client::run_client` journals it with `SyncPolicy` immediate, then `reset_session`) | `print_time` regression ≥ [`PRINT_TIME_RESET_MIN_REGRESSION_S`] in a motion/heartbeat row (catches a torn or lost marker) |
+//! | Boundary | Signal |
+//! |----------|--------|
+//! | Reboot | a **new segment** (frame offset restarts low in the merged stream) whose `mono_ns` regressed ≥ [`REBOOT_MONO_REGRESSION_NS`] |
+//! | Firmware restart | a [`MarkerKind::SocketLost`] marker (`plrd::client::run_client` journals it immediate-sync, then `reset_session`) |
 //!
 //! A reboot always opens a fresh WAL segment (a new process), so in the
 //! merged record stream it coincides with the per-segment frame offset
 //! restarting low. Gating the reboot test on that offset regression means
 //! it can only fire at a real segment boundary — never on a within-segment
 //! `mono_ns` step, which the writer never produces in append order but a
-//! hand-built record stream can. Firmware-restart delimiters, by
-//! contrast, are intra-segment and do not consult the offset.
+//! hand-built record stream can. The firmware-restart delimiter is
+//! intra-segment and does not consult the offset.
 //!
-//! The `SocketLost` marker is the reliable firmware-restart delimiter
-//! because it is produced by exactly the code path that resets the
-//! print-time axis and is journaled durably before any post-restart
-//! record. The `print_time`-regression backstop exists only for the case
-//! where that marker was itself lost to a torn tail.
+//! ## Why there is no print-time "backstop" — and what that costs
+//!
+//! An earlier revision added a second firmware-restart signal: a
+//! `print_time` regression, meant to catch a `SocketLost` marker lost to
+//! a torn tail. It was **deleted** because it cannot be specified safely
+//! and buys nothing:
+//!
+//! * **It has no sound threshold.** The obvious "reset" quantity to test
+//!   is the newest heartbeat's `print_time`, but that field is
+//!   `latest_print_time` — a running *max* that folds in
+//!   `toolhead.print_time`, the *planning* frontier
+//!   (`plrd::convert` on the status path; [`crate::window`] documents it
+//!   as planned-ahead). When Klipper plans through a dwell the frontier
+//!   jumps several seconds and the batched trapq rows that fill the gap
+//!   arrive *afterwards*, starting at pre-jump times. Comparing that
+//!   running max against a lagging row is a structurally unbounded
+//!   cross-source "regression" that no constant threshold survives: on
+//!   the reference capture it false-fired eight times, every time
+//!   re-exceeding the old max on the very next row, with zero true
+//!   positives.
+//! * **A lost marker coincides with the crash anyway.** `SocketLost` is
+//!   written through the marker path, which — unlike droppable `Context`
+//!   records under WAL backpressure — is **never dropped** (that
+//!   asymmetry is the whole reason [`MarkerKind::ExclusionUpdateLost`]
+//!   exists). The only way a real restart's `SocketLost` is absent is a
+//!   torn tail *at* that marker; and a torn tail can only be the **newest
+//!   segment's** (rotation fsyncs a segment before opening its
+//!   successor). Records cannot follow the tear, so there is no
+//!   post-restart session to isolate — the durable log simply ends in the
+//!   pre-restart session, which is already the newest epoch this module
+//!   selects. See the widened hazard pin in the tests.
 //!
 //! # The safety asymmetry
 //!
 //! A **missed** boundary poisons the window with another epoch's
 //! evidence — the bug this module fixes; the window inflates but with
-//! meaningless states the machine was never in during *this* crash. A
-//! **spurious** boundary (over-partition) merely drops genuine
-//! crash-epoch evidence from the head of the epoch, which widens the
-//! forward-simulated set — the safe direction. Every threshold here is
-//! therefore chosen to never miss a real boundary, accepting that it may
-//! occasionally split one session in two.
+//! meaningless states the machine was never in during *this* crash. With
+//! the backstop gone, both remaining delimiters fire only on hard,
+//! producer-guaranteed evidence (a real new segment with a real clock
+//! reset; a durable marker), so a **spurious** split cannot arise from
+//! reading normal within-session behaviour — the class of over-partition
+//! that could have dropped the *newest* crash evidence (a frontier-jump
+//! landing after the last context, making the tail a "newer
+//! non-printing" fragment) is removed at the source, not merely bounded.
 //!
 //! # What is selected
 //!
@@ -87,16 +115,6 @@ use plr_wal::{MarkerKind, RecoveryScan, ScanEnd, ScannedRecord, WalRecord};
 /// producer does not actually create; it never misses a reboot.
 pub const REBOOT_MONO_REGRESSION_NS: u64 = 1_000_000_000;
 
-/// A drop in `print_time` of at least this many seconds, with the host
-/// clock continuous and no delimiting `SocketLost` marker, is treated as
-/// a firmware restart whose marker was lost. A real restart resets
-/// `print_time` to ~0, a drop of the entire accumulated print time
-/// (many seconds at least). Ordinary within-session non-monotonicity is
-/// bounded by Klipper's lookahead reordering across the toolhead and
-/// extruder queues (sub-second); this threshold sits well above it so
-/// the backstop cannot fire on a single healthy session.
-pub const PRINT_TIME_RESET_MIN_REGRESSION_S: f64 = 5.0;
-
 /// Why two adjacent epochs are separated.
 #[derive(Debug, Clone, PartialEq)]
 pub enum EpochBoundaryKind {
@@ -114,15 +132,6 @@ pub enum EpochBoundaryKind {
     FirmwareRestart {
         /// `mono_ns` of the `SocketLost` marker.
         socket_lost_mono_ns: u64,
-    },
-    /// `print_time` regressed across motion/heartbeat rows with the host
-    /// clock continuous and no `SocketLost` marker: a firmware restart
-    /// whose delimiting marker was lost. Backstop delimiter.
-    PrintTimeReset {
-        /// Running maximum `print_time` of the epoch that ended.
-        last_print_time: f64,
-        /// `print_time` of the first record of the new epoch.
-        next_print_time: f64,
     },
 }
 
@@ -225,15 +234,22 @@ impl CrashEpochSelection {
             .collect()
     }
 
-    /// Builds the recovery scan narrowed to the crash epoch. When the
-    /// crash epoch is *not* the newest partition (a later epoch, e.g. a
-    /// post-crash boot, exists), the scan's tail metadata is reset to a
-    /// clean end: an epoch that a later epoch supersedes was durably
-    /// closed before the next one began (the same invariant
-    /// `plrd::scan` enforces — a non-newest segment must end cleanly),
-    /// so its crash is evidenced by the following reboot, not by a torn
-    /// tail. The newest partition keeps the original end (a genuine torn
-    /// tail is preserved).
+    /// Builds the recovery scan narrowed to the crash epoch.
+    ///
+    /// The merged scan's tail metadata (`end`, `truncation_offset`)
+    /// describes only the **newest** segment (`merge_scans` keeps the last
+    /// segment's and discards the rest), so when the crash epoch is *not*
+    /// the newest partition that metadata belongs to a *later* epoch and
+    /// cannot be attributed to the crash epoch. The crash epoch's own tail
+    /// state is not recoverable after the merge, so `end` is set to
+    /// `CleanEof` as a neutral placeholder. This is safe, not merely
+    /// convenient: whether the crash epoch's last segment ended torn or
+    /// clean is not load-bearing here — the crash is evidenced by the
+    /// succeeding epoch boundary (reboot/restart), and both tear states
+    /// map to the same [`crate::window::CrashClass::HostDeathOrPowerLoss`]
+    /// handling; `torn_tail` only annotates the report. The newest
+    /// partition keeps the original `end`, so a genuine power-loss torn
+    /// tail is preserved where it *is* the crash evidence.
     #[must_use]
     pub fn narrow(&self, scan: &RecoveryScan) -> RecoveryScan {
         let Some(i) = self.selected else {
@@ -254,29 +270,6 @@ impl CrashEpochSelection {
             },
         }
     }
-}
-
-/// The `print_time`-domain frontier value a record carries, if any, for
-/// the firmware-restart backstop.
-///
-/// Only the signals the producer maintains AS the print-time frontier
-/// count: trapq segment end times (each planned move) and heartbeat
-/// `print_time` (`plrd::convert`'s `latest_print_time`, which
-/// `reset_session` zeroes on a restart). Stepper `last_step_time`
-/// deliberately does **not** — a stepper dump reports already-committed
-/// steps and lags the frontier by the batching + step-generation delay,
-/// so treating a lagging dump as a print-time high-water would read
-/// ordinary lag as a reset. `Context::print_time` is not yet written by
-/// the producer but is consulted so the delimiter stays correct if it
-/// ever is.
-fn record_print_time(record: &WalRecord) -> Option<f64> {
-    let value = match record {
-        WalRecord::TrapqSegment(t) => t.end_time(),
-        WalRecord::Heartbeat(h) => h.print_time,
-        WalRecord::Context(c) => return c.print_time.filter(|v| v.is_finite()),
-        WalRecord::StepperRange(_) | WalRecord::Marker(_) => return None,
-    };
-    value.is_finite().then_some(value)
 }
 
 /// `true` when the record is a context that names a non-empty print
@@ -315,7 +308,6 @@ pub fn partition(records: &[ScannedRecord]) -> Vec<EpochSpan> {
     let mut has_motion = false;
     let mut min_mono = u64::MAX;
     let mut max_mono = 0u64;
-    let mut max_print_time = f64::NEG_INFINITY;
     // A `SocketLost` seen in the current epoch, pending the first record
     // of the next session that closes the epoch at that record.
     let mut pending_socket_lost: Option<u64> = None;
@@ -334,32 +326,24 @@ pub fn partition(records: &[ScannedRecord]) -> Vec<EpochSpan> {
     for (idx, scanned) in records.iter().enumerate() {
         let record = &scanned.record;
         let mono = record.mono_ns();
-        let pt = record_print_time(record);
         let new_segment = prev_offset.is_some_and(|prev| scanned.offset <= prev);
 
-        // Decide whether a NEW epoch begins at `idx`. Precedence: reboot
-        // (a hard clock reset at a segment boundary) first, then a pending
-        // socket-loss restart, then the print-time backstop. A reboot
-        // subsumes the other two: the new boot's session and print_time
-        // start fresh regardless.
+        // Decide whether a NEW epoch begins at `idx`. A reboot (a hard
+        // clock reset at a segment boundary) takes precedence over a
+        // pending socket-loss restart: the new boot's session starts
+        // fresh regardless. Both fire only on producer-guaranteed
+        // evidence — a real new segment with a real clock reset, or a
+        // durable marker.
         let boundary = if idx > start && new_segment && mono + REBOOT_MONO_REGRESSION_NS <= max_mono
         {
             Some(EpochBoundaryKind::HostReboot {
                 last_mono_ns: max_mono,
                 next_mono_ns: mono,
             })
-        } else if let Some(socket_lost_mono_ns) = pending_socket_lost {
-            Some(EpochBoundaryKind::FirmwareRestart {
+        } else {
+            pending_socket_lost.map(|socket_lost_mono_ns| EpochBoundaryKind::FirmwareRestart {
                 socket_lost_mono_ns,
             })
-        } else if let Some(pt) = pt {
-            (max_print_time.is_finite() && pt + PRINT_TIME_RESET_MIN_REGRESSION_S <= max_print_time)
-                .then_some(EpochBoundaryKind::PrintTimeReset {
-                    last_print_time: max_print_time,
-                    next_print_time: pt,
-                })
-        } else {
-            None
         };
 
         if let Some(kind) = boundary {
@@ -381,16 +365,12 @@ pub fn partition(records: &[ScannedRecord]) -> Vec<EpochSpan> {
             has_motion = false;
             min_mono = u64::MAX;
             max_mono = 0;
-            max_print_time = f64::NEG_INFINITY;
             pending_socket_lost = None;
         }
 
         // Fold the record into the current epoch.
         min_mono = min_mono.min(mono);
         max_mono = max_mono.max(mono);
-        if let Some(pt) = pt {
-            max_print_time = max_print_time.max(pt);
-        }
         printing |= is_printing_context(record);
         has_context |= matches!(record, WalRecord::Context(_));
         has_motion |= is_motion(record);
@@ -444,10 +424,7 @@ fn newest_by(epochs: &[EpochSpan], pred: impl Fn(&EpochSpan) -> bool) -> Option<
 mod tests {
     use plr_wal::{Marker, MarkerKind, RecoveryScan, ScanEnd, ScannedRecord, WalRecord};
 
-    use super::{
-        partition, select_crash_epoch, EpochBoundaryKind, PRINT_TIME_RESET_MIN_REGRESSION_S,
-        REBOOT_MONO_REGRESSION_NS,
-    };
+    use super::{partition, select_crash_epoch, EpochBoundaryKind, REBOOT_MONO_REGRESSION_NS};
     use crate::testutil::{
         context_at, heartbeat_at, scan_of_segments, stepper_range, trapq_segment,
     };
@@ -596,38 +573,30 @@ mod tests {
     }
 
     #[test]
-    fn firmware_restart_backstop_fires_without_a_marker() {
-        // A torn/lost SocketLost: only a print_time regression remains,
-        // the host clock is continuous. The backstop MUST still split.
-        let drop = PRINT_TIME_RESET_MIN_REGRESSION_S + 1.0;
+    fn a_planning_frontier_jump_declares_no_boundary() {
+        // The exact shape that made the deleted print-time backstop
+        // false-fire on the reference capture (probe: 2549.739 -> 2542.960,
+        // then re-exceed): Klipper plans through a dwell, so the heartbeat's
+        // latest_print_time (a running max folding in the toolhead PLANNING
+        // frontier) jumps far ahead; the batched trapq rows that fill the
+        // gap arrive AFTERWARDS, starting at pre-jump times, then the next
+        // row re-passes the old max. One session, one segment: the
+        // partition must see exactly ONE epoch.
         let sel = select_crash_epoch(&scan(vec![
-            WalRecord::Heartbeat(heartbeat_at(100 * S, 100.0)),
-            WalRecord::TrapqSegment(trapq_segment("toolhead", 100.0, 0.5, 100 * S)),
-            WalRecord::Context(context_at(100 * S, 25_000)),
-            // print_time collapses; mono keeps climbing; no marker.
-            WalRecord::TrapqSegment(trapq_segment("toolhead", 100.0 - drop, 0.5, 110 * S)),
-            WalRecord::Context(context_at(110 * S, 200)),
+            WalRecord::TrapqSegment(trapq_segment("toolhead", 2549.7, 0.04, 100 * S)),
+            // Heartbeat carries the jumped planning frontier.
+            WalRecord::Heartbeat(heartbeat_at(101 * S, 2549.739)),
+            // Batched rows fill the planned gap, starting BEFORE the jump.
+            WalRecord::TrapqSegment(trapq_segment("toolhead", 2542.940, 0.02, 102 * S)),
+            WalRecord::TrapqSegment(trapq_segment("toolhead", 2542.960, 7.84, 102 * S)),
+            WalRecord::Context(context_at(102 * S, 200)),
         ]));
-        assert_eq!(sel.epochs.len(), 2);
-        assert_eq!(sel.selected, Some(1));
-        assert!(matches!(
-            sel.epochs[1].boundary_before,
-            Some(EpochBoundaryKind::PrintTimeReset { .. })
-        ));
-    }
-
-    #[test]
-    fn a_healthy_session_reordering_does_not_false_split() {
-        // Sub-threshold print_time non-monotonicity (queue interleaving)
-        // must NOT be read as a restart.
-        let jitter = PRINT_TIME_RESET_MIN_REGRESSION_S - 1.0;
-        let sel = select_crash_epoch(&scan(vec![
-            WalRecord::Heartbeat(heartbeat_at(100 * S, 100.0)),
-            WalRecord::TrapqSegment(trapq_segment("toolhead", 100.0, 0.5, 100 * S)),
-            WalRecord::TrapqSegment(trapq_segment("extruder", 100.0 - jitter, 0.5, 101 * S)),
-            WalRecord::Context(context_at(101 * S, 200)),
-        ]));
-        assert_eq!(sel.epochs.len(), 1, "queue jitter must not split");
+        assert_eq!(
+            sel.epochs.len(),
+            1,
+            "a planning-frontier jump is not a restart"
+        );
+        assert!(!sel.partitioned());
     }
 
     #[test]
