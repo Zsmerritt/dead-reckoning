@@ -99,6 +99,23 @@ pub enum IngestNote {
         /// Host-monotonic time of the graceful stop (ns).
         mono_ns: u64,
     },
+    /// The recorder declared it was entering a reduced-cadence idle
+    /// regime ([`plr_wal::MarkerKind::RecordingQuiescent`]). A sparse
+    /// heartbeat-record stream after this point is deliberate, not a
+    /// stalled recorder.
+    ///
+    /// Purely a data-quality note: it changes no reconstruction verdict.
+    /// The recorder only enters the regime when no recoverable print is in
+    /// progress (a print keeps full cadence through its dwells and pauses),
+    /// so a quiet span never overlaps a stop-window coverage span — the
+    /// liveness reasoning in [`crate::exclude`] is never applied across
+    /// one. Recorded so `plrd scan` can report an idle tail honestly and so
+    /// the "quiet never overlaps a coverage span" invariant is checkable in
+    /// the log rather than assumed.
+    RecordingQuiescent {
+        /// Host-monotonic time the idle regime began (ns).
+        mono_ns: u64,
+    },
     /// A marker written by a newer format revision was preserved as
     /// opaque and ignored.
     UnknownMarker {
@@ -308,6 +325,13 @@ pub fn ingest(scan: &RecoveryScan, heartbeat: Option<&HeartbeatRecovery>) -> Wal
                     MarkerKind::RecorderStopped => {
                         recorder_stopped = Some((idx, marker.mono_ns));
                         notes.push(IngestNote::RecorderStopped {
+                            mono_ns: marker.mono_ns,
+                        });
+                    }
+                    // A cadence declaration only: never touches any
+                    // reconstruction verdict — see `IngestNote::RecordingQuiescent`.
+                    MarkerKind::RecordingQuiescent => {
+                        notes.push(IngestNote::RecordingQuiescent {
                             mono_ns: marker.mono_ns,
                         });
                     }
@@ -655,6 +679,35 @@ mod tests {
             .notes
             .contains(&IngestNote::UnknownMarker { mono_ns: 2 }));
         assert_eq!(timeline.markers.len(), 2);
+    }
+
+    /// The idle-throttle marker is a pure data-quality note: it is
+    /// recorded, but it must not read as a clean shutdown, must not become
+    /// recorder-stopped tail evidence, and must not touch the crash
+    /// classification. It is the recorded fact that a following sparse
+    /// heartbeat stream is deliberate — nothing more.
+    #[test]
+    fn recording_quiescent_marker_is_a_benign_note() {
+        let scan = scan_of(vec![
+            WalRecord::TrapqSegment(trapq_segment("toolhead", 1.0, 0.5, 1)),
+            marker(9, MarkerKind::RecordingQuiescent),
+        ]);
+        let timeline = ingest(&scan, None);
+        assert!(timeline
+            .notes
+            .contains(&IngestNote::RecordingQuiescent { mono_ns: 9 }));
+        assert!(
+            !timeline.clean_shutdown,
+            "an idle-cadence declaration is not a print end"
+        );
+        assert_eq!(
+            timeline.recorder_stopped_tail, None,
+            "it is not a recorder stop"
+        );
+        assert_eq!(timeline.socket_lost_tail, None);
+        // The marker is preserved verbatim for the forensic report.
+        assert_eq!(timeline.markers.len(), 1);
+        assert_eq!(timeline.markers[0].kind, MarkerKind::RecordingQuiescent);
     }
 
     #[test]

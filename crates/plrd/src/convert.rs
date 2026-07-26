@@ -193,8 +193,8 @@ use plr_klipper::{
 };
 use plr_reconstruct::ReconstructConfig;
 use plr_wal::{
-    Context, ExcludeObjectDef, ExcludeState, FanTarget, GcodeState, HeaterTarget, StepChunk,
-    StepperRange, TransformObservations, TrapqSegment, VirtualSdState, WalRecord,
+    Context, ExcludeObjectDef, ExcludeState, FanTarget, GcodeState, HeaterTarget, MarkerKind,
+    StepChunk, StepperRange, TransformObservations, TrapqSegment, VirtualSdState, WalRecord,
 };
 use serde_json::{Map, Value};
 
@@ -210,15 +210,111 @@ pub const TEMPLATE_KEY: &str = "k";
 /// Minimum spacing of contexts triggered *only* by file-position advance.
 pub const POSITION_CONTEXT_MIN_NS: u64 = 1_000_000_000;
 
-/// Append a WAL `Heartbeat` record every Nth heartbeat-file rewrite
-/// (10 Hz file rate → 1 Hz WAL rate). Consumed by `walsvc`, which
-/// applies it, and by [`reconstruct_config`], which tells recovery how
-/// far apart the heartbeat *records* it reads back should be.
+/// The **reader's** conservative expected spacing basis for WAL heartbeat
+/// *records*, as a divisor of the heartbeat-file rate: one record per this
+/// many file beats (10 Hz / 10 = 1 Hz). Consumed by [`reconstruct_config`]
+/// to set `heartbeat_period_ns`, from which recovery derives its
+/// coverage-gap tolerance.
 ///
-/// It lives here rather than in `walsvc` because it is a contract
-/// between the writer and the reader, and `walsvc` is Linux-only while
-/// this module is not.
+/// # Why this is the reader basis, and stays 1 Hz even though the writer
+/// now emits faster
+///
+/// The *writer's* active cadence is [`WAL_HEARTBEAT_ACTIVE_EVERY`] (every
+/// file beat, 10 Hz — see there for why). The reader, however, must
+/// tolerate the **sparsest** active stream it can be handed, which is the
+/// pre-throttle 1 Hz WAL a printer running an older `plrd` wrote (and
+/// older segments in the same directory). Deriving the gap tolerance from
+/// 1 Hz keeps every such stream reading as continuous; a denser 10 Hz
+/// stream is a fortiori continuous under it. Tightening the basis to
+/// 10 Hz would make every pre-throttle WAL read as a chain of holes — the
+/// exact false-positive [`crate::convert`] warns about — for a coverage
+/// check that idle spacing never even enters. So this is deliberately the
+/// loose, backward-compatible value.
+///
+/// It lives here rather than in `walsvc` because it is a contract between
+/// the writer and the reader, and `walsvc` is Linux-only while this module
+/// is not.
 pub const WAL_HEARTBEAT_EVERY: u64 = 10;
+
+/// The **writer's** active-regime cadence: append a WAL heartbeat *record*
+/// every heartbeat-file beat (one-in-one → the full 10 Hz file rate) while
+/// a print is in progress or motion is recent.
+///
+/// # Why the full rate while printing
+///
+/// The stop window's lower bound `t_a` is the newest heartbeat's print
+/// time; a sparse record stream lets `t_a` lag the true power cut, and
+/// measured on real crash WALs that lag was a major contributor to
+/// 2.5–4.0 s stop windows, which multiply through XY/E evidence into
+/// hundreds of match candidates and force a manual recovery. Denser
+/// heartbeat *records* pin `t_a` to within ~100 ms of the cut. The byte
+/// cost is noise during printing — motion records already fill a 16 MiB
+/// segment every 3–5 minutes, against which 10 Hz heartbeats add a few
+/// percent — whereas the same records were the *dominant* cost while idle,
+/// which is exactly what [`WAL_HEARTBEAT_QUIET_EVERY`] throttles. Same
+/// mechanism, opposite dial at each end.
+///
+/// Not a reader contract (denser-than-expected is always safe for the
+/// reader): writer-side only, consumed by `walsvc`.
+pub const WAL_HEARTBEAT_ACTIVE_EVERY: u64 = 1;
+
+/// Append a WAL `Heartbeat` record only every Nth heartbeat-file rewrite
+/// **while the recorder is idle** (no print in progress and no recent
+/// motion). At the default 10 Hz file rate this is one WAL heartbeat
+/// record every 30 s, versus one per second while active.
+///
+/// # Why this exists
+///
+/// The heartbeat *file* (128 B, rewritten in place) does not grow, but a
+/// WAL heartbeat *record* is appended to the log at the active cadence
+/// regardless of whether anything is printing — ~250 B/s, ~7.8 GB/year on
+/// an idle printer, measured at ~16.8 MB per 19.6 h idle segment on the
+/// user's machine. Throttling the idle *record* cadence by this factor
+/// (30×) removes almost all of that while keeping a coarse liveness trail
+/// in the log itself.
+///
+/// # Why the reader does not need it
+///
+/// Unlike [`WAL_HEARTBEAT_EVERY`], this is **not** a reader contract:
+/// reconstruction's heartbeat-continuity reasoning
+/// (`plr_reconstruct::exclude`) only ever runs across a *stop-window
+/// coverage span*, which lies inside a recoverable print — and the idle
+/// regime is entered only once a print has conclusively ended or when no
+/// print is running, so no coverage span ever contains an idle span.
+/// A [`plr_wal::MarkerKind::RecordingQuiescent`] marker records the regime
+/// change so that invariant is checkable in the log. The value therefore
+/// lives writer-side only; `walsvc` reads it (via `WalSvcCfg`).
+pub const WAL_HEARTBEAT_QUIET_EVERY: u64 = 300;
+
+/// How long after the last observed motion the recorder keeps full
+/// heartbeat cadence when no print is otherwise known to be in progress,
+/// in nanoseconds (5 s).
+///
+/// # Why the data plane, not just `print_stats`
+///
+/// `print_stats.state` and `virtual_sdcard.is_active` arrive by
+/// subscription and lag the start of a print; the opening moments of a
+/// print are already the weakest recovery case, so cadence must rise at or
+/// before the first instant motion is possible. Motion (`dump_trapq` /
+/// `dump_stepper`) data arriving **is** proof motion began, so it is used
+/// as an independent trigger: the regime is active whenever a print is in
+/// progress (`Recorder::print_in_progress`, which stays set through a
+/// print's dwells and pauses) **or** motion arrived within this window.
+///
+/// The window also bounds the cost of a stray manual jog while idle: after
+/// the jog the regime falls back to idle once this much time passes with
+/// no further motion, rather than latching active forever. During a real
+/// print `print_in_progress` holds the regime active regardless, so this
+/// window only governs motion that is *not* part of a file print.
+///
+/// The residual race it cannot close: between the instant Klipper produces
+/// the first move of a print and the instant plrd receives that batch
+/// (one dump-batch period, ≤ ~0.5 s), the regime is still idle. During
+/// that sub-second window the WAL heartbeat *records* are still sparse —
+/// but the heartbeat *file* is unaffected (so `t_a` is unaffected), and no
+/// exclusion context (the only thing continuity gates) can exist that
+/// early, so nothing downstream is weakened.
+pub const IDLE_AFTER_MOTION_NS: u64 = 5_000_000_000;
 
 /// Derives the reconstruction tunables from the daemon's own
 /// configuration, so recovery is not left guessing at rates this process
@@ -334,6 +430,13 @@ pub struct Output {
     /// The print ended on purpose (complete or cancelled); the caller
     /// journals a `CleanShutdown` marker.
     pub clean_shutdown: bool,
+    /// A heartbeat-cadence regime change the caller must journal as a
+    /// marker. `Some(RecordingQuiescent)` when the recorder just entered
+    /// the idle regime (active → idle edge); `None` otherwise. Never
+    /// dropped — it is the recorded fact that explains the sparse
+    /// heartbeat stream that follows (see
+    /// [`plr_wal::MarkerKind::RecordingQuiescent`]).
+    pub regime_marker: Option<MarkerKind>,
 }
 
 /// Stateful converter: merges Klipper's diff-style status stream into a
@@ -395,6 +498,20 @@ pub struct Recorder {
     /// `None` until a status update carries `toolhead.print_time`.
     toolhead_print_time: Option<f64>,
     est_sample: Option<(u64, f64)>,
+    /// Host-monotonic time (ns) of the newest motion record produced this
+    /// session (a non-empty trapq batch or any stepper batch), or `None`
+    /// if none yet. Feeds the heartbeat-cadence regime: motion arriving is
+    /// proof a print (or a manual move) is under way, independent of the
+    /// lagging status plane. See [`IDLE_AFTER_MOTION_NS`].
+    last_motion_mono_ns: Option<u64>,
+    /// The heartbeat-cadence regime as of the last handled message: `true`
+    /// = full cadence (a print is in progress or motion is recent), `false`
+    /// = idle/throttled. Held so the active → idle edge can be detected and
+    /// journaled as a [`plr_wal::MarkerKind::RecordingQuiescent`] marker.
+    /// Starts `false` (assume idle until a positive signal), the
+    /// conservative direction: a print running at daemon start raises it on
+    /// the first status/motion.
+    recording_active: bool,
     last_context_mono_ns: Option<u64>,
     last_context_file_position: u64,
     exclude: ExcludeObjectSnapshot,
@@ -443,6 +560,8 @@ impl Recorder {
             latest_print_time: 0.0,
             toolhead_print_time: None,
             est_sample: None,
+            last_motion_mono_ns: None,
+            recording_active: false,
             last_context_mono_ns: None,
             last_context_file_position: 0,
             exclude: ExcludeObjectSnapshot::new(),
@@ -497,6 +616,15 @@ impl Recorder {
         // value would certify durable coverage that does not exist —
         // the containment-unsafe direction.
         self.toolhead_print_time = None;
+        // The killed session's motion belongs to the dead klippy instance;
+        // a stale value must not hold the new session's regime active. The
+        // regime falls back to idle until the new session provides fresh
+        // motion or a printing status. Heartbeats are paused across the
+        // gap anyway (`client` sends `heartbeat_data(None)` on socket
+        // loss), so no `RecordingQuiescent` marker is needed here — the
+        // `SocketLost` marker already bounds the silence.
+        self.last_motion_mono_ns = None;
+        self.recording_active = false;
         self.exclude = ExcludeObjectSnapshot::new();
         self.exclude_seen = false;
         self.exclude_definitions_dirty = false;
@@ -591,7 +719,8 @@ impl Recorder {
                 self.exclude_definitions_dirty &= !carried_definitions;
             }
         }
-        out.heartbeat = self.heartbeat_data();
+        out.regime_marker = self.note_regime(mono_ns);
+        out.heartbeat = self.heartbeat_data(mono_ns);
         out
     }
 
@@ -620,7 +749,15 @@ impl Recorder {
             out.records
                 .push((WalRecord::TrapqSegment(segment), SyncPolicy::Batched));
         }
-        out.heartbeat = self.heartbeat_data();
+        // Motion arriving is the data-plane proof that a print (or a
+        // manual move) is under way; it raises the heartbeat regime at or
+        // before the status plane can. Only a batch that actually carried
+        // moves counts — an empty dump batch is not motion.
+        if !batch.data.is_empty() {
+            self.last_motion_mono_ns = Some(mono_ns);
+        }
+        out.regime_marker = self.note_regime(mono_ns);
+        out.heartbeat = self.heartbeat_data(mono_ns);
         out
     }
 
@@ -645,22 +782,65 @@ impl Recorder {
             records: vec![(WalRecord::StepperRange(range), SyncPolicy::Batched)],
             ..Output::default()
         };
-        out.heartbeat = self.heartbeat_data();
+        // A stepper dump is always committed motion (one range per batch),
+        // so it always raises the regime — the data-plane trigger.
+        self.last_motion_mono_ns = Some(mono_ns);
+        out.regime_marker = self.note_regime(mono_ns);
+        out.heartbeat = self.heartbeat_data(mono_ns);
         out
     }
 
     /// The current heartbeat payload; `None` until a correlation sample
     /// (`estimated_print_time` + `eventtime`) has been observed — no
     /// liveness claim without one.
+    ///
+    /// `mono_ns` is the capture time of the message being handled; it sets
+    /// the [`HeartbeatData::active`] cadence regime (see
+    /// [`Self::regime_active`]).
     #[must_use]
-    pub fn heartbeat_data(&self) -> Option<HeartbeatData> {
+    pub fn heartbeat_data(&self, mono_ns: u64) -> Option<HeartbeatData> {
+        let active = self.regime_active(mono_ns);
         self.est_sample.map(
             |(est_sample_mono_ns, est_sample_print_time)| HeartbeatData {
                 print_time: self.latest_print_time,
                 est_sample_mono_ns,
                 est_sample_print_time,
+                active,
             },
         )
+    }
+
+    /// The heartbeat-cadence regime at `mono_ns`: `true` (full cadence)
+    /// while a print is in progress **or** motion arrived within
+    /// [`IDLE_AFTER_MOTION_NS`], `false` (idle/throttled) otherwise.
+    ///
+    /// Uses the data plane (recent motion) as well as the status plane
+    /// (`print_in_progress`) so cadence rises at the first instant motion
+    /// is possible, not when the lagging `print_stats`/`is_active` status
+    /// finally arrives — see [`IDLE_AFTER_MOTION_NS`].
+    #[must_use]
+    pub fn regime_active(&self, mono_ns: u64) -> bool {
+        if self.print_in_progress {
+            return true;
+        }
+        self.last_motion_mono_ns
+            .is_some_and(|last| mono_ns.saturating_sub(last) < IDLE_AFTER_MOTION_NS)
+    }
+
+    /// Updates the stored regime for `mono_ns` and returns the marker the
+    /// caller must journal when the regime just fell from active to idle.
+    ///
+    /// Only the active → idle edge is marked (`RecordingQuiescent`): it is
+    /// the one that needs explaining, because a sparse heartbeat stream
+    /// after it would otherwise read as a stalled recorder. The idle →
+    /// active edge needs no marker — the resumed dense heartbeat stream
+    /// (and `walsvc`'s forced heartbeat record at the transition) is itself
+    /// the proof of liveness, and it bounds the quiet span.
+    fn note_regime(&mut self, mono_ns: u64) -> Option<MarkerKind> {
+        let now_active = self.regime_active(mono_ns);
+        let was_active = self.recording_active;
+        self.recording_active = now_active;
+        (was_active && !now_active).then_some(MarkerKind::RecordingQuiescent)
     }
 
     fn merge_toolhead(&mut self, update: &StatusUpdate) {
@@ -1852,11 +2032,111 @@ mod tests {
     #[test]
     fn reset_session_pauses_heartbeat_until_fresh_sample() {
         let mut r = recorder_with_snapshot();
-        assert!(r.heartbeat_data().is_some());
+        assert!(r.heartbeat_data(2_000).is_some());
         r.reset_session();
         assert!(
-            r.heartbeat_data().is_none(),
+            r.heartbeat_data(2_000).is_none(),
             "no liveness claim from a dead session's sample"
+        );
+    }
+
+    /// An idle recorder throttles its heartbeat cadence; the **data plane**
+    /// (motion arriving) raises it at or before the lagging status plane
+    /// can; and the active → idle fall journals exactly one
+    /// `RecordingQuiescent` marker so the sparse stream that follows is a
+    /// recorded fact.
+    #[test]
+    fn idle_regime_throttles_and_marks_but_motion_raises_it_first() {
+        let mut r = Recorder::new();
+        r.set_heater_names(vec!["extruder".into()]);
+        // Idle initial status: printer in standby, nothing active.
+        let idle = json!({"eventtime": 100.0, "status": {
+            "toolhead": {"print_time": 0.0, "estimated_print_time": 9.5,
+                          "position": [0.0, 0.0, 0.0, 0.0]},
+            "gcode_move": {"speed_factor": 1.0, "speed": 1500.0, "extrude_factor": 1.0,
+                "absolute_coordinates": true, "absolute_extrude": true,
+                "homing_origin": [0.0, 0.0, 0.0, 0.0], "position": [0.0, 0.0, 0.0, 0.0],
+                "gcode_position": [0.0, 0.0, 0.0, 0.0]},
+            "virtual_sdcard": {"file_path": null, "is_active": false,
+                                "file_position": 0, "file_size": 0},
+            "print_stats": {"state": "standby"},
+        }});
+        let out = r.on_initial_status(&idle, 1_000_000_000).unwrap();
+        assert_eq!(
+            out.regime_marker, None,
+            "the first idle observation is not a fall"
+        );
+        assert!(
+            !out.heartbeat.unwrap().active,
+            "idle => throttled heartbeat cadence"
+        );
+
+        // Motion arrives (trapq) BEFORE any `printing` status: the regime
+        // must already be active — the Trap-2 data-plane trigger.
+        let batch: TrapqBatch = serde_json::from_value(json!({"data": [
+            [12.5, 0.25, 40.0, -1500.0, [10.0, 20.0, 0.3], [1.0, 0.0, 0.0]]]}))
+        .unwrap();
+        let out = r.on_trapq("toolhead", &batch, 2_000_000_000);
+        assert!(
+            out.heartbeat.unwrap().active,
+            "motion alone raises the regime, without waiting for print_stats"
+        );
+        assert_eq!(out.regime_marker, None, "the rise is deliberately unmarked");
+
+        // 6 s after the last motion, still no print in progress: the regime
+        // falls back to idle and journals the marker exactly once.
+        let out = r.on_status(
+            &status(json!({"eventtime": 108.0, "status": {
+                "toolhead": {"estimated_print_time": 9.6}}})),
+            8_000_000_000,
+            false,
+        );
+        assert!(
+            !out.heartbeat.unwrap().active,
+            "no motion for > IDLE_AFTER_MOTION_NS => idle again"
+        );
+        assert_eq!(
+            out.regime_marker,
+            Some(plr_wal::MarkerKind::RecordingQuiescent),
+            "the active -> idle fall must be journaled"
+        );
+
+        // Staying idle does not re-emit the marker.
+        let out = r.on_status(
+            &status(json!({"eventtime": 110.0, "status": {
+                "toolhead": {"estimated_print_time": 9.7}}})),
+            10_000_000_000,
+            false,
+        );
+        assert_eq!(out.regime_marker, None, "one marker per fall, not per beat");
+        assert!(!out.heartbeat.unwrap().active);
+    }
+
+    /// A print in progress holds the regime active through a long dwell
+    /// (heating, `G4`) even with no motion for tens of seconds, so
+    /// heartbeats stay dense and no `RecordingQuiescent` is journaled
+    /// mid-print — the property that keeps a quiet span from ever
+    /// overlapping a recoverable window.
+    #[test]
+    fn a_print_in_progress_stays_active_through_a_long_dwell() {
+        // `recorder_with_snapshot` processed an initial status with
+        // `is_active: true`, so a print is in progress and the regime rose.
+        let mut r = recorder_with_snapshot();
+        assert!(r.regime_active(1_000), "a loaded print is active");
+        // 30 s later, only estimated_print_time has ticked — no motion.
+        let out = r.on_status(
+            &status(json!({"eventtime": 200.0, "status": {
+                "toolhead": {"estimated_print_time": 40.0}}})),
+            40_000_000_000,
+            false,
+        );
+        assert!(
+            out.heartbeat.unwrap().active,
+            "a dwell mid-print must stay at full cadence"
+        );
+        assert_eq!(
+            out.regime_marker, None,
+            "no quiescent marker may be journaled inside a print"
         );
     }
 

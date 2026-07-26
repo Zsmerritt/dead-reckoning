@@ -358,6 +358,13 @@ fn forward(
     for (record, sync) in out.records {
         sender.record(record, sync, mono_ns)?;
     }
+    // The regime marker is journaled BEFORE the throttled heartbeat data
+    // it explains: it records that the sparse heartbeat stream about to
+    // begin is deliberate. Undroppable (a dropped "we went quiet" would
+    // leave the sparseness unexplained) — see `convert::Output::regime_marker`.
+    if let Some(kind) = out.regime_marker {
+        sender.marker(Marker { mono_ns, kind })?;
+    }
     if let Some(hb) = out.heartbeat {
         sender.heartbeat_data(Some(hb))?;
     }
@@ -702,6 +709,7 @@ mod tests {
             MarkerKind::SubscriptionGap { .. } => "SubscriptionGap",
             MarkerKind::ExclusionUpdateLost => "ExclusionUpdateLost",
             MarkerKind::RecorderStopped => "RecorderStopped",
+            MarkerKind::RecordingQuiescent => "RecordingQuiescent",
             MarkerKind::Unknown => "Unknown",
         }
     }
