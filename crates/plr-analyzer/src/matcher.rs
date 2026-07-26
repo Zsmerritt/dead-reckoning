@@ -248,7 +248,11 @@ pub enum MatchError {
 }
 
 /// Validate the evidence and config, returning the offending field.
-fn validate(evidence: &StopEvidence, config: &MatchConfig) -> Result<(), MatchError> {
+///
+/// `pub(crate)` so the parallel preview builder ([`crate::preview`]) can
+/// reject the same non-finite / inverted inputs `match_stop_point` does,
+/// without a second, subtly-different predicate.
+pub(crate) fn validate(evidence: &StopEvidence, config: &MatchConfig) -> Result<(), MatchError> {
     let tolerances = [
         ("xy_tolerance", config.xy_tolerance),
         ("e_tolerance", config.e_tolerance),
@@ -289,7 +293,10 @@ fn validate(evidence: &StopEvidence, config: &MatchConfig) -> Result<(), MatchEr
 }
 
 /// True when the move's byte span overlaps the search window.
-fn in_window(mv: &SimMove, window: ByteWindow) -> bool {
+///
+/// `pub(crate)` so [`crate::preview`] scopes its nudge domain to the
+/// same in-window predicate the matcher uses.
+pub(crate) fn in_window(mv: &SimMove, window: ByteWindow) -> bool {
     mv.span.end > window.start && window.end.is_none_or(|end| mv.span.start < end)
 }
 
@@ -405,14 +412,23 @@ fn ranks_better(a: &MatchCandidate, b: &MatchCandidate) -> bool {
     }
 }
 
-/// Match the stop evidence against the model's simulated move stream.
-/// See the module docs for the ambiguity policy.
-pub fn match_stop_point(
+/// Evaluate every in-window, position-known move against the evidence,
+/// returning the ranked candidate list (one entry per source line, best
+/// chord kept) and the count of moves skipped for G28-unknown axes.
+///
+/// This is the shared evaluate path behind both consumers:
+/// [`match_stop_point`] runs the confidence ladder on the output, and
+/// [`crate::preview::build_preview`] seeds its representative set from it.
+/// Extracted verbatim from `match_stop_point`'s former body so there is
+/// exactly one evaluate loop — no second predicate that could drift.
+///
+/// Assumes the evidence and config were already validated (both callers
+/// call [`validate`] first); it never re-validates and never fails.
+pub(crate) fn collect_candidates(
     model: &LayerModel,
     evidence: &StopEvidence,
     config: &MatchConfig,
-) -> Result<MatchResult, MatchError> {
-    validate(evidence, config)?;
+) -> (Vec<MatchCandidate>, usize) {
     let mut skipped_unknown = 0_usize;
     // One candidate per source line, best chord kept.
     let mut by_line: std::collections::BTreeMap<u64, MatchCandidate> =
@@ -448,6 +464,18 @@ pub fn match_stop_point(
             std::cmp::Ordering::Equal
         }
     });
+    (candidates, skipped_unknown)
+}
+
+/// Match the stop evidence against the model's simulated move stream.
+/// See the module docs for the ambiguity policy.
+pub fn match_stop_point(
+    model: &LayerModel,
+    evidence: &StopEvidence,
+    config: &MatchConfig,
+) -> Result<MatchResult, MatchError> {
+    validate(evidence, config)?;
+    let (candidates, skipped_unknown) = collect_candidates(model, evidence, config);
     let confidence = match candidates.len() {
         0 => {
             // Z is exact in the replay; if it pins a unique trusted
@@ -978,5 +1006,78 @@ mod tests {
         assert_eq!(r, back);
         let err_json = serde_json::to_string(&MatchError::NoMatch).expect("serialize error");
         assert!(err_json.contains("NoMatch"));
+    }
+
+    /// The `collect_candidates` extraction is a *faithful* refactor: the
+    /// candidate list and skipped count `match_stop_point` exposes on its
+    /// `Ok` results are exactly what the shared helper returns for the
+    /// same validated input. This is the pin that lets the ladder and the
+    /// preview builder share one evaluate path. (The full pre-existing
+    /// matcher suite above, run unchanged, is the companion proof that the
+    /// refactor left observable behavior identical.)
+    ///
+    /// Mutation proof: dropping the `candidates.sort_by` in
+    /// `collect_candidates` reorders its output while `match_stop_point`
+    /// keeps exposing the same list — but the *existing* ordering tests
+    /// (`e_interval_disambiguates_retraced_geometry`, ranked candidates)
+    /// bite; and mutating the loop (e.g. not counting `skipped_unknown`)
+    /// makes the equality below fail directly.
+    #[test]
+    fn collect_candidates_matches_the_ladder_input() {
+        use proptest::prelude::*;
+        use proptest::test_runner::{Config, FileFailurePersistence, TestRunner};
+
+        let m = model_of(
+            "G90\nM83\nG92 E0\nG1 Z0.2 F7200\n;TYPE:Sparse infill\n\
+             G1 X20 Y20 F9000\nG1 X40 Y20 E0.5 F3000\nG1 X20 Y20 F9000\nG1 X40 Y20 E0.5 F3000\n\
+             G1 E-0.8 F2100\nG1 Z0.6 F7200\nG1 X10 Y0 F9000\nG1 Z0.2 F7200\nG1 E0.8 F2100\n\
+             G3 X0 Y10 I-10 E2 F1800\nG1 Z0.4 F7200\nG1 X20 Y10 E1 F3000\n",
+        );
+        let strat = (
+            -10.0f64..60.0,
+            0.0f64..40.0,
+            -10.0f64..60.0,
+            0.0f64..40.0,
+            proptest::option::of(0.0f64..3.0),
+            proptest::collection::vec(0.0f64..0.7, 0..3),
+        );
+        let mut runner = TestRunner::new(Config {
+            cases: 256,
+            failure_persistence: Some(Box::new(FileFailurePersistence::Off)),
+            ..Config::default()
+        });
+        runner
+            .run(&strat, |(x0, w, y0, h, e_mid, zs)| {
+                let evidence = StopEvidence {
+                    x: Interval {
+                        min: x0,
+                        max: x0 + w,
+                    },
+                    y: Interval {
+                        min: y0,
+                        max: y0 + h,
+                    },
+                    e: e_mid.map(|c| Interval {
+                        min: c - 0.2,
+                        max: c + 0.2,
+                    }),
+                    z_candidates: zs,
+                    window: ByteWindow {
+                        start: 0,
+                        end: None,
+                    },
+                };
+                let config = MatchConfig::default();
+                // Only meaningful once the shared validation passes (both
+                // consumers validate before calling collect_candidates).
+                prop_assume!(validate(&evidence, &config).is_ok());
+                let (cands, skipped) = collect_candidates(&m, &evidence, &config);
+                if let Ok(result) = match_stop_point(&m, &evidence, &config) {
+                    prop_assert_eq!(&result.candidates, &cands);
+                    prop_assert_eq!(result.skipped_unknown, skipped);
+                }
+                Ok(())
+            })
+            .unwrap();
     }
 }

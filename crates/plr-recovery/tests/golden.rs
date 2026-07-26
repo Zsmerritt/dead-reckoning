@@ -6,9 +6,10 @@ mod common;
 
 use plr_analyzer::{ContactOutcome, DeclineReason, MatchConfidence};
 use plr_recovery::{
-    plan_recovery, select_resume_target, Diagnose, ExcludeObjectDef, FallbackReason, FileTemps,
-    OvershootTerm, Phase, PlanConfig, PlanInputs, PlanOutcome, PlanWarning, RecoveryError,
-    RecoveryPlan, RuntimeComputation, Tier, TriggerSource,
+    plan_recovery, select_resume_target, select_resume_target_with_policy, Diagnose,
+    ExcludeObjectDef, FallbackReason, FileTemps, OvershootTerm, Phase, PlanConfig, PlanInputs,
+    PlanOutcome, PlanWarning, RecoveryError, RecoveryPlan, ResumePolicy, RuntimeComputation, Tier,
+    TriggerSource,
 };
 
 use common::{
@@ -2025,6 +2026,91 @@ fn resume_target_is_the_layer_1_infill_line() {
     };
     let target = select_resume_target(&model, &ambiguous).unwrap();
     assert_eq!(target.offset, resume_offset());
+}
+
+#[test]
+fn resume_policy_selects_first_mid_last() {
+    let model = model();
+    // Three ascending real extrusion-line offsets on layer 0.
+    let o_first = offset_of("G1 X10 Y10 E1 F1800", 0);
+    let o_mid = offset_of("G1 X30 Y10 E1", 0);
+    let o_last = offset_of("G1 X30 Y30 E1", 0);
+    assert!(o_first < o_mid && o_mid < o_last, "offsets ascending");
+    let ambiguous = plr_analyzer::MatchResult {
+        candidates: vec![],
+        confidence: MatchConfidence::AmbiguousWindow {
+            // Deliberately unsorted to prove the selector sorts.
+            offsets: vec![o_mid, o_last, o_first],
+        },
+        skipped_unknown: 0,
+    };
+
+    // Byte-identity pin: Last == the historical policy-free selector, and
+    // == an independently computed skip-forward from offsets.max().
+    let today = select_resume_target(&model, &ambiguous).unwrap();
+    let last = select_resume_target_with_policy(&model, &ambiguous, ResumePolicy::Last).unwrap();
+    assert_eq!(
+        last, today,
+        "Last must be byte-identical to select_resume_target"
+    );
+    let expected_last = model
+        .first_deposition_at_or_after(o_last)
+        .unwrap()
+        .span
+        .start;
+    assert_eq!(last.offset, expected_last);
+    assert_eq!(last.offset, o_last);
+
+    // Ask resolves as Last until the preview plan lands (increment 2).
+    assert_eq!(
+        select_resume_target_with_policy(&model, &ambiguous, ResumePolicy::Ask).unwrap(),
+        today
+    );
+
+    // First = min offset; Mid = lower-median (index 1 of 3) = o_mid.
+    let first = select_resume_target_with_policy(&model, &ambiguous, ResumePolicy::First).unwrap();
+    assert_eq!(first.offset, o_first);
+    let mid = select_resume_target_with_policy(&model, &ambiguous, ResumePolicy::Mid).unwrap();
+    assert_eq!(mid.offset, o_mid);
+
+    // Mutation proof: the three extremes are distinct, so a selector that
+    // returned the wrong offset (min for Last, etc.) is caught here.
+    assert_ne!(first.offset, last.offset);
+    assert_ne!(mid.offset, last.offset);
+    assert_ne!(first.offset, mid.offset);
+
+    // Even-count lower median: 4 offsets -> index (4-1)/2 = 1 (2nd).
+    let four = plr_analyzer::MatchResult {
+        candidates: vec![],
+        confidence: MatchConfidence::AmbiguousWindow {
+            offsets: vec![o_first, o_mid, o_last, o_last + 1],
+        },
+        skipped_unknown: 0,
+    };
+    // The 2nd-smallest offset is o_mid; first_deposition_at_or_after lands
+    // there (o_mid is itself a deposition line).
+    assert_eq!(
+        select_resume_target_with_policy(&model, &four, ResumePolicy::Mid)
+            .unwrap()
+            .offset,
+        o_mid
+    );
+
+    // UniqueLine ignores the policy entirely.
+    let unique = match_at(resume_offset());
+    for policy in [
+        ResumePolicy::First,
+        ResumePolicy::Mid,
+        ResumePolicy::Last,
+        ResumePolicy::Ask,
+    ] {
+        assert_eq!(
+            select_resume_target_with_policy(&model, &unique, policy)
+                .unwrap()
+                .offset,
+            resume_offset()
+        );
+    }
 }
 
 #[test]

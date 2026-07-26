@@ -965,30 +965,50 @@ pub struct ResumeTarget {
     pub on_infill: bool,
 }
 
-/// Selects the resume target from the match result (design doc §8,
-/// step 12): the **latest** plausible stop offset (skip-forward is the
-/// conservative direction — resuming earlier would double-extrude over
-/// printed geometry), then the first depositing move at or after it.
+/// Which stop in an ambiguous candidate set becomes the resume point
+/// (design `docs/design/resume-preview.md` §3).
 ///
-/// # Errors
-///
-/// A typed [`FallbackReason`] when the match is too coarse or no safe
-/// deposition exists — the caller degrades to manual recovery.
-pub fn select_resume_target(
+/// The policy only bites when a *set* exists ([`MatchConfidence::
+/// AmbiguousWindow`]): a [`MatchConfidence::UniqueLine`] has one line and
+/// ignores the policy, and [`MatchConfidence::LayerOnly`] is always too
+/// coarse to resume automatically.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ResumePolicy {
+    /// Minimum-offset candidate — re-prints geometry that may already
+    /// exist (the nozzle plows the existing wall). Kept, warned plainly.
+    First,
+    /// Lower-median-offset candidate (by execution-order file offset; the
+    /// same convention as [`plr_analyzer::median_index`], shared so `mid`
+    /// picks the same stop over an offset list or a preview set). May
+    /// re-print; warned like `First`.
+    Mid,
+    /// Maximum-offset candidate — skip-forward, the safe default: never
+    /// double-prints, bounded sub-line void. Byte-identical to the
+    /// historical selector.
+    Last,
+    /// Operator picks via the interactive preview. The preview plan does
+    /// not exist yet (increment 2 wires the routing), so `Ask` currently
+    /// resolves exactly as [`ResumePolicy::Last`] — a headless setup gets
+    /// today's safe skip-forward, never a regression.
+    Ask,
+}
+
+impl Default for ResumePolicy {
+    /// The ruled default is `Ask` (interactive preview); it resolves as
+    /// `Last` until the preview plan lands.
+    fn default() -> Self {
+        Self::Ask
+    }
+}
+
+/// Resolve a base offset to a concrete [`ResumeTarget`]: the first
+/// depositing move at or after `base`, with its infill classification.
+/// The shared tail behind both [`select_resume_target`] and
+/// [`select_resume_target_with_policy`] — one predicate, no drift.
+fn resolve_resume_from_offset(
     model: &LayerModel,
-    result: &MatchResult,
+    base: u64,
 ) -> Result<ResumeTarget, FallbackReason> {
-    let base = match &result.confidence {
-        MatchConfidence::UniqueLine { offset } => *offset,
-        MatchConfidence::AmbiguousWindow { offsets } => offsets
-            .iter()
-            .max()
-            .copied()
-            .ok_or(FallbackReason::NoResumeDeposition)?,
-        MatchConfidence::LayerOnly { layer } => {
-            return Err(FallbackReason::MatchTooCoarse { layer: *layer })
-        }
-    };
     let mv = model
         .first_deposition_at_or_after(base)
         .ok_or(FallbackReason::NoResumeDeposition)?;
@@ -1013,6 +1033,87 @@ pub fn select_resume_target(
         layer: mv.layer,
         on_infill,
     })
+}
+
+/// Selects the resume target from the match result (design doc §8,
+/// step 12): the **latest** plausible stop offset (skip-forward is the
+/// conservative direction — resuming earlier would double-extrude over
+/// printed geometry), then the first depositing move at or after it.
+///
+/// This is the historical, policy-free selector — equivalent to
+/// [`select_resume_target_with_policy`] with [`ResumePolicy::Last`], and
+/// kept as the byte-identical default-safe path (regression-pinned).
+///
+/// # Errors
+///
+/// A typed [`FallbackReason`] when the match is too coarse or no safe
+/// deposition exists — the caller degrades to manual recovery.
+pub fn select_resume_target(
+    model: &LayerModel,
+    result: &MatchResult,
+) -> Result<ResumeTarget, FallbackReason> {
+    let base = match &result.confidence {
+        MatchConfidence::UniqueLine { offset } => *offset,
+        MatchConfidence::AmbiguousWindow { offsets } => offsets
+            .iter()
+            .max()
+            .copied()
+            .ok_or(FallbackReason::NoResumeDeposition)?,
+        MatchConfidence::LayerOnly { layer } => {
+            return Err(FallbackReason::MatchTooCoarse { layer: *layer })
+        }
+    };
+    resolve_resume_from_offset(model, base)
+}
+
+/// The offset a policy selects from an ambiguous candidate offset list.
+/// `None` only when the list is empty. `Last`/`Ask` return the maximum —
+/// byte-identical to [`select_resume_target`]'s `offsets.iter().max()`.
+fn select_offset(offsets: &[u64], policy: ResumePolicy) -> Option<u64> {
+    if offsets.is_empty() {
+        return None;
+    }
+    let mut sorted = offsets.to_vec();
+    sorted.sort_unstable();
+    let chosen = match policy {
+        ResumePolicy::First => sorted[0],
+        ResumePolicy::Mid => sorted[plr_analyzer::median_index(sorted.len())],
+        ResumePolicy::Last | ResumePolicy::Ask => sorted[sorted.len() - 1],
+    };
+    Some(chosen)
+}
+
+/// Policy-aware resume selection (design §3): for an ambiguous set,
+/// `First`/`Mid`/`Last` pick the min / lower-median / max offset; `Ask`
+/// resolves as `Last` until the preview plan exists (increment 2). A
+/// `UniqueLine` ignores the policy (one line); `LayerOnly` is always too
+/// coarse.
+///
+/// # Byte-identity guarantee
+///
+/// For every [`MatchConfidence::AmbiguousWindow`],
+/// `select_resume_target_with_policy(m, r, ResumePolicy::Last)` equals
+/// `select_resume_target(m, r)` exactly — the default-safe automatic path
+/// is unchanged. (Regression-pinned and mutation-proven in the tests.)
+///
+/// # Errors
+///
+/// A typed [`FallbackReason`], as [`select_resume_target`].
+pub fn select_resume_target_with_policy(
+    model: &LayerModel,
+    result: &MatchResult,
+    policy: ResumePolicy,
+) -> Result<ResumeTarget, FallbackReason> {
+    let base = match &result.confidence {
+        MatchConfidence::UniqueLine { offset } => *offset,
+        MatchConfidence::AmbiguousWindow { offsets } => {
+            select_offset(offsets, policy).ok_or(FallbackReason::NoResumeDeposition)?
+        }
+        MatchConfidence::LayerOnly { layer } => {
+            return Err(FallbackReason::MatchTooCoarse { layer: *layer })
+        }
+    };
+    resolve_resume_from_offset(model, base)
 }
 
 /// Everything [`plan_recovery`] consumes. All borrowed; no I/O.

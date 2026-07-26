@@ -51,12 +51,13 @@ pub mod preheat;
 pub mod resume_file;
 
 pub use build::{
-    plan_recovery, preflight_generated_file, select_resume_target, ExcludeObjectDef,
-    FallbackReason, PlanConfig, PlanInputs, PlanOutcome, ResumeTarget, ACCEL_MAX, ACCEL_MIN,
-    CONFIRM_TIMEOUT_DEFAULT, CONFIRM_TIMEOUT_DEFAULT_S, CONFIRM_TIMEOUT_MAX_S,
-    CONFIRM_TIMEOUT_MIN_S, DRAG_TEMP_FLOOR, GCODE_BARRIER_TIMEOUT_DEFAULT,
-    GCODE_BARRIER_TIMEOUT_DEFAULT_S, GCODE_BARRIER_TIMEOUT_MAX_S, GCODE_BARRIER_TIMEOUT_MIN_S,
-    PROBE_HOLD_BAND, PROBE_TEMP_HEADROOM, PROBE_TEMP_MEASURED_TOLERANCE,
+    plan_recovery, preflight_generated_file, select_resume_target,
+    select_resume_target_with_policy, ExcludeObjectDef, FallbackReason, PlanConfig, PlanInputs,
+    PlanOutcome, ResumePolicy, ResumeTarget, ACCEL_MAX, ACCEL_MIN, CONFIRM_TIMEOUT_DEFAULT,
+    CONFIRM_TIMEOUT_DEFAULT_S, CONFIRM_TIMEOUT_MAX_S, CONFIRM_TIMEOUT_MIN_S, DRAG_TEMP_FLOOR,
+    GCODE_BARRIER_TIMEOUT_DEFAULT, GCODE_BARRIER_TIMEOUT_DEFAULT_S, GCODE_BARRIER_TIMEOUT_MAX_S,
+    GCODE_BARRIER_TIMEOUT_MIN_S, PROBE_HOLD_BAND, PROBE_TEMP_HEADROOM,
+    PROBE_TEMP_MEASURED_TOLERANCE,
 };
 pub use diagnosis::{Diagnose, Diagnosis, Expected, Measured, Tier, UNSAFE_PURGE_Z_BELOW_BED};
 pub use envelope::{
