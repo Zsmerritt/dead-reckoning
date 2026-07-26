@@ -83,7 +83,8 @@ the consensus-touch tunables (`touch_samples`, `touch_sample_range`,
 `purge_speed`, `purge_retract`), `drag_nozzle_temp`, the acceleration
 overrides (`recovery_accel`, `accel_home`, `accel_travel`, `accel_probe`,
 `accel_entry`), the confirm-points (`confirm_z_before_resume`,
-`debug_confirm_each_step`, `confirm_timeout_s`) and the one hard-refusal
+`debug_confirm_each_step`, `confirm_timeout_s`), the exclusive-g-code-access
+barrier (`gcode_barrier_timeout_s`) and the one hard-refusal
 escape hatch `UNSAFE_allow_purge_z_below_bed`. Each is documented — with
 its band, its default and the physics behind it — in
 [`deploy/plrd.conf.example`](../deploy/plrd.conf.example); `plrd` reads

@@ -16,6 +16,9 @@
 //!    `print_stats.state` ∈ {standby, complete, cancelled, error}
 //!    (i.e. not printing or paused), and `virtual_sdcard.is_active ==
 //!    false`. Refusal sends no gcode.
+//!    * **Gate 4b — a g-code mutex barrier, then gate 4 again**; see
+//!      below. The one thing this sends is the read-only sentinel
+//!      [`GCODE_BARRIER_SENTINEL`], which changes nothing.
 //! 5. **Machine prerequisites** — already fatal inside the pipeline
 //!    (`pipeline::run_pipeline` runs `validate_machine` before any
 //!    planning); no plan exists to execute if they failed.
@@ -24,6 +27,117 @@
 //! Execution writes a JSONL transcript
 //! (`recovery-transcript-<unix-seconds>.jsonl` in the WAL directory);
 //! refusing to create it refuses to execute.
+//!
+//! # Gate 4b: why gate 4's answer needs a barrier to be worth anything
+//!
+//! Gate 4 is a *sample*. Between taking it and the plan's first command
+//! landing, anything else with a g-code channel can change the machine —
+//! and there is one such thing that is guaranteed to be mid-flight
+//! whenever a recovery is started from the console, namely the
+//! `[gcode_macro]` the operator's `PLR_RECOVER` may be sitting inside.
+//!
+//! Klipper runs every externally-submitted script under the g-code mutex
+//! (`gcode.run_script`, `../klipper/klippy/gcode.py:239-241`), and a
+//! macro's body runs *nested inside* its caller's critical section
+//! (`run_script_from_command`, `gcode.py:237-238`, holds no lock of its
+//! own). So while the macro that invoked `PLR_RECOVER` still has commands
+//! left, the mutex is held for all of them — and dead-reckoning's first
+//! `printer.gcode.script` will queue behind them
+//! (`ReactorMutex::__enter__`, `../klipper/klippy/reactor.py:77-88`,
+//! parks the caller's greenlet rather than failing). Gate 4's answer is
+//! therefore stale by exactly the length of the rest of that macro, and
+//! the macro can spend that time homing, moving Z, or starting a print.
+//!
+//! Gate 4b closes that with a *synchronisation* rather than a guess:
+//!
+//! 1. send [`GCODE_BARRIER_SENTINEL`] — a read-only command whose reply
+//!    cannot arrive until dead-reckoning has actually held and released
+//!    the g-code mutex, i.e. until everything that was queued ahead of it
+//!    has finished;
+//! 2. re-run gate 4, whose answer now describes the machine *after* the
+//!    other source finished, not before it started.
+//!
+//! A source that never releases the mutex — the deadlock shape, an old
+//! blocking plugin whose macro is itself waiting on this daemon — resolves
+//! into the `[plr]` `gcode_barrier_timeout_s` budget (or
+//! [`ExecOptions::gcode_barrier_timeout`]) and a refusal, which is the
+//! fail-closed direction.
+//!
+//! ## Once is not enough: the gap between this gate and the first command
+//!
+//! This gate is still only a sample, and the gap after it is not small. On
+//! the socket path it contains the **entire pre-flight confirm pause** —
+//! `executor::preflight_confirmations` and the `debug_confirm_each_step`
+//! pause both run before any command is issued — which is bounded only by
+//! `confirm_timeout_s`, i.e. up to an hour at the top of the permitted band,
+//! or unbounded human time at a CLI `--step` prompt. During it an autostart
+//! macro or a queued job can begin printing, and answering "continue" would
+//! then issue `SET_KINEMATIC_POSITION` and `PROBE` into a running print and
+//! report `COMPLETED`.
+//!
+//! So [`BarrierGate`] re-runs this whole check once per step, immediately
+//! before that step's commands go out — see [`crate::executor::Exclusivity`]
+//! for the placement argument and for why it cannot refuse the recovery's
+//! own progress.
+//!
+//! **The residual, stated accurately.** What is left is one Moonraker round
+//! trip: another g-code source can take the mutex between the re-check and
+//! the send. That gap is *microseconds* and cannot be closed from outside
+//! Klipper, which is a genuinely different claim from the one this comment
+//! used to make — it said a `[delayed_gcode]` between two plan steps was
+//! unobservable, and that was false and harmful, because observing it costs
+//! exactly one `printer.objects.query` and is now what happens.
+//!
+//! ## What was considered and rejected: `idle_timeout.state`
+//!
+//! `idle_timeout.state == "Printing"` looks like the natural detector and
+//! is not one, in both directions. Read at source
+//! (`../klipper/klippy/extras/idle_timeout.py`):
+//!
+//! * The transition *into* `"Printing"` that tracks the toolhead is
+//!   `handle_sync_print_time` (`idle_timeout.py:98-107`), fired from the
+//!   `toolhead:sync_print_time` event, which `ToolHead._calc_print_time`
+//!   emits only when it advances `print_time` past the estimate
+//!   (`../klipper/klippy/toolhead.py:260-268`). Nothing about *entering* a
+//!   macro or taking the mutex does that. A macro whose motion comes *after*
+//!   its `PLR_RECOVER` line — which is precisely the dangerous shape — is
+//!   still `"Idle"`/`"Ready"` at gate time. **False negative in the unsafe
+//!   direction.**
+//! * Conversely `_calc_print_time` also runs from
+//!   `ToolHead.get_last_move_time` (`toolhead.py:320-326`), which
+//!   `register_lookahead_callback` calls on an empty lookahead
+//!   (`toolhead.py:526-530`). That is reached by setting a heater
+//!   (`extras/heaters.py:360-363`), any fan or pin request
+//!   (`extras/fan.py:71-72` → `extras/output_pin.py:65-67`),
+//!   `SET_STEPPER_ENABLE` (`extras/stepper_enable.py:106`), `G4`
+//!   (`toolhead.py:419`), and TMC/endstop register reads
+//!   (`extras/tmc.py:368`, `extras/query_endstops.py:28`). So a periodic
+//!   `[delayed_gcode]` that pokes a fan every couple of seconds keeps the
+//!   state at `"Printing"` almost continuously — and each poke holds it
+//!   there for ~1.5 s, since the exit path needs `lookahead_empty`, a
+//!   negative buffer *and* a free mutex (`idle_timeout.py:80-97`).
+//!   **False refusal of a legitimate recovery, on a common configuration.**
+//! * And there is a *second* assignment of `"Printing"` that has nothing to
+//!   do with the toolhead at all: `transition_idle_state` sets it while it
+//!   runs the idle g-code (`idle_timeout.py:46-49`) and only then settles to
+//!   `"Idle"` (`:56`). So the field also reads `"Printing"` for the duration
+//!   of `TURN_OFF_HEATERS` + `M84` — the moment the machine is *becoming*
+//!   maximally idle. Another transient false positive, and it lands exactly
+//!   where an operator is most likely to start a recovery: on a printer that
+//!   has been sitting untouched.
+//!
+//! Boot and `FIRMWARE_RESTART` both land on `"Idle"` — the field is
+//! initialised there (`idle_timeout.py:32`) and a firmware restart builds
+//! a fresh object — so those two edges would have been safe; and gate 4
+//! runs exactly once, before anything is sent, so it could not have
+//! refused this daemon's own later steps. Neither of those redeems the two
+//! failures above.
+//!
+//! The one field that *would* answer the question, `GCodeMacro.in_script`
+//! (`../klipper/klippy/extras/gcode_macro.py:190-200`), is not published:
+//! that object's `get_status` returns only its variables
+//! (`gcode_macro.py:172-173`). Detecting "called from inside a macro" is
+//! therefore only possible in-process, i.e. in the Klipper plugin.
 
 use std::io::{BufRead, Write};
 use std::path::Path;
@@ -331,11 +445,15 @@ pub(crate) async fn execute_with_gates(
     // G-code scripts legitimately run for minutes (heat soak, probe).
     client.set_call_timeout(exec_options.temp_timeout);
 
-    // Gate 4: ready + idle.
-    if let Err(reason) = printer_ready_and_idle(&mut client).await {
-        let _ = writeln!(out, "recover: REFUSED — {reason}; nothing was sent.");
-        return EXIT_RUNTIME;
-    }
+    // The two filesystem gates come BEFORE the printer gates, deliberately.
+    // Both are pure local I/O with no RPC, so a disk failure refuses with
+    // "nothing was sent" in the literal sense — not "nothing that changes
+    // the machine". Ordering them the other way round would trade that
+    // exact wording for nothing: the printer gates would still run, and
+    // their sentinel would already be on the wire by the time the disk
+    // failed. The cost is that a *printer* refusal now happens with a
+    // transcript and a recovery file already on disk, which is handled
+    // where that refusal is raised.
 
     // Transcript file: no transcript, no execution.
     let transcript_path = config.wal_dir.join(format!(
@@ -368,6 +486,18 @@ pub(crate) async fn execute_with_gates(
     }
     let bundle = &bundle;
 
+    // Gates 4 and 4b. First point at which anything reaches the printer.
+    if let Err(reason) = idle_and_exclusive(
+        &mut client,
+        barrier_budget(&bundle.plan, exec_options),
+        exec_options.temp_timeout,
+    )
+    .await
+    {
+        refuse_at_printer_gate(&reason, bundle, &mut transcript_file, out);
+        return EXIT_RUNTIME;
+    }
+
     let mut frame_guard = MarkerFrameGuard {
         wal_dir: config.wal_dir.clone(),
     };
@@ -382,6 +512,9 @@ pub(crate) async fn execute_with_gates(
         gate.confirm(step, out)
     };
 
+    let mut exclusivity = BarrierGate {
+        restore_timeout: exec_options.temp_timeout,
+    };
     let outcome = {
         let mut transcript = Transcript::new(&mut transcript_file);
         execute(
@@ -391,6 +524,7 @@ pub(crate) async fn execute_with_gates(
             &mut gate_fn,
             confirmer,
             &mut frame_guard,
+            &mut exclusivity,
             &mut transcript,
         )
         .await
@@ -453,6 +587,20 @@ fn report_abort(outcome: &ExecOutcome, config: &Config, out: &mut (dyn Write + S
              recover:   Fix the WAL directory {} (it also holds the transcript), then \
              retry or cool the printer down by hand.",
             config.wal_dir.display()
+        );
+    } else if let crate::executor::StopCause::ExclusivityLost(why) = cause {
+        // The operator's problem is not this recovery — it is that
+        // something else owns their printer. Say that, and say what this
+        // step did NOT do, because the abort landed before the step's
+        // commands went out.
+        let _ = writeln!(
+            out,
+            "recover: STOPPED before step {step_id} — {why}\n\
+             recover:   Step {step_id} sent nothing. Everything before it ran and is left \
+             exactly as any abort at this point leaves it.\n\
+             recover:   Something else is driving this printer: an autostart macro, a queued \
+             job, or a [gcode_macro] that called PLR_RECOVER and kept going. Let it finish (or \
+             cancel it), then run a fresh dry run before resuming — the plan is now stale."
         );
     } else {
         let _ = writeln!(
@@ -678,6 +826,178 @@ fn retarget_recovery_file(bundle: &mut PlanBundle, new_name: &str) -> usize {
     patched
 }
 
+/// The g-code mutex barrier's sentinel command.
+///
+/// `M110` (set line number) is chosen because it is inert *by
+/// construction*, which is the only property that matters here:
+///
+/// * it goes through `gcode.run_script`, so it takes and releases the
+///   g-code mutex — that is the whole point
+///   (`../klipper/klippy/webhooks.py:447-448`, `gcode.py:239-241`);
+/// * **its handler is literally `pass`** (`gcode.py:338-340`). It changes
+///   no state, queues no move, touches no toolhead or heater, and emits no
+///   output at all;
+/// * it is registered in the block of commands that exist *before* the
+///   config is loaded (`gcode.py:117-124`), so it cannot fail because of
+///   how the operator's printer is configured.
+///
+/// # Why not `M115`, which this used to be
+///
+/// Two reasons, both found in review, and both disqualifying:
+///
+/// * **It is not unconditionally inert.** `[gcode_macro M115]` with
+///   `rename_existing: M115.1` is legal Klipper config — the rename passes
+///   the `is_traditional_gcode` consistency check (`gcode.py:137-142`) — so
+///   on such a printer the "read-only" barrier would run an arbitrary macro
+///   body, possibly homing or heating, as the recovery's first act, and
+///   that body could `gcmd.error` the barrier into a refusal.
+/// * **It is not silent.** The API socket calls `run_script` with
+///   `need_ack=False`, so `gcmd.ack` returns false and `cmd_M115` falls
+///   through to `respond_info` (`gcode.py:344-351`): every recovery
+///   attempt, *including every refusal*, would drop an unexplained
+///   firmware banner into the operator's console and Moonraker's g-code
+///   store.
+///
+/// `M110` is renameable in principle too — nothing in Klipper forbids
+/// `[gcode_macro M110]` — so "inert" is a property of stock Klipper plus a
+/// config nobody writes, not a proof. The barrier's failure direction is a
+/// refusal, so a hijacked sentinel that errors costs a false refusal rather
+/// than a hidden hazard; one that silently succeeds costs nothing the
+/// following ready-and-idle re-sample does not re-check.
+pub(crate) const GCODE_BARRIER_SENTINEL: &str = "M110";
+
+/// Gates 4 and 4b together, in the order that makes each worth having.
+///
+/// The `Err` string is the whole operator-facing reason, so the three
+/// refusals stay distinguishable in the report and in the tests: a printer
+/// that was busy all along, a mutex nobody released, and a printer that
+/// stopped being idle while we waited are three different diagnoses and
+/// three different things for the operator to do.
+async fn idle_and_exclusive(
+    client: &mut MoonrakerClient,
+    barrier_budget: Duration,
+    restore_timeout: Duration,
+) -> Result<(), String> {
+    // Gate 4, FIRST: a plainly busy printer is refused without this daemon
+    // putting a single byte of g-code on the wire.
+    if let Err(reason) = printer_ready_and_idle(client).await {
+        return Err(format!("{reason}; nothing was sent."));
+    }
+    // Gate 4b: synchronise with Klipper's g-code mutex, then re-sample
+    // gate 4 (module docs). Until the sentinel returns, gate 4's answer
+    // describes the machine as it was *before* whatever was already holding
+    // the mutex — most importantly the `[gcode_macro]` a console
+    // `PLR_RECOVER` is nested in — got to run its remaining commands.
+    if let Err(reason) = gcode_mutex_barrier(client, barrier_budget, restore_timeout).await {
+        return Err(format!(
+            "{reason}. Nothing but the read-only {GCODE_BARRIER_SENTINEL} was sent. If this \
+             recovery was started from a [gcode_macro], that macro still holds the mutex: \
+             call PLR_RECOVER as the macro's LAST command, or run it directly."
+        ));
+    }
+    if let Err(reason) = printer_ready_and_idle(client).await {
+        return Err(format!(
+            "the printer stopped being idle while dead-reckoning was waiting for Klipper's \
+             g-code mutex ({reason}). Another g-code source ran between the check and now — \
+             most likely the [gcode_macro] this recovery was started from. Nothing but the \
+             read-only {GCODE_BARRIER_SENTINEL} was sent."
+        ));
+    }
+    Ok(())
+}
+
+/// Refuses at gates 4/4b, after the filesystem gates have already run.
+///
+/// Two clean-ups the earlier ordering did not need, both consequences of
+/// doing the disk work first (see the ordering note in
+/// [`execute_with_gates`]):
+///
+/// * **journal it.** The transcript exists by now, and a gate refusal used
+///   to be recorded nowhere but stdout — which on the socket path means it
+///   survived only as long as the response the plugin printed.
+/// * **remove the recovery file.** Nothing will select it, and leaving it
+///   behind would make the next attempt re-resolve to a `-2` name and
+///   litter the sdcard root one file per refusal. `write_recovery_file`
+///   created it with `create_new`, so this cannot remove somebody else's
+///   file; if the removal fails, the existing collision handling copes,
+///   which is already tested.
+fn refuse_at_printer_gate(
+    reason: &str,
+    bundle: &PlanBundle,
+    transcript_file: &mut std::fs::File,
+    out: &mut (dyn Write + Send),
+) {
+    let _ = writeln!(
+        transcript_file,
+        "{}",
+        serde_json::json!({"event": "refused", "gate": "idle-and-exclusive", "reason": reason})
+    );
+    let _ = transcript_file.flush();
+    let _ = std::fs::remove_file(&bundle.recovery_file_path);
+    let _ = writeln!(out, "recover: REFUSED — {reason}");
+}
+
+/// The barrier budget in force for `plan`: the operator's `[plr]`
+/// `gcode_barrier_timeout_s` when set, else the daemon's default.
+///
+/// The same rule the executor applies to its own per-step re-checks, in one
+/// function so the pre-execution gate and the per-step gate cannot disagree
+/// about how long the operator asked to wait.
+fn barrier_budget(plan: &plr_recovery::RecoveryPlan, exec_options: &ExecOptions) -> Duration {
+    crate::executor::plan_duration_or(
+        plan.gcode_barrier_timeout_s,
+        exec_options.gcode_barrier_timeout,
+    )
+}
+
+/// The production [`Exclusivity`]: [`idle_and_exclusive`], re-run before
+/// every step's commands go out.
+///
+/// It is the *same* check as gates 4 and 4b, deliberately — a second,
+/// weaker predicate for the per-step case would be a second thing to keep
+/// true. `restore_timeout` is what the client's per-call budget is put back
+/// to afterwards, so a barrier does not silently shorten the multi-minute
+/// budget a heat-soak step needs.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) struct BarrierGate {
+    pub(crate) restore_timeout: Duration,
+}
+
+impl crate::executor::Exclusivity for BarrierGate {
+    fn recheck<'a>(
+        &'a mut self,
+        client: &'a mut MoonrakerClient,
+        budget: Duration,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + 'a>> {
+        let restore = self.restore_timeout;
+        Box::pin(async move { idle_and_exclusive(client, budget, restore).await })
+    }
+}
+
+/// Gate 4b's first half: block until dead-reckoning has held and released
+/// Klipper's g-code mutex, so gate 4 can be re-sampled against a machine
+/// nobody else is mid-command on (see the module docs).
+///
+/// Fail-closed: any error — timeout, RPC error, dropped connection — is a
+/// refusal, because "we could not establish that we have exclusive g-code
+/// access" and "we have exclusive g-code access" must not share a branch.
+async fn gcode_mutex_barrier(
+    client: &mut MoonrakerClient,
+    budget: Duration,
+    restore_timeout: Duration,
+) -> Result<(), String> {
+    client.set_call_timeout(budget);
+    let result = client.gcode_script(GCODE_BARRIER_SENTINEL).await;
+    client.set_call_timeout(restore_timeout);
+    result.map_err(|e| {
+        format!(
+            "could not confirm exclusive g-code access — the read-only \
+             {GCODE_BARRIER_SENTINEL} barrier did not complete ({e}), so another g-code \
+             source may still hold Klipper's g-code mutex"
+        )
+    })
+}
+
 /// Gate 4 predicate (see module docs for the exact fields, cited from
 /// Moonraker `printer.objects.query`).
 async fn printer_ready_and_idle(client: &mut MoonrakerClient) -> Result<(), String> {
@@ -750,7 +1070,7 @@ mod tests {
     use crate::executor::ExecOptions;
     use crate::pipeline::{machine_config, PipelineOutcome, PlanBundle};
     use crate::testmoon::FakeMoonraker;
-    use serde_json::json;
+    use serde_json::{json, Value};
     use std::io::Cursor;
     use std::path::PathBuf;
     use std::time::Duration;
@@ -805,6 +1125,7 @@ mod tests {
                 temp_timeout: Duration::from_millis(300),
                 poll_interval: Duration::from_millis(20),
                 confirm_timeout: Duration::from_millis(300),
+                gcode_barrier_timeout: Duration::from_millis(300),
             },
             connect_timeout: Duration::from_secs(2),
         }
@@ -920,6 +1241,238 @@ mod tests {
         assert!(fake.gcode_sent().is_empty());
     }
 
+    // --- Gate 4b: the g-code mutex barrier -------------------------------
+    //
+    // The hazard, restated so the tests below can be read against it: gate
+    // 4 is a sample, and Klipper holds the g-code mutex for the whole body
+    // of a `[gcode_macro]` (`gcode.run_script`,
+    // `../klipper/klippy/gcode.py:239-241`, wrapping a nested
+    // `run_script_from_command` that takes no lock of its own). So a
+    // recovery started from inside a macro passes gate 4 against a machine
+    // the macro has not finished changing, and the plan's first command
+    // does not land until the macro's last one has.
+    //
+    // Neither test below restates a constant: each one builds a printer
+    // that *behaves* like the hazard and checks that the barrier catches
+    // it. Removing the barrier makes both fail (verified: the macro test
+    // reaches `COMPLETED` and sends `M24` with the barrier removed).
+
+    /// A macro that starts a print *after* calling `PLR_RECOVER`.
+    ///
+    /// The printer answers "idle" until the sentinel is served, which is
+    /// exactly when the mutex would be handed over — and by then the
+    /// macro's `M24` has run. Gate 4's first sample is therefore honest and
+    /// stale, and only the re-sample can see it.
+    #[test]
+    fn a_macro_that_starts_a_print_after_calling_us_is_refused_at_the_barrier() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let printing = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = std::sync::Arc::clone(&printing);
+        let fake = rt.block_on(FakeMoonraker::spawn(move |method, params| {
+            if method == "printer.gcode.script"
+                && params["script"].as_str() == Some(super::GCODE_BARRIER_SENTINEL)
+            {
+                // The mutex was released to us; the macro had already run
+                // its `M24` to get here.
+                flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                return Ok(json!("ok"));
+            }
+            let mut v = happy_handler(method, params)?;
+            if method == "printer.objects.query" && flag.load(std::sync::atomic::Ordering::SeqCst) {
+                if let Some(status) = v.get_mut("status").and_then(Value::as_object_mut) {
+                    status.insert("print_stats".to_owned(), json!({"state": "printing"}));
+                    status.insert(
+                        "virtual_sdcard".to_owned(),
+                        json!({"is_active": true, "file_path": "/g/x.gcode", "file_position": 0}),
+                    );
+                }
+            }
+            Ok(v)
+        }));
+        let config = test_config("barrier-macro", &fake.url());
+        // `plan_outcome_in`, not `plan_outcome`: the latter puts the sdcard
+        // root in an unrelated temp dir, which made the "no recovery file
+        // left behind" assertion below vacuously true — caught by mutation,
+        // which removed the cleanup and saw the test still pass.
+        let (code, output) = run_drive(
+            &plan_outcome_in(&config.wal_dir),
+            &config,
+            &fast_recover(true, true, false),
+            "y\n",
+        );
+        assert_eq!(code, crate::EXIT_RUNTIME, "{output}");
+        assert!(
+            output.contains("stopped being idle while dead-reckoning was waiting"),
+            "{output}"
+        );
+        assert!(output.contains("[gcode_macro]"), "{output}");
+        // The ONLY thing sent is the read-only sentinel: no plan command,
+        // and in particular nothing that moves or heats.
+        assert_eq!(
+            fake.gcode_sent(),
+            vec![super::GCODE_BARRIER_SENTINEL.to_owned()],
+            "the barrier refusal must send nothing but the sentinel"
+        );
+        // The refusal is journalled. A transcript exists because the two
+        // filesystem gates now run first, and a gate refusal that survived
+        // only in stdout was invisible after the fact on the socket path.
+        let transcript = std::fs::read_dir(&config.wal_dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .find(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with("recovery-transcript-")
+            })
+            .expect("transcript");
+        let text = std::fs::read_to_string(transcript.path()).unwrap();
+        assert!(text.contains("\"event\":\"refused\""), "{text}");
+        assert!(text.contains("idle-and-exclusive"), "{text}");
+        // No step ever started.
+        assert!(!text.contains("step-start"), "{text}");
+        // And the recovery file this run created was removed rather than
+        // left to litter the sdcard root one file per refusal.
+        assert!(
+            !std::fs::read_dir(&config.wal_dir)
+                .unwrap()
+                .filter_map(Result::ok)
+                .any(|e| e.file_name().to_string_lossy().contains("_RECOVERY")),
+            "the unused recovery file must not be left behind"
+        );
+    }
+
+    /// A g-code source that never releases the mutex in time — the
+    /// deadlock shape, e.g. a macro that is itself blocked waiting on this
+    /// daemon, or a klippy wedged inside somebody else's script.
+    ///
+    /// The fake runs on **its own runtime on its own thread**, and that is
+    /// load-bearing rather than tidiness. A blocking handler on the runtime
+    /// under test starves the very task whose timeout is being tested:
+    /// `tokio::time::timeout` polls its inner future first, so a client task
+    /// that is not polled until after the response has arrived sees the
+    /// response and returns `Ok` no matter how long the deadline has been
+    /// past. Written that way this test passed the barrier and reported
+    /// `COMPLETED` — it was measuring the fake, not the code. A real klippy
+    /// holding its own mutex cannot stall this daemon's event loop, so the
+    /// isolated runtime is also the faithful model.
+    #[test]
+    fn a_held_gcode_mutex_times_out_into_a_refusal() {
+        use std::sync::{Arc, Mutex};
+        let scripts: Arc<Mutex<Vec<String>>> = Arc::default();
+        let log = Arc::clone(&scripts);
+        let (url_tx, url_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("fake runtime");
+            rt.block_on(async move {
+                let fake = FakeMoonraker::spawn(move |method, params| {
+                    if method == "printer.gcode.script" {
+                        let script = params["script"].as_str().unwrap_or_default().to_owned();
+                        log.lock().expect("script log").push(script.clone());
+                        if script == super::GCODE_BARRIER_SENTINEL {
+                            // Five times the barrier budget below: the
+                            // answer cannot arrive in time.
+                            std::thread::sleep(Duration::from_secs(2));
+                        }
+                    }
+                    happy_handler(method, params)
+                })
+                .await;
+                url_tx.send(fake.url()).expect("url");
+                // Outlive the refusal, then let the fake drop.
+                tokio::time::sleep(Duration::from_secs(3)).await;
+            });
+        });
+        let url = url_rx.recv().expect("fake url");
+        let config = test_config("barrier-held", &url);
+        let (code, output) = run_drive(
+            &plan_outcome_in(&config.wal_dir),
+            &config,
+            &fast_recover(true, true, false),
+            "y\n",
+        );
+        assert_eq!(code, crate::EXIT_RUNTIME, "{output}");
+        assert!(
+            output.contains("may still hold Klipper's g-code mutex"),
+            "the refusal must name the actual resource: {output}"
+        );
+        assert!(output.contains("timed out"), "{output}");
+        assert!(
+            output.contains("PLR_RECOVER as the macro's LAST command"),
+            "{output}"
+        );
+        // The sentinel attempt and nothing else: no plan command ran.
+        assert_eq!(
+            scripts.lock().unwrap().as_slice(),
+            &[super::GCODE_BARRIER_SENTINEL.to_owned()],
+            "{output}"
+        );
+    }
+
+    /// The barrier's other failure mode: klippy answers the sentinel with
+    /// an error (`printer.gcode.script` -> `Klippy is shutdown` is
+    /// Moonraker's real reply when klippy dies mid-script). "We could not
+    /// establish exclusive g-code access" must not share a branch with "we
+    /// have it".
+    #[test]
+    fn a_failed_barrier_sentinel_refuses_rather_than_assuming_success() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let fake = rt.block_on(FakeMoonraker::spawn(|method, params| {
+            if method == "printer.gcode.script"
+                && params["script"].as_str() == Some(super::GCODE_BARRIER_SENTINEL)
+            {
+                return Err((400, "Klippy is shutdown: Lost communication".to_owned()));
+            }
+            happy_handler(method, params)
+        }));
+        let config = test_config("barrier-error", &fake.url());
+        let (code, output) = run_drive(
+            &plan_outcome_in(&config.wal_dir),
+            &config,
+            &fast_recover(true, true, false),
+            "y\n",
+        );
+        assert_eq!(code, crate::EXIT_RUNTIME, "{output}");
+        assert!(
+            output.contains("may still hold Klipper's g-code mutex"),
+            "{output}"
+        );
+        assert!(output.contains("Klippy is shutdown"), "{output}");
+        assert_eq!(
+            fake.gcode_sent(),
+            vec![super::GCODE_BARRIER_SENTINEL.to_owned()],
+            "{output}"
+        );
+    }
+
+    /// The barrier runs where it claims to: after gate 4 and before the
+    /// plan's first command.
+    #[test]
+    fn the_barrier_sentinel_precedes_every_plan_command() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let fake = rt.block_on(FakeMoonraker::spawn(happy_handler));
+        let config = test_config("barrier-order", &fake.url());
+        let (code, output) = run_drive(
+            &plan_outcome_in(&config.wal_dir),
+            &config,
+            &fast_recover(true, true, false),
+            "y\n",
+        );
+        assert_eq!(code, crate::EXIT_OK, "{output}");
+        let sent = fake.gcode_sent();
+        assert_eq!(
+            sent.first().map(String::as_str),
+            Some(super::GCODE_BARRIER_SENTINEL),
+            "{sent:?}"
+        );
+        assert!(
+            sent.len() > 1,
+            "the plan must still have executed: {sent:?}"
+        );
+    }
+
     #[test]
     fn happy_path_executes_and_writes_a_transcript() {
         let rt = tokio::runtime::Runtime::new().unwrap();
@@ -935,11 +1488,18 @@ mod tests {
         );
         assert_eq!(code, crate::EXIT_OK, "{output}");
         assert!(output.contains("COMPLETED"), "{output}");
+        // The full send order, spelled out: gate 4b's barrier, then one
+        // per-step re-check barrier immediately before each step's commands
+        // (`executor::Exclusivity`). Nothing else, and nothing out of order.
         assert_eq!(
             fake.gcode_sent(),
             vec![
+                super::GCODE_BARRIER_SENTINEL,
+                super::GCODE_BARRIER_SENTINEL,
                 "SET_IDLE_TIMEOUT TIMEOUT=86400",
+                super::GCODE_BARRIER_SENTINEL,
                 "PROBE PROBE_SPEED=1 SAMPLES=1",
+                super::GCODE_BARRIER_SENTINEL,
                 "SET_KINEMATIC_POSITION Z=12.25",
             ]
         );
@@ -1101,9 +1661,12 @@ mod tests {
         );
         assert_eq!(code, crate::EXIT_RUNTIME, "{output}");
         assert!(output.contains("cannot write recovery file"), "{output}");
+        // Literally nothing on the wire. The two filesystem gates run
+        // BEFORE the printer gates precisely so that a disk failure keeps
+        // this assertion in its strongest form.
         assert!(
             fake.gcode_sent().is_empty(),
-            "a write failure must abort before any motion: {:?}",
+            "a write failure must abort before anything is sent: {:?}",
             fake.gcode_sent()
         );
     }
@@ -1122,10 +1685,15 @@ mod tests {
         );
         assert_eq!(code, crate::EXIT_RUNTIME, "{output}");
         assert!(output.contains("ABORTED at step 3"), "{output}");
+        // The declined third step re-checks nothing and sends nothing: the
+        // gate refuses before the per-step barrier.
         assert_eq!(
             fake.gcode_sent(),
             vec![
+                super::GCODE_BARRIER_SENTINEL,
+                super::GCODE_BARRIER_SENTINEL,
                 "SET_IDLE_TIMEOUT TIMEOUT=86400",
+                super::GCODE_BARRIER_SENTINEL,
                 "PROBE PROBE_SPEED=1 SAMPLES=1",
             ]
         );
@@ -1153,7 +1721,15 @@ mod tests {
         assert_eq!(code, crate::EXIT_RUNTIME, "{output}");
         assert!(output.contains("ABORTED at step 1"), "{output}");
         assert!(output.contains("idle-timeout-not-applied"), "{output}");
-        assert_eq!(fake.gcode_sent().len(), 1, "abort must not continue");
+        assert_eq!(
+            fake.gcode_sent(),
+            vec![
+                super::GCODE_BARRIER_SENTINEL,
+                super::GCODE_BARRIER_SENTINEL,
+                "SET_IDLE_TIMEOUT TIMEOUT=86400"
+            ],
+            "abort must not continue"
+        );
     }
 
     #[test]
@@ -1587,6 +2163,41 @@ mod tests {
         panic!("the interlock was never armed");
     }
 
+    /// Waits until a command starting with `prefix` has actually reached
+    /// the fake printer.
+    ///
+    /// [`spawn_until_armed`] cannot stand in for this and must not be used
+    /// as if it could. Arming is *strictly earlier* than the send:
+    /// `executor::arm_frame_if_entering` runs before `run_step` issues the
+    /// step's commands (`executor.rs`, the `for step in &plan.steps` loop),
+    /// so the interlock file exists before any of `SET_KINEMATIC_POSITION`
+    /// has been serialised, let alone acknowledged by the fake's
+    /// WebSocket task. Asserting on `fake.gcode_sent()` the instant the
+    /// file appears is therefore not a race that is *usually* won — it is
+    /// an assertion about an event that has not been waited for at all.
+    /// Measured on Linux, 24 cores, 24 concurrent copies of the test plus
+    /// 24 busy-loop load processes: **18 failures in 2000 runs** before this
+    /// helper, **0 in 2000** after, and every failure printed the same
+    /// history — `["M115", "SET_IDLE_TIMEOUT TIMEOUT=86400"]` — i.e. the
+    /// declare simply had not been sent yet.
+    ///
+    /// The fix is to wait for the observable the assertion is about. A
+    /// longer arming budget would not have touched it: arming had already
+    /// succeeded in every one of those failures.
+    async fn wait_for_gcode(fake: &FakeMoonraker, prefix: &str) -> Vec<String> {
+        for _ in 0..1_000 {
+            let sent = fake.gcode_sent();
+            if sent.iter().any(|c| c.starts_with(prefix)) {
+                return sent;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!(
+            "no command starting with {prefix:?} was ever sent; saw {:?}",
+            fake.gcode_sent()
+        );
+    }
+
     /// BLOCKER 1: a daemon shutdown while paused must not discard the
     /// interlock. Dropping the runtime drops the execution future
     /// mid-`await`, so nothing on the abort path ever runs — and the
@@ -1601,12 +2212,11 @@ mod tests {
         rt.block_on(async {
             let handle = spawn_until_armed(bundle, config, Box::new(NeverAnswers)).await;
             // The declare really was issued: we are in the danger zone.
+            // Waited for, not assumed — see `wait_for_gcode`.
+            let sent = wait_for_gcode(&fake, "SET_KINEMATIC_POSITION").await;
             assert!(
-                fake.gcode_sent()
-                    .iter()
-                    .any(|c| c.starts_with("SET_KINEMATIC_POSITION")),
-                "{:?}",
-                fake.gcode_sent()
+                sent.iter().any(|c| c.starts_with("SET_KINEMATIC_POSITION")),
+                "{sent:?}"
             );
             // `systemctl restart plrd`: the task is dropped mid-await.
             handle.abort();

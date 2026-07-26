@@ -666,6 +666,73 @@ slow (a long pipeline run on a big WAL can push `recover_dryrun`
 toward its 120 s budget on slow media — prune old segments, see
 [disk sizing](#disk-sizing-and-write-load)).
 
+**`recover: REFUSED — could not confirm exclusive g-code access …` or
+`… the printer stopped being idle while dead-reckoning was waiting for
+Klipper's g-code mutex …`.**
+Something other than dead-reckoning was running g-code when the recovery
+started, and it still was when the recovery tried to take over. Klipper
+holds its g-code mutex for the whole body of a `[gcode_macro]`, so this
+fires most often when `PLR_RECOVER` is called from a macro that has more
+commands after it — the daemon cannot send anything until that macro
+finishes, and by then the machine is not the machine it checked. Nothing
+was sent but a read-only `M110`, whose Klipper handler does nothing at all.
+
+Fixes, in order of preference: run `PLR_RECOVER` directly rather than from
+a macro; if it must live in a macro, make it the **last** command in the
+body; and check nothing else (a console command, a `[delayed_gcode]`, a
+bed mesh) is mid-run. If the message names a timeout, the mutex was not
+released within the budget — look for a macro that is itself waiting on
+the daemon, or a klippy stuck inside somebody else's script
+(`journalctl -u klipper -n 100`).
+
+If your macros legitimately do tens of seconds of work *after* calling
+`PLR_RECOVER`, raise the budget rather than living with refusals:
+
+```
+[plr]
+gcode_barrier_timeout_s: 90     # default 30; permitted 5–600
+```
+
+Raising it trades promptness for tolerance and never weakens the check —
+the wait ends either way, in exclusive access or in a refusal.
+
+**`recover: STOPPED before step N — the printer stopped being idle …`.**
+The same check, re-run immediately before each step's commands go out (it
+is not enough to run it once: a confirmation pause can last an hour, and a
+job can start during it). Step N sent nothing; everything before it ran.
+Something else is driving the printer — an autostart macro, a queued job, or
+that `[gcode_macro]` again. Let it finish or cancel it, then run a fresh dry
+run: the plan is stale, and the Z frame is marked unknown so `--execute` is
+refused until you do.
+
+**Is a recovery still running / still waiting for me?**
+Ask the daemon, do not start one to find out:
+
+```
+printf '{"cmd": "recover_state"}\n' | socat - UNIX-CONNECT:/var/lib/plrd/plrd.sock
+```
+
+It reports `executing`, `awaiting_confirmation`, the outstanding
+`resume_token`, and `confirm_expires_in_s` — how long the daemon will still
+wait before it aborts the pause by itself. It is read-only: it cannot
+start, answer or cancel anything. A confirmation whose deadline has passed
+reads as `awaiting_confirmation: false` with `confirm_expired: true`, which
+means the recovery has already aborted (and the Z frame will be marked
+unknown — re-run a dry run before resuming).
+
+**What it does and does not see.** It reports recoveries started *through
+this socket, in this `plrd` process* — that is the whole of what the plugin
+can start, so for console use the answer is authoritative. It does **not**
+see a `plrd recover --execute` you ran yourself in another process or over
+SSH: that is a separate process with its own state, and `recover_state`
+will say `execution: none` while it runs. (Nothing serialises those two
+against each other either — a pre-existing gap, not something this query
+introduced — so do not run a CLI recovery and a console recovery at the
+same time.) It also forgets everything if `plrd` restarts: the mirror is
+in memory, and after a restart nothing *is* executing, which is the honest
+answer. The durable record of a recovery that died mid-flight is the
+frame-invalid marker in the WAL directory, not this query.
+
 **Control-socket permissions (mode 0666) — and how to tighten them.**
 The daemon deliberately creates `/var/lib/plrd/plrd.sock` world-writable:
 the stock install runs plrd as root while klippy — the socket's one
@@ -677,6 +744,17 @@ narrow and gated: `recover_execute` demands an explicit confirm, still
 passes machine validation, the klippy-ready + printer-idle gate, and
 transcript-or-refuse, and can only ever execute the deterministic
 pipeline plan — there is no arbitrary-G-code or configuration surface.
+`recover_state` widens the *readable* surface: it hands out the outstanding
+confirm-point's resume token. Be clear about what that enables. The token
+is a correlation identifier, never an authenticator, and anyone who can
+read it could already have sent `recover_execute` on the same socket — but
+confirm-points exist to require a human at the machine, and a local client
+that never received the pause can now **discover** the token and answer it,
+including "continue", without ever having seen the diagnosis. It is judged
+worth it because the alternative is worse: if the connection that received
+a pause dies, nobody can answer it and the recovery sits paused with the
+heaters on until the deadline. If you do not want that widening, the remedy
+is the same as for every other command here — tighten the socket's mode.
 On a multi-user host, tighten it: run plrd as the klippy user (systemd
 `User=`), or add a drop-in with
 `ExecStartPost=chgrp <group> %S/plrd/plrd.sock` + `chmod 0660` (plrd

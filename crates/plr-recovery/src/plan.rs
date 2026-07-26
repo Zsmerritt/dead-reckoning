@@ -988,6 +988,19 @@ pub struct RecoveryPlan {
     /// than discovered at the pause.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub confirm_timeout_s: Option<f64>,
+    /// `[plr]` `gcode_barrier_timeout_s`: how long execution waits for
+    /// Klipper's g-code mutex, at each point where it is about to send
+    /// after a gap it does not control, before refusing. `None` leaves the
+    /// daemon's own default
+    /// ([`crate::build::GCODE_BARRIER_TIMEOUT_DEFAULT_S`]).
+    ///
+    /// Carried on the plan for the same reason as
+    /// [`RecoveryPlan::confirm_timeout_s`]: it is a `printer.cfg` `[plr]`
+    /// key, validated with the rest of them, so an absurd value is refused
+    /// with a diagnosis at planning time rather than discovered when the
+    /// recovery is already half-executed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gcode_barrier_timeout_s: Option<f64>,
     /// Non-fatal observations.
     pub warnings: Vec<PlanWarning>,
 }

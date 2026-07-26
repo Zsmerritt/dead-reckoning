@@ -295,7 +295,10 @@ as the code states it:
   interactive prompt. The machine must be commissioned (console
   attestations read from the live `[plr]` config — or, legacy mode,
   `[machine]` attestations plus the config-hash blessing) and the
-  printer ready and idle before a single command is sent.
+  printer ready and idle before a single command is sent — *and still
+  idle after* dead-reckoning has taken and released Klipper's g-code
+  mutex, which is what stops a recovery started from inside a
+  `[gcode_macro]` from racing that macro's remaining commands.
 - **Honest degradation.** Subscription gaps, missing file tails, adaptive
   (non-restorable) bed meshes, unparseable lines — all surface as typed flags
   or plan warnings, and several degrade to a **typed manual-recovery
@@ -347,7 +350,8 @@ Implemented and tested:
   blessed `validated_config_hash`); **dry run is the default** — the
   dry path provably cannot send (no network client is ever constructed);
   `--execute` requires `--confirm` *and* an interactive yes (console:
-  `EXECUTE=1 CONFIRM=YES`); the printer must be ready and idle; `--step`
+  `EXECUTE=1 CONFIRM=YES`); the printer must be ready and idle, then
+  still ready and idle after a read-only g-code mutex barrier; `--step`
   asks again before every step (CLI-only). During execution every step's
   verifications must pass — any failure aborts with a typed reason — and
   everything sent, received, and evaluated is written to a JSONL

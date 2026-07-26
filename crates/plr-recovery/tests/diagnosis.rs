@@ -33,8 +33,9 @@ use plr_recovery::diagnosis::{Diagnose, Tier};
 use plr_recovery::machine::PrereqFailure;
 use plr_recovery::preflight::{BoundsViolation, PlanRejection, ViolationKind};
 use plr_recovery::{
-    PlanConfig, PlanWarning, RecoveryError, ACCEL_MAX, ACCEL_MIN, CONFIRM_TIMEOUT_MAX_S,
-    CONFIRM_TIMEOUT_MIN_S, UNSAFE_PURGE_Z_BELOW_BED,
+    PlanConfig, PlanWarning, RecoveryError, ACCEL_MAX, ACCEL_MIN, CONFIRM_TIMEOUT_DEFAULT_S,
+    CONFIRM_TIMEOUT_MAX_S, CONFIRM_TIMEOUT_MIN_S, GCODE_BARRIER_TIMEOUT_MAX_S,
+    GCODE_BARRIER_TIMEOUT_MIN_S, UNSAFE_PURGE_Z_BELOW_BED,
 };
 
 /// Every [`RecoveryError`] variant, with the tier it must carry.
@@ -94,6 +95,14 @@ fn every_recovery_error() -> Vec<(RecoveryError, Tier)> {
                 value: 5.0,
                 min: CONFIRM_TIMEOUT_MIN_S,
                 max: CONFIRM_TIMEOUT_MAX_S,
+            },
+            Tier::Hard,
+        ),
+        (
+            RecoveryError::GcodeBarrierTimeoutOutOfRange {
+                value: 0.0,
+                min: GCODE_BARRIER_TIMEOUT_MIN_S,
+                max: GCODE_BARRIER_TIMEOUT_MAX_S,
             },
             Tier::Hard,
         ),
@@ -347,6 +356,7 @@ fn tier_of_recovery_error(e: &RecoveryError) -> Tier {
         | RecoveryError::InvalidPlanConfig { .. }
         | RecoveryError::AccelOutOfRange { .. }
         | RecoveryError::ConfirmTimeoutOutOfRange { .. }
+        | RecoveryError::GcodeBarrierTimeoutOutOfRange { .. }
         | RecoveryError::ProbeTempHeadroomUnavailable { .. }
         | RecoveryError::DragTempOutOfRange { .. }
         | RecoveryError::PurgeMacroMissing { .. }
@@ -457,7 +467,7 @@ fn every_recovery_error_variant_yields_a_usable_diagnosis() {
     let all = every_recovery_error();
     assert_eq!(
         all.len(),
-        19,
+        20,
         "a sample value was removed from this list; it must exercise every arm"
     );
     for (error, tier) in &all {
@@ -699,7 +709,11 @@ fn the_confirm_timeout_is_bounded_on_both_sides() {
             Some(CONFIRM_TIMEOUT_MAX_S)
         );
     }
-    for ok in [CONFIRM_TIMEOUT_MIN_S, 600.0, CONFIRM_TIMEOUT_MAX_S] {
+    for ok in [
+        CONFIRM_TIMEOUT_MIN_S,
+        CONFIRM_TIMEOUT_DEFAULT_S,
+        CONFIRM_TIMEOUT_MAX_S,
+    ] {
         PlanConfig {
             confirm_timeout_s: Some(ok),
             ..PlanConfig::default()
@@ -709,6 +723,96 @@ fn the_confirm_timeout_is_bounded_on_both_sides() {
     }
     // Absent is always fine: the daemon's default stays in force.
     assert_eq!(PlanConfig::default().confirm_timeout_s, None);
+}
+
+#[test]
+fn the_gcode_barrier_timeout_is_bounded_on_both_sides() {
+    for bad in [
+        GCODE_BARRIER_TIMEOUT_MIN_S - 1.0,
+        GCODE_BARRIER_TIMEOUT_MAX_S + 1.0,
+        0.0,
+        f64::NAN,
+        f64::INFINITY,
+    ] {
+        let error = PlanConfig {
+            gcode_barrier_timeout_s: Some(bad),
+            ..PlanConfig::default()
+        }
+        .validate()
+        .unwrap_err_or_panic(&format!("gcode_barrier_timeout_s = {bad} must refuse"));
+        assert!(
+            matches!(error, RecoveryError::GcodeBarrierTimeoutOutOfRange { .. }),
+            "{bad}: {error:?}"
+        );
+        let d = error.diagnosis();
+        assert_eq!(d.code, "gcode_barrier_timeout_out_of_range");
+        assert_eq!(d.tier, Tier::Hard);
+        assert_eq!(d.override_key, None);
+        assert_eq!(
+            d.expected.as_ref().unwrap().min,
+            Some(GCODE_BARRIER_TIMEOUT_MIN_S)
+        );
+        assert_eq!(
+            d.expected.as_ref().unwrap().max,
+            Some(GCODE_BARRIER_TIMEOUT_MAX_S)
+        );
+    }
+    for ok in [GCODE_BARRIER_TIMEOUT_MIN_S, GCODE_BARRIER_TIMEOUT_MAX_S] {
+        PlanConfig {
+            gcode_barrier_timeout_s: Some(ok),
+            ..PlanConfig::default()
+        }
+        .validate()
+        .unwrap_or_else(|e| panic!("{ok} must be accepted: {e:?}"));
+    }
+    assert_eq!(PlanConfig::default().gcode_barrier_timeout_s, None);
+}
+
+/// The out-of-range advice quotes a default the same validator accepts.
+///
+/// Not a restatement of the band. `confirm_timeout_out_of_range` tells the
+/// operator "remove the key to use the N s default", where N is
+/// [`CONFIRM_TIMEOUT_DEFAULT_S`] — which is also the deadline `plrd`
+/// enforces. This reads N back out of the rendered advice and hands it to
+/// the same validator that produced the refusal, so advice that a printer
+/// would reject fails here instead of in front of an operator mid-recovery.
+///
+/// It lives in this crate on purpose: `plrd` is excluded from the Windows
+/// gate (`--exclude plrd`), so the plrd-side equivalent is structurally
+/// invisible to a Windows-only run, while this file is a default member and
+/// always runs.
+#[test]
+fn the_out_of_range_advice_quotes_a_default_the_validator_accepts() {
+    let error = PlanConfig {
+        confirm_timeout_s: Some(CONFIRM_TIMEOUT_MAX_S + 1.0),
+        ..PlanConfig::default()
+    }
+    .validate()
+    .unwrap_err_or_panic("an out-of-band confirm_timeout_s must refuse");
+    let fix = error.diagnosis().suggested_fix;
+    // "… or remove the key to use the <N> s default."
+    let quoted: f64 = fix
+        .split("to use the ")
+        .nth(1)
+        .and_then(|rest| rest.split(" s default").next())
+        .unwrap_or_else(|| panic!("the advice must name the default: {fix}"))
+        .parse()
+        .unwrap_or_else(|e| panic!("the advice's default must be a number ({e}): {fix}"));
+    // Compared as `Duration`s — exact, and it ties the rendered advice to
+    // the one `Duration` constant that `plrd` also enforces.
+    assert_eq!(
+        std::time::Duration::from_secs_f64(quoted),
+        plr_recovery::CONFIRM_TIMEOUT_DEFAULT,
+        "the advice must quote the real default: {fix}"
+    );
+    PlanConfig {
+        confirm_timeout_s: Some(quoted),
+        ..PlanConfig::default()
+    }
+    .validate()
+    .unwrap_or_else(|e| {
+        panic!("the advice names {quoted} s, which the same validator rejects: {e:?}")
+    });
 }
 
 /// A Hard refusal with `override_key: None` is refused no matter what

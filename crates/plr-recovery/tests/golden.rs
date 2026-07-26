@@ -2112,6 +2112,7 @@ fn confirm_points_and_accel_overrides_are_inert_when_unset() {
             debug_confirm_each_step: false,
             unsafe_allow_purge_z_below_bed: false,
             confirm_timeout_s: None,
+            gcode_barrier_timeout_s: None,
             ..PlanConfig::default()
         },
     );
@@ -2460,4 +2461,25 @@ fn the_confirm_timeout_rides_onto_the_plan() {
     assert!(!serde_json::to_string(&baseline)
         .unwrap()
         .contains("confirm_timeout_s"));
+}
+
+/// `gcode_barrier_timeout_s` rides onto the plan the same way, so the
+/// executor's per-step re-check waits as long as the operator asked rather
+/// than as long as the daemon guessed.
+#[test]
+fn the_gcode_barrier_timeout_rides_onto_the_plan() {
+    let plan = build_plan_with(
+        &machine_tap(),
+        plain_transforms(),
+        &PlanConfig {
+            gcode_barrier_timeout_s: Some(45.0),
+            ..PlanConfig::default()
+        },
+    );
+    assert_eq!(plan.gcode_barrier_timeout_s, Some(45.0));
+    let baseline = build_plan(&machine_tap(), plain_transforms());
+    assert_eq!(baseline.gcode_barrier_timeout_s, None);
+    assert!(!serde_json::to_string(&baseline)
+        .unwrap()
+        .contains("gcode_barrier_timeout_s"));
 }

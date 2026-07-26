@@ -26,6 +26,7 @@
 //!   `G92 E` would have run.
 
 use std::fmt::Write as _;
+use std::time::Duration;
 
 use plr_analyzer::{
     ContactOutcome, DeclineReason, FeatureClass, LayerModel, MatchConfidence, MatchResult,
@@ -319,13 +320,49 @@ pub struct PlanConfig {
     /// out-of-band value is refused with
     /// [`RecoveryError::ConfirmTimeoutOutOfRange`], never clamped.
     pub confirm_timeout_s: Option<f64>,
+    /// `[plr]` key `gcode_barrier_timeout_s` — how long the recovery will
+    /// wait for Klipper's g-code mutex before refusing, seconds. `None`
+    /// leaves the daemon's [`GCODE_BARRIER_TIMEOUT_DEFAULT_S`] default.
+    ///
+    /// The knob exists because the *right* value depends on the operator's
+    /// own macros: a printer whose `PLR_RECOVER` sits in a macro that then
+    /// does thirty seconds of real work needs a longer wait, and the only
+    /// alternatives without this key are editing the macro or rebuilding
+    /// the daemon. Raising it trades promptness for tolerance; it never
+    /// weakens the check, because the wait ends either way — in exclusive
+    /// access or in a refusal.
+    ///
+    /// Range [[`GCODE_BARRIER_TIMEOUT_MIN_S`],
+    /// [`GCODE_BARRIER_TIMEOUT_MAX_S`]]; an out-of-band value is refused
+    /// with [`RecoveryError::GcodeBarrierTimeoutOutOfRange`], never
+    /// clamped.
+    pub gcode_barrier_timeout_s: Option<f64>,
 }
 
-/// Default [`PlanConfig::confirm_timeout_s`], seconds.
+/// Default [`PlanConfig::confirm_timeout_s`].
 ///
 /// Long enough to walk to the printer, look at the nozzle, and walk back
 /// — which is exactly what a Z-height confirmation asks for.
-pub const CONFIRM_TIMEOUT_DEFAULT_S: f64 = 600.0;
+///
+/// **This is the single definition of that default.** It used to be
+/// written out twice in two units in two crates — `600.0` here and
+/// `Duration::from_mins(10)` in `plrd`'s executor — which is not a
+/// duplication but a latent divergence: the number this crate *documents*
+/// to the operator (and quotes back at them in
+/// [`crate::diagnosis`]'s `confirm_timeout_out_of_range` fix text) would
+/// have silently stopped describing the number the daemon *enforces*, and
+/// nothing on the operator's side could reveal the difference. `plrd`'s
+/// `executor::DEFAULT_CONFIRM_TIMEOUT` is now this constant, and
+/// [`CONFIRM_TIMEOUT_DEFAULT_S`] is derived from it.
+pub const CONFIRM_TIMEOUT_DEFAULT: Duration = Duration::from_mins(10);
+
+/// [`CONFIRM_TIMEOUT_DEFAULT`] in seconds — the units of the `[plr]`
+/// `confirm_timeout_s` key and of the band below. Derived, never written
+/// out a second time.
+// A whole number of seconds in the hundreds is exact in f64; the band
+// (30..=3600 s) cannot reach a magnitude where u64 -> f64 loses anything.
+#[allow(clippy::cast_precision_loss)]
+pub const CONFIRM_TIMEOUT_DEFAULT_S: f64 = CONFIRM_TIMEOUT_DEFAULT.as_secs() as f64;
 
 /// Lower bound for [`PlanConfig::confirm_timeout_s`], seconds.
 ///
@@ -340,6 +377,41 @@ pub const CONFIRM_TIMEOUT_MIN_S: f64 = 30.0;
 /// recovery would sit paused with the heaters on and the toolhead over
 /// the part for as long as the number says.
 pub const CONFIRM_TIMEOUT_MAX_S: f64 = 3_600.0;
+
+/// Default [`PlanConfig::gcode_barrier_timeout_s`].
+///
+/// Generous enough to absorb the ordinary case the barrier exists for — a
+/// `[gcode_macro]` that called `PLR_RECOVER` and has a handful of commands
+/// left, or a console command already in flight — and short enough that
+/// the operator gets a diagnosis instead of a hang.
+///
+/// Single definition, same reasoning as [`CONFIRM_TIMEOUT_DEFAULT`]:
+/// `plrd`'s `executor::DEFAULT_GCODE_BARRIER_TIMEOUT` is this constant.
+pub const GCODE_BARRIER_TIMEOUT_DEFAULT: Duration = Duration::from_secs(30);
+
+/// [`GCODE_BARRIER_TIMEOUT_DEFAULT`] in seconds — the units of the `[plr]`
+/// key and of the band below. Derived, never written out a second time.
+// Whole seconds in the tens; the band (5..=600 s) cannot reach a magnitude
+// where u64 -> f64 loses anything.
+#[allow(clippy::cast_precision_loss)]
+pub const GCODE_BARRIER_TIMEOUT_DEFAULT_S: f64 = GCODE_BARRIER_TIMEOUT_DEFAULT.as_secs() as f64;
+
+/// Lower bound for [`PlanConfig::gcode_barrier_timeout_s`], seconds.
+///
+/// Five seconds. Below that the barrier stops distinguishing "somebody
+/// else holds the mutex" from "this printer is slow": a busy Klipper host
+/// can take a second or more to turn a queued script around, and a barrier
+/// that expires inside that window would refuse healthy recoveries while
+/// telling the operator something false about why.
+pub const GCODE_BARRIER_TIMEOUT_MIN_S: f64 = 5.0;
+
+/// Upper bound for [`PlanConfig::gcode_barrier_timeout_s`], seconds.
+///
+/// Ten minutes. Past that the bound stops being a bound: the operator is
+/// staring at a console that has said nothing for longer than they will
+/// wait, and the honest answer — that something else owns the printer — was
+/// available minutes earlier.
+pub const GCODE_BARRIER_TIMEOUT_MAX_S: f64 = 600.0;
 
 /// Lower bound, mm/s², for every acceleration override
 /// ([`PlanConfig::recovery_accel`] and the per-phase `accel_*` keys).
@@ -531,6 +603,7 @@ impl Default for PlanConfig {
             debug_confirm_each_step: false,
             unsafe_allow_purge_z_below_bed: false,
             confirm_timeout_s: None,
+            gcode_barrier_timeout_s: None,
         }
     }
 }
@@ -737,6 +810,18 @@ impl PlanConfig {
                     value: seconds,
                     min: CONFIRM_TIMEOUT_MIN_S,
                     max: CONFIRM_TIMEOUT_MAX_S,
+                });
+            }
+        }
+        // G-code mutex barrier budget: same treatment, same reasoning.
+        if let Some(seconds) = self.gcode_barrier_timeout_s {
+            if !seconds.is_finite()
+                || !(GCODE_BARRIER_TIMEOUT_MIN_S..=GCODE_BARRIER_TIMEOUT_MAX_S).contains(&seconds)
+            {
+                return Err(RecoveryError::GcodeBarrierTimeoutOutOfRange {
+                    value: seconds,
+                    min: GCODE_BARRIER_TIMEOUT_MIN_S,
+                    max: GCODE_BARRIER_TIMEOUT_MAX_S,
                 });
             }
         }
@@ -2495,6 +2580,7 @@ pub fn plan_recovery(
         recovery_file,
         debug_confirm_each_step: config.debug_confirm_each_step,
         confirm_timeout_s: config.confirm_timeout_s,
+        gcode_barrier_timeout_s: config.gcode_barrier_timeout_s,
         warnings,
     };
     run_preflight(&plan, &machine, candidate.point)?;

@@ -17,6 +17,19 @@ WHY THIS TEST PARSES RUST.  The numbers being compared live in the Rust
 crates; a python copy of them asserted against itself would prove nothing
 and would go stale in silence.  Extraction is checked for vacuity, the
 same discipline tests/test_daemon_keys.py uses for the ``[plr]`` key set.
+
+A SCRAPE-BASED GUARD IS A CROSS-BRANCH TRIPWIRE, BY DESIGN.  Because this
+test reads another file's *source text*, a change that moves or rewrites
+that text — even one correct in isolation — trips it, and git's 3-way
+merge cannot see the coupling: the failure surfaces only once both
+branches meet.  That happened here.  One branch made
+``DEFAULT_CONFIRM_TIMEOUT`` an alias of the plan-config constant, removing
+the duplicate literal this test used to compare, while this test still
+scraped the old literal.  Read that as the guard WORKING: it failed
+loudly the instant its pattern stopped matching rather than silently
+asserting nothing.  A scrape that quietly matches nothing is how this
+project booked a false-green gate once before — the loud failure is the
+whole point, not a sign the guard is broken.
 """
 
 import os
@@ -57,24 +70,60 @@ def _rust_f64(source, name, path):
 
 
 def daemon_confirm_constants():
-    """plrd's own confirm-timeout numbers, read out of the Rust source."""
+    """plrd's own confirm-timeout numbers, read out of the Rust source.
+
+    The sole numeric literal for the confirm-timeout default lives in
+    ``crates/plr-recovery/src/build.rs``, as
+    ``CONFIRM_TIMEOUT_DEFAULT: Duration = Duration::from_mins(N)``.  plrd's
+    executor keeps no second copy: ``DEFAULT_CONFIRM_TIMEOUT`` in
+    ``crates/plrd/src/executor.rs`` is the alias
+    ``= plr_recovery::CONFIRM_TIMEOUT_DEFAULT``.  We pin that aliasing, so a
+    literal creeping back into the executor — the two-defaults divergence
+    returning — fails this test loudly.
+    """
     build = _read(_BUILD_RS)
     executor = _read(_EXECUTOR_RS)
-    # `DEFAULT_CONFIRM_TIMEOUT: Duration = Duration::from_mins(10)`
-    minutes = re.search(
+
+    # plrd's executor must ALIAS the plan-config default, not restate it: a
+    # literal here (`= Duration::from_mins(10)`) is a second spelling free
+    # to drift from build.rs, exactly the divergence this file prevents.
+    alias = re.search(
         r"pub const DEFAULT_CONFIRM_TIMEOUT:\s*Duration\s*=\s*"
-        r"Duration::from_mins\((\d+)\)",
+        r"plr_recovery::CONFIRM_TIMEOUT_DEFAULT\s*;",
         executor,
     )
-    assert minutes is not None, (
-        "crates/plrd/src/executor.rs no longer declares DEFAULT_CONFIRM_TIMEOUT "
-        "as Duration::from_mins(N) — reconcile the plugin's ceiling by hand"
+    assert alias is not None, (
+        "crates/plrd/src/executor.rs must define DEFAULT_CONFIRM_TIMEOUT "
+        "as `= plr_recovery::CONFIRM_TIMEOUT_DEFAULT`. The single source of "
+        "truth is CONFIRM_TIMEOUT_DEFAULT (Duration::from_mins) in "
+        "crates/plr-recovery/src/build.rs; a literal here is the "
+        "two-defaults divergence coming back — reconcile it, do not re-add "
+        "the number."
     )
+
+    # Read the number from that single source of truth.
+    minutes = re.search(
+        r"pub const CONFIRM_TIMEOUT_DEFAULT:\s*Duration\s*=\s*"
+        r"Duration::from_mins\((\d+)\)",
+        build,
+    )
+    assert minutes is not None, (
+        "crates/plr-recovery/src/build.rs no longer declares "
+        "CONFIRM_TIMEOUT_DEFAULT as Duration::from_mins(N) — it is the sole "
+        "literal plrd's confirm-timeout default derives from; reconcile the "
+        "plugin's deadline by hand, do not skip."
+    )
+    default_s = float(minutes.group(1)) * 60.0
+
     return {
-        "default_s": _rust_f64(build, "CONFIRM_TIMEOUT_DEFAULT_S", _BUILD_RS),
+        "default_s": default_s,
         "min_s": _rust_f64(build, "CONFIRM_TIMEOUT_MIN_S", _BUILD_RS),
         "max_s": _rust_f64(build, "CONFIRM_TIMEOUT_MAX_S", _BUILD_RS),
-        "executor_default_s": float(minutes.group(1)) * 60.0,
+        # The executor resolves DEFAULT_CONFIRM_TIMEOUT to this same literal
+        # (aliasing asserted above), so plrd's two views of the default are
+        # one number; the anti-vacuity check keeps that from silently
+        # decaying into "matched nothing".
+        "executor_default_s": default_s,
     }
 
 
@@ -87,9 +136,11 @@ def test_the_extraction_is_not_vacuous():
     # that started matching the wrong literal fails here rather than
     # silently weakening the interlock.
     assert 1.0 <= values["min_s"] < values["default_s"] < values["max_s"] <= 86400.0
-    # The two spellings of plrd's default (the plan-config constant and the
-    # executor's Duration) must agree with each other; if they ever diverge
-    # the daemon has two defaults and this plugin cannot reason about either.
+    # plrd's default now has ONE spelling: build.rs's CONFIRM_TIMEOUT_DEFAULT
+    # literal, which the executor aliases (asserted in the extractor above).
+    # This equality confirms both views resolved to that one number rather
+    # than to nothing; the alias-pin in the extractor is what fails if a
+    # rival literal is reintroduced in the executor.
     assert values["default_s"] == values["executor_default_s"]
 
 

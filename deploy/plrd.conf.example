@@ -481,6 +481,32 @@ control_socket = /var/lib/plrd/plrd.sock
 #                          frame ambiguous.
 #
 # ----------------------------------------------------------------------
+# EXCLUSIVE G-CODE ACCESS — OPTIONAL
+#
+#   Before each step's commands go out, plrd proves it has Klipper's
+#   g-code channel to itself: it sends one read-only M110 (whose Klipper
+#   handler does nothing at all), which cannot come back until plrd has
+#   held and released the g-code mutex, and then re-checks that the
+#   printer is still ready and idle. That is what stops a recovery
+#   started from inside a [gcode_macro] from racing the macro's remaining
+#   commands, and what stops a job that starts while you are away
+#   answering a confirmation from being resumed into.
+#
+#   gcode_barrier_timeout_s  (30) how long to wait for that channel
+#                          before refusing. Band [5, 600] seconds;
+#                          out-of-band REFUSES with a diagnosis rather
+#                          than clamping.
+#                          Raise it if your macros legitimately do tens
+#                          of seconds of work AFTER calling PLR_RECOVER —
+#                          otherwise you will see refusals that a longer
+#                          wait would have absorbed. Raising it trades
+#                          promptness for tolerance and never weakens the
+#                          check: the wait ends either way, in exclusive
+#                          access or in a refusal.
+#                          Better still, make PLR_RECOVER the LAST
+#                          command in the macro, or run it directly.
+#
+# ----------------------------------------------------------------------
 # ACCELERATION during recovery — all OPTIONAL, all [50, 20000] mm/s^2
 #
 # Recovery moves happen next to printed geometry in a Z frame established

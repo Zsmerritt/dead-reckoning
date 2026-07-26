@@ -40,12 +40,17 @@ pub enum MoonrakerError {
     #[error("moonraker closed the connection")]
     Closed,
     /// The call did not complete within the timeout.
-    #[error("moonraker call `{method}` timed out after {seconds}s")]
+    ///
+    /// Rendered from a `Duration` rather than whole seconds: the
+    /// sub-second budgets are real ones (the g-code mutex barrier's is
+    /// 300 ms in tests), and "timed out after 0s" in a refusal an operator
+    /// reads is a false statement about how long the daemon waited.
+    #[error("moonraker call `{method}` timed out after {:.3}s", after.as_secs_f64())]
     Timeout {
         /// The JSON-RPC method that timed out.
         method: String,
-        /// The timeout that fired, in seconds.
-        seconds: u64,
+        /// The timeout that fired.
+        after: Duration,
     },
     /// JSON-RPC error response.
     #[error("moonraker error {code} for `{method}`: {message}")]
@@ -82,7 +87,7 @@ impl MoonrakerClient {
         let (ws, _response) = tokio::time::timeout(timeout, connect).await.map_err(|_| {
             MoonrakerError::Timeout {
                 method: "connect".to_owned(),
-                seconds: timeout.as_secs(),
+                after: timeout,
             }
         })??;
         Ok(Self {
@@ -105,7 +110,7 @@ impl MoonrakerClient {
             .await
             .map_err(|_| MoonrakerError::Timeout {
                 method: method.to_owned(),
-                seconds: timeout.as_secs(),
+                after: timeout,
             })?
     }
 

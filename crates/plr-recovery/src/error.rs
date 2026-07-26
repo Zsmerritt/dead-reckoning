@@ -152,6 +152,18 @@ pub enum RecoveryError {
         /// The inclusive upper bound, seconds.
         max: f64,
     },
+    /// `gcode_barrier_timeout_s` was non-finite or outside
+    /// [[`crate::build::GCODE_BARRIER_TIMEOUT_MIN_S`],
+    /// [`crate::build::GCODE_BARRIER_TIMEOUT_MAX_S`]] seconds.
+    #[error("gcode_barrier_timeout_s = {value} s is outside [{min}, {max}] s")]
+    GcodeBarrierTimeoutOutOfRange {
+        /// The rejected value, seconds.
+        value: f64,
+        /// The inclusive lower bound, seconds.
+        min: f64,
+        /// The inclusive upper bound, seconds.
+        max: f64,
+    },
     /// One or more machine prerequisites failed
     /// ([`crate::machine::validate_machine`]). Recovery must not be
     /// attempted on this machine until every failure is resolved.

@@ -529,6 +529,7 @@ mod tests {
             recovery_file: crate::resume_file::RecoveryFileSpec::default(),
             debug_confirm_each_step: false,
             confirm_timeout_s: None,
+            gcode_barrier_timeout_s: None,
             warnings: vec![],
         }
     }
