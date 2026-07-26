@@ -321,17 +321,21 @@ pub fn partition(records: &[ScannedRecord]) -> Vec<EpochSpan> {
     let mut pending_socket_lost: Option<u64> = None;
     // Frame offset of the previous record. A reboot always opens a NEW
     // segment (fresh process), which in the merged stream shows as the
-    // frame offset restarting low — so a reboot is only credible where
-    // the offset regressed. This refuses to read a within-segment
-    // mono step (which a real writer never produces, but a hand-built
-    // fixture can) as a boot boundary.
+    // frame offset restarting at the segment-header length — so a reboot
+    // is only credible where the offset did NOT advance. Frame offsets
+    // strictly increase within a segment (every frame has positive
+    // length), so `offset <= prev` is false within a segment and true at
+    // any segment boundary, even one following a single-record segment
+    // (both offsets equal the header length). This refuses to read a
+    // within-segment mono step (which a real writer never produces, but a
+    // hand-built fixture can) as a boot boundary.
     let mut prev_offset: Option<u64> = None;
 
     for (idx, scanned) in records.iter().enumerate() {
         let record = &scanned.record;
         let mono = record.mono_ns();
         let pt = record_print_time(record);
-        let new_segment = prev_offset.is_some_and(|prev| scanned.offset < prev);
+        let new_segment = prev_offset.is_some_and(|prev| scanned.offset <= prev);
 
         // Decide whether a NEW epoch begins at `idx`. Precedence: reboot
         // (a hard clock reset at a segment boundary) first, then a pending
@@ -523,6 +527,29 @@ mod tests {
         for r in &narrowed.records {
             assert!(r.record.mono_ns() < 1000 * S, "old-boot record leaked");
         }
+    }
+
+    #[test]
+    fn reboot_after_a_single_record_segment_is_still_caught() {
+        // Edge: the segment before the reboot held exactly one record, so
+        // its only frame offset equals the next segment's first (the
+        // header length). `offset <= prev` still flags the boundary.
+        let sel = select_crash_epoch(&scan_of_segments(vec![
+            vec![WalRecord::Heartbeat(heartbeat_at(50_000 * S, 100.0))],
+            vec![
+                WalRecord::Heartbeat(heartbeat_at(20 * S, 5.0)),
+                WalRecord::Context(context_at(20 * S, 40)),
+            ],
+        ]));
+        assert_eq!(
+            sel.epochs.len(),
+            2,
+            "reboot after a 1-record segment must split"
+        );
+        assert!(matches!(
+            sel.epochs[1].boundary_before,
+            Some(EpochBoundaryKind::HostReboot { .. })
+        ));
     }
 
     #[test]
