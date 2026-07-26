@@ -88,6 +88,7 @@
 //! `thiserror` errors for missing prerequisites only.
 
 pub mod config;
+pub mod epoch;
 pub mod error;
 pub mod exclude;
 pub mod reconstruct;
@@ -96,6 +97,7 @@ pub mod timeline;
 pub mod window;
 
 pub use config::ReconstructConfig;
+pub use epoch::{partition, select_crash_epoch, CrashEpochSelection, EpochBoundaryKind, EpochSpan};
 pub use error::{ContextDefect, ReconstructError};
 pub use exclude::{
     parse_object_definitions, point_in_polygon, resolve_exclusions, ExclusionConfirmation,
@@ -126,14 +128,24 @@ pub(crate) mod testutil {
 
     /// A scan holding `records` at synthetic offsets, ending cleanly.
     pub(crate) fn scan_of(records: Vec<WalRecord>) -> RecoveryScan {
-        let records: Vec<ScannedRecord> = records
-            .into_iter()
-            .enumerate()
-            .map(|(i, record)| ScannedRecord {
-                offset: 32 + (i as u64) * 64,
-                record,
-            })
-            .collect();
+        scan_of_segments(vec![records])
+    }
+
+    /// A scan whose records come from several segments concatenated as
+    /// `plrd::scan::merge_scans` does: each segment's frame offsets restart
+    /// low, so a reboot between two segments shows as the offset
+    /// regressing. Give a segment two or more records so its last offset
+    /// exceeds the next segment's first (32), making the boundary visible.
+    pub(crate) fn scan_of_segments(segments: Vec<Vec<WalRecord>>) -> RecoveryScan {
+        let mut records: Vec<ScannedRecord> = Vec::new();
+        for segment in segments {
+            for (i, record) in segment.into_iter().enumerate() {
+                records.push(ScannedRecord {
+                    offset: 32 + (i as u64) * 64,
+                    record,
+                });
+            }
+        }
         RecoveryScan {
             header: None,
             records,

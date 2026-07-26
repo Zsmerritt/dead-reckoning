@@ -450,6 +450,19 @@ pub struct Degradation {
     /// The anchor context could not be placed on the print-time axis;
     /// the extension horizon used a conservative fallback catch-up.
     pub anchor_time_unknown: bool,
+    /// The merged WAL spanned more than one boot/firmware epoch and this
+    /// reconstruction was scoped to the crash epoch alone: evidence from
+    /// older boots, a pre-restart idle session, or a post-crash idle boot
+    /// was **excluded** before ingestion (see [`crate::epoch`]).
+    ///
+    /// Informational, not a loss of fidelity: those records are not
+    /// evidence about *this* crash, so removing them makes the result
+    /// correct rather than uncertain — it does **not** move
+    /// [`Self::confidence`]. Set by [`crate::reconstruct`], which owns the
+    /// partition; [`crate::compute_stop_set`] never sets it on its own.
+    /// Recompute [`crate::select_crash_epoch`] over the scan for the
+    /// per-epoch detail behind this flag.
+    pub cross_epoch_evidence_discarded: bool,
 }
 
 /// The possible-stop set: everything downstream recovery needs to

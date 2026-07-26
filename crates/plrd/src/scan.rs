@@ -19,8 +19,8 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use plr_reconstruct::{
-    reconstruct, CrashClass, PossibleStopSet, ReceiveSeqObservation, ReconstructInputs,
-    Reconstruction, StopWindow,
+    reconstruct, select_crash_epoch, CrashClass, EpochBoundaryKind, PossibleStopSet,
+    ReceiveSeqObservation, ReconstructInputs, Reconstruction, StopWindow,
 };
 use plr_wal::{
     recover_heartbeat, scan_read, HeartbeatRecovery, RecordKind, RecoveryScan, ScanEnd, WalRecord,
@@ -92,6 +92,7 @@ pub fn run_scan(
         scans.push(scan);
     }
     let merged = merge_scans(&scans);
+    report_epochs(&mut w, &merged);
 
     let heartbeat_path =
         heartbeat_override.map_or_else(|| wal_dir.join(HEARTBEAT_FILE_NAME), Path::to_path_buf);
@@ -220,16 +221,32 @@ pub(crate) fn load_receive_seq(path: &Path) -> Option<ReceiveSeqObservation> {
     })
 }
 
-/// The newest context's print file path and position, if any context
-/// named one.
+/// The half-open `[start, end)` index range of the crash epoch within a
+/// merged scan — the newest boot/firmware session that was printing (see
+/// `plr_reconstruct::epoch`). Falls back to the whole stream when there
+/// is nothing to partition. File selection and the reconstruction share
+/// this so the print file always comes from the epoch being recovered,
+/// never from an older boot or a post-crash idle boot.
+pub(crate) fn crash_epoch_range(merged: &RecoveryScan) -> (usize, usize) {
+    plr_reconstruct::select_crash_epoch(merged)
+        .crash_epoch()
+        .map_or((0, merged.records.len()), |e| (e.start, e.end))
+}
+
+/// The newest context's print file path and position within the crash
+/// epoch, if any context there named one.
 pub(crate) fn last_print_file(merged: &RecoveryScan) -> Option<(String, u64)> {
-    merged.records.iter().rev().find_map(|r| match &r.record {
-        WalRecord::Context(c) => c
-            .virtual_sdcard
-            .as_ref()
-            .map(|v| (v.file_path.clone(), v.file_position)),
-        _ => None,
-    })
+    let (start, end) = crash_epoch_range(merged);
+    merged.records[start..end]
+        .iter()
+        .rev()
+        .find_map(|r| match &r.record {
+            WalRecord::Context(c) => c
+                .virtual_sdcard
+                .as_ref()
+                .map(|v| (v.file_path.clone(), v.file_position)),
+            _ => None,
+        })
 }
 
 struct Report<'a>(&'a mut dyn Write);
@@ -335,10 +352,14 @@ fn read_receive_seq(w: &mut Report<'_>, path: &Path) -> Option<ReceiveSeqObserva
 /// forward-simulation extension. Whole-file read with `base_offset` 0;
 /// print files are tens of MB at most.
 fn read_file_tail(w: &mut Report<'_>, merged: &RecoveryScan) -> Option<Vec<u8>> {
-    let path = merged.records.iter().rev().find_map(|r| match &r.record {
-        WalRecord::Context(c) => c.virtual_sdcard.as_ref().map(|v| v.file_path.clone()),
-        _ => None,
-    });
+    let (start, end) = crash_epoch_range(merged);
+    let path = merged.records[start..end]
+        .iter()
+        .rev()
+        .find_map(|r| match &r.record {
+            WalRecord::Context(c) => c.virtual_sdcard.as_ref().map(|v| v.file_path.clone()),
+            _ => None,
+        });
     let Some(path) = path else {
         w.line("print file: no context names one; forward extension disabled");
         return None;
@@ -354,6 +375,49 @@ fn read_file_tail(w: &mut Report<'_>, merged: &RecoveryScan) -> Option<Vec<u8>> 
             ));
             None
         }
+    }
+}
+
+/// Reports how the merged stream partitions into boot/firmware epochs and
+/// which one recovery is scoped to. Silent for a single-epoch log (the
+/// common case), so it adds noise only when partitioning actually
+/// discarded another epoch's evidence.
+fn report_epochs(w: &mut Report<'_>, merged: &RecoveryScan) {
+    let selection = select_crash_epoch(merged);
+    if !selection.partitioned() {
+        return;
+    }
+    w.line(&format!(
+        "epochs: {} found; recovering the newest printing epoch ({} older, {} newer discarded)",
+        selection.epochs.len(),
+        selection.discarded_older(),
+        selection.discarded_newer(),
+    ));
+    for kind in selection.boundaries() {
+        let desc = match kind {
+            EpochBoundaryKind::HostReboot {
+                last_mono_ns,
+                next_mono_ns,
+            } => format!("reboot (mono {last_mono_ns} -> {next_mono_ns} ns)"),
+            EpochBoundaryKind::FirmwareRestart {
+                socket_lost_mono_ns,
+            } => format!("firmware restart (SocketLost at mono {socket_lost_mono_ns} ns)"),
+            EpochBoundaryKind::PrintTimeReset {
+                last_print_time,
+                next_print_time,
+            } => format!(
+                "firmware restart, no marker (print_time {last_print_time:.3} -> {next_print_time:.3} s)"
+            ),
+        };
+        w.line(&format!("  epoch boundary: {desc}"));
+    }
+    if let Some(epoch) = selection.crash_epoch() {
+        w.line(&format!(
+            "  crash epoch: {} records, mono {} .. {} ns",
+            epoch.len(),
+            epoch.min_mono_ns,
+            epoch.max_mono_ns,
+        ));
     }
 }
 
