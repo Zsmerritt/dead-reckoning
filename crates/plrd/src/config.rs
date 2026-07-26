@@ -71,6 +71,18 @@ pub struct Config {
     /// Rotate to a new WAL segment when the current one reaches this many
     /// bytes.
     pub segment_rotate_bytes: u64,
+    /// Best-effort byte cap on the WAL directory. At each daemon start
+    /// (before the WAL service opens any segment) retention prunes whole
+    /// **old sessions**, oldest first, until the directory fits this cap —
+    /// but it never deletes the newest session or any pinned session, so
+    /// this is a floor on how much is reclaimed, not a hard ceiling.
+    ///
+    /// Honest worst case: `wal_retention_bytes` + the current session's
+    /// growth since the last restart (a full print, or idle accumulation
+    /// until the next restart) + any pinned prints
+    /// (`pending_recovery.json` / `frame_invalid.json`). See
+    /// `crate::retention`.
+    pub wal_retention_bytes: u64,
     /// Bounded channel capacity between the async socket reader and the
     /// sync WAL thread. When full, motion records are dropped and the gap
     /// is journaled (see `sender::WalSender`).
@@ -162,6 +174,7 @@ impl Default for Config {
             batch_sync_ms: 500,
             heartbeat_o_dsync: false,
             segment_rotate_bytes: 16 * 1024 * 1024,
+            wal_retention_bytes: 1024 * 1024 * 1024,
             channel_capacity: 1024,
             moonraker_url: "ws://127.0.0.1:7125/websocket".to_owned(),
             control_socket: PathBuf::from("/var/lib/plrd/plrd.sock"),
@@ -246,6 +259,7 @@ impl Config {
             "batch_sync_ms" => self.batch_sync_ms = parse_u64(value)?,
             "heartbeat_o_dsync" => self.heartbeat_o_dsync = parse_bool(value)?,
             "segment_rotate_bytes" => self.segment_rotate_bytes = parse_u64(value)?,
+            "wal_retention_bytes" => self.wal_retention_bytes = parse_u64(value)?,
             "channel_capacity" => {
                 self.channel_capacity = usize::try_from(parse_u64(value)?)
                     .map_err(|_| "value does not fit in usize".to_owned())?;
@@ -310,6 +324,19 @@ impl Config {
         // A segment must at least hold its header plus a real record.
         if self.segment_rotate_bytes < 4096 {
             return Err("segment_rotate_bytes must be >= 4096".to_owned());
+        }
+        // The retention cap must hold at least one full segment: the
+        // newest session is always kept whole, so a cap below one rotation
+        // unit could never be met and is a configuration mistake.
+        // Refuse, do not clamp (typo safety, like every other knob here).
+        if self.wal_retention_bytes < self.segment_rotate_bytes {
+            return Err(format!(
+                "wal_retention_bytes ({}) must be >= segment_rotate_bytes ({}): the cap has \
+                 to hold at least one full segment. The newest session and any pinned prints \
+                 are retained regardless, so peak disk use is this cap plus the current \
+                 session plus pinned prints.",
+                self.wal_retention_bytes, self.segment_rotate_bytes
+            ));
         }
         if self.channel_capacity < 8 {
             return Err("channel_capacity must be >= 8".to_owned());
@@ -489,6 +516,26 @@ channel_capacity = 64
         // Boundary values are accepted.
         assert!(Config::parse("heartbeat_hz = 1000\nbatch_sync_ms = 1").is_ok());
         assert!(Config::parse("segment_rotate_bytes = 4096\nchannel_capacity = 8").is_ok());
+    }
+
+    #[test]
+    fn wal_retention_bytes_parses_defaults_and_validates() {
+        // Default is 1 GiB.
+        assert_eq!(Config::parse("").unwrap().wal_retention_bytes, 1 << 30);
+        // Explicit value round-trips.
+        let config = Config::parse("wal_retention_bytes = 536870912").unwrap();
+        assert_eq!(config.wal_retention_bytes, 512 * 1024 * 1024);
+        // Must be >= segment_rotate_bytes: refused (not clamped) when below.
+        let err = Config::parse("segment_rotate_bytes = 16777216\nwal_retention_bytes = 8388608")
+            .unwrap_err();
+        assert!(err.contains("must be >= segment_rotate_bytes"), "{err}");
+        // Equal to one segment is the accepted boundary.
+        assert!(
+            Config::parse("segment_rotate_bytes = 16777216\nwal_retention_bytes = 16777216")
+                .is_ok()
+        );
+        // Non-integer refused.
+        assert!(Config::parse("wal_retention_bytes = lots").is_err());
     }
 
     #[test]

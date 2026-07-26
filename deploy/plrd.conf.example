@@ -45,6 +45,30 @@ heartbeat_o_dsync = false
 # Rotate to a new WAL segment at this size (bytes).
 segment_rotate_bytes = 16777216
 
+# Best-effort byte cap on the WAL directory. At each daemon START (before
+# the WAL service opens a segment) plrd prunes whole OLD sessions — one
+# host-boot's worth of segments each — oldest first, until the directory
+# fits this cap. It is BEST-EFFORT, not a hard ceiling: the newest session
+# is never deleted (it may be the live print, and recording is about to
+# resume into it), and neither is any session backing a pending recovery
+# or the frame-invalid interlock. A print's early segments are load-bearing
+# evidence, so sessions are kept or dropped whole — never in part.
+#
+# HONEST WORST CASE — plan disk for:
+#     wal_retention_bytes
+#   + the current session's growth since the last restart
+#       (a full print's WAL, or idle accumulation until the next restart —
+#        the idle heartbeat throttle bounds the rate, not the total)
+#   + any pinned prints (pending_recovery.json / frame_invalid.json), which
+#     are retained until a completed or fresh dry run clears them.
+# When pins hold usage above the cap, plrd deletes everything it safely can
+# and says so LOUDLY: a journald line AND a console message (RESPOND/M117)
+# naming the pinned print and the overage. It never deletes silently.
+#
+# Must be >= segment_rotate_bytes (the cap has to hold at least one full
+# segment); an out-of-band value is REFUSED, never clamped. Default 1 GiB.
+wal_retention_bytes = 1073741824
+
 # Bounded queue between the socket reader and the WAL thread. When the
 # disk stalls and it fills, motion records are dropped and the gap is
 # journaled as a SubscriptionGap marker.

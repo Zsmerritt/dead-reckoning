@@ -1055,6 +1055,18 @@ pub fn write_pending(wal_dir: &Path, pending: &PendingRecovery) -> std::io::Resu
     std::fs::write(wal_dir.join(PENDING_FILE_NAME), json)
 }
 
+/// Reads the pending-recovery state file, if present and parseable.
+///
+/// Read-only and total; `None` when the file is absent, unreadable, or not
+/// valid JSON for a [`PendingRecovery`]. WAL retention
+/// (`crate::retention::resolve_pins`) reads it to learn which print a pin
+/// protects; see that module for how the file is mapped back to a session.
+#[must_use]
+pub fn read_pending(wal_dir: &Path) -> Option<PendingRecovery> {
+    let text = std::fs::read_to_string(wal_dir.join(PENDING_FILE_NAME)).ok()?;
+    serde_json::from_str(&text).ok()
+}
+
 /// Removes any stale state file.
 pub fn clear_pending(wal_dir: &Path) {
     let _ = std::fs::remove_file(wal_dir.join(PENDING_FILE_NAME));
