@@ -22,8 +22,11 @@
 //!   10 Hz) using the dual-slot protocol (`slot_for_sequence`), then
 //!   `fdatasync`'d — or written through `O_DSYNC` when configured, which
 //!   makes the `write` itself synchronous (same guarantee, one syscall).
-//!   Every Nth heartbeat is also appended to the WAL (batched) so the
-//!   log itself carries correlation samples.
+//!   A heartbeat is also appended to the WAL (batched) so the log itself
+//!   carries correlation samples — every file beat while printing
+//!   (`WAL_HEARTBEAT_ACTIVE_EVERY`, 10 Hz, pinning `t_a` to a power cut),
+//!   throttled to `wal_heartbeat_quiet_every` (~30 s) while idle so an
+//!   idle printer does not bleed ~250 B/s of records forever.
 //! * **Receive-seq sidecar**: rewritten + `fdatasync`'d on every counter
 //!   advance (~1 Hz). Torn writes only lose the observation, which is
 //!   the safe direction (see `seqfile`).
@@ -75,7 +78,7 @@ use crate::scan::{segment_file_name, segment_index};
 use crate::sender::{HeartbeatData, SyncPolicy, WalCmd};
 use crate::seqfile::encode_seq;
 
-use crate::convert::WAL_HEARTBEAT_EVERY;
+use crate::convert::WAL_HEARTBEAT_ACTIVE_EVERY;
 
 /// Service configuration (derived from `config::Config` by the daemon).
 #[derive(Debug, Clone)]
@@ -95,6 +98,14 @@ pub struct WalSvcCfg {
     pub heartbeat_o_dsync: bool,
     /// Segment rotation threshold in bytes.
     pub rotate_bytes: u64,
+    /// Append a WAL heartbeat *record* every Nth heartbeat-file beat while
+    /// the recorder is idle (`HeartbeatData::active == false`). While
+    /// active the cadence is [`WAL_HEARTBEAT_ACTIVE_EVERY`] (one record per
+    /// file beat, the full 10 Hz rate). Sourced from
+    /// [`crate::convert::WAL_HEARTBEAT_QUIET_EVERY`]; a field (not a
+    /// constant) so tests can exercise the throttle without waiting out
+    /// hundreds of real beats.
+    pub wal_heartbeat_quiet_every: u64,
 }
 
 /// Fatal service errors. Anything here means durability can no longer be
@@ -126,6 +137,11 @@ struct Service {
     hb_file: File,
     hb_seq: u64,
     hb_data: Option<HeartbeatData>,
+    /// Sequence number of the last heartbeat *record* appended to the WAL,
+    /// or `None` if none yet. The record cadence is regime-dependent, so a
+    /// running "beats since last record" is tracked rather than a fixed
+    /// modulus.
+    last_wal_hb_seq: Option<u64>,
     seq_file: File,
     dirty: bool,
     batch_deadline: Option<Instant>,
@@ -183,6 +199,7 @@ impl Service {
             hb_file,
             hb_seq,
             hb_data: None,
+            last_wal_hb_seq: None,
             seq_file,
             dirty: false,
             batch_deadline: None,
@@ -312,8 +329,33 @@ impl Service {
             fdatasync(&self.hb_file)?;
         }
         self.hb_seq = self.hb_seq.wrapping_add(1);
-        if heartbeat.sequence.is_multiple_of(WAL_HEARTBEAT_EVERY) {
+        // WAL heartbeat *record* cadence is regime-dependent: one record
+        // every file beat while active (`WAL_HEARTBEAT_ACTIVE_EVERY` = 1 →
+        // the full 10 Hz rate, which pins `t_a` to within ~100 ms of a
+        // power cut), one per `wal_heartbeat_quiet_every` file beats while
+        // idle (~30 s at defaults), so an idle printer stops appending
+        // ~250 B/s of heartbeat records. The heartbeat *file* rewrite above
+        // is unaffected — only the growing log records are throttled.
+        //
+        // The idle → active transition therefore also forces a record on
+        // the very first active beat, giving an in-print coverage span a
+        // fresh heartbeat anchor at the first instant of motion: the last
+        // idle record is tens of beats behind, so `seq - last >= 1` holds
+        // at once. (This is a property of the active divisor being 1; there
+        // is no separate edge flag. Raising `WAL_HEARTBEAT_ACTIVE_EVERY`
+        // above 1 would reintroduce up to that many beats of anchor lag and
+        // would need an explicit force-on-rise again.)
+        let divisor = if data.active {
+            WAL_HEARTBEAT_ACTIVE_EVERY
+        } else {
+            self.cfg.wal_heartbeat_quiet_every
+        };
+        let due = self
+            .last_wal_hb_seq
+            .is_none_or(|last| heartbeat.sequence.wrapping_sub(last) >= divisor);
+        if due {
             self.append(&WalRecord::Heartbeat(heartbeat), SyncPolicy::Batched)?;
+            self.last_wal_hb_seq = Some(heartbeat.sequence);
         }
         Ok(())
     }
@@ -434,7 +476,7 @@ fn crash_writer(dir: &Path) -> Result<(), WalSvcError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{crash_writer_main, spawn, WalSvcCfg, WAL_HEARTBEAT_EVERY};
+    use super::{crash_writer_main, spawn, WalSvcCfg, WAL_HEARTBEAT_ACTIVE_EVERY};
     use crate::scan::{segment_file_name, segment_index};
     use crate::sender::{HeartbeatData, SyncPolicy, WalCmd};
     use crate::seqfile::decode_seq;
@@ -568,6 +610,11 @@ mod tests {
             heartbeat_period: Duration::from_millis(15),
             heartbeat_o_dsync: o_dsync,
             rotate_bytes: rotate,
+            // Small (but still > the active WAL_HEARTBEAT_EVERY = 10, as in
+            // production) so the idle throttle is exercisable without
+            // waiting out hundreds of real beats; production uses
+            // `WAL_HEARTBEAT_QUIET_EVERY` = 300.
+            wal_heartbeat_quiet_every: 20,
         }
     }
 
@@ -593,6 +640,16 @@ mod tests {
             print_time: 12.625,
             est_sample_mono_ns: 5_500,
             est_sample_print_time: 12.61,
+            active: true,
+        }
+    }
+
+    /// Like [`heartbeat_data`] but in the idle regime (throttled WAL
+    /// heartbeat records).
+    fn idle_heartbeat_data() -> HeartbeatData {
+        HeartbeatData {
+            active: false,
+            ..heartbeat_data()
         }
     }
 
@@ -676,7 +733,8 @@ mod tests {
             .cloned()
             .collect();
         assert_eq!(non_heartbeat, sent);
-        // Heartbeat records were interleaved at the 1-in-N cadence.
+        // Heartbeat records were interleaved (active cadence: one per file
+        // beat).
         let wal_heartbeats = recovered
             .iter()
             .filter(|r| matches!(r, WalRecord::Heartbeat(_)))
@@ -830,18 +888,17 @@ mod tests {
     }
 
     #[test]
-    fn wal_heartbeat_cadence_is_one_in_n() {
+    fn active_regime_appends_a_wal_heartbeat_record_every_file_beat() {
         let dir = temp_dir("cadence");
-        let (tx, rx) = sync_channel(16);
+        let (tx, rx) = sync_channel(64);
         let mut c = cfg(&dir, false, 1 << 20);
         c.heartbeat_period = Duration::from_millis(5);
         let handle = spawn(c, rx);
+        // Active regime: full cadence — one WAL heartbeat record per file
+        // beat (WAL_HEARTBEAT_ACTIVE_EVERY = 1, the 10 Hz rate that pins
+        // `t_a` close to a power cut).
         send(&tx, WalCmd::Heartbeat(Some(heartbeat_data())));
-        // Enough beats for the 1-in-N ratio to be meaningful. The
-        // assertion below is self-calibrating (it derives the expected
-        // record count from the beats that actually happened), so this
-        // only has to guarantee the sample is big enough.
-        await_heartbeat(&dir.join("heartbeat.bin"), 3 * WAL_HEARTBEAT_EVERY);
+        await_heartbeat(&dir.join("heartbeat.bin"), 30);
         send(&tx, WalCmd::Shutdown);
         handle.join().unwrap().unwrap();
         let result = scan_segment(&dir, 1);
@@ -855,13 +912,113 @@ mod tests {
             .heartbeat
             .sequence
             + 1;
-        // One WAL record per WAL_HEARTBEAT_EVERY file beats (allow the
-        // off-by-one of where the modulus window started).
-        let expected = file_beats / WAL_HEARTBEAT_EVERY;
+        assert_eq!(WAL_HEARTBEAT_ACTIVE_EVERY, 1);
+        // One record per file beat: the record count tracks the file-beat
+        // count (allow a one-beat skew for the tick in flight at shutdown).
+        assert!(
+            wal_heartbeats >= file_beats.saturating_sub(1) && wal_heartbeats <= file_beats,
+            "active: file beats {file_beats}, wal records {wal_heartbeats} (expected ~one each)"
+        );
+    }
+
+    /// The idle regime (`HeartbeatData::active == false`) throttles the WAL
+    /// heartbeat *record* cadence to `wal_heartbeat_quiet_every` (here 20,
+    /// vs the active 10), while the heartbeat *file* keeps rewriting at the
+    /// full rate — the whole point of the fix. Self-calibrating: it derives
+    /// the expected record count from the file beats that actually landed.
+    #[test]
+    fn idle_regime_throttles_wal_heartbeat_records_to_the_quiet_cadence() {
+        let dir = temp_dir("idle-cadence");
+        let (tx, rx) = sync_channel(64);
+        let mut c = cfg(&dir, false, 1 << 20);
+        c.heartbeat_period = Duration::from_millis(5);
+        let quiet_every = c.wal_heartbeat_quiet_every;
+        let handle = spawn(c, rx);
+        // Idle from the start: throttled record cadence.
+        send(&tx, WalCmd::Heartbeat(Some(idle_heartbeat_data())));
+        // Enough file beats for the ratio to be meaningful.
+        await_heartbeat(&dir.join("heartbeat.bin"), 4 * quiet_every);
+        send(&tx, WalCmd::Shutdown);
+        handle.join().unwrap().unwrap();
+
+        let result = scan_segment(&dir, 1);
+        let wal_heartbeats = result
+            .records
+            .iter()
+            .filter(|r| matches!(r.record, WalRecord::Heartbeat(_)))
+            .count() as u64;
+        let file_beats = recover_heartbeat(&std::fs::read(dir.join("heartbeat.bin")).unwrap())
+            .unwrap()
+            .heartbeat
+            .sequence
+            + 1;
+        // One WAL record per `quiet_every` file beats (the first record is
+        // forced, hence the +1 slack at the top).
+        let expected = file_beats / quiet_every;
         assert!(
             wal_heartbeats >= expected.saturating_sub(1) && wal_heartbeats <= expected + 1,
-            "beats {file_beats}, wal records {wal_heartbeats}"
+            "idle: file beats {file_beats}, wal records {wal_heartbeats}, quiet_every {quiet_every}"
         );
+        // And decisively fewer than the active cadence would have written
+        // over the same beats (active = one record per beat = ~file_beats),
+        // which is the leak fix.
+        assert!(
+            wal_heartbeats < file_beats / 4,
+            "idle throttle must undercut the active per-beat cadence: \
+             {wal_heartbeats} records over {file_beats} beats"
+        );
+    }
+
+    /// The idle → active transition forces a WAL heartbeat record
+    /// immediately, so an in-print stop-window coverage span always has a
+    /// fresh heartbeat *record* anchor at the first instant of motion,
+    /// rather than a stale idle one tens of seconds old (which
+    /// `plr_reconstruct`'s coverage anchor would read as a hole). Proven by
+    /// a record appearing within a couple of beats of the transition, far
+    /// sooner than the quiet cadence would allow.
+    #[test]
+    fn going_active_forces_an_immediate_wal_heartbeat_record() {
+        let dir = temp_dir("rise-anchor");
+        let (tx, rx) = sync_channel(64);
+        let mut c = cfg(&dir, false, 1 << 20);
+        c.heartbeat_period = Duration::from_millis(5);
+        let quiet_every = c.wal_heartbeat_quiet_every;
+        let handle = spawn(c, rx);
+        // Idle: the first record is forced, then the stream goes sparse.
+        send(&tx, WalCmd::Heartbeat(Some(idle_heartbeat_data())));
+        // Wait past the first forced record and a few more beats, so we are
+        // mid-quiet-interval (no record is due for a while under the quiet
+        // cadence).
+        await_heartbeat(&dir.join("heartbeat.bin"), quiet_every / 2);
+        let before = count_wal_heartbeats(&dir);
+        // Now go active: the rise must force a record well before the next
+        // quiet-cadence record would have been due.
+        send(&tx, WalCmd::Heartbeat(Some(heartbeat_data())));
+        let hb_at_rise = read_heartbeat(&dir.join("heartbeat.bin"))
+            .unwrap()
+            .heartbeat
+            .sequence;
+        // Give a couple of beats for the forced record to be appended and
+        // fsync'd, then stop and inspect. Waiting for +3 beats is well
+        // under the ~`quiet_every` beats a throttled record would need.
+        await_heartbeat(&dir.join("heartbeat.bin"), hb_at_rise + 3);
+        send(&tx, WalCmd::Shutdown);
+        handle.join().unwrap().unwrap();
+        let after = count_wal_heartbeats(&dir);
+        assert!(
+            after > before,
+            "the idle -> active transition must force a fresh WAL heartbeat record \
+             within a few beats (before {before}, after {after})"
+        );
+    }
+
+    /// WAL heartbeat records in segment 1.
+    fn count_wal_heartbeats(dir: &Path) -> usize {
+        scan_segment(dir, 1)
+            .records
+            .iter()
+            .filter(|r| matches!(r.record, WalRecord::Heartbeat(_)))
+            .count()
     }
 
     #[test]

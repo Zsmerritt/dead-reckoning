@@ -909,6 +909,41 @@ pub enum MarkerKind {
     /// outright, and from [`SocketLost`](MarkerKind::SocketLost), which
     /// says Klipper went away while the recorder kept running.
     RecorderStopped,
+    /// **The recorder entered a reduced-cadence idle regime.**
+    ///
+    /// Written when no print is in progress and no motion has arrived
+    /// recently, so WAL heartbeat *records* are appended far less often
+    /// than during a print (the 128-byte heartbeat *file* keeps its full
+    /// rate — its liveness proof is free, only the growing WAL records are
+    /// throttled). A sparse heartbeat-*record* stream after this marker is
+    /// deliberate, not a stalled recorder.
+    ///
+    /// # Why the log has to say this
+    ///
+    /// A hole in the heartbeat-record stream is load-bearing evidence: it
+    /// is what distinguishes "the writer was running and journaled
+    /// nothing" from "the writer was stalled or dead and could have missed
+    /// something" (see [`crate::Heartbeat`] and `plr_reconstruct::exclude`,
+    /// where continuity across a silent span is what lets the *absence* of
+    /// an object-cancellation record count as proof nothing was
+    /// cancelled). Simply slowing the heartbeat records during idle would
+    /// make every idle span read as a stalled recorder. This marker
+    /// records the reduced cadence as a **fact**, so the sparseness is
+    /// explained rather than ambiguous.
+    ///
+    /// # What it does and does not license
+    ///
+    /// The regime is entered only when no recoverable print is in progress
+    /// (a print keeps the recorder at full cadence through its dwells and
+    /// pauses, and it is lowered to idle only once a print has
+    /// conclusively ended or when no print is running), so a quiet span
+    /// never overlaps a stop-window coverage span. The marker therefore
+    /// changes no recovery verdict; it exists so that invariant is
+    /// *checkable in the log* rather than assumed, and so `plrd scan`
+    /// reports an idle tail honestly. The regime ends — and full cadence
+    /// resumes — at the first motion or print activity; the resumed dense
+    /// heartbeat stream is the liveness proof from there.
+    RecordingQuiescent,
     /// A marker kind written by a newer format revision; preserved as
     /// opaque. Never written by this version except when round-tripping.
     #[serde(other)]
@@ -1315,6 +1350,8 @@ mod tests {
                 end_mono_ns: 2,
             },
             MarkerKind::ExclusionUpdateLost,
+            MarkerKind::RecorderStopped,
+            MarkerKind::RecordingQuiescent,
             MarkerKind::Unknown,
         ] {
             let record = WalRecord::Marker(Marker { mono_ns: 9, kind });
@@ -1630,6 +1667,24 @@ mod tests {
             vec![[0.0, -max], [max, -max], [max, 0.0], [0.0, 0.0]]
         );
         assert!(def.values_are_finite());
+    }
+
+    #[test]
+    fn recording_quiescent_marker_wire_tag_is_stable() {
+        // The on-wire tag an older reader sees. A pre-change reader has no
+        // `RecordingQuiescent` arm, so its `#[serde(other)]` maps exactly
+        // this tag to `MarkerKind::Unknown` — the forward-compatibility
+        // contract for the idle-throttle marker. Pinning the string here
+        // makes an accidental rename a failing test rather than a silent
+        // format break.
+        let marker = Marker {
+            mono_ns: 7,
+            kind: MarkerKind::RecordingQuiescent,
+        };
+        let json = serde_json::to_string(&marker).unwrap();
+        assert!(json.contains(r#""kind":"RecordingQuiescent""#), "{json}");
+        // And the same bytes decode back to the same kind in this reader.
+        assert_eq!(serde_json::from_str::<Marker>(&json).unwrap(), marker);
     }
 
     #[test]

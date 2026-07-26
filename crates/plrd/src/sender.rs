@@ -62,6 +62,20 @@ pub struct HeartbeatData {
     pub est_sample_mono_ns: u64,
     /// Klipper `estimated_print_time` at that instant (seconds).
     pub est_sample_print_time: f64,
+    /// The recorder's cadence regime for the WAL heartbeat *records*.
+    ///
+    /// `true` while a print is in progress or motion has arrived recently
+    /// (full cadence, one WAL heartbeat record per file beat —
+    /// `convert::WAL_HEARTBEAT_ACTIVE_EVERY`, the 10 Hz rate that pins
+    /// `t_a` to a power cut); `false` when idle (throttled to
+    /// `walsvc::WalSvcCfg::wal_heartbeat_quiet_every`, so an idle printer
+    /// stops appending ~250 B/s of heartbeat records indefinitely). The
+    /// heartbeat *file* rewrite rate is unaffected —
+    /// only the growing WAL records are throttled. Recovery never reads
+    /// this: it is the writer's cadence decision, and an idle regime never
+    /// overlaps a recoverable print (see
+    /// `plr_wal::MarkerKind::RecordingQuiescent`).
+    pub active: bool,
 }
 
 /// Commands consumed by the WAL thread.
@@ -493,6 +507,7 @@ mod tests {
             print_time: 1.0,
             est_sample_mono_ns: 5,
             est_sample_print_time: 0.9,
+            active: true,
         };
         sender.heartbeat_data(Some(data)).unwrap();
         // Channel now full: both are silently dropped, no gap opens.

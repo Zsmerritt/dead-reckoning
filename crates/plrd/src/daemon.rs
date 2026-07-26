@@ -37,6 +37,7 @@ fn wal_cfg(config: &Config) -> WalSvcCfg {
         heartbeat_period: std::time::Duration::from_secs_f64(1.0 / config.heartbeat_hz),
         heartbeat_o_dsync: config.heartbeat_o_dsync,
         rotate_bytes: config.segment_rotate_bytes,
+        wal_heartbeat_quiet_every: crate::convert::WAL_HEARTBEAT_QUIET_EVERY,
     }
 }
 
@@ -450,6 +451,10 @@ mod tests {
         assert_eq!(cfg.heartbeat_period, std::time::Duration::from_millis(50));
         assert!(cfg.heartbeat_o_dsync);
         assert_eq!(cfg.rotate_bytes, 4096);
+        assert_eq!(
+            cfg.wal_heartbeat_quiet_every,
+            crate::convert::WAL_HEARTBEAT_QUIET_EVERY
+        );
     }
 
     #[test]

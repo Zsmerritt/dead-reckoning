@@ -358,6 +358,13 @@ fn forward(
     for (record, sync) in out.records {
         sender.record(record, sync, mono_ns)?;
     }
+    // The regime marker is journaled BEFORE the throttled heartbeat data
+    // it explains: it records that the sparse heartbeat stream about to
+    // begin is deliberate. Undroppable (a dropped "we went quiet" would
+    // leave the sparseness unexplained) — see `convert::Output::regime_marker`.
+    if let Some(kind) = out.regime_marker {
+        sender.marker(Marker { mono_ns, kind })?;
+    }
     if let Some(hb) = out.heartbeat {
         sender.heartbeat_data(Some(hb))?;
     }
@@ -702,6 +709,7 @@ mod tests {
             MarkerKind::SubscriptionGap { .. } => "SubscriptionGap",
             MarkerKind::ExclusionUpdateLost => "ExclusionUpdateLost",
             MarkerKind::RecorderStopped => "RecorderStopped",
+            MarkerKind::RecordingQuiescent => "RecordingQuiescent",
             MarkerKind::Unknown => "Unknown",
         }
     }
@@ -890,6 +898,66 @@ mod tests {
         assert_eq!(names, ["extruder", "heater_bed"]);
         assert!(available_heaters(&json!({})).is_empty());
         assert!(available_heaters(&json!({"status": {}})).is_empty());
+    }
+
+    /// The regime marker's delivery chain: `forward()` is the ONLY place
+    /// `Output.regime_marker` becomes a WAL record, so this pins that it
+    /// lands — ordered after the message's records and before the throttled
+    /// heartbeat data it explains. Without it a `forward()` refactor could
+    /// silently stop journaling quiescence, turning every idle span back
+    /// into the ambiguous absence the fix exists to prevent.
+    ///
+    /// Bites the mutation `let _ = out.regime_marker;` at the forward call
+    /// site: that drops the marker, and the expected sequence below then
+    /// lacks `marker/"RecordingQuiescent"`. (Platform: `client.rs` is part
+    /// of the Linux-only `plrd` crate — this runs on the Linux gate, never
+    /// the Windows hook.)
+    #[test]
+    fn forward_journals_the_regime_marker_between_records_and_heartbeat() {
+        use crate::convert::Output;
+        use crate::sender::{HeartbeatData, SyncPolicy};
+        use plr_wal::TrapqSegment;
+        let (tx, rx) = std::sync::mpsc::sync_channel(16);
+        let mut sender = WalSender::new(tx);
+        let record = WalRecord::TrapqSegment(TrapqSegment {
+            mono_ns: 1,
+            queue: "toolhead".to_owned(),
+            print_time: 1.0,
+            duration: 0.1,
+            start_velocity: 0.0,
+            acceleration: 0.0,
+            start_x: 0.0,
+            start_y: 0.0,
+            start_z: 0.0,
+            x_r: 1.0,
+            y_r: 0.0,
+            z_r: 0.0,
+        });
+        let out = Output {
+            records: vec![(record, SyncPolicy::Batched)],
+            heartbeat: Some(HeartbeatData {
+                print_time: 1.0,
+                est_sample_mono_ns: 5,
+                est_sample_print_time: 0.9,
+                // Idle: the throttled cadence the marker explains.
+                active: false,
+            }),
+            receive_seq: None,
+            clean_shutdown: false,
+            regime_marker: Some(MarkerKind::RecordingQuiescent),
+        };
+        super::forward(out, &mut sender, 42).unwrap();
+        let mut items = Vec::new();
+        drain_into(&rx, &mut items);
+        assert_eq!(
+            items,
+            vec![
+                "trapq/toolhead".to_owned(),
+                "marker/\"RecordingQuiescent\"".to_owned(),
+                "hb-data".to_owned(),
+            ],
+            "the regime marker must land in the WAL, ordered records -> marker -> heartbeat data"
+        );
     }
 
     #[test]
