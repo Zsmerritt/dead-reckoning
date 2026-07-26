@@ -65,11 +65,12 @@ pub struct HeartbeatData {
     /// The recorder's cadence regime for the WAL heartbeat *records*.
     ///
     /// `true` while a print is in progress or motion has arrived recently
-    /// (full cadence, one WAL heartbeat record per
-    /// `convert::WAL_HEARTBEAT_EVERY` file beats); `false` when idle
-    /// (throttled to `walsvc::WalSvcCfg::wal_heartbeat_quiet_every`, so an
-    /// idle printer stops appending ~250 B/s of heartbeat records
-    /// indefinitely). The heartbeat *file* rewrite rate is unaffected —
+    /// (full cadence, one WAL heartbeat record per file beat —
+    /// `convert::WAL_HEARTBEAT_ACTIVE_EVERY`, the 10 Hz rate that pins
+    /// `t_a` to a power cut); `false` when idle (throttled to
+    /// `walsvc::WalSvcCfg::wal_heartbeat_quiet_every`, so an idle printer
+    /// stops appending ~250 B/s of heartbeat records indefinitely). The
+    /// heartbeat *file* rewrite rate is unaffected —
     /// only the growing WAL records are throttled. Recovery never reads
     /// this: it is the writer's cadence decision, and an idle regime never
     /// overlaps a recoverable print (see

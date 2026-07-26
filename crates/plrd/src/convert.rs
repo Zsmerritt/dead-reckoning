@@ -431,10 +431,11 @@ pub struct Output {
     /// journals a `CleanShutdown` marker.
     pub clean_shutdown: bool,
     /// A heartbeat-cadence regime change the caller must journal as a
-    /// marker. `Some(RecordingQuiescent)` when the recorder just entered
-    /// the idle regime (active → idle edge); `None` otherwise. Never
-    /// dropped — it is the recorded fact that explains the sparse
-    /// heartbeat stream that follows (see
+    /// marker. `Some(RecordingQuiescent)` when the recorder has newly
+    /// entered the idle regime — an active → idle edge, or the first
+    /// evaluation of a session that starts idle (the idle-from-birth case);
+    /// `None` otherwise. Never dropped — it is the recorded fact that
+    /// explains the sparse heartbeat stream that follows (see
     /// [`plr_wal::MarkerKind::RecordingQuiescent`]).
     pub regime_marker: Option<MarkerKind>,
 }
@@ -512,6 +513,16 @@ pub struct Recorder {
     /// conservative direction: a print running at daemon start raises it on
     /// the first status/motion.
     recording_active: bool,
+    /// Whether the regime has been evaluated at least once this session.
+    /// `false` at construction and after [`Self::reset_session`]. The first
+    /// evaluation of a session journals a `RecordingQuiescent` marker when
+    /// it finds the recorder idle, not only on a later active → idle *edge*
+    /// — otherwise a daemon that starts on an idle printer (the commonest
+    /// shape: the real capture's segment 1 is 19.6 h of exactly this) would
+    /// write a sparse heartbeat stream with no marker anywhere in the
+    /// session, leaving the sparseness an ambiguous absence rather than the
+    /// recorded fact this fix exists to make it.
+    regime_evaluated: bool,
     last_context_mono_ns: Option<u64>,
     last_context_file_position: u64,
     exclude: ExcludeObjectSnapshot,
@@ -562,6 +573,7 @@ impl Recorder {
             est_sample: None,
             last_motion_mono_ns: None,
             recording_active: false,
+            regime_evaluated: false,
             last_context_mono_ns: None,
             last_context_file_position: 0,
             exclude: ExcludeObjectSnapshot::new(),
@@ -619,12 +631,15 @@ impl Recorder {
         // The killed session's motion belongs to the dead klippy instance;
         // a stale value must not hold the new session's regime active. The
         // regime falls back to idle until the new session provides fresh
-        // motion or a printing status. Heartbeats are paused across the
-        // gap anyway (`client` sends `heartbeat_data(None)` on socket
-        // loss), so no `RecordingQuiescent` marker is needed here — the
-        // `SocketLost` marker already bounds the silence.
+        // motion or a printing status. `regime_evaluated` is cleared too, so
+        // the reconnected session is treated like a fresh start: if it comes
+        // back to an idle printer, its first evaluation journals a
+        // `RecordingQuiescent` (bounding the sparse stream that follows),
+        // and if it comes back mid-print, the first active evaluation simply
+        // resumes dense heartbeats with no marker.
         self.last_motion_mono_ns = None;
         self.recording_active = false;
+        self.regime_evaluated = false;
         self.exclude = ExcludeObjectSnapshot::new();
         self.exclude_seen = false;
         self.exclude_definitions_dirty = false;
@@ -818,6 +833,17 @@ impl Recorder {
     /// (`print_in_progress`) so cadence rises at the first instant motion
     /// is possible, not when the lagging `print_stats`/`is_active` status
     /// finally arrives — see [`IDLE_AFTER_MOTION_NS`].
+    ///
+    /// # An errored print holds full cadence until reset
+    ///
+    /// `print_in_progress` is cleared only by a *positively finished* state
+    /// (`complete`/`cancelled`/`standby`) or by `reset_session`, never by
+    /// `error` — an errored print is exactly what recovery exists for, so it
+    /// must stay recoverable. A printer left sitting in `error` therefore
+    /// keeps recording at the full 10 Hz rate (the pre-fix byte rate) until
+    /// the operator resets it. This is deliberate and conservative; the
+    /// ~8 B/s idle claim is for a genuinely idle (`standby`) printer, not an
+    /// errored one.
     #[must_use]
     pub fn regime_active(&self, mono_ns: u64) -> bool {
         if self.print_in_progress {
@@ -828,19 +854,28 @@ impl Recorder {
     }
 
     /// Updates the stored regime for `mono_ns` and returns the marker the
-    /// caller must journal when the regime just fell from active to idle.
+    /// caller must journal when the recorder is now idle *and* that idleness
+    /// is newly established — either the active → idle edge, or the first
+    /// evaluation of a session that starts idle.
     ///
-    /// Only the active → idle edge is marked (`RecordingQuiescent`): it is
-    /// the one that needs explaining, because a sparse heartbeat stream
-    /// after it would otherwise read as a stalled recorder. The idle →
-    /// active edge needs no marker — the resumed dense heartbeat stream
-    /// (and `walsvc`'s forced heartbeat record at the transition) is itself
-    /// the proof of liveness, and it bounds the quiet span.
+    /// Marking the active → idle edge explains a sparse heartbeat stream
+    /// that would otherwise read as a stalled recorder. Marking the *first*
+    /// idle evaluation covers the idle-from-birth session (a daemon that
+    /// starts on an idle printer): without it that session would carry a
+    /// throttled stream with no marker anywhere, an ambiguous absence rather
+    /// than a recorded fact. The idle → active transition needs no marker —
+    /// the resumed dense heartbeat stream (whose first record `walsvc`
+    /// forces at once) is itself the liveness proof, and it bounds the quiet
+    /// span.
     fn note_regime(&mut self, mono_ns: u64) -> Option<MarkerKind> {
         let now_active = self.regime_active(mono_ns);
+        let first_evaluation = !self.regime_evaluated;
         let was_active = self.recording_active;
+        self.regime_evaluated = true;
         self.recording_active = now_active;
-        (was_active && !now_active).then_some(MarkerKind::RecordingQuiescent)
+        // Idle now, and that idleness is new: a fall from active, or a
+        // session whose very first evaluation is idle.
+        (!now_active && (was_active || first_evaluation)).then_some(MarkerKind::RecordingQuiescent)
     }
 
     fn merge_toolhead(&mut self, update: &StatusUpdate) {
@@ -1389,10 +1424,14 @@ mod tests {
     fn reconstruct_config_derives_the_wal_heartbeat_period() {
         use crate::config::Config;
 
-        // The default 10 Hz *file* rate becomes a 1 Hz *record* rate,
-        // because walsvc appends one record per WAL_HEARTBEAT_EVERY
-        // ticks. Getting this wrong by that factor makes an on-time
-        // heartbeat stream look like a chain of holes to recovery.
+        // The reader's period is derived from the conservative 1 Hz basis
+        // (WAL_HEARTBEAT_EVERY = 10 divisor of the 10 Hz file rate), NOT
+        // the writer's actual active cadence (now one record per file beat,
+        // WAL_HEARTBEAT_ACTIVE_EVERY = 1). The basis is deliberately the
+        // sparsest active stream the reader can be handed — a pre-throttle
+        // 1 Hz WAL — so those still read as continuous; the denser 10 Hz
+        // stream is a fortiori continuous. Tightening it to 10 Hz would
+        // make every pre-throttle WAL look like a chain of holes.
         let config = Config::default();
         assert_eq!(config.heartbeat_hz, 10.0);
         assert_eq!(
@@ -2063,8 +2102,9 @@ mod tests {
         }});
         let out = r.on_initial_status(&idle, 1_000_000_000).unwrap();
         assert_eq!(
-            out.regime_marker, None,
-            "the first idle observation is not a fall"
+            out.regime_marker,
+            Some(plr_wal::MarkerKind::RecordingQuiescent),
+            "a session that starts idle marks its quiescence on the first evaluation"
         );
         assert!(
             !out.heartbeat.unwrap().active,
@@ -2137,6 +2177,52 @@ mod tests {
         assert_eq!(
             out.regime_marker, None,
             "no quiescent marker may be journaled inside a print"
+        );
+    }
+
+    /// A daemon that starts on an idle printer (the commonest shape — the
+    /// real capture's segment 1 is 19.6 h of it) journals its quiescence on
+    /// the very first evaluation, so the sparse stream that follows is a
+    /// recorded fact and not an ambiguous absence. A session that starts
+    /// mid-print does NOT mark (dense heartbeats speak for themselves).
+    #[test]
+    fn a_session_that_starts_idle_marks_its_quiescence() {
+        let idle = json!({"eventtime": 100.0, "status": {
+            "toolhead": {"print_time": 0.0, "estimated_print_time": 9.5,
+                          "position": [0.0, 0.0, 0.0, 0.0]},
+            "gcode_move": {"speed_factor": 1.0, "speed": 1500.0, "extrude_factor": 1.0,
+                "absolute_coordinates": true, "absolute_extrude": true,
+                "homing_origin": [0.0, 0.0, 0.0, 0.0], "position": [0.0, 0.0, 0.0, 0.0],
+                "gcode_position": [0.0, 0.0, 0.0, 0.0]},
+            "virtual_sdcard": {"file_path": null, "is_active": false,
+                                "file_position": 0, "file_size": 0},
+            "print_stats": {"state": "standby"},
+        }});
+        let mut r = Recorder::new();
+        r.set_heater_names(vec!["extruder".into()]);
+        let out = r.on_initial_status(&idle, 1_000_000_000).unwrap();
+        assert_eq!(
+            out.regime_marker,
+            Some(plr_wal::MarkerKind::RecordingQuiescent),
+            "the idle-from-birth session must journal quiescence on its first evaluation"
+        );
+
+        // A session that starts mid-print (is_active: true) must NOT mark:
+        // the dense heartbeat stream is its own liveness proof.
+        let mut r = recorder_with_snapshot();
+        // recorder_with_snapshot already ran the initial (active) status.
+        assert!(r.regime_active(1));
+        // Re-run the constructor's assertion path: the initial status
+        // carried is_active: true, so no quiescent marker was produced.
+        let out = r.on_status(
+            &status(json!({"eventtime": 100.1, "status": {
+                    "toolhead": {"estimated_print_time": 9.6}}})),
+            1_100_000_000,
+            false,
+        );
+        assert_eq!(
+            out.regime_marker, None,
+            "an active-from-birth session must not journal a quiescent marker"
         );
     }
 
