@@ -68,8 +68,8 @@ use plr_analyzer::{
     ContactOutcome, Interval, MatchConfig, ModelConfig, StopEvidence,
 };
 use plr_reconstruct::{
-    anchor_state_from_context, reconstruct, FileTail, PossibleStopSet, ReconstructInputs,
-    Reconstruction, RecoveryReconstruction,
+    anchor_state_from_context, reconstruct, select_crash_epoch, FileTail, PossibleStopSet,
+    ReconstructInputs, Reconstruction, RecoveryReconstruction,
 };
 use plr_recovery::{
     plan_recovery, select_resume_target, validate_machine, MachineConfig, MachineRejection,
@@ -180,6 +180,22 @@ impl CompletionReport {
     }
 }
 
+/// A one-line note when the merged WAL spans more than one boot/firmware
+/// epoch, describing that recovery is scoped to the newest printing one.
+/// `None` for a single-epoch log (the common case).
+fn epoch_note(merged: &plr_wal::RecoveryScan) -> Option<String> {
+    let selection = select_crash_epoch(merged);
+    selection.partitioned().then(|| {
+        format!(
+            "pipeline: WAL spans {} epochs; recovering the newest printing epoch \
+             ({} older, {} newer discarded)",
+            selection.epochs.len(),
+            selection.discarded_older(),
+            selection.discarded_newer(),
+        )
+    })
+}
+
 /// Runs the full pipeline, narrating progress to `out`. `Err` only for
 /// hard I/O failures on the WAL directory itself.
 pub fn run_pipeline(config: &Config, out: &mut dyn Write) -> Result<PipelineOutcome, String> {
@@ -192,6 +208,12 @@ pub fn run_pipeline(config: &Config, out: &mut dyn Write) -> Result<PipelineOutc
         merged.records.len(),
         merged.end
     ));
+    // Reconstruction scopes itself to the crash epoch; narrate it when the
+    // log spans more than one boot/firmware session so the operator knows
+    // older epochs were excluded rather than merged (see plr_reconstruct::epoch).
+    if let Some(note) = epoch_note(&merged) {
+        say(&note);
+    }
 
     let heartbeat = match scan::load_heartbeat(&config.heartbeat_file()) {
         Ok(recovery) => Some(recovery),
