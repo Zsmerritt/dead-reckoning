@@ -358,6 +358,10 @@ struct BootOutcome {
 
 /// Classifies the previous session and prepares the announcement
 /// commands, if any (see `detect` for the semantics).
+// One match over the four `Detection` outcomes, each arm resolving both the
+// announcement and the power-fail-sidecar disposition; splitting it would
+// scatter that paired decision for no clarity gain.
+#[allow(clippy::too_many_lines)]
 fn boot_detection(config: &Config) -> BootOutcome {
     use crate::detect::{self, Detection};
     let detection = detect::detect(
@@ -678,7 +682,7 @@ mod tests {
         use plr_wal::{SegmentHeader, WalRecord, WalWriter};
         let config = temp_config("boot-pending");
         // Empty WAL dir: nothing pending, no announcement.
-        assert!(super::boot_detection(&config).is_none());
+        assert!(super::boot_detection(&config).announcement.is_none());
         // Unclean WAL with a print in progress: pending + announcement,
         // and the state file exists.
         let gcode = config.wal_dir.join("part.gcode");
@@ -741,7 +745,9 @@ mod tests {
             }))
             .unwrap();
         std::fs::write(config.wal_dir.join("wal-000001.plr"), writer.into_inner()).unwrap();
-        let announcement = super::boot_detection(&config).expect("announcement expected");
+        let announcement = super::boot_detection(&config)
+            .announcement
+            .expect("announcement expected");
         let (primary, fallback) = &announcement.commands;
         assert!(primary.starts_with("RESPOND"), "{primary}");
         assert!(fallback.starts_with("M117"), "{fallback}");
@@ -761,7 +767,7 @@ mod tests {
             }))
             .unwrap();
         std::fs::write(config.wal_dir.join("wal-000001.plr"), writer.into_inner()).unwrap();
-        assert!(super::boot_detection(&config).is_none());
+        assert!(super::boot_detection(&config).announcement.is_none());
         assert!(!pending_path.exists());
     }
 
@@ -1035,7 +1041,7 @@ mod tests {
         // A stale offer from an earlier boot.
         std::fs::write(&pending_path, "{}").unwrap();
         assert!(
-            super::boot_detection(&config).is_some(),
+            super::boot_detection(&config).announcement.is_some(),
             "a completion message"
         );
         assert!(
@@ -1051,7 +1057,7 @@ mod tests {
                 std::fs::remove_file(path).unwrap();
             }
         }
-        assert!(super::boot_detection(&config).is_none());
+        assert!(super::boot_detection(&config).announcement.is_none());
         assert!(
             pending_path.exists(),
             "an inconclusive verdict must not retract an offer"
@@ -1100,7 +1106,7 @@ mod tests {
         let pending_path = config.wal_dir.join(crate::detect::PENDING_FILE_NAME);
         std::fs::write(&pending_path, "{}").unwrap();
 
-        assert!(super::boot_detection(&config).is_none());
+        assert!(super::boot_detection(&config).announcement.is_none());
         assert!(!pending_path.exists(), "the Clean arm must have run");
         assert!(
             crate::detect::read_frame_invalid(&config.wal_dir).is_some(),
@@ -1126,11 +1132,11 @@ G1 X60 Y60 E900 F1800
         std::fs::write(&gcode, &text).unwrap();
         // Unfinished work, no marker: a genuine offer.
         write_unclean_wal(&config, gcode.to_string_lossy().as_ref(), 500, false);
-        assert!(super::boot_detection(&config).is_some());
+        assert!(super::boot_detection(&config).announcement.is_some());
         // The same WAL plus a graceful-stop marker: silence.
         write_unclean_wal(&config, gcode.to_string_lossy().as_ref(), 500, true);
         assert!(
-            super::boot_detection(&config).is_none(),
+            super::boot_detection(&config).announcement.is_none(),
             "a deliberate recorder stop must not announce"
         );
     }

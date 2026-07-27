@@ -404,6 +404,10 @@ fn wall_ns() -> u64 {
 /// to be deployed). On any other target this is `None` and the postdates
 /// check degrades to the reason + power-fail evidence — see
 /// [`crate::detect::interrupted_by_power_fail`].
+// The Linux arm is always `Some`; the `None` arm is a different target's
+// body, invisible to clippy on this compile — the Option is load-bearing
+// cross-platform, not an unnecessary wrap.
+#[allow(clippy::unnecessary_wraps)]
 fn arm_mono_ns() -> Option<u64> {
     #[cfg(target_os = "linux")]
     {

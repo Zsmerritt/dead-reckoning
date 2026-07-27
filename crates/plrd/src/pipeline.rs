@@ -209,6 +209,10 @@ fn epoch_note(merged: &plr_wal::RecoveryScan) -> Option<String> {
 
 /// Runs the full pipeline, narrating progress to `out`. `Err` only for
 /// hard I/O failures on the WAL directory itself.
+// Linear orchestration (load WAL, reconstruct, gate completion, route by
+// policy, plan); splitting it would scatter the shared `say`/config state
+// across helpers for no clarity gain — same posture as `daemon::run`.
+#[allow(clippy::too_many_lines)]
 pub fn run_pipeline(config: &Config, out: &mut dyn Write) -> Result<PipelineOutcome, String> {
     let mut say = |text: &str| {
         let _ = writeln!(out, "{text}");
