@@ -1055,16 +1055,50 @@ pub fn write_pending(wal_dir: &Path, pending: &PendingRecovery) -> std::io::Resu
     std::fs::write(wal_dir.join(PENDING_FILE_NAME), json)
 }
 
-/// Reads the pending-recovery state file, if present and parseable.
+/// Tri-state presence of an on-disk state file: whether it is absent,
+/// present but unreadable/torn, or present and parsed.
 ///
-/// Read-only and total; `None` when the file is absent, unreadable, or not
-/// valid JSON for a [`PendingRecovery`]. WAL retention
-/// (`crate::retention::resolve_pins`) reads it to learn which print a pin
-/// protects; see that module for how the file is mapped back to a session.
+/// The distinction matters for WAL retention (`crate::retention`): a torn
+/// `pending_recovery.json` — produced by exactly the power loss this project
+/// exists for — is an *unlocalizable pin*, not the absence of one, so it must
+/// hold all evidence rather than let pruning proceed. `.ok()`-style readers
+/// that collapse "torn" into "absent" fail open; these do not.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StatePresence<T> {
+    /// The file does not exist.
+    Absent,
+    /// The file exists but could not be read or parsed (torn write, bad
+    /// JSON, or an I/O error).
+    Unreadable,
+    /// The file exists and parsed.
+    Present(T),
+}
+
+/// Reads [`PENDING_FILE_NAME`] as a tri-state (see [`StatePresence`]).
 #[must_use]
-pub fn read_pending(wal_dir: &Path) -> Option<PendingRecovery> {
-    let text = std::fs::read_to_string(wal_dir.join(PENDING_FILE_NAME)).ok()?;
-    serde_json::from_str(&text).ok()
+pub fn read_pending_presence(wal_dir: &Path) -> StatePresence<PendingRecovery> {
+    read_state_presence(&wal_dir.join(PENDING_FILE_NAME))
+}
+
+/// Reads [`FRAME_INVALID_FILE_NAME`] as a tri-state (see [`StatePresence`]).
+#[must_use]
+pub fn read_frame_invalid_presence(wal_dir: &Path) -> StatePresence<FrameInvalid> {
+    read_state_presence(&frame_invalid_path(wal_dir))
+}
+
+/// Shared tri-state reader: `NotFound` is [`StatePresence::Absent`]; any
+/// other I/O error, or a JSON parse failure, is
+/// [`StatePresence::Unreadable`] (present but torn); a clean parse is
+/// [`StatePresence::Present`].
+fn read_state_presence<T: serde::de::DeserializeOwned>(path: &Path) -> StatePresence<T> {
+    match std::fs::read_to_string(path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => StatePresence::Absent,
+        Err(_) => StatePresence::Unreadable,
+        Ok(text) => match serde_json::from_str(&text) {
+            Ok(value) => StatePresence::Present(value),
+            Err(_) => StatePresence::Unreadable,
+        },
+    }
 }
 
 /// Removes any stale state file.

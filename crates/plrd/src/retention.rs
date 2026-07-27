@@ -169,41 +169,118 @@ pub struct PruningPlan {
 /// [`crate::scan::list_segments`] returns them) into sessions, oldest
 /// first.
 ///
-/// A new session begins at the first segment, at any segment whose header
-/// is unreadable or whose predecessor's was (an uncomparable clock cannot
-/// be shown to be the same boot, so it is isolated), and at a reboot: a
-/// header `created_mono_ns` that regressed from the previous segment's by
-/// at least [`REBOOT_MONO_REGRESSION_NS`]. Total; never panics.
+/// # No deletion decision may depend on data adjacent to a corrupt header
+///
+/// An unreadable header is the corruption this project's threat model most
+/// plausibly produces (a torn write during `create_segment`, or a damaged
+/// older segment). The naive rule — start a new session on both sides of an
+/// unreadable header — silently defeats the keep-invariants: it fragments
+/// one boot into "independent old sessions", so the planner deletes the
+/// early segments of a pinned print's own boot (they became a separate old
+/// session), and a torn *newest* file becomes its own newest session,
+/// demoting the real previous boot out of newest-protection and deleting it.
+///
+/// So this function obeys a stronger rule than the reboot delimiter alone:
+///
+/// * **Bridge.** A reboot is a regression of at least
+///   [`REBOOT_MONO_REGRESSION_NS`] from the newest *readable* mono seen so
+///   far — bridged across any intervening unreadable segments (from
+///   `plr_reconstruct::epoch::partition`, written overflow-free). A corrupt
+///   segment in the middle of a boot therefore cannot reset the comparison
+///   and split the boot: the readable neighbours on either side still decide
+///   it (200 vs 400 → same boot).
+/// * **Never delimit on corruption.** An unreadable header never opens a
+///   session by itself; it joins the session under construction (opening one
+///   only if it is the very first segment). A readable segment seen while no
+///   readable mono has yet been recorded (only unreadables so far) also joins
+///   rather than starting a fresh deletable session beside corruption.
+/// * **Taint.** Any session that ends up containing an unreadable segment is
+///   marked non-deletable ([`Session::push`]), so — whichever boot the
+///   corrupt file truly belonged to — its neighbours are kept, not deleted.
+///   A torn newest file thus extends the newest readable session and keeps
+///   it protected; when a reboot is nonetheless detectable across the gap,
+///   the corrupt file stays with (and taints) the older side while the clean
+///   newer boot is grouped on its own readable merits.
+///
+/// The upshot: bridging keeps a boot whole so pins and newest-protection
+/// cover all of it; tainting means that where a boot cannot be reconstructed
+/// with confidence, the answer is "keep", never "delete". Total; never panics.
 #[must_use]
 pub fn group_into_sessions(segments: &[SegmentMeta]) -> Vec<Session> {
     let mut sessions: Vec<Session> = Vec::new();
-    let mut prev_mono: Option<u64> = None;
-    for (i, seg) in segments.iter().enumerate() {
-        let boundary = if i == 0 {
-            true
-        } else {
-            match (prev_mono, seg.created_mono_ns) {
-                // A backwards jump of at least the floor is a reboot. This
-                // is `cur + REBOOT_MONO_REGRESSION_NS <= prev` from
-                // `plr_reconstruct::epoch::partition`, written
-                // overflow-free.
-                (Some(prev), Some(cur)) => prev.saturating_sub(cur) >= REBOOT_MONO_REGRESSION_NS,
-                // Either header uncomparable: isolate at a boundary so a
-                // corrupt segment never merges two boots into one session.
-                _ => true,
-            }
+    let mut last_readable_mono: Option<u64> = None;
+    for seg in segments {
+        let boundary = match seg.created_mono_ns {
+            // Corruption never delimits: extend the current session (or open
+            // the first). `push` taints it non-deletable.
+            None => sessions.is_empty(),
+            Some(cur) => match last_readable_mono {
+                // No readable mono to compare against yet (leading/consecutive
+                // corruption): do not start a fresh deletable session beside
+                // the corrupt one — join the tainted session already open.
+                None => sessions.is_empty(),
+                // Bridged reboot test against the newest readable mono.
+                Some(prev) => prev.saturating_sub(cur) >= REBOOT_MONO_REGRESSION_NS,
+            },
         };
         if boundary {
             sessions.push(Session::new());
         }
-        // Safe: the first iteration always pushed.
+        // Safe: the first iteration always opens a session.
         sessions
             .last_mut()
-            .expect("a session was pushed before the first fold")
+            .expect("a session was opened before the first fold")
             .push(seg);
-        prev_mono = seg.created_mono_ns;
+        if let Some(cur) = seg.created_mono_ns {
+            last_readable_mono = Some(cur);
+        }
     }
     sessions
+}
+
+/// Indices of segments whose header could not be decoded (corruption).
+/// Surfacing these loudly is itself a requirement: a corrupt file in the
+/// WAL directory is something the operator must hear about. Pure/testable.
+#[must_use]
+pub fn unreadable_segments(metas: &[SegmentMeta]) -> Vec<u64> {
+    metas
+        .iter()
+        .filter(|m| m.created_mono_ns.is_none())
+        .map(|m| m.index)
+        .collect()
+}
+
+/// The set of segments retention must never delete, computed independently
+/// of any plan so it can *verify* one. A segment is protected when it lies
+/// in the newest session, in any pinned session (from the pin's session
+/// onward), in any non-deletable (corruption-tainted) session, or is the
+/// highest-numbered segment present (the WAL service is about to create
+/// `max + 1`). [`apply_pruning`] refuses to unlink anything in this set even
+/// if the planner is buggy.
+#[must_use]
+pub fn protected_segments(sessions: &[Session], pins: &Pins) -> std::collections::BTreeSet<u64> {
+    let mut protected = std::collections::BTreeSet::new();
+    if sessions.is_empty() {
+        return protected;
+    }
+    let newest = sessions.len() - 1;
+    let keep_floor = pins.keep_from.map_or(newest, |k| k.min(newest));
+    for session in &sessions[keep_floor..] {
+        protected.extend(session.segments.iter().copied());
+    }
+    for session in sessions {
+        if !session.deletable {
+            protected.extend(session.segments.iter().copied());
+        }
+    }
+    if let Some(max) = sessions
+        .iter()
+        .flat_map(|s| s.segments.iter().copied())
+        .max()
+    {
+        protected.insert(max);
+    }
+    protected
 }
 
 /// Decides which segments to delete. Pure, total, cross-platform — the
@@ -321,35 +398,72 @@ fn read_header_mono(path: &Path) -> Option<u64> {
 /// interlock is flagged in the message. When it stands alone, there is
 /// nothing to map it to, so the safe answer is to keep everything.
 ///
+/// # A torn state file is an unlocalizable pin, not the absence of one
+///
+/// The state files are read as a tri-state
+/// ([`detect::StatePresence`](crate::detect::StatePresence)). A file that is
+/// **present but unreadable** — a torn `pending_recovery.json` written and
+/// then interrupted by the very power loss this project handles — is treated
+/// as a pin we cannot localize: keep everything, loudly. Collapsing "torn"
+/// into "absent" (as an `.ok()?` reader would) fails open and lets pruning
+/// delete a live offer's evidence.
+///
+/// # Which session, when the same file appears twice (documented, not accidental)
+///
+/// Resolution is deliberately *newest*-session-first: a file reprinted after
+/// an earlier attempt appears in two sessions, and the pending offer always
+/// refers to the most recent attempt (that is how `detect` derives it, from
+/// the crash epoch). The real capture shows exactly this — the same
+/// `virtual_sdcard.file_path` recorded in more than one boot — so pinning the
+/// newest naming session, and everything after it, is the chosen behaviour,
+/// not an artefact. An older attempt's session is then prunable on its own
+/// merits unless separately protected.
+///
 /// # Failing toward keeping evidence
 ///
 /// Any inability to localize a pin resolves to `keep_from: Some(0)` (keep
-/// all segments): a pending file whose print is in none of the sessions
-/// (it may have already been pruned in an earlier run, or the file scrolled
-/// out), or a lone frame-invalid interlock. Deleting evidence we cannot
-/// prove is superseded is the one outcome worse than growth.
+/// all segments): a torn state file, a pending file whose print is in none of
+/// the sessions (it may have already been pruned in an earlier run, or the
+/// file scrolled out), or a lone frame-invalid interlock. Deleting evidence
+/// we cannot prove is superseded is the one outcome worse than growth.
 #[must_use]
 pub fn resolve_pins(wal_dir: &Path, sessions: &[Session]) -> Pins {
-    let pending = crate::detect::read_pending(wal_dir);
-    let frame_invalid = crate::detect::read_frame_invalid(wal_dir).is_some();
+    use crate::detect::StatePresence;
+    let pending = crate::detect::read_pending_presence(wal_dir);
+    let frame = crate::detect::read_frame_invalid_presence(wal_dir);
 
-    let Some(pending) = pending else {
-        if frame_invalid {
+    let keep_all = |reason: &str| Pins {
+        keep_from: Some(0),
+        pinned: Some(reason.to_owned()),
+    };
+
+    // A present-but-torn state file cannot be localized: keep everything.
+    if matches!(pending, StatePresence::Unreadable) {
+        return keep_all(
+            "pending_recovery.json is present but unreadable (torn write); keeping all WAL",
+        );
+    }
+    if matches!(frame, StatePresence::Unreadable) {
+        return keep_all(
+            "frame_invalid.json is present but unreadable (torn write); keeping all WAL",
+        );
+    }
+    let frame_present = matches!(frame, StatePresence::Present(_));
+
+    let StatePresence::Present(pending) = pending else {
+        // pending Absent (Unreadable handled above).
+        if frame_present {
             // Interlock active but nothing names the print: keep all.
-            return Pins {
-                keep_from: Some(0),
-                pinned: Some(
-                    "frame-invalid interlock (no pending file to localize; keeping all WAL)"
-                        .to_owned(),
-                ),
-            };
+            return keep_all(
+                "frame-invalid interlock (no pending file to localize; keeping all WAL)",
+            );
         }
         return Pins::default();
     };
 
     match newest_session_naming(wal_dir, sessions, &pending.file) {
         Some(ordinal) => {
-            let note = if frame_invalid || pending.frame_invalid {
+            let note = if frame_present || pending.frame_invalid {
                 " [Z frame UNKNOWN — fresh dry run required]"
             } else {
                 ""
@@ -359,15 +473,10 @@ pub fn resolve_pins(wal_dir: &Path, sessions: &[Session]) -> Pins {
                 pinned: Some(format!("pending recovery for '{}'{note}", pending.file)),
             }
         }
-        None => Pins {
-            // The pinned print is in none of the current sessions: keep
-            // everything rather than risk deleting a live offer's backing.
-            keep_from: Some(0),
-            pinned: Some(format!(
-                "pending recovery for '{}' (session not found; keeping all WAL)",
-                pending.file
-            )),
-        },
+        None => keep_all(&format!(
+            "pending recovery for '{}' (session not found; keeping all WAL)",
+            pending.file
+        )),
     }
 }
 
@@ -400,29 +509,22 @@ fn session_names_file(wal_dir: &Path, session: &Session, file: &str) -> bool {
     })
 }
 
-/// The primary/fallback G-Code commands for a console-visible overage
-/// notice, mirroring `detect::announcement_commands`. Quote characters in
-/// the pin description are stripped so the message is safe inside a
-/// `RESPOND ... MSG="..."` argument.
-#[cfg(target_os = "linux")]
-fn overage_commands(overage: &Overage) -> Option<(String, String)> {
-    let pinned = overage.pinned.as_ref()?;
-    let safe = pinned.replace(['"', '\''], "");
-    let message = format!(
-        "dead-reckoning: WAL retention cannot meet its {} B cap — {} B over, held by {}. \
-         Evidence is being KEPT, not deleted; free space or clear the pin.",
-        overage.cap, overage.over_by, safe,
-    );
-    Some((
-        format!("RESPOND PREFIX=dead-reckoning MSG=\"{message}\""),
-        format!("M117 {message}"),
-    ))
+/// Builds `(primary, fallback)` RESPOND/M117 commands for a console notice,
+/// mirroring `detect::announcement_commands`. Quote characters are stripped
+/// so the message is safe inside a `RESPOND ... MSG="..."` argument.
+fn console_commands(message: &str) -> (String, String) {
+    let safe = message.replace(['"', '\''], "");
+    (
+        format!("RESPOND PREFIX=dead-reckoning MSG=\"{safe}\""),
+        format!("M117 {safe}"),
+    )
 }
 
 /// Runs retention against the configured WAL directory: read segment
-/// headers, group into sessions, resolve pins, plan, and apply
-/// (unlink + directory fsync). Returns the console-message commands for a
-/// pin-driven overage, if any, for the caller to deliver via Moonraker.
+/// headers, group into sessions, resolve pins, plan, verify, and apply
+/// (unlink + directory fsync). Returns any console notices — corruption
+/// found, and/or a pin-driven overage — for the caller to deliver via
+/// Moonraker (each as `(primary, fallback)` commands).
 ///
 /// **Linux only, and it must run before the WAL service spawns** so the
 /// highest-numbered segment `walsvc` is about to create `max + 1` past is
@@ -432,22 +534,42 @@ fn overage_commands(overage: &Overage) -> Option<(String, String)> {
 /// one directory `fsync`.
 #[cfg(target_os = "linux")]
 #[must_use]
-pub fn run_pruning(config: &crate::config::Config) -> Option<(String, String)> {
+pub fn run_pruning(config: &crate::config::Config) -> Vec<(String, String)> {
     let wal_dir = config.wal_dir.as_path();
     let cap = config.wal_retention_bytes;
+    let mut notices: Vec<(String, String)> = Vec::new();
 
     let metas = match read_segment_metas(wal_dir) {
         Ok(metas) => metas,
         Err(e) => {
             // An unreadable/absent WAL dir is normal on a first-ever boot;
-            // it is not retention's job to create it (walsvc does). Log at
-            // most a quiet note and move on.
+            // it is not retention's job to create it (walsvc does).
             eprintln!("plrd: WAL retention: skipping ({e})");
-            return None;
+            return notices;
         }
     };
     if metas.is_empty() {
-        return None;
+        return notices;
+    }
+
+    // Corruption in the WAL directory is itself something the operator must
+    // hear about: log every unreadable header and raise a console notice
+    // naming the files. (The grouping already keeps them, tainted.)
+    let corrupt = unreadable_segments(&metas);
+    if !corrupt.is_empty() {
+        let names: Vec<String> = corrupt.iter().map(|&i| segment_file_name(i)).collect();
+        eprintln!(
+            "plrd: WAL retention: {} segment header(s) unreadable ({}); their boots are \
+             being KEPT (never pruned) — investigate possible corruption",
+            corrupt.len(),
+            names.join(", "),
+        );
+        notices.push(console_commands(&format!(
+            "dead-reckoning: WAL has {} unreadable segment header(s) ({}); those boots are \
+             KEPT, not pruned — check for storage corruption",
+            corrupt.len(),
+            names.join(", "),
+        )));
     }
 
     let sessions = group_into_sessions(&metas);
@@ -455,7 +577,11 @@ pub fn run_pruning(config: &crate::config::Config) -> Option<(String, String)> {
     let plan = plan_pruning(&sessions, &pins, cap);
 
     if !plan.delete.is_empty() {
-        match apply_pruning(wal_dir, &plan.delete) {
+        // Independent keep-set: the deleting half must be incapable of
+        // removing a protected segment even if the planner is buggy.
+        let protected = protected_segments(&sessions, &pins);
+        let max_index = metas.iter().map(|m| m.index).max().unwrap_or(0);
+        match apply_pruning(wal_dir, &plan.delete, &protected, max_index) {
             Ok(removed) => {
                 let reclaimed: u64 = metas
                     .iter()
@@ -469,13 +595,12 @@ pub fn run_pruning(config: &crate::config::Config) -> Option<(String, String)> {
                 );
             }
             Err(e) => {
-                eprintln!("plrd: WAL retention: some deletions failed: {e}");
+                eprintln!("plrd: WAL retention: deletion refused/failed: {e}");
             }
         }
     }
 
     if let Some(overage) = &plan.overage {
-        // Always the log line...
         eprintln!(
             "plrd: WAL retention: {} B retained exceeds the {} B cap by {} B{}; \
              keeping all evidence (a pin or the current print beats the cap)",
@@ -487,17 +612,56 @@ pub fn run_pruning(config: &crate::config::Config) -> Option<(String, String)> {
                 .as_ref()
                 .map_or(String::new(), |p| format!(", held by {p}")),
         );
-        // ...and, when a pin holds it, the console-visible message.
-        return overage_commands(overage);
+        // A pin-driven overage also gets a console notice naming the pin.
+        if let Some(pinned) = &overage.pinned {
+            notices.push(console_commands(&format!(
+                "dead-reckoning: WAL retention cannot meet its {} B cap — {} B over, held by {}. \
+                 Evidence is being KEPT, not deleted; free space or clear the pin.",
+                overage.cap, overage.over_by, pinned,
+            )));
+        }
     }
-    None
+    notices
 }
 
-/// Unlinks the chosen segments and fsyncs the directory so the removals
-/// are durable. Attempts every deletion even if one fails; a missing file
+/// Unlinks the chosen segments and fsyncs the directory so the removals are
+/// durable.
+///
+/// # Structural guard (belt-and-braces)
+///
+/// Deletion is the highest-consequence operation in the project, so this
+/// function is *incapable* of removing a protected segment even if
+/// [`plan_pruning`] is buggy: before unlinking anything it verifies every
+/// index in `delete` against `protected` (the independently recomputed
+/// keep-set from [`protected_segments`]) and against `max_index` (the
+/// highest-numbered segment, which the WAL service is about to succeed).
+/// A single violation refuses the **whole** batch — nothing is unlinked —
+/// because a delete list that contains a protected segment is evidence the
+/// planner is wrong, and the safe response to a wrong planner is to touch
+/// nothing.
+///
+/// Otherwise it attempts every deletion even if one fails; a missing file
 /// (already gone) is not an error. Returns the number removed.
 #[cfg(target_os = "linux")]
-fn apply_pruning(wal_dir: &Path, delete: &[u64]) -> std::io::Result<usize> {
+fn apply_pruning(
+    wal_dir: &Path,
+    delete: &[u64],
+    protected: &std::collections::BTreeSet<u64>,
+    max_index: u64,
+) -> Result<usize, String> {
+    for &index in delete {
+        if index == max_index {
+            return Err(format!(
+                "refusing to delete the highest-numbered segment {index} (planner-bug guard); \
+                 nothing deleted"
+            ));
+        }
+        if protected.contains(&index) {
+            return Err(format!(
+                "refusing to delete protected segment {index} (planner-bug guard); nothing deleted"
+            ));
+        }
+    }
     let mut removed = 0_usize;
     let mut first_error: Option<std::io::Error> = None;
     for &index in delete {
@@ -514,9 +678,11 @@ fn apply_pruning(wal_dir: &Path, delete: &[u64]) -> std::io::Result<usize> {
     }
     // fsync the directory so the unlinks survive a power cut, exactly as
     // `detect::sync_dir` does for the frame-invalid rename.
-    std::fs::File::open(wal_dir)?.sync_all()?;
+    std::fs::File::open(wal_dir)
+        .and_then(|d| d.sync_all())
+        .map_err(|e| format!("directory fsync after unlink: {e}"))?;
     match first_error {
-        Some(e) => Err(e),
+        Some(e) => Err(format!("{removed} removed, then i/o error: {e}")),
         None => Ok(removed),
     }
 }
@@ -524,8 +690,8 @@ fn apply_pruning(wal_dir: &Path, delete: &[u64]) -> std::io::Result<usize> {
 #[cfg(test)]
 mod tests {
     use super::{
-        group_into_sessions, plan_pruning, read_segment_metas, resolve_pins, Pins, SegmentMeta,
-        Session,
+        group_into_sessions, plan_pruning, protected_segments, read_segment_metas, resolve_pins,
+        unreadable_segments, Pins, SegmentMeta, Session,
     };
     use crate::scan::segment_file_name;
     use plr_reconstruct::epoch::REBOOT_MONO_REGRESSION_NS;
@@ -617,23 +783,45 @@ mod tests {
         assert_eq!(at.len(), 2);
     }
 
+    fn unreadable(index: u64, size_bytes: u64) -> SegmentMeta {
+        SegmentMeta {
+            index,
+            size_bytes,
+            created_mono_ns: None,
+        }
+    }
+
     #[test]
-    fn an_unreadable_header_isolates_and_is_kept() {
+    fn a_corrupt_header_mid_boot_bridges_and_taints_one_session() {
+        // BLOCKER fix: a corrupt segment in the middle of one boot must NOT
+        // fragment it. The readable neighbours (100 vs 300, same boot) bridge
+        // across the gap; the whole boot is one session, tainted non-deletable
+        // by the corrupt member.
+        let s = group_into_sessions(&[seg(1, 16, 100 * S), unreadable(2, 16), seg(3, 16, 300 * S)]);
+        assert_eq!(s.len(), 1, "corrupt middle must not split the boot");
+        assert_eq!(s[0].segments, vec![1, 2, 3]);
+        assert!(
+            !s[0].deletable,
+            "a session with a corrupt member is tainted"
+        );
+    }
+
+    #[test]
+    fn a_reboot_is_still_detected_across_a_corrupt_header() {
+        // Bridging must still see a genuine reboot spanning the corrupt gap:
+        // 50000 (boot A) vs 20 (boot B) is a regression even with an
+        // unreadable segment between them. The corrupt file stays with (and
+        // taints) the older side; the clean newer boot groups on its own.
         let s = group_into_sessions(&[
-            seg(1, 16, 100 * S),
-            SegmentMeta {
-                index: 2,
-                size_bytes: 16,
-                created_mono_ns: None,
-            },
-            seg(3, 16, 300 * S),
+            seg(1, 16, 50_000 * S),
+            unreadable(2, 16),
+            seg(3, 16, 20 * S),
         ]);
-        // The corrupt segment neither merges with its neighbours nor lets
-        // them merge across it: three sessions, the middle non-deletable.
-        assert_eq!(s.len(), 3);
-        assert_eq!(s[1].segments, vec![2]);
-        assert!(!s[1].deletable);
-        assert!(s[0].deletable && s[2].deletable);
+        assert_eq!(s.len(), 2);
+        assert_eq!(s[0].segments, vec![1, 2]);
+        assert!(!s[0].deletable, "corrupt member taints the older boot");
+        assert_eq!(s[1].segments, vec![3]);
+        assert!(s[1].deletable, "the clean newer boot is untainted");
     }
 
     // ---- plan_pruning: the four safety invariants ---------------------
@@ -954,6 +1142,263 @@ mod tests {
         let pins = resolve_pins(&dir, &sessions);
         assert_eq!(pins.keep_from, Some(0));
         assert!(pins.pinned.unwrap().contains("Z frame UNKNOWN"));
+    }
+
+    fn pending_for(file: &str) -> crate::detect::PendingRecovery {
+        crate::detect::PendingRecovery {
+            detected_wall_ns: 1,
+            file: file.to_owned(),
+            file_position: 0,
+            file_size: None,
+            percent: None,
+            crash_class: "x".to_owned(),
+            frame_invalid: false,
+        }
+    }
+
+    // ---- protected_segments (the apply-side keep-set) -----------------
+
+    #[test]
+    fn protected_set_covers_newest_pinned_tainted_and_max() {
+        let sessions = vec![
+            one_seg_session(1, 100), // old, deletable, unpinned
+            Session {
+                segments: vec![2, 3],
+                total_bytes: 100,
+                deletable: false, // corruption-tainted
+            },
+            one_seg_session(4, 100), // pinned (keep_from = 2)
+            one_seg_session(5, 100), // newest
+        ];
+        let pins = Pins {
+            keep_from: Some(2),
+            pinned: Some("x".to_owned()),
+        };
+        let p = protected_segments(&sessions, &pins);
+        assert!(p.contains(&4) && p.contains(&5), "pinned-onward protected");
+        assert!(
+            p.contains(&2) && p.contains(&3),
+            "tainted session protected"
+        );
+        assert!(p.contains(&5), "highest index protected");
+        assert!(
+            !p.contains(&1),
+            "an old deletable unpinned session is not protected"
+        );
+    }
+
+    // ---- BLOCKER probes: corruption must never cause a wrongful delete -
+
+    /// Wrecks the magic bytes of an existing segment's header on disk.
+    fn corrupt_header(dir: &Path, index: u64) {
+        let path = dir.join(segment_file_name(index));
+        let mut bytes = std::fs::read(&path).unwrap();
+        for b in bytes.iter_mut().take(8) {
+            *b = 0;
+        }
+        std::fs::write(&path, bytes).unwrap();
+    }
+
+    #[test]
+    fn probe_a_corrupt_mid_boot_with_pin_keeps_the_whole_pinned_boot() {
+        // One boot, segs 1-5 all naming the live print; seg 3's header
+        // corrupted; a pending pin present. The pin must cover the WHOLE boot
+        // — segs 1-2 must NOT be deleted (the pre-corruption fragment bug).
+        // Platform: both (pure reading + planning).
+        let dir = temp_dir("probe-a");
+        for i in 1..=5u64 {
+            write_segment(
+                &dir,
+                i,
+                (100 + i * 100) * S,
+                &[printing_context("/g/live.gcode")],
+            );
+        }
+        corrupt_header(&dir, 3);
+        crate::detect::write_pending(&dir, &pending_for("/g/live.gcode")).unwrap();
+        let metas = read_segment_metas(&dir).unwrap();
+        assert_eq!(unreadable_segments(&metas), vec![3]);
+        let sessions = group_into_sessions(&metas);
+        assert_eq!(
+            sessions.len(),
+            1,
+            "corrupt middle must not fragment the boot"
+        );
+        let pins = resolve_pins(&dir, &sessions);
+        // Tiny cap: without the fix a "post-corruption fragment" would be
+        // deleted here.
+        let plan = plan_pruning(&sessions, &pins, 1);
+        assert!(
+            plan.delete.is_empty(),
+            "no segment of the pinned boot may be deleted: {:?}",
+            plan.delete
+        );
+        crate::detect::clear_pending(&dir);
+    }
+
+    #[test]
+    fn probe_b_corrupt_mid_boot_without_pin_keeps_the_newest_boot() {
+        // Same shape, no pin: the newest (only) boot is tainted AND newest, so
+        // invariant (a) holds and nothing is deleted. Platform: both.
+        let dir = temp_dir("probe-b");
+        for i in 1..=5u64 {
+            write_segment(
+                &dir,
+                i,
+                (100 + i * 100) * S,
+                &[printing_context("/g/live.gcode")],
+            );
+        }
+        corrupt_header(&dir, 3);
+        let metas = read_segment_metas(&dir).unwrap();
+        let sessions = group_into_sessions(&metas);
+        let pins = resolve_pins(&dir, &sessions);
+        assert_eq!(pins, Pins::default());
+        let plan = plan_pruning(&sessions, &pins, 1);
+        assert!(
+            plan.delete.is_empty(),
+            "the newest boot's head must not be deleted"
+        );
+    }
+
+    #[test]
+    fn probe_e_torn_newest_file_does_not_delete_the_previous_boot() {
+        // segs 1-2 the real previous boot; seg 3 a 7-byte torn file from a
+        // power loss during create_segment. Without the fix seg 3 becomes the
+        // "newest session" and the whole previous boot is deleted with no
+        // message. With it, seg 3 extends and taints the newest session;
+        // nothing is deleted. Platform: both.
+        let dir = temp_dir("probe-e");
+        write_segment(&dir, 1, 100 * S, &[printing_context("/g/prev.gcode")]);
+        write_segment(&dir, 2, 200 * S, &[printing_context("/g/prev.gcode")]);
+        std::fs::write(dir.join(segment_file_name(3)), [0_u8; 7]).unwrap();
+        let metas = read_segment_metas(&dir).unwrap();
+        assert_eq!(unreadable_segments(&metas), vec![3]);
+        let sessions = group_into_sessions(&metas);
+        assert_eq!(
+            sessions.len(),
+            1,
+            "torn newest must not form its own session"
+        );
+        assert!(!sessions[0].deletable);
+        let pins = resolve_pins(&dir, &sessions);
+        let plan = plan_pruning(&sessions, &pins, 1);
+        assert!(
+            plan.delete.is_empty(),
+            "a torn newest file must not demote the previous boot: {:?}",
+            plan.delete
+        );
+    }
+
+    // ---- MAJOR 2: torn state files keep everything --------------------
+
+    #[test]
+    fn a_torn_pending_file_keeps_everything() {
+        let dir = temp_dir("torn-pending");
+        write_segment(&dir, 1, 100 * S, &[printing_context("/g/a.gcode")]);
+        let metas = read_segment_metas(&dir).unwrap();
+        let sessions = group_into_sessions(&metas);
+        // Present but not valid JSON: an unlocalizable pin, not absence.
+        std::fs::write(
+            dir.join(crate::detect::PENDING_FILE_NAME),
+            b"{ this is not json",
+        )
+        .unwrap();
+        let pins = resolve_pins(&dir, &sessions);
+        assert_eq!(pins.keep_from, Some(0));
+        assert!(pins.pinned.unwrap().contains("unreadable"));
+    }
+
+    #[test]
+    fn a_torn_frame_invalid_file_keeps_everything() {
+        let dir = temp_dir("torn-frame");
+        write_segment(&dir, 1, 100 * S, &[printing_context("/g/a.gcode")]);
+        let metas = read_segment_metas(&dir).unwrap();
+        let sessions = group_into_sessions(&metas);
+        std::fs::write(crate::detect::frame_invalid_path(&dir), b"garbage").unwrap();
+        let pins = resolve_pins(&dir, &sessions);
+        assert_eq!(pins.keep_from, Some(0));
+        assert!(pins.pinned.unwrap().contains("unreadable"));
+    }
+
+    // ---- MAJOR 1: the Linux unlink half (guard + real dirs) -----------
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn apply_pruning_refuses_protected_and_the_highest_segment() {
+        let dir = temp_dir("apply-guard");
+        for i in 1..=3u64 {
+            write_segment(&dir, i, i * S, &[]);
+        }
+        let protected: std::collections::BTreeSet<u64> = [2].into_iter().collect();
+        // Refuses the highest-numbered segment (3), deleting nothing.
+        assert!(super::apply_pruning(&dir, &[3], &protected, 3).is_err());
+        // Refuses a protected index (2), deleting nothing.
+        assert!(super::apply_pruning(&dir, &[2], &protected, 3).is_err());
+        assert!(dir.join(segment_file_name(2)).exists());
+        assert!(dir.join(segment_file_name(3)).exists());
+        // A benign delete (1) succeeds.
+        assert_eq!(super::apply_pruning(&dir, &[1], &protected, 3).unwrap(), 1);
+        assert!(!dir.join(segment_file_name(1)).exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn apply_pruning_tolerates_missing_and_reports_first_error() {
+        let dir = temp_dir("apply-errs");
+        write_segment(&dir, 1, S, &[]);
+        let empty: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
+        // NotFound tolerance: index 9 has no file; removed 0, not an error.
+        assert_eq!(super::apply_pruning(&dir, &[9], &empty, 100).unwrap(), 0);
+        // First-error path: make index 2 a DIRECTORY so remove_file fails,
+        // but index 1 (a real file) is still removed.
+        std::fs::create_dir(dir.join(segment_file_name(2))).unwrap();
+        let err = super::apply_pruning(&dir, &[1, 2], &empty, 100).unwrap_err();
+        assert!(err.contains("i/o error"), "{err}");
+        assert!(!dir.join(segment_file_name(1)).exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn run_pruning_deletes_old_boots_and_keeps_newest_on_disk() {
+        let dir = temp_dir("run-prune");
+        // Boot A (old): segs 1,2. Boot B (newest): seg 3 (mono reset).
+        write_segment(&dir, 1, 50_000 * S, &[printing_context("/g/old.gcode")]);
+        write_segment(&dir, 2, 50_100 * S, &[printing_context("/g/old.gcode")]);
+        write_segment(&dir, 3, 20 * S, &[printing_context("/g/new.gcode")]);
+        let one = std::fs::metadata(dir.join(segment_file_name(1)))
+            .unwrap()
+            .len();
+        let config = crate::config::Config {
+            wal_dir: dir.clone(),
+            segment_rotate_bytes: 4096,
+            wal_retention_bytes: one * 2 + 10,
+            ..crate::config::Config::default()
+        };
+        let _ = super::run_pruning(&config);
+        assert!(!dir.join(segment_file_name(1)).exists(), "old boot pruned");
+        assert!(!dir.join(segment_file_name(2)).exists(), "old boot pruned");
+        assert!(dir.join(segment_file_name(3)).exists(), "newest boot kept");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn run_pruning_surfaces_a_corruption_notice_and_keeps_the_boot() {
+        let dir = temp_dir("run-corrupt");
+        write_segment(&dir, 1, 100 * S, &[printing_context("/g/a.gcode")]);
+        std::fs::write(dir.join(segment_file_name(2)), [0_u8; 7]).unwrap(); // torn newest
+        let config = crate::config::Config {
+            wal_dir: dir.clone(),
+            ..crate::config::Config::default()
+        };
+        let notices = super::run_pruning(&config);
+        assert!(
+            notices
+                .iter()
+                .any(|(primary, _)| primary.contains("unreadable segment header")),
+            "a corruption notice must be raised"
+        );
+        assert!(dir.join(segment_file_name(1)).exists(), "the boot is kept");
     }
 
     // ---- end to end on a synthetic three-boot directory ---------------

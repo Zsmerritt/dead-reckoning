@@ -81,9 +81,10 @@ pub fn run(config_path: &Path) -> u8 {
     // highest-numbered segment `walsvc` is about to create `max + 1` past
     // is still the current max, hence in the newest session, which pruning
     // never deletes. Read-only classification plus unlink + dir fsync;
-    // never fatal. Returns the console notice for a pin-driven overage.
-    let retention_overage = crate::retention::run_pruning(&config);
-    let overage_url = config.moonraker_url.clone();
+    // never fatal. Returns console notices (corruption found, pin-driven
+    // overage) for best-effort delivery to the operator.
+    let retention_notices = crate::retention::run_pruning(&config);
+    let retention_url = config.moonraker_url.clone();
 
     let (tx, rx) = std::sync::mpsc::sync_channel::<WalCmd>(config.channel_capacity);
     let wal_thread = walsvc::spawn(wal_cfg(&config), rx);
@@ -141,10 +142,11 @@ pub fn run(config_path: &Path) -> u8 {
         if let Some(announcement) = announcement {
             tokio::spawn(announce_pending(moonraker_url, announcement));
         }
-        // A pin held the WAL above its retention cap: tell the operator on
-        // the console, best-effort, concurrent with recording.
-        if let Some(commands) = retention_overage {
-            tokio::spawn(announce_overage(overage_url, commands));
+        // Retention notices (WAL corruption, or a pin holding usage over the
+        // cap): tell the operator on the console, best-effort, concurrent
+        // with recording.
+        for commands in retention_notices {
+            tokio::spawn(announce_overage(retention_url.clone(), commands));
         }
         tokio::select! {
             result = run_client(&client_cfg, &mut sender, &mut recorder) => result,
@@ -363,12 +365,13 @@ async fn announce_pending(url: String, announcement: BootAnnouncement) {
     eprintln!("plrd: could not deliver the pending-recovery announcement (gave up)");
 }
 
-/// Delivers the WAL-retention overage notice to the console via Moonraker
-/// (`printer.gcode.script`), best-effort with retries because klippy may
-/// be down at boot. No live-status pre-check (unlike [`announce_pending`]):
-/// this is a standing storage condition, not an offer that could be stale.
-/// The `(primary, fallback)` commands come from
-/// `retention::run_pruning` (RESPOND then M117; either landing is success).
+/// Delivers a WAL-retention console notice (corruption found, or a pin
+/// holding usage over the cap) via Moonraker (`printer.gcode.script`),
+/// best-effort with retries because klippy may be down at boot. No
+/// live-status pre-check (unlike [`announce_pending`]): these are standing
+/// storage conditions, not offers that could be stale. The
+/// `(primary, fallback)` commands come from `retention::run_pruning`
+/// (RESPOND then M117; either landing is success).
 async fn announce_overage(url: String, commands: (String, String)) {
     use crate::moonraker::MoonrakerClient;
     const ATTEMPTS: u32 = 30;
@@ -380,13 +383,13 @@ async fn announce_overage(url: String, commands: (String, String)) {
             if client.gcode_script(&commands.0).await.is_ok()
                 || client.gcode_script(&commands.1).await.is_ok()
             {
-                eprintln!("plrd: WAL-retention overage notice delivered");
+                eprintln!("plrd: WAL-retention notice delivered");
                 return;
             }
         }
         tokio::time::sleep(RETRY).await;
     }
-    eprintln!("plrd: could not deliver the WAL-retention overage notice (gave up)");
+    eprintln!("plrd: could not deliver the WAL-retention notice (gave up)");
 }
 
 /// Is Klipper right now printing the file the offer is about?
