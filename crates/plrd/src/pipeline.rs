@@ -1571,53 +1571,70 @@ G1 X60 Y60 E0.02
     /// the extension's start time cannot be read from motion evidence and
     /// falls back to the reader-lead bound (`t_a` minus
     /// `max_processing_lead`). That bound assumes execution may lag the
-    /// recorded frontier by seconds, which is what keeps the set
-    /// containing the truth, and it widens the offset candidate window
-    /// past what the matcher can resolve per line. The outcome is
-    /// therefore `ManualFallback`, deliberately.
+    /// recorded frontier by seconds, which is what keeps the set containing
+    /// the truth, and it widens the offset candidate window.
     ///
-    /// Asserted rather than left implicit for two reasons: it records the
-    /// degradation as intended behaviour, so nobody narrows the bound to
-    /// "fix" this and silently reopens the containment hole the bound
-    /// closes; and it gives the unanchored path a consumer-level test
-    /// that can fail. `docs/operations.md` carries the operator-facing
-    /// half — an early-print power loss lands in manual recovery, which
-    /// costs the operator little because almost nothing has printed.
+    /// The outcome is `ManualFallback` either way, but the frontier cap
+    /// (Part 1, `feat/layer-attribution`) changed *which* step declines,
+    /// and this test is re-pinned to it deliberately. **Before the cap:**
+    /// the reader-lead horizon left 16 candidate lines, past what the
+    /// matcher can resolve per line, so the *matcher* declined
+    /// ("stop-point match failed … below layer granularity"). **After the
+    /// cap:** its parser-leads-execution bound narrows the high end (here
+    /// Δt ≈ 1.25 s of executable path from the frontier), leaving 7
+    /// candidates — a matcher-resolvable `AmbiguousWindow` — so the matcher
+    /// now succeeds and recovery is refused one step later at *contact
+    /// selection*: a stop this early sits on the resume layer itself with
+    /// no layer below to probe ("resume layer 0 out of range"). The
+    /// original test comment already anticipated exactly this structural
+    /// refusal for a narrow horizon.
+    ///
+    /// The containment hole the reader-lead bound closes stays closed: the
+    /// cap narrows only the *high* end, and the window LOW end is still the
+    /// frontier (byte 8), so the truth — a stop that had not advanced past
+    /// the frontier — remains contained. This is asserted below (the window
+    /// low end is pinned to 8), which is what now catches an unsound
+    /// narrowing, in place of the obsolete `count >= 12` guard the cap
+    /// legitimately falsifies.
+    ///
+    /// Asserted rather than left implicit so the unanchored path keeps a
+    /// consumer-level test that can fail. `docs/operations.md` carries the
+    /// operator-facing half — an early-print power loss lands in manual
+    /// recovery, which costs the operator little because almost nothing has
+    /// printed.
     #[test]
     fn an_early_print_cut_without_motion_evidence_falls_back_to_manual() {
         let (_dir, config) = early_print_fixture("early-print-unanchored");
         let (outcome, output) = run(&config);
+        // Outcome preserved: still ManualFallback, no regression — the
+        // decline moved from the matcher to contact selection, not from
+        // automatic to manual (see this test's doc comment for the cap).
         let PipelineOutcome::ManualFallback(reason) = outcome else {
             panic!("expected ManualFallback, got {outcome:?}\n{output}");
         };
-        // The reason it reports today: the widened window leaves more
-        // candidate lines than layer granularity can separate.
+        // The frontier cap resolves the window, so recovery is now refused
+        // structurally: a layer-0 stop has no layer below to probe.
         assert!(
-            reason.contains("stop-point match failed"),
+            reason.contains("contact selection failed")
+                && reason.contains("resume layer 0 out of range"),
             "reason changed: {reason}\n{output}"
         );
+        // The cap did its job: the window is now a bounded, matcher-
+        // resolvable AmbiguousWindow (was 16 candidate lines past layer
+        // granularity; now 7), and its LOW end is still the frontier
+        // (byte 8) — the cap narrowed only the high end, never below the
+        // truth, so the reader-lead containment hole stays closed.
         assert!(
-            reason.contains("below layer granularity"),
-            "reason changed: {reason}\n{output}"
+            output.contains("AmbiguousWindow"),
+            "the frontier cap must resolve this to a bounded window: {output}"
         );
-        // Pin the widening numerically, not just by message: the
-        // reader-lead bound gives a 5 s horizon and 16 candidate lines
-        // here, where anchoring on the capture time would give 2 s and 8.
-        // Narrowing the bound therefore fails this assertion instead of
-        // silently reopening the containment hole the bound closes.
-        let count: usize = reason
-            .split_whitespace()
-            .find_map(|word| word.parse().ok())
-            .unwrap_or(0);
         assert!(
-            count >= 12,
-            "only {count} candidate lines — the reader-lead widening is gone: {reason}"
+            output.contains("offsets: [8,"),
+            "the frontier (byte 8) must remain the window low end: {output}"
         );
         // Nothing is lost by declining here: a stop this early has no
         // layer below the resume layer to probe, so recovery is refused
-        // on structural grounds too (with the narrow horizon this same
-        // fixture fails contact selection with "resume layer 0 out of
-        // range"). See docs/operations.md.
+        // on structural grounds. See docs/operations.md.
         assert!(
             output.contains("layer model from byte 8: 2 layers"),
             "{output}"
