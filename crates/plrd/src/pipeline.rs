@@ -209,10 +209,6 @@ fn epoch_note(merged: &plr_wal::RecoveryScan) -> Option<String> {
 
 /// Runs the full pipeline, narrating progress to `out`. `Err` only for
 /// hard I/O failures on the WAL directory itself.
-// Linear orchestration (load WAL, reconstruct, gate completion, route by
-// policy, plan); splitting it would scatter the shared `say`/config state
-// across helpers for no clarity gain — same posture as `daemon::run`.
-#[allow(clippy::too_many_lines)]
 pub fn run_pipeline(config: &Config, out: &mut dyn Write) -> Result<PipelineOutcome, String> {
     let mut say = |text: &str| {
         let _ = writeln!(out, "{text}");
@@ -238,31 +234,15 @@ pub fn run_pipeline(config: &Config, out: &mut dyn Write) -> Result<PipelineOutc
         }
     };
     let receive_seq = scan::load_receive_seq(&config.receive_seq_file());
-    // The power-fail sidecar (the watcher's channel-bypassing edge copy):
-    // recovery's exact-T fact, epoch-admitted inside reconstruct. The
-    // write-once sidecar is DELETED by the daemon at boot once detection
-    // consumed it, so a `plrd recover` run later finds it gone — fall back
-    // to the copy boot detection PERSISTED into `pending_recovery.json`.
-    // Feeding it through the same input means it obeys the identical
-    // epoch-admission band (`sidecar_admits`): a persisted edge not adjacent
-    // to this crash's tail is rejected exactly as a stale sidecar would be,
-    // so an old pending edge cannot resurrect against an unrelated crash.
-    let power_fail_edge_mono_ns = scan::load_power_fail_edge(&config.power_fail_sidecar_file())
-        .or_else(
-            || match crate::detect::read_pending_presence(&config.wal_dir) {
-                crate::detect::StatePresence::Present(pending) => {
-                    let edge = pending.power_fail_edge_mono_ns;
-                    if edge.is_some() {
-                        say(
-                            "pipeline: power-fail sidecar absent; using the edge persisted in \
-                         pending_recovery.json (same epoch-admission band applies)",
-                        );
-                    }
-                    edge
-                }
-                _ => None,
-            },
-        );
+    // The power-fail edge (the watcher's channel-bypassing exact-T fact):
+    // the sidecar if still present, else the copy boot detection PERSISTED
+    // into `pending_recovery.json` (the daemon deletes the write-once
+    // sidecar at boot once consumed). The SAME resolver `plrd scan` uses
+    // (`scan::power_fail_edge`), so the two never disagree about one power
+    // loss. Fed through the same `power_fail_edge_mono_ns` input, so a
+    // persisted edge obeys the identical `sidecar_admits` band and a stale
+    // one cannot resurrect against an unrelated later crash.
+    let power_fail_edge_mono_ns = scan::power_fail_edge(&config.wal_dir);
 
     // The print file is optional until we know recovery is needed: a
     // clean shutdown must classify as clean even with no file around.
@@ -2474,6 +2454,108 @@ M84
         assert!(
             output.contains("machine config from the [plr] section"),
             "{output}"
+        );
+    }
+
+    /// The ask-preview fixture, but with a journaled slicer `current_layer`
+    /// mark (`SET_PRINT_STATS_INFO CURRENT_LAYER=`) on the WAL contexts, so
+    /// the pipeline's absolute-frame corroboration gate is actually
+    /// exercised. The mark is placed on BOTH contexts so whichever one
+    /// anchors the replay carries it. `anchor_fp` is the anchor context's
+    /// journaled `file_position` — the replay's `base_offset`: 0 makes the
+    /// model span from file start (absolute frame, mark commensurable), any
+    /// other value a mid-file model (mark withheld).
+    #[cfg(unix)]
+    fn plr_fixture_with_layer_mark(tag: &str, mark: u32, anchor_fp: u64) -> (PathBuf, Config) {
+        let (dir, config) = plr_fixture(tag, &[]);
+        let gcode_path = dir.join("part.gcode");
+        let mut writer = WalWriter::create(Vec::new(), &SegmentHeader::new(1, 1)).unwrap();
+        writer.append(&WalRecord::Heartbeat(heartbeat())).unwrap();
+        writer
+            .append(&WalRecord::TrapqSegment(preceding_motion()))
+            .unwrap();
+        let mut early = crash_context(gcode_path.to_str().unwrap());
+        early.mono_ns = 1_000_000_000;
+        early.print_time = Some(6.0);
+        if let Some(vsd) = &mut early.virtual_sdcard {
+            vsd.file_position = anchor_fp;
+        }
+        early.gcode.position = vec![0.0, 0.0, 0.0, 0.0];
+        early.gcode.gcode_position = vec![0.0, 0.0, 0.0, 0.0];
+        early.current_layer = Some(mark);
+        early.total_layer = Some(mark + 5);
+        writer.append(&WalRecord::Context(early)).unwrap();
+        let mut crash = crash_context(gcode_path.to_str().unwrap());
+        crash.current_layer = Some(mark);
+        crash.total_layer = Some(mark + 5);
+        writer.append(&WalRecord::Context(crash)).unwrap();
+        std::fs::write(dir.join("wal-000001.plr"), writer.into_inner()).unwrap();
+        (dir, config)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn preview_provenance_is_withheld_on_a_mid_file_model_despite_a_slicer_mark() {
+        // MAJOR-3: the absolute-frame corroboration gate is NON-vacuous.
+        // This fixture CARRIES a journaled slicer current_layer mark, and the
+        // model is built from a MID-FILE anchor (base_offset != 0) whose
+        // window-relative layer ordinals are incommensurable with the
+        // absolute mark — so the mark MUST be withheld:
+        // corroborating_layer_mark is None and every stop reads as
+        // model-inferred, never journal. Mutating the gate `base_offset == 0`
+        // to `true` would wrongly ADOPT the mark (Some), which this test
+        // catches.
+        let (_dir, config) = plr_fixture_with_layer_mark("preview-provenance-midfile", 40, 8);
+        let (outcome, output) = run(&config);
+        let PipelineOutcome::Plan(bundle) = outcome else {
+            panic!("expected a plan, got {outcome:?}\n{output}");
+        };
+        // The model must be mid-file for this gate to apply — the narration
+        // proves it (a base-0 model would say "offset window bytes" instead).
+        assert!(
+            output.contains("window-relative to the resume anchor"),
+            "the fixture must build a MID-FILE model for this gate to bite: {output}"
+        );
+        let preview = bundle
+            .plan
+            .preview
+            .as_ref()
+            .expect("the ratified `ask` default attaches a preview");
+        assert_eq!(
+            preview.corroborating_layer_mark, None,
+            "a mid-file model must withhold the (incommensurable) slicer mark: {output}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn preview_provenance_adopts_the_slicer_mark_on_a_base_zero_model() {
+        // MAJOR-3, the other direction: with the anchor at file_position 0
+        // the model spans from FILE START, so window ordinals ARE absolute
+        // and the mark is commensurable — the pipeline adopts it as
+        // corroborating_layer_mark, which the daemon's `preview_detail` then
+        // turns into "journal" for stops whose layer is `<= mark`. Together
+        // with the mid-file test above this pins BOTH sides of the
+        // `base_offset == 0` gate (a mutation either way is caught).
+        let (_dir, config) = plr_fixture_with_layer_mark("preview-provenance-base0", 40, 0);
+        let (outcome, output) = run(&config);
+        let PipelineOutcome::Plan(bundle) = outcome else {
+            panic!("expected a plan, got {outcome:?}\n{output}");
+        };
+        // The model spans from file start — the narration says so.
+        assert!(
+            output.contains("layer attribution:") && !output.contains("window-relative"),
+            "the fixture must build a BASE-0 (whole-file) model: {output}"
+        );
+        let preview = bundle
+            .plan
+            .preview
+            .as_ref()
+            .expect("the ratified `ask` default attaches a preview");
+        assert_eq!(
+            preview.corroborating_layer_mark,
+            Some(40),
+            "a base-0 model must adopt the absolute slicer mark: {output}"
         );
     }
 

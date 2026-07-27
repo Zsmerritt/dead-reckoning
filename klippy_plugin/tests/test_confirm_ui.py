@@ -546,6 +546,16 @@ def test_the_last_stop_says_a_forward_nudge_clamps():
     assert "cannot go further" in body
 
 
+def test_the_only_stop_says_there_is_nowhere_to_go():
+    # A single-stop set is BOTH boundaries at once: the notice must not give
+    # first-vs-last (direction-specific) advice.
+    body = "\n".join(preview_texts(fx.preview_pause(at_boundary="only")["data"]))
+    assert "ONLY stop" in body
+    assert "nowhere to nudge" in body
+    assert "FIRST stop" not in body
+    assert "LAST stop" not in body
+
+
 def test_an_interior_stop_carries_no_boundary_notice():
     body = "\n".join(preview_texts(fx.preview_pause(at_boundary=None)["data"]))
     assert "FIRST stop" not in body

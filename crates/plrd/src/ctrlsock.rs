@@ -2815,8 +2815,9 @@ mod tests {
             detail["acceptable"].as_bool().is_some(),
             "acceptable: {pause}"
         );
-        // `at_boundary` is "first" | "last" | null (the boundary-nudge
-        // follow-up): present every pause, null in the interior.
+        // `at_boundary` is "first" | "last" | "only" | null (the
+        // boundary-nudge follow-up): present every pause, null in the
+        // interior, "only" for a single-stop set.
         assert!(
             detail.get("at_boundary").is_some(),
             "at_boundary key: {pause}"

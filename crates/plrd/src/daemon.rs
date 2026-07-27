@@ -101,19 +101,10 @@ pub fn run(config_path: &Path) -> u8 {
     // never before it, so a genuine edge is never dropped before it is used.
     // Failure to delete is logged, never fatal — the same posture as the
     // `pending_recovery.json` clear sites.
-    if boot.preserve_power_fail_sidecar {
-        eprintln!(
-            "plrd: keeping the power-fail sidecar {} (its edge was not durably consumed)",
-            config.power_fail_sidecar_file().display()
-        );
-    } else if let Err(e) = std::fs::remove_file(config.power_fail_sidecar_file()) {
-        if e.kind() != std::io::ErrorKind::NotFound {
-            eprintln!(
-                "plrd: could not delete consumed power-fail sidecar {} (continuing): {e}",
-                config.power_fail_sidecar_file().display()
-            );
-        }
-    }
+    dispose_power_fail_sidecar(
+        &config.power_fail_sidecar_file(),
+        boot.preserve_power_fail_sidecar,
+    );
 
     // WAL retention: prune superseded old sessions down to the configured
     // cap. This MUST run here — after boot detection (which also reads the
@@ -354,6 +345,35 @@ struct BootOutcome {
     /// boot) still needs. Mirrors the same fate as the pending file: an edge
     /// and the offer it belongs to are preserved together.
     preserve_power_fail_sidecar: bool,
+}
+
+/// The power-fail sidecar lifecycle decision, extracted so the keep/delete
+/// site itself is unit-testable (not only `boot_detection`'s verdict).
+///
+/// The sidecar is a WRITE-ONCE event file. When `preserve` is `false` its
+/// edge has been durably consumed — PERSISTED into `pending_recovery.json`
+/// by boot detection — so the file is deleted; a stale copy left behind
+/// would poison a LATER crash's early-uptime reconstruction. When `preserve`
+/// is `true` detection was inconclusive (unreadable/unanalyzable WAL, or a
+/// failed pending-write), the edge was NOT durably consumed, and deleting it
+/// would destroy an unconsumed exact-T edge a later readable boot or `plrd
+/// recover` still needs — so it is kept. Failure to delete is logged, never
+/// fatal (the same posture as the `pending_recovery.json` clear sites); a
+/// genuinely absent file (`NotFound`) is silent.
+fn dispose_power_fail_sidecar(path: &std::path::Path, preserve: bool) {
+    if preserve {
+        eprintln!(
+            "plrd: keeping the power-fail sidecar {} (its edge was not durably consumed)",
+            path.display()
+        );
+    } else if let Err(e) = std::fs::remove_file(path) {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            eprintln!(
+                "plrd: could not delete consumed power-fail sidecar {} (continuing): {e}",
+                path.display()
+            );
+        }
+    }
 }
 
 /// Classifies the previous session and prepares the announcement
@@ -675,6 +695,127 @@ mod tests {
             wal_dir: dir,
             ..Config::default()
         }
+    }
+
+    /// Writes an unclean WAL whose print file has genuine unfinished work
+    /// after byte 250 — the shape boot detection classifies as a recoverable
+    /// Pending (same shape as the inline fixture in
+    /// `boot_detection_writes_pending_and_prepares_announcement`).
+    fn write_recoverable_wal(config: &Config) {
+        use plr_wal::{SegmentHeader, WalRecord, WalWriter};
+        let gcode = config.wal_dir.join("part.gcode");
+        let mut text = String::from(";");
+        while text.len() < 249 {
+            text.push('p');
+        }
+        text.push_str("\nG1 X60 Y60 E900 F1800\n");
+        std::fs::write(&gcode, text.as_bytes()).unwrap();
+        let mut writer = WalWriter::create(Vec::new(), &SegmentHeader::new(1, 1)).unwrap();
+        writer
+            .append(&WalRecord::Heartbeat(plr_wal::Heartbeat {
+                sequence: 1,
+                mono_ns: 1_000_000_000,
+                wall_ns: 1,
+                print_time: 5.0,
+                est_sample_mono_ns: 1_000_000_000,
+                est_sample_print_time: 5.0,
+                wal_offset: 32,
+            }))
+            .unwrap();
+        writer
+            .append(&WalRecord::Context(plr_wal::Context {
+                mono_ns: 1_000_000_000,
+                print_time: Some(5.0),
+                virtual_sdcard: Some(plr_wal::VirtualSdState {
+                    file_path: gcode.to_string_lossy().into_owned(),
+                    file_position: 250,
+                    file_size: None,
+                }),
+                gcode: plr_wal::GcodeState {
+                    speed_factor: 1.0,
+                    speed: 1500.0,
+                    extrude_factor: 1.0,
+                    absolute_coordinates: true,
+                    absolute_extrude: true,
+                    homing_origin: vec![0.0; 4],
+                    position: vec![0.0; 4],
+                    gcode_position: vec![0.0; 4],
+                },
+                transforms: plr_wal::TransformObservations {
+                    bed_mesh_active: false,
+                    bed_mesh_profile: None,
+                    z_thermal_adjust_enabled: None,
+                    z_thermal_adjust_offset: None,
+                    skew_active: false,
+                    skew_profile: None,
+                },
+                heaters: Vec::new(),
+                fans: Vec::new(),
+                exclude: None,
+                print_state: None,
+                current_layer: None,
+                total_layer: None,
+            }))
+            .unwrap();
+        std::fs::write(config.wal_dir.join("wal-000001.plr"), writer.into_inner()).unwrap();
+    }
+
+    #[test]
+    fn boot_detection_preserves_the_sidecar_only_when_the_edge_is_not_durably_consumed() {
+        // MAJOR-2: the sidecar-preservation guard is NON-vacuous. Each arm
+        // sets `preserve_power_fail_sidecar` deliberately, and the reviewer's
+        // always-delete mutations at the Pending arm and the Nothing arm are
+        // made to bite here.
+
+        // Successful Pending consume: the edge is persisted into the pending
+        // file, so the sidecar is safe to delete.
+        let ok = temp_config("preserve-consume");
+        write_recoverable_wal(&ok);
+        let boot = super::boot_detection(&ok);
+        assert!(
+            boot.announcement.is_some(),
+            "the fixture must be a recovery offer"
+        );
+        assert!(
+            !boot.preserve_power_fail_sidecar,
+            "a successful pending-consume persists the edge -> delete the sidecar"
+        );
+
+        // Pending whose PERSIST FAILS (a directory sits at the pending path
+        // so `std::fs::write` cannot create the file): the edge was NOT
+        // durably consumed, so KEEP the sidecar. Mutating the Pending arm to
+        // always-delete makes this assertion fail.
+        let failw = temp_config("preserve-write-fail");
+        write_recoverable_wal(&failw);
+        std::fs::create_dir(failw.wal_dir.join(crate::detect::PENDING_FILE_NAME)).unwrap();
+        assert!(
+            super::boot_detection(&failw).preserve_power_fail_sidecar,
+            "a failed pending-write leaves the sidecar the sole copy -> keep it"
+        );
+
+        // Inconclusive (an empty WAL dir cannot be analysed -> a Nothing
+        // whose verdict is 'I could not tell'): the edge was not consumed, so
+        // KEEP it. Mutating the Nothing arm to always-delete makes this fail.
+        let inconclusive = temp_config("preserve-inconclusive");
+        assert!(
+            super::boot_detection(&inconclusive).preserve_power_fail_sidecar,
+            "an inconclusive verdict must not destroy an unconsumed edge"
+        );
+    }
+
+    #[test]
+    fn dispose_power_fail_sidecar_keeps_or_deletes_per_the_flag() {
+        // MAJOR-2: the keep/delete site itself, exercised directly (a
+        // mutation dropping the `preserve` guard fails this test).
+        let config = temp_config("dispose-sidecar");
+        let path = config.power_fail_sidecar_file();
+        std::fs::write(&path, b"edge").unwrap();
+        super::dispose_power_fail_sidecar(&path, true);
+        assert!(path.exists(), "preserve=true must keep the sidecar");
+        super::dispose_power_fail_sidecar(&path, false);
+        assert!(!path.exists(), "preserve=false must delete the sidecar");
+        // A genuinely absent file is silent, never fatal.
+        super::dispose_power_fail_sidecar(&path, false);
     }
 
     #[test]

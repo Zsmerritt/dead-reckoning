@@ -76,12 +76,14 @@ not exist).  The 14 fields, with their Rust source types::
                              entry moves); the executor also refuses accept
                              on it, so the dialog renders it non-acceptable
     at_boundary        str | null   "first" when the cursor is on the
-                             earliest stop, "last" on the final one, null in
-                             between.  A ±nudge past a boundary CLAMPS and
-                             re-emits the same stop; the renderer states this
-                             so the operator learns why nothing changed
-                             rather than seeing a byte-identical prompt.
-                             ABSENT on an old daemon predating the field
+                             earliest stop, "last" on the final one, "only"
+                             when the set has a single stop (both boundaries
+                             at once), null in between.  A ±nudge past a
+                             boundary CLAMPS and re-emits the same stop; the
+                             renderer states this so the operator learns why
+                             nothing changed rather than seeing a
+                             byte-identical prompt.  ABSENT on an old daemon
+                             predating the field
 
 THE THREE-PART REQUIREMENT.  Every rendered confirmation says WHY it
 stopped, SUGGESTS a fix, and OFFERS to continue anyway — in the dialog
@@ -569,6 +571,11 @@ def preview_detail_lines(detail):
         lines.append(
             "You are at the LAST stop — a forward nudge or Next cannot go "
             "further (it stays here)."
+        )
+    elif at_boundary == "only":
+        lines.append(
+            "This is the ONLY stop — there is nowhere to nudge or step to "
+            "(any nudge, Next, or Prev stays here)."
         )
     return lines
 

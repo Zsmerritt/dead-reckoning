@@ -1447,13 +1447,17 @@ fn preview_detail(spec: &plr_recovery::PreviewSpec, cursor: usize) -> Value {
             .binding(cursor_u32(cursor))
             .is_some_and(|b| !b.entry_commands.is_empty()),
         // "first" when the cursor sits on the earliest stop, "last" on the
-        // final one, else null. A ±1/±10 nudge past a boundary CLAMPS (the
-        // loop's `clamp` keeps the cursor in range), re-emitting this same
-        // stop; the plugin reads this so the operator learns WHY nothing
-        // changed instead of seeing a byte-identical prompt. Emitted every
-        // pause (present even on the first open, honest when the loop opens
-        // on the skip-forward default that happens to be the last stop).
-        "at_boundary": if cursor == 0 {
+        // final one, "only" when the set has a SINGLE stop (both boundaries
+        // at once — a nudge in EITHER direction clamps, so first-vs-last
+        // advice would be direction-wrong), else null. A ±1/±10 nudge past a
+        // boundary CLAMPS (the loop's `clamp` keeps the cursor in range),
+        // re-emitting this same stop; the plugin reads this so the operator
+        // learns WHY nothing changed instead of seeing a byte-identical
+        // prompt. Emitted EVERY pause (an always-present readout, not a
+        // nudge-triggered one) — honest even on the first open.
+        "at_boundary": if spec.stops.len() <= 1 {
+            json!("only")
+        } else if cursor == 0 {
             json!("first")
         } else if cursor + 1 == spec.stops.len() {
             json!("last")
@@ -4005,6 +4009,16 @@ pub(crate) mod tests {
         assert_eq!(
             super::preview_detail(&spec, 2)["at_boundary"],
             json!("last")
+        );
+
+        // A SINGLE-stop set is BOTH boundaries at once -> "only", never
+        // "first" (a forward clamped nudge on a lone stop must not render
+        // backward-direction advice).
+        let mut lone = preview_spec();
+        lone.stops.truncate(1);
+        assert_eq!(
+            super::preview_detail(&lone, 0)["at_boundary"],
+            json!("only")
         );
     }
 

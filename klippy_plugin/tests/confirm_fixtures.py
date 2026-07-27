@@ -217,8 +217,8 @@ def preview_detail(
     sends it), ``feature`` (the ``FeatureClass`` Debug name), ``on_infill`` /
     ``is_candidate`` / ``before_skip_forward`` / ``acceptable`` (bools),
     ``position`` / ``count`` (1-based rep position), and ``at_boundary``
-    ("first" | "last" | null — the boundary-nudge follow-up; pass ``_OMIT``
-    to model an old daemon that never sends it).
+    ("first" | "last" | "only" | null — the boundary-nudge follow-up; pass
+    ``_OMIT`` to model an old daemon that never sends it).
     """
     detail = {
         "offset": offset,

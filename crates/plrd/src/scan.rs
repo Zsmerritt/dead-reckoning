@@ -105,7 +105,10 @@ pub fn run_scan(
     let heartbeat = read_heartbeat(&mut w, &heartbeat_path);
 
     let receive_seq = read_receive_seq(&mut w, &wal_dir.join(RECEIVE_SEQ_FILE_NAME));
-    let power_fail_edge_mono_ns = load_power_fail_edge(&wal_dir.join(POWER_FAIL_FILE_NAME));
+    // Sidecar if present, else the edge boot detection persisted into the
+    // pending file — the SAME resolution the recovery pipeline uses, so
+    // `plrd scan`'s interlock verdict cannot disagree with `plrd recover`.
+    let power_fail_edge_mono_ns = power_fail_edge(wal_dir);
 
     let file_tail_bytes = read_file_tail(&mut w, &merged);
     let file_tail = file_tail_bytes
@@ -280,6 +283,34 @@ pub(crate) fn load_power_fail_edge(path: &Path) -> Option<u64> {
         );
     }
     edge
+}
+
+/// The crash's power-fail edge, resolved the ONE way every reconstruction
+/// surface must resolve it: the write-once sidecar if it is still there,
+/// else the copy boot detection PERSISTED into `pending_recovery.json`
+/// (`crate::detect::PendingRecovery::power_fail_edge_mono_ns`) — because the
+/// daemon deletes the sidecar at boot once detection has consumed it, so any
+/// LATER run (`plrd recover`, `plrd scan`) finds it gone.
+///
+/// Shared by the recovery pipeline AND `plrd scan` so the two never give
+/// different answers about one power-loss event: without this, `scan` would
+/// read the (deleted) sidecar only, reconstruct with no edge, and print the
+/// generic interlock branch while `recover` and the boot announcement — both
+/// of which see the persisted edge — attribute the power loss.
+///
+/// The edge is fed downstream through the SAME `power_fail_edge_mono_ns`
+/// input the sidecar used, so a persisted edge obeys the identical
+/// `sidecar_admits` epoch band: one not adjacent to the current crash tail is
+/// rejected exactly as a stale sidecar would be, so an old pending edge
+/// cannot resurrect against an unrelated later crash.
+pub(crate) fn power_fail_edge(wal_dir: &Path) -> Option<u64> {
+    load_power_fail_edge(&wal_dir.join(POWER_FAIL_FILE_NAME)).or_else(|| {
+        match crate::detect::read_pending_presence(wal_dir) {
+            crate::detect::StatePresence::Present(pending) => pending.power_fail_edge_mono_ns,
+            // Absent or torn pending file: no persisted edge to fall back to.
+            _ => None,
+        }
+    })
 }
 
 /// The half-open `[start, end)` index range of the crash epoch within a

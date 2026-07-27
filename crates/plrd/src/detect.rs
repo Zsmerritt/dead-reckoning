@@ -1698,6 +1698,81 @@ mod tests {
     }
 
     #[test]
+    fn boot_scan_and_recover_agree_on_a_power_interrupted_recovery() {
+        // MAJOR-1 same-answer property: one probe shape, three surfaces —
+        // the boot announcement, `plrd scan`, and `plrd recover`'s edge
+        // loader — all agreeing the recovery was interrupted by power loss,
+        // even AFTER the write-once sidecar is consumed and deleted. The edge
+        // is persisted into the pending file and both scan and recover read
+        // it back the same way (the shared `scan::power_fail_edge`). Before
+        // the fix, scan read the deleted sidecar only and printed the generic
+        // interlock branch while the announcement and recover attributed the
+        // loss.
+        let dir = temp_dir("same-answer");
+        let gcode_path = unfinished_gcode(&dir);
+        let edge = 1_000_000_000u64;
+        write_wal(
+            &dir,
+            &[
+                WalRecord::Heartbeat(heartbeat(edge, 42.0)),
+                WalRecord::Context(context(edge, gcode_path.to_str().unwrap(), 500)),
+            ],
+        );
+        // The eager Z-frame interlock, armed just before this session lost
+        // power (arm mono precedes the edge, so the edge postdates it).
+        super::write_frame_invalid(
+            &dir,
+            &super::FrameInvalid {
+                detected_wall_ns: 1,
+                step_id: 5,
+                phase: "shifted-frame".to_owned(),
+                reason: "shifted-frame-declared".to_owned(),
+                arm_mono_ns: Some(edge - 500_000_000),
+            },
+        )
+        .unwrap();
+        // The write-once sidecar, present at the boot that detects the crash.
+        std::fs::write(
+            dir.join(crate::scan::POWER_FAIL_FILE_NAME),
+            crate::powerfail::encode_power_fail_edge(edge),
+        )
+        .unwrap();
+
+        // SURFACE 1 — boot: the sidecar is folded in, so detect attributes
+        // the power loss and PERSISTS the edge into the pending file.
+        let Detection::Pending(pending) = detect(&dir, &dir.join("heartbeat.bin"), 1) else {
+            panic!("expected pending");
+        };
+        assert_eq!(pending.interrupted_by.as_deref(), Some("power-fail"));
+        assert_eq!(pending.power_fail_edge_mono_ns, Some(edge));
+        let (boot_primary, _) = announcement_commands(&pending);
+        assert!(
+            boot_primary.contains("interrupted by power loss"),
+            "boot announcement must attribute the loss: {boot_primary}"
+        );
+
+        // The boot sidecar lifecycle: persist the pending, delete the
+        // now-consumed write-once sidecar.
+        write_pending(&dir, &pending).unwrap();
+        std::fs::remove_file(dir.join(crate::scan::POWER_FAIL_FILE_NAME)).unwrap();
+
+        // SURFACE 2 — `plrd scan` (sidecar gone) reaches the SAME verdict via
+        // the shared loader, not the generic interlock branch.
+        let mut buf: Vec<u8> = Vec::new();
+        crate::scan::run_scan(&dir, None, &mut buf).unwrap();
+        let scan_out = String::from_utf8(buf).unwrap();
+        assert!(
+            scan_out.contains("interrupted by power loss"),
+            "scan must agree with the boot announcement: {scan_out}"
+        );
+
+        // SURFACE 3 — `plrd recover`'s edge loader (the same function) finds
+        // the persisted edge too, so its reconstruction folds it exactly as
+        // boot did.
+        assert_eq!(crate::scan::power_fail_edge(&dir), Some(edge));
+    }
+
+    #[test]
     fn announcement_commands_are_console_safe() {
         let pending = PendingRecovery {
             detected_wall_ns: 1,
