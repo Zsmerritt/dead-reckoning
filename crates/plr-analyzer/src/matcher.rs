@@ -248,7 +248,11 @@ pub enum MatchError {
 }
 
 /// Validate the evidence and config, returning the offending field.
-fn validate(evidence: &StopEvidence, config: &MatchConfig) -> Result<(), MatchError> {
+///
+/// `pub(crate)` so the parallel preview builder ([`crate::preview`]) can
+/// reject the same non-finite / inverted inputs `match_stop_point` does,
+/// without a second, subtly-different predicate.
+pub(crate) fn validate(evidence: &StopEvidence, config: &MatchConfig) -> Result<(), MatchError> {
     let tolerances = [
         ("xy_tolerance", config.xy_tolerance),
         ("e_tolerance", config.e_tolerance),
@@ -289,7 +293,10 @@ fn validate(evidence: &StopEvidence, config: &MatchConfig) -> Result<(), MatchEr
 }
 
 /// True when the move's byte span overlaps the search window.
-fn in_window(mv: &SimMove, window: ByteWindow) -> bool {
+///
+/// `pub(crate)` so [`crate::preview`] scopes its nudge domain to the
+/// same in-window predicate the matcher uses.
+pub(crate) fn in_window(mv: &SimMove, window: ByteWindow) -> bool {
     mv.span.end > window.start && window.end.is_none_or(|end| mv.span.start < end)
 }
 
@@ -405,14 +412,23 @@ fn ranks_better(a: &MatchCandidate, b: &MatchCandidate) -> bool {
     }
 }
 
-/// Match the stop evidence against the model's simulated move stream.
-/// See the module docs for the ambiguity policy.
-pub fn match_stop_point(
+/// Evaluate every in-window, position-known move against the evidence,
+/// returning the ranked candidate list (one entry per source line, best
+/// chord kept) and the count of moves skipped for G28-unknown axes.
+///
+/// This is the shared evaluate path behind both consumers:
+/// [`match_stop_point`] runs the confidence ladder on the output, and
+/// [`crate::preview::build_preview`] seeds its representative set from it.
+/// Extracted verbatim from `match_stop_point`'s former body so there is
+/// exactly one evaluate loop — no second predicate that could drift.
+///
+/// Assumes the evidence and config were already validated (both callers
+/// call [`validate`] first); it never re-validates and never fails.
+pub(crate) fn collect_candidates(
     model: &LayerModel,
     evidence: &StopEvidence,
     config: &MatchConfig,
-) -> Result<MatchResult, MatchError> {
-    validate(evidence, config)?;
+) -> (Vec<MatchCandidate>, usize) {
     let mut skipped_unknown = 0_usize;
     // One candidate per source line, best chord kept.
     let mut by_line: std::collections::BTreeMap<u64, MatchCandidate> =
@@ -448,6 +464,18 @@ pub fn match_stop_point(
             std::cmp::Ordering::Equal
         }
     });
+    (candidates, skipped_unknown)
+}
+
+/// Match the stop evidence against the model's simulated move stream.
+/// See the module docs for the ambiguity policy.
+pub fn match_stop_point(
+    model: &LayerModel,
+    evidence: &StopEvidence,
+    config: &MatchConfig,
+) -> Result<MatchResult, MatchError> {
+    validate(evidence, config)?;
+    let (candidates, skipped_unknown) = collect_candidates(model, evidence, config);
     let confidence = match candidates.len() {
         0 => {
             // Z is exact in the replay; if it pins a unique trusted
@@ -979,4 +1007,17 @@ mod tests {
         let err_json = serde_json::to_string(&MatchError::NoMatch).expect("serialize error");
         assert!(err_json.contains("NoMatch"));
     }
+
+    // NOTE on the `collect_candidates` extraction's faithfulness: there is
+    // deliberately no "collect_candidates == match_stop_point's candidates"
+    // test. Since `match_stop_point` now *calls* `collect_candidates` and
+    // exposes its result verbatim (`result.candidates`/`skipped_unknown`),
+    // such a test compares f(x) to itself — a tautology that survives real
+    // mutations (e.g. dropping the `skipped_unknown` increment breaks both
+    // sides equally). Faithfulness rests instead on two honest witnesses: the
+    // reviewed byte-for-byte diff showing the loop body was moved unchanged
+    // and the ladder left intact, and the full pre-existing matcher suite
+    // above running green unchanged (its ordering and skipped-count tests —
+    // e.g. `e_interval_disambiguates_retraced_geometry` — bite the same
+    // mutations directly).
 }

@@ -52,6 +52,7 @@ mod raster;
 pub mod contact;
 pub mod matcher;
 pub mod model;
+pub mod preview;
 pub mod structure;
 pub mod work;
 
@@ -66,6 +67,10 @@ pub use matcher::{
 pub use model::{
     build_layer_model, classify_feature_type, FeatureClass, Layer, LayerModel, ModelConfig,
     ModelStop, MoveKind, SimMove, TypedPath, WindowLayers, XySegment,
+};
+pub use preview::{
+    build_preview, median_index, PreviewBounds, PreviewOutcome, PreviewRefusal, PreviewSet,
+    PreviewStop, PREVIEW_MAX_LAYERS, PREVIEW_MAX_REPS, PREVIEW_MAX_STOPS,
 };
 pub use structure::{
     assess_contact_point, BoundingBox, ClearRun, ContactMode, CriterionCheck, FootprintTrace,
