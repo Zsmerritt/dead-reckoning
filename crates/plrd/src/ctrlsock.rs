@@ -404,6 +404,13 @@ struct LivePause {
     step_id: u32,
     phase: String,
     code: &'static str,
+    /// The pause's `detail` map — the SAME per-pause payload `report_pause`
+    /// publishes (a resume preview's current-stop map, a Z-height's derivation,
+    /// etc). Increment 3 carries it here so a `recover_state` poll can render
+    /// the outstanding stop, not just its token/kind/step — the mirror was the
+    /// one surface still missing it (design §11, increment-3 carried
+    /// obligation).
+    detail: Value,
     raised_at: std::time::Instant,
     deadline: Duration,
 }
@@ -436,6 +443,11 @@ struct StateSnapshot {
     confirm_timeout_s: Option<f64>,
     /// What is left of it, seconds.
     expires_in_s: Option<f64>,
+    /// The outstanding pause's `detail` map, when `awaiting` — the same
+    /// per-pause payload `report_pause` sends (e.g. a resume preview's
+    /// current-stop map). `Value::Null` when not awaiting. Additive: a client
+    /// that ignores it reads `recover_state` exactly as before.
+    detail: Value,
     /// A pause was raised and its deadline lapsed without an answer.
     ///
     /// Distinguishes "never paused" from "paused, and you missed it" so a
@@ -470,6 +482,7 @@ impl Observed {
                 step_id: notice.step_id,
                 phase: notice.phase.clone(),
                 code: notice.diagnosis.code,
+                detail: notice.detail.clone(),
                 raised_at: notice.raised_at,
                 deadline: notice.deadline,
             });
@@ -523,6 +536,7 @@ impl Observed {
                     snapshot.code = Some(pause.code);
                     snapshot.confirm_timeout_s = Some(pause.deadline.as_secs_f64());
                     snapshot.expires_in_s = Some(left.as_secs_f64());
+                    snapshot.detail = pause.detail.clone();
                 }
                 // Lapsed (or a deadline of zero, which is the never-stamped
                 // sentinel): report it as gone, and say so.
@@ -823,6 +837,10 @@ fn render_state(snapshot: &StateSnapshot) -> Value {
             "diagnosis_code": snapshot.code,
             "confirm_timeout_s": snapshot.confirm_timeout_s,
             "confirm_expires_in_s": snapshot.expires_in_s,
+            // The outstanding pause's detail map, mirroring `report_pause`'s
+            // `detail` (a preview stop, a z-height derivation, ...). `null`
+            // when nothing is awaiting.
+            "detail": snapshot.detail,
         }),
     )
 }
@@ -2084,7 +2102,19 @@ mod tests {
         FakeMoonraker,
         Arc<std::sync::Mutex<SimPrinter>>,
     ) {
-        let (_dir, mut config) = crate::pipeline::e2e_tests::plr_fixture(tag, plr_overrides);
+        // RE-PIN for the increment-3 `ask` flip. These socket tests
+        // exercise the BINARY confirm flows — z-height, step-debug, the
+        // timeout/frame rule, accel restore, the wrong-kind guard — not the
+        // resume preview. Under the ratified default `ask` the pipeline now
+        // attaches a preview pause AHEAD of them, so each test would open on
+        // a `preview` pause instead of the one it means to drive. Pin
+        // `last` (skip-forward, no preview) by default; a test that wants
+        // the preview (the multi-pause integration test) passes its own
+        // `resume_candidate_policy`, which wins because later overrides
+        // replace earlier ones in `configfile_status`.
+        let mut overrides = vec![("resume_candidate_policy", json!("last"))];
+        overrides.extend_from_slice(plr_overrides);
+        let (_dir, mut config) = crate::pipeline::e2e_tests::plr_fixture(tag, &overrides);
         let sim = Arc::new(std::sync::Mutex::new(SimPrinter::new(
             config.wal_dir.to_str().unwrap(),
         )));
@@ -2105,6 +2135,15 @@ mod tests {
         format!(
             "{{\"cmd\": \"recover_confirm\", \"args\": {{\"token\": \"{token}\", \
              \"answer\": \"{answer}\"}}}}\n"
+        )
+    }
+
+    /// A preview `nudge` with its signed integer `count` — the console
+    /// `PLR_RECOVER_NUDGE FWD=/BACK=` maps to +n / -n (design §F.2).
+    fn nudge_request(token: &str, count: i64) -> String {
+        format!(
+            "{{\"cmd\": \"recover_confirm\", \"args\": {{\"token\": \"{token}\", \
+             \"answer\": \"nudge\", \"count\": {count}}}}}\n"
         )
     }
 
@@ -2326,7 +2365,13 @@ mod tests {
     async fn an_unanswered_pause_times_out_into_a_clean_abort_with_the_frame_rule() {
         let (_dir, mut config) = crate::pipeline::e2e_tests::plr_fixture(
             "confirm-timeout",
-            &[("confirm_z_before_resume", json!(true))],
+            // RE-PIN for the `ask` flip: this test drives the z-height
+            // pause's timeout/frame rule, so it pins `last` to keep the
+            // preview from attaching ahead of the z-confirm pause.
+            &[
+                ("resume_candidate_policy", json!("last")),
+                ("confirm_z_before_resume", json!(true)),
+            ],
         );
         let sim = Arc::new(std::sync::Mutex::new(SimPrinter::new(
             config.wal_dir.to_str().unwrap(),
@@ -2693,6 +2738,19 @@ mod tests {
         let left = state["data"]["confirm_expires_in_s"].as_f64().unwrap();
         assert!(left > 80.0 && left <= 90.0, "{state}");
         assert!(state["data"]["step"].as_u64().is_some(), "{state}");
+        // INCREMENT 3: the poll mirror now carries the outstanding pause's
+        // `detail` map — byte-for-byte the same one `report_pause` sent — so
+        // a client polling `recover_state` (rather than holding the pause
+        // response) can render the current stop. For a z-height pause that
+        // is the standoff/derivation map.
+        assert_eq!(
+            state["data"]["detail"], paused["data"]["detail"],
+            "recover_state must mirror report_pause's detail: {state}"
+        );
+        assert!(
+            state["data"]["detail"]["derivation"].as_str().is_some(),
+            "{state}"
+        );
 
         // And it agrees with the `busy` refusal, which was the only probe a
         // client used to have: both describe the same window.
@@ -2707,6 +2765,132 @@ mod tests {
         let state = roundtrip(&path, "{\"cmd\": \"recover_state\"}\n").await;
         assert_eq!(state["data"]["executing"], json!(false), "{state}");
         assert_eq!(state["data"]["awaiting_confirmation"], json!(false));
+        // Nothing awaiting -> the detail mirror is null, never a stale stop.
+        assert_eq!(state["data"]["detail"], json!(null), "{state}");
+    }
+
+    /// A `data["detail"]` field, asserted present with a plausible type —
+    /// the plugin reads these BYTE-FOR-BYTE, so the socket test pins the
+    /// producer's shape (design §10 attack #7).
+    #[cfg(unix)]
+    fn assert_preview_detail_shape(pause: &Value) {
+        let detail = &pause["data"]["detail"];
+        assert!(detail["offset"].as_u64().is_some(), "offset: {pause}");
+        assert!(
+            detail["resume_offset"].as_u64().is_some(),
+            "resume_offset: {pause}"
+        );
+        assert!(
+            detail["xy"].as_array().map(Vec::len) == Some(2),
+            "xy: {pause}"
+        );
+        assert!(detail["z"].as_f64().is_some(), "z: {pause}");
+        // `layer` is u32 or null; `feature` is the FeatureClass Debug string.
+        assert!(detail.get("layer").is_some(), "layer key: {pause}");
+        assert!(detail["feature"].as_str().is_some(), "feature: {pause}");
+        assert!(
+            detail["on_infill"].as_bool().is_some(),
+            "on_infill: {pause}"
+        );
+        assert!(
+            detail["is_candidate"].as_bool().is_some(),
+            "is_candidate: {pause}"
+        );
+        assert!(detail["position"].as_u64().is_some(), "position: {pause}");
+        assert!(detail["count"].as_u64().is_some(), "count: {pause}");
+        assert!(
+            detail["before_skip_forward"].as_bool().is_some(),
+            "before_skip_forward: {pause}"
+        );
+        assert!(
+            detail["acceptable"].as_bool().is_some(),
+            "acceptable: {pause}"
+        );
+    }
+
+    /// The full resume-preview conversation over the real socket (design
+    /// §D.3, increment-3 obligation): a fresh token PER reposition, a stale
+    /// (already-answered) token nudged twice is harmless, a wrong-kind
+    /// (binary) verb on the preview pause is refused with the pause
+    /// RESTORED, and accept resolves to a completion. Runs under `ask`
+    /// (overriding the confirm-server default `last`), so the pipeline
+    /// attaches the interactive preview.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_full_preview_conversation_round_trips_over_the_socket() {
+        let (path, _wal_dir, _fake) = spawn_confirm_server(
+            "preview-socket",
+            &[("resume_candidate_policy", json!("ask"))],
+        )
+        .await;
+
+        // Open on the preview: kind "preview", the 12-field detail map, and
+        // the mirror agrees.
+        let p1 = roundtrip(&path, EXECUTE_ASK).await;
+        assert_eq!(
+            p1["data"]["outcome"],
+            json!("awaiting_confirmation"),
+            "{p1}"
+        );
+        assert_eq!(p1["data"]["confirm_kind"], json!("preview"), "{p1}");
+        assert_preview_detail_shape(&p1);
+        let t1 = p1["data"]["resume_token"].as_str().unwrap().to_owned();
+        let count = p1["data"]["detail"]["count"].as_u64().unwrap();
+        assert!(count >= 1, "the nudge domain must be non-empty: {p1}");
+        // The poll mirror carries the SAME stop.
+        let state = roundtrip(&path, "{\"cmd\": \"recover_state\"}\n").await;
+        assert_eq!(state["data"]["confirm_kind"], json!("preview"), "{state}");
+        assert_eq!(state["data"]["detail"], p1["data"]["detail"], "{state}");
+
+        // A FRESH token per reposition: nudge forward one, get a new pause
+        // with a new token and a fresh detail readout.
+        let p2 = roundtrip(&path, &nudge_request(&t1, 1)).await;
+        assert_eq!(p2["data"]["confirm_kind"], json!("preview"), "{p2}");
+        assert_preview_detail_shape(&p2);
+        let t2 = p2["data"]["resume_token"].as_str().unwrap().to_owned();
+        assert_ne!(t1, t2, "each reposition mints a fresh token: {p2}");
+
+        // A STALE token nudged twice is harmless: t1 is already answered, so
+        // the daemon returns unknown-token and the current pause (t2) is
+        // untouched — a double-click on a nudge cannot disturb the loop.
+        for _ in 0..2 {
+            let expired = roundtrip(&path, &nudge_request(&t1, 1)).await;
+            assert_eq!(
+                expired["data"]["outcome"],
+                json!("unknown-token"),
+                "a stale nudge must be a typed no-op: {expired}"
+            );
+        }
+        // t2 still answers.
+        let state = roundtrip(&path, "{\"cmd\": \"recover_state\"}\n").await;
+        assert_eq!(state["data"]["resume_token"], json!(t2), "{state}");
+
+        // A WRONG-KIND verb (binary `continue`) on the preview pause is
+        // refused as malformed, and the pause is RESTORED (the daemon puts
+        // it back before returning), so t2 still answers afterwards.
+        let wrong = roundtrip(&path, &confirm_request(&t2, "continue")).await;
+        assert_eq!(wrong["data"]["outcome"], json!("malformed"), "{wrong}");
+        assert!(
+            wrong["text"].as_str().unwrap().contains("preview"),
+            "the refusal names the preview vocabulary: {wrong}"
+        );
+        let state = roundtrip(&path, "{\"cmd\": \"recover_state\"}\n").await;
+        assert_eq!(
+            state["data"]["awaiting_confirmation"],
+            json!(true),
+            "the pause must survive a wrong-kind verb: {state}"
+        );
+        assert_eq!(state["data"]["resume_token"], json!(t2), "{state}");
+
+        // Nudge BACK one (signed count) — still a preview pause, still a
+        // fresh token — then accept the shown stop, which materialises the
+        // recovery file and runs it to completion.
+        let p3 = roundtrip(&path, &nudge_request(&t2, -1)).await;
+        assert_eq!(p3["data"]["confirm_kind"], json!("preview"), "{p3}");
+        let t3 = p3["data"]["resume_token"].as_str().unwrap().to_owned();
+        let done = roundtrip(&path, &confirm_request(&t3, "accept")).await;
+        assert_eq!(done["ok"], json!(true), "accept must complete: {done}");
+        assert_eq!(done["data"]["outcome"], json!("completed"), "{done}");
     }
 
     #[cfg(unix)]

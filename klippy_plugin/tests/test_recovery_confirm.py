@@ -1710,10 +1710,12 @@ def test_a_failed_launch_keeps_a_question_answerable(
 
 
 def test_malformed_is_not_treated_as_terminal(plugin, run, fake_printer):
-    # ctrlsock.rs:740-751 returns `malformed` from recover_confirm BEFORE
-    # session.outstanding.take(), so plrd is still standing at the confirm
-    # point.  Routing it to idle was the same mis-derivation the `error`
-    # exclusion exists to avoid.
+    # ctrlsock.rs returns `malformed` from recover_confirm BEFORE
+    # session.outstanding.take() (and RESTORES the pause on a wrong-kind
+    # answer), so plrd is still standing at the confirm point.  Routing it to
+    # idle was the same mis-derivation the `error` exclusion exists to avoid.
+    # And because the pause SURVIVES, the token is kept (review NOTE-1): the
+    # question is still answerable rather than thrown away.
     assert "malformed" not in recovery.TERMINAL_OUTCOMES
     plugin.daemon = ScriptedDaemon(
         {
@@ -1732,8 +1734,12 @@ def test_malformed_is_not_treated_as_terminal(plugin, run, fake_printer):
     since = responses_since(gcode)
     run("PLR_RECOVER_CONTINUE")
     body = "\n".join(since())
+    # Not terminal: the recovery is not claimed finished.
     assert plugin.recovery.state() == "unknown"
-    assert "DO NOT touch the printer" in body
+    assert "KEPT the question open" in body
+    assert "Do NOT assume the recovery ended" in body
+    # The pause survived, so the token did too — still answerable.
+    assert plugin.recovery.can_answer() is True
 
 
 @pytest.mark.parametrize("outcome", ["unknown-cmd", "oversized"])
@@ -2256,3 +2262,318 @@ def test_a_broken_console_cannot_take_klippy_down_from_the_abort_report(
     # A raise here would reach klippy's reactor loop, which turns it into a
     # printer shutdown (klippy/klippy.py:170-186).
     assert fake_printer.reactor.pump_async(1, timeout=2.0) == 1
+
+
+# --- resume preview: the reposition loop over the socket (design §F.2) --
+#
+# A preview pause rides the SAME awaiting/running loop every binary pause
+# does (no new plugin state): a reposition answer (next/prev/nudge) sends a
+# recover_confirm and plrd PAUSES AGAIN with the next stop, which arrives
+# through the identical path a second binary confirm-point would. These
+# tests drive the whole loop through the registered console commands.
+
+
+def execute_preview(plugin, run, **script):
+    """Start a recovery whose first reply is a preview pause."""
+    calls = {"recover_execute": [fx.preview_pause()]}
+    calls.update(script)
+    plugin.daemon = ScriptedDaemon(calls)
+    execute(plugin, run)
+
+
+def test_a_preview_pause_reaches_a_rendered_preview_prompt(plugin, run, fake_printer):
+    execute_preview(plugin, run)
+    gcode = fake_printer.lookup_object("gcode")
+    lines = gcode.responses
+    # A RENDERED preview prompt, with the reposition buttons wired to plain
+    # commands (the console is the floor, dialogs the enhancement).
+    assert any("action:prompt_begin Power-loss recovery — align" in ln for ln in lines)
+    assert "action:prompt_button Accept|PLR_RECOVER_ACCEPT|primary" in lines
+    assert any("PLR_RECOVER_NUDGE FWD=1" in ln for ln in lines)
+    assert any("PLR_RECOVER_NUDGE BACK=10" in ln for ln in lines)
+    assert "action:prompt_footer_button Abort recovery|PLR_RECOVER_ABORT|error" in lines
+    # The per-stop readout is on the wire (offset + XY), not just a log line.
+    body = "\n".join(lines)
+    assert "byte 244,118" in body and "X132.4 Y88.1" in body
+    assert plugin.recovery.state() == "awaiting_confirmation"
+    assert plugin.recovery.can_answer() is True
+
+
+def test_accept_sends_accept_and_the_recovery_completes(plugin, run, fake_printer):
+    execute_preview(plugin, run, recover_confirm=[fx.completed()])
+    since = responses_since(fake_printer.lookup_object("gcode"))
+    run("PLR_RECOVER_ACCEPT")
+    assert plugin.daemon.calls[1] == (
+        "recover_confirm",
+        {"token": "plrc-17bd4c0f9a2-5", "answer": "accept"},
+        daemon_link.EXECUTE_TIMEOUT,
+    )
+    assert "plan complete" in "\n".join(since())
+    assert plugin.recovery.state() == "idle"
+
+
+def test_next_repositions_and_the_next_stop_is_rendered(plugin, run, fake_printer):
+    # next -> plrd repositions and PAUSES AGAIN with the new stop, which the
+    # plugin renders exactly as it rendered the first (offset refreshed).
+    execute_preview(
+        plugin,
+        run,
+        recover_confirm=[
+            fx.preview_pause(token="plrc-17bd4c0f9a2-6", offset=250000, position=4)
+        ],
+    )
+    since = responses_since(fake_printer.lookup_object("gcode"))
+    run("PLR_RECOVER_NEXT")
+    assert plugin.daemon.answers() == ["next"]
+    body = "\n".join(since())
+    assert "byte 250,000" in body  # the NEW stop's offset, re-emitted
+    assert "stop 4 of 5" in body
+    # Still awaiting, still answerable: the loop moved awaiting -> running ->
+    # awaiting with no new state invented.
+    assert plugin.recovery.state() == "awaiting_confirmation"
+    assert plugin.recovery.can_answer() is True
+
+
+@pytest.mark.parametrize(
+    "params,expected_count",
+    [
+        ({"FWD": 1}, 1),
+        ({"FWD": 10}, 10),
+        ({"BACK": 1}, -1),
+        ({"BACK": 10}, -10),
+    ],
+)
+def test_nudge_sends_the_signed_count_plrd_parses(
+    plugin, run, fake_printer, params, expected_count
+):
+    execute_preview(
+        plugin, run, recover_confirm=[fx.preview_pause(token="plrc-17bd4c0f9a2-6")]
+    )
+    run("PLR_RECOVER_NUDGE", **params)
+    cmd, args, _t = plugin.daemon.calls[1]
+    assert cmd == "recover_confirm"
+    assert args["answer"] == "nudge"
+    assert args["count"] == expected_count
+
+
+def test_nudge_requires_exactly_one_direction(plugin, run):
+    execute_preview(plugin, run)
+    with pytest.raises(fake_klippy.FakeCommandError, match="exactly one of FWD"):
+        run("PLR_RECOVER_NUDGE", FWD=1, BACK=1, calls=0)
+    with pytest.raises(fake_klippy.FakeCommandError, match="exactly one of FWD"):
+        run("PLR_RECOVER_NUDGE", calls=0)
+
+
+def test_nudge_rejects_a_step_that_is_not_one_or_ten(plugin, run):
+    execute_preview(plugin, run)
+    with pytest.raises(fake_klippy.FakeCommandError, match="1 .fine. or 10"):
+        run("PLR_RECOVER_NUDGE", FWD=5, calls=0)
+
+
+def test_a_full_preview_conversation_pause_nudge_pause_accept(
+    plugin, run, fake_printer
+):
+    # The whole loop end to end: open on a stop, nudge to another, accept.
+    execute_preview(
+        plugin,
+        run,
+        recover_confirm=[
+            fx.preview_pause(token="plrc-17bd4c0f9a2-6", offset=245000),
+            fx.completed(),
+        ],
+    )
+    gcode = fake_printer.lookup_object("gcode")
+    run("PLR_RECOVER_NUDGE", FWD=1)
+    assert "byte 245,000" in "\n".join(gcode.responses)
+    since = responses_since(gcode)
+    run("PLR_RECOVER_ACCEPT")
+    assert plugin.daemon.answers() == ["nudge", "accept"]
+    assert "plan complete" in "\n".join(since())
+    assert plugin.recovery.state() == "idle"
+
+
+# --- the shutdown rule under every verb (design §D.2) -----------------
+
+
+@pytest.mark.parametrize(
+    "command,params",
+    [
+        ("PLR_RECOVER_ACCEPT", {}),
+        ("PLR_RECOVER_NEXT", {}),
+        ("PLR_RECOVER_PREV", {}),
+        ("PLR_RECOVER_NUDGE", {"FWD": 1}),
+        ("PLR_RECOVER_NUDGE", {"BACK": 10}),
+    ],
+)
+def test_shutdown_refuses_every_repositioning_verb(
+    plugin, run, fake_printer, command, params
+):
+    # A shut-down machine cannot move, so accept AND every reposition are
+    # refused — the generalization of the continue-when-shutdown rule.
+    execute_preview(plugin, run)
+    fake_printer.in_shutdown_state = True  # shutdown without running handlers
+    with pytest.raises(fake_klippy.FakeCommandError, match="shut down"):
+        run(command, calls=0, **params)
+    # Nothing was sent to plrd: the pause is untouched and still answerable.
+    assert [c for c in plugin.daemon.calls if c[0] == "recover_confirm"] == []
+    assert plugin.recovery.can_answer() is True
+
+
+def test_shutdown_still_allows_abort_on_a_preview_pause(plugin, run, fake_printer):
+    execute_preview(plugin, run, recover_confirm=[fx.aborted()])
+    fake_printer.in_shutdown_state = True
+    since = responses_since(fake_printer.lookup_object("gcode"))
+    run("PLR_RECOVER_ABORT")
+    assert plugin.daemon.answers() == ["abort"]
+    assert "did not complete" in "\n".join(since())
+
+
+# --- kind discrimination (design §D.3) --------------------------------
+
+
+def test_a_preview_verb_on_a_binary_pause_is_refused_and_keeps_the_token(
+    plugin, run, fake_printer
+):
+    # The binary z-height pause takes continue/abort; a preview verb is
+    # refused BEFORE the token is spent, so the pause stays answerable (the
+    # token-preserving mirror of the daemon's own wrong-kind guard).
+    plugin.daemon = ScriptedDaemon({"recover_execute": [fx.z_height_pause()]})
+    execute(plugin, run)
+    for command in ("PLR_RECOVER_ACCEPT", "PLR_RECOVER_NEXT", "PLR_RECOVER_PREV"):
+        with pytest.raises(fake_klippy.FakeCommandError, match="not a resume preview"):
+            run(command, calls=0)
+    with pytest.raises(fake_klippy.FakeCommandError, match="not a resume preview"):
+        run("PLR_RECOVER_NUDGE", FWD=1, calls=0)
+    assert [c for c in plugin.daemon.calls if c[0] == "recover_confirm"] == []
+    assert plugin.recovery.can_answer() is True
+    # The binary answer still works.
+    plugin.daemon.script["recover_confirm"] = [fx.completed()]
+    run("PLR_RECOVER_CONTINUE")
+    assert plugin.daemon.answers() == ["continue"]
+
+
+def test_continue_on_a_preview_pause_is_refused_and_names_the_preview_verbs(
+    plugin, run
+):
+    execute_preview(plugin, run)
+    with pytest.raises(fake_klippy.FakeCommandError, match="resume-preview pause"):
+        run("PLR_RECOVER_CONTINUE", calls=0)
+    assert plugin.recovery.can_answer() is True
+
+
+def test_abort_works_on_a_preview_pause(plugin, run, fake_printer):
+    execute_preview(plugin, run, recover_confirm=[fx.aborted()])
+    run("PLR_RECOVER_ABORT")
+    assert plugin.daemon.answers() == ["abort"]
+    assert plugin.recovery.state() == "idle"
+
+
+def test_reshow_re_emits_the_current_preview_stops_full_readout(
+    plugin, run, fake_printer
+):
+    # PLR_STATUS reshow reads the last pause payload, so it must re-emit the
+    # CURRENT stop's full readout (design §F.2, carried obligation).
+    execute_preview(plugin, run)
+    gcode = fake_printer.lookup_object("gcode")
+    since = responses_since(gcode)
+    shown = plugin.recovery.reshow(gcode.respond_info)
+    assert shown is True
+    body = "\n".join(since())
+    assert "byte 244,118" in body and "X132.4 Y88.1" in body
+    assert "stop 3 of 5" in body
+    assert "action:prompt_button Accept|PLR_RECOVER_ACCEPT|primary" in since()
+
+
+# --- review fix 1: kind-aware guidance (design §F.2) ------------------
+#
+# Under the default `ask`, a resume-preview pause is the routine first
+# pause, and it is answered with the reposition verbs — NOT continue/abort.
+# Every place the plugin tells an operator how to answer must name the right
+# commands, or PLR_STATUS points a preview operator at a command the daemon
+# refuses on a healthy pause.
+
+
+def test_status_lines_on_a_preview_pause_name_the_preview_verbs(
+    plugin, run, fake_printer
+):
+    execute_preview(plugin, run)
+    lines = "\n".join(plugin.recovery.status_lines())
+    assert "PLR_RECOVER_ACCEPT" in lines
+    assert "PLR_RECOVER_NUDGE" in lines
+    # Must NOT point a preview operator at the binary verbs.
+    assert "PLR_RECOVER_CONTINUE" not in lines
+
+
+def test_status_lines_on_a_binary_pause_still_name_continue_abort(
+    plugin, run, fake_printer
+):
+    plugin.daemon = ScriptedDaemon({"recover_execute": [fx.z_height_pause()]})
+    execute(plugin, run)
+    lines = "\n".join(plugin.recovery.status_lines())
+    assert "PLR_RECOVER_CONTINUE" in lines
+    assert "PLR_RECOVER_ACCEPT" not in lines
+
+
+def test_claim_expiry_on_a_preview_pause_names_the_preview_verbs(
+    plugin, run, fake_printer
+):
+    execute_preview(plugin, run)
+    gcode = fake_printer.lookup_object("gcode")
+    since = responses_since(gcode)
+    # Drive the claim downgrade directly (the reactor timer callback).
+    plugin.recovery._on_claim_expiry(0.0)
+    body = "\n".join(since())
+    assert "PLR_RECOVER_ACCEPT" in body
+    assert "PLR_RECOVER_NUDGE" in body
+    assert "PLR_RECOVER_CONTINUE" not in body
+    # The token is kept across the downgrade, so it is still answerable.
+    assert plugin.recovery.can_answer() is True
+
+
+def test_busy_message_on_a_preview_pause_names_the_preview_verbs(
+    plugin, run, fake_printer
+):
+    # A second recovery attempt while a preview pause is awaiting is refused
+    # and must name the preview verbs, not continue/abort.
+    execute_preview(plugin, run)
+    msg = plugin.recovery._busy_message("TEST")
+    assert "PLR_RECOVER_ACCEPT" in msg
+    assert "PLR_RECOVER_CONTINUE" not in msg
+
+
+# --- review fix 2: keep the token on a daemon `malformed` reply -------
+
+
+def test_a_malformed_reply_keeps_the_token_and_the_same_token_answers(
+    plugin, run, fake_printer
+):
+    # ctrlsock.rs RESTORES the pause on a wrong-kind answer, so the plugin
+    # must keep the token — the question is still answerable. First ACCEPT is
+    # scripted to draw `malformed`; the retry with the SAME token completes.
+    execute_preview(plugin, run, recover_confirm=[fx.malformed(), fx.completed()])
+    gcode = fake_printer.lookup_object("gcode")
+    since = responses_since(gcode)
+    run("PLR_RECOVER_ACCEPT")
+    body = "\n".join(since())
+    assert "KEPT the question open" in body
+    # The token survived the refusal.
+    assert plugin.recovery.can_answer() is True
+    # ...and the SAME token answers successfully on retry.
+    since2 = responses_since(gcode)
+    run("PLR_RECOVER_ACCEPT")
+    assert "plan complete" in "\n".join(since2())
+    assert plugin.recovery.state() == "idle"
+    tokens = plugin.daemon.tokens()
+    assert len(tokens) == 2 and tokens[0] == tokens[1], tokens
+
+
+def test_a_malformed_recover_execute_still_takes_the_conservative_path(
+    plugin, run, fake_printer
+):
+    # A `malformed` with NOTHING in flight (a rejected recover_execute, not a
+    # rejected answer) carries no token to keep, so it stays on the
+    # conservative unresolved path — never claims the recovery ended.
+    plugin.daemon = ScriptedDaemon({"recover_execute": [fx.malformed()]})
+    execute(plugin, run)
+    assert plugin.recovery.state() == "unknown"
+    assert plugin.recovery.can_answer() is False

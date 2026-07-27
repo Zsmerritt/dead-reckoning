@@ -276,6 +276,20 @@ class PLRPlugin:
         "Answer plrd's outstanding recovery confirmation with 'abort' — the "
         "recovery stops cleanly"
     )
+    cmd_PLR_RECOVER_ACCEPT_help = (
+        "Accept the previewed resume point — plrd generates the recovery "
+        "file from it and resumes the print"
+    )
+    cmd_PLR_RECOVER_NEXT_help = (
+        "Resume preview: step to the next representative candidate stop"
+    )
+    cmd_PLR_RECOVER_PREV_help = (
+        "Resume preview: step to the previous representative candidate stop"
+    )
+    cmd_PLR_RECOVER_NUDGE_help = (
+        "Resume preview: move the hover point along the toolpath "
+        "(FWD=<n> or BACK=<n>, n = 1 fine or 10 coarse)"
+    )
     cmd_PLR_NOISE_TEST_help = (
         "Measure the accel-chip noise floor (requires START=1; moves the "
         "toolhead) and stage noise_floor_* for SAVE_CONFIG"
@@ -327,11 +341,16 @@ class PLRPlugin:
             ("PLR_NOISE_TEST", noise_test.cmd_PLR_NOISE_TEST),
             ("PLR_DRAG_PROBE", drag_probe.cmd_PLR_DRAG_PROBE),
             ("PLR_DRAG_CALIBRATE", drag_calibrate.cmd_PLR_DRAG_CALIBRATE),
-            # -- confirm-point answers (recovery.py; two lines, kept
-            # contiguous so a concurrent branch's addition to this table
-            # stays a trivial merge) --
+            # -- confirm-point answers (recovery.py; kept contiguous so a
+            # concurrent branch's addition to this table stays a trivial
+            # merge). The first two answer a binary pause; the last four
+            # answer a resume-preview pause (design §F.2). --
             ("PLR_RECOVER_CONTINUE", recovery.cmd_PLR_RECOVER_CONTINUE),
             ("PLR_RECOVER_ABORT", recovery.cmd_PLR_RECOVER_ABORT),
+            ("PLR_RECOVER_ACCEPT", recovery.cmd_PLR_RECOVER_ACCEPT),
+            ("PLR_RECOVER_NEXT", recovery.cmd_PLR_RECOVER_NEXT),
+            ("PLR_RECOVER_PREV", recovery.cmd_PLR_RECOVER_PREV),
+            ("PLR_RECOVER_NUDGE", recovery.cmd_PLR_RECOVER_NUDGE),
             ("PLR_WIZARD_START", wizard.cmd_PLR_WIZARD_START),
             ("PLR_WIZARD_DRYRUN", wizard.cmd_PLR_WIZARD_DRYRUN),
             ("PLR_WIZARD_CONFIRM_CLEAN", wizard.cmd_PLR_WIZARD_CONFIRM_CLEAN),

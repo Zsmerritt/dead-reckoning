@@ -130,9 +130,31 @@ logger = logging.getLogger(__name__)
 # strings the dialog's buttons fire.
 CMD_CONTINUE = confirm_ui.CMD_CONTINUE
 CMD_ABORT = confirm_ui.CMD_ABORT
+CMD_ACCEPT = confirm_ui.CMD_ACCEPT
+CMD_NEXT = confirm_ui.CMD_NEXT
+CMD_PREV = confirm_ui.CMD_PREV
+CMD_NUDGE = confirm_ui.CMD_NUDGE
+KIND_PREVIEW = confirm_ui.KIND_PREVIEW
 
+# The wire ``answer`` verbs plrd accepts (crates/plrd/src/ctrlsock.rs
+# ``cmd_recover_confirm`` / ``parse_preview_answer``): a BINARY pause takes
+# continue/abort; a resume-PREVIEW pause takes accept/next/prev/nudge/abort,
+# with ``nudge`` carrying a signed integer ``count`` (+n forward, -n back).
+# ``abort`` is valid on either kind.
 ANSWER_CONTINUE = "continue"
 ANSWER_ABORT = "abort"
+ANSWER_ACCEPT = "accept"
+ANSWER_NEXT = "next"
+ANSWER_PREV = "prev"
+ANSWER_NUDGE = "nudge"
+
+# Verbs valid only on a preview pause, and the full recognized set.  A
+# preview verb on a binary pause (or ``continue`` on a preview pause) is
+# refused BEFORE the token is spent, so the pause and its answerability
+# survive a mis-typed command (the daemon guards the same mismatch, with
+# the pause restored — this is the local, token-preserving mirror of it).
+_PREVIEW_ANSWERS = (ANSWER_ACCEPT, ANSWER_NEXT, ANSWER_PREV, ANSWER_NUDGE)
+_ALL_ANSWERS = (ANSWER_CONTINUE, ANSWER_ABORT) + _PREVIEW_ANSWERS
 
 # --- session states ---------------------------------------------------
 #
@@ -573,8 +595,7 @@ class RecoverySession:
                 )
         if self.can_answer():
             lines.append(
-                "  a question can still be answered: %s or %s"
-                % (CMD_CONTINUE, CMD_ABORT)
+                "  a question can still be answered: %s" % (self._answer_commands(),)
             )
         return lines
 
@@ -727,17 +748,17 @@ class RecoverySession:
             "g-code mutex plrd needs for its own, so this must be the last "
             "line of any macro.\n"
             "If plrd stops to ask you something, a prompt appears and the "
-            "console names the exact command to answer it (%s / %s)."
-            % (source, CMD_CONTINUE, CMD_ABORT)
+            "console names the exact command to answer it (it depends on the "
+            "question — a resume-point preview is answered differently from a "
+            "yes/no confirmation)." % (source,)
         )
 
     def _busy_message(self, source):
         if self._state == STATE_AWAITING:
             return (
                 "%s: a recovery is already in flight and is WAITING FOR YOUR "
-                "ANSWER — run %s to continue it or %s to stop it. Run "
-                "PLR_STATUS to see the question again."
-                % (source, CMD_CONTINUE, CMD_ABORT)
+                "ANSWER — run %s. Run PLR_STATUS to see the question again."
+                % (source, self._answer_commands())
             )
         return (
             "%s: a recovery is already in flight (started by %s). plrd runs "
@@ -747,21 +768,89 @@ class RecoverySession:
 
     # -- answering ----------------------------------------------------
 
-    def answer(self, gcmd, answer, source):
-        """Answer the outstanding confirm-point (``continue``/``abort``)."""
-        if answer not in (ANSWER_CONTINUE, ANSWER_ABORT):
-            # Not reachable from the two commands; a guard against a future
-            # caller inventing a third answer plrd would reject.
+    def _pause_kind(self):
+        """The outstanding pause's ``confirm_kind``, or None.
+
+        Read from the cached pause payload (``report_pause``'s ``data``
+        map), which is the same source :meth:`reshow` renders from, so the
+        kind this method discriminates on is exactly the kind the operator
+        was shown.
+        """
+        if isinstance(self._data, dict):
+            return self._data.get("confirm_kind")
+        return None
+
+    def _answer_commands(self):
+        """The console commands that answer the CURRENT outstanding pause,
+        branched on its kind.
+
+        A resume-preview pause (the routine first pause under the default
+        ``ask``) is answered with the reposition verbs, NOT continue/abort —
+        so every place the plugin tells an operator how to answer must name
+        the right ones. Pointing a preview operator at ``PLR_RECOVER_CONTINUE``
+        would hand them a command the daemon refuses on a healthy pause, and
+        would contradict the dialog's own fallback line on the same screen.
+        Falls back to the binary pair when the kind is unknown (no pause
+        cached yet, or a non-preview pause).
+        """
+        if self._pause_kind() == KIND_PREVIEW:
+            return "%s / %s / %s / %s FWD=|BACK= / %s" % (
+                CMD_ACCEPT,
+                CMD_NEXT,
+                CMD_PREV,
+                CMD_NUDGE,
+                CMD_ABORT,
+            )
+        return "%s or %s" % (CMD_CONTINUE, CMD_ABORT)
+
+    def answer(self, gcmd, answer, source, count=None):
+        """Answer the outstanding confirm-point.
+
+        ``continue``/``abort`` answer a binary pause; ``accept``/``next``/
+        ``prev``/``nudge`` answer a resume-preview pause (``nudge`` carries a
+        signed ``count``).  ``abort`` answers either.  The vocabulary is
+        widened for preview pauses ONLY, discriminated by the outstanding
+        pause's kind (design §D.3 / §F.2).
+        """
+        if answer not in _ALL_ANSWERS:
+            # Not reachable from the commands; a guard against a future
+            # caller inventing an answer plrd would reject.
             raise gcmd.error("%s: unknown answer %r" % (source, answer))
         if not self.can_answer():
             raise gcmd.error(self._nothing_to_answer(source))
-        if answer == ANSWER_CONTINUE and self.printer.is_shutdown():
-            # Continuing means telling plrd to drive a printer that cannot
-            # move.  Refuse; aborting is still allowed (and is what the
-            # shutdown handler already did).
+        # THE SHUTDOWN RULE (design §D.2).  A shut-down machine cannot move,
+        # so every verb that would resume or REPOSITION is refused —
+        # accept, next, prev and nudge as well as continue.  Only abort is
+        # allowed, because aborting is the one thing a shut-down recovery
+        # can still do (and is what the shutdown handler itself does).
+        if answer != ANSWER_ABORT and self.printer.is_shutdown():
             raise gcmd.error(
-                "%s: klippy is shut down — the recovery cannot continue. "
-                "Run %s to stop it." % (source, CMD_ABORT)
+                "%s: klippy is shut down — the recovery cannot %s a printer "
+                "that cannot move. Run %s to stop it."
+                % (
+                    source,
+                    "reposition" if answer in _PREVIEW_ANSWERS else "continue",
+                    CMD_ABORT,
+                )
+            )
+        # KIND DISCRIMINATION (design §D.3).  A preview verb is valid only on
+        # a preview pause, and ``continue`` only on a binary one; ``abort``
+        # is valid on either.  Refuse a mismatch HERE, before the token is
+        # spent, so the pause stays answerable — the token-preserving mirror
+        # of the daemon's own "wrong-kind → pause restored" guard.
+        kind = self._pause_kind()
+        if answer in _PREVIEW_ANSWERS and kind != KIND_PREVIEW:
+            raise gcmd.error(
+                "%s: this pause is not a resume preview (it is a %r "
+                "confirmation) — answer it with %s or %s."
+                % (source, kind or "binary", CMD_CONTINUE, CMD_ABORT)
+            )
+        if answer == ANSWER_CONTINUE and kind == KIND_PREVIEW:
+            raise gcmd.error(
+                "%s: this is a resume-preview pause — answer it with %s to "
+                "accept the shown point, %s / %s to step between candidates, "
+                "%s FWD=/BACK= to move along the toolpath, or %s to stop."
+                % (source, CMD_ACCEPT, CMD_NEXT, CMD_PREV, CMD_NUDGE, CMD_ABORT)
             )
         token = self._token
         was = self._state
@@ -792,9 +881,16 @@ class RecoverySession:
         )
         self._answering = answer
         self._disarm_timer()
+        # ``nudge`` carries a signed ``count`` the daemon requires
+        # (parse_preview_answer: non-zero i32); every other verb is
+        # answer-only.  Built here, after the mismatch guards, so a stray
+        # count on a non-nudge verb never reaches the wire.
+        args = {"token": token, "answer": answer}
+        if answer == ANSWER_NUDGE:
+            args["count"] = count
         started = self._async.call(
             "recover_confirm",
-            {"token": token, "answer": answer},
+            args,
             daemon_link.EXECUTE_TIMEOUT,
             self._on_response,
             self._on_error,
@@ -814,10 +910,19 @@ class RecoverySession:
                 "moment (the question is still open)." % (source,)
             )
         self._end_dialog()
-        gcmd.respond_info(
-            "%s: answered '%s'. plrd is continuing; its next report appears "
-            "here." % (source, answer)
-        )
+        if answer in _PREVIEW_ANSWERS and answer != ANSWER_ACCEPT:
+            # A reposition (next/prev/nudge): plrd moves the hover point and
+            # PAUSES AGAIN with the new stop, which arrives here as the next
+            # prompt — not a completion.
+            gcmd.respond_info(
+                "%s: repositioning. plrd moves the hover point and shows the "
+                "next stop here." % (source,)
+            )
+        else:
+            gcmd.respond_info(
+                "%s: answered '%s'. plrd is continuing; its next report "
+                "appears here." % (source, answer)
+            )
 
     def _nothing_to_answer(self, source):
         if self._state in (STATE_RUNNING, STATE_PLRD_BUSY):
@@ -911,12 +1016,26 @@ class RecoverySession:
                 ),
             )
             return
+        # A `malformed` reply to an ANSWER we sent (not a start — those carry
+        # no `_answering_token`) means plrd REFUSED the verb but KEPT the
+        # pause standing: `cmd_recover_confirm` returns malformed before
+        # taking the outstanding question, and RESTORES it on a wrong-kind
+        # answer (a preview verb on a binary pause, or `continue` on a
+        # preview pause; ctrlsock.rs). The question is still answerable, so
+        # the token is kept rather than thrown away — the daemon deliberately
+        # preserved it. (The plugin discriminates kind locally so it should
+        # never send a wrong-kind verb, but the daemon's guard is the
+        # backstop, and losing the token when the daemon kept the pause is
+        # the bug this branch removes.)
+        if outcome == "malformed" and self._answering_token is not None:
+            self._wrong_kind_restore(response)
+            return
         # Unclassifiable — including `error` (ctrlsock.rs:834: one tag for
         # "the pipeline failed before anything was sent" and "the execution
-        # task never returned, so its cleanup never ran") and `malformed`
-        # (:740-751 returns it BEFORE `session.outstanding.take()`, so plrd
-        # may be standing at a confirm point right now).  A protocol addition
-        # must not be able to make this plugin claim a finish it cannot see.
+        # task never returned, so its cleanup never ran") and a `malformed`
+        # with nothing in flight (a rejected recover_execute — nothing ran).
+        # A protocol addition must not be able to make this plugin claim a
+        # finish it cannot see.
         self._unresolved(
             response,
             "plrd answered %r, which this plugin cannot classify, so what it "
@@ -953,6 +1072,44 @@ class RecoverySession:
                 "This says nothing about what plrd is doing, so the recovery "
                 "state is unchanged:\n%s" % ("\n".join(self.status_lines()),)
             )
+        self._notify_finished()
+
+    def _wrong_kind_restore(self, response):
+        """plrd refused an answer as ``malformed`` but KEPT the pause.
+
+        Mirrors :meth:`_plrd_busy`'s token handling: the daemon restored the
+        outstanding question (ctrlsock.rs), so the same token still answers
+        it — keep the token and the cached readout (so :meth:`reshow` still
+        works and :meth:`_answer_commands` still names the right verbs), and
+        re-arm the deadline plrd is still enforcing. The published state is
+        the honest uncertainty (UNKNOWN): the plugin cannot demonstrate the
+        pause is live, it can only infer it from the typed refusal, so it
+        does not re-claim ``awaiting_confirmation`` — but it never pretends
+        the recovery ended either.
+        """
+        answering_token = self._answering_token
+        self._answering = None
+        self._answering_token = None
+        # Keep the token (and, with it, the cached pause payload): the daemon
+        # deliberately preserved the question.
+        self._token = answering_token
+        if answering_token is None:
+            self._data = None
+        # Toward alarming — no reason required.
+        self._transition(STATE_UNKNOWN)
+        self._disarm_timer()
+        if answering_token is not None:
+            self._arm_timer()
+        text = response.get("text")
+        if isinstance(text, str) and text.strip():
+            self._respond(text)
+        self._end_dialog()
+        self._respond(
+            "PLR recovery: plrd refused that answer as malformed but KEPT the "
+            "question open (it restores the pause on a wrong-kind answer). It "
+            "is still answerable — run PLR_STATUS to see it again, then answer "
+            "with %s. Do NOT assume the recovery ended." % (self._answer_commands(),)
+        )
         self._notify_finished()
 
     def _plrd_busy(self, response):
@@ -1287,11 +1444,11 @@ class RecoverySession:
                     "plrd's own default deadline, so plrd may well have aborted "
                     "the recovery already — this plugin cannot tell, because "
                     "plrd does not report the deadline it is using.\n"
-                    "Nothing was answered on your behalf, and %s / %s still "
+                    "Nothing was answered on your behalf, and %s still "
                     "work: plrd's reply will say whether it moved on. Starting "
                     "a NEW recovery is no longer refused, but doing so ABANDONS "
                     "this question (plrd is told to drop it). Check PLR_STATUS "
-                    "first." % (CMD_CONTINUE, CMD_ABORT)
+                    "first." % (self._answer_commands(),)
                 )
         except Exception:
             logger.exception("plr: recovery confirm-claim handler failed")
@@ -1626,3 +1783,51 @@ def cmd_PLR_RECOVER_CONTINUE(plugin, gcmd):
 def cmd_PLR_RECOVER_ABORT(plugin, gcmd):
     """PLR_RECOVER_ABORT — answer plrd's confirmation with 'abort'."""
     plugin.recovery.answer(gcmd, ANSWER_ABORT, CMD_ABORT)
+
+
+# --- resume-preview reposition answers (design §F.2) ------------------
+#
+# These four are the preview's console floor: the dialog's Accept / Prev /
+# Next / nudge buttons fire exactly these, the preview fallback lines name
+# exactly these, and every one calls the same widened ``answer()`` so the
+# shutdown rule, kind discrimination and token handling are shared with the
+# binary answers.
+
+
+def cmd_PLR_RECOVER_ACCEPT(plugin, gcmd):
+    """PLR_RECOVER_ACCEPT — accept the previewed resume point."""
+    plugin.recovery.answer(gcmd, ANSWER_ACCEPT, CMD_ACCEPT)
+
+
+def cmd_PLR_RECOVER_NEXT(plugin, gcmd):
+    """PLR_RECOVER_NEXT — step to the next representative preview stop."""
+    plugin.recovery.answer(gcmd, ANSWER_NEXT, CMD_NEXT)
+
+
+def cmd_PLR_RECOVER_PREV(plugin, gcmd):
+    """PLR_RECOVER_PREV — step to the previous representative preview stop."""
+    plugin.recovery.answer(gcmd, ANSWER_PREV, CMD_PREV)
+
+
+def cmd_PLR_RECOVER_NUDGE(plugin, gcmd):
+    """PLR_RECOVER_NUDGE FWD=<n> | BACK=<n> — nudge along the toolpath.
+
+    Exactly one of FWD / BACK, each 1 (fine) or 10 (coarse), per the ruled
+    two-size nudge.  The signed ``count`` (+n forward, -n back) is what plrd
+    parses; ``answer()`` applies the shutdown rule and kind discrimination
+    before it reaches the wire.
+    """
+    fwd = gcmd.get_int("FWD", None)
+    back = gcmd.get_int("BACK", None)
+    if (fwd is None) == (back is None):
+        raise gcmd.error(
+            "%s: give exactly one of FWD=<n> or BACK=<n> (n = 1 or 10)." % (CMD_NUDGE,)
+        )
+    magnitude = fwd if fwd is not None else back
+    if magnitude not in (1, 10):
+        raise gcmd.error(
+            "%s: the nudge step must be 1 (fine) or 10 (coarse), got %d."
+            % (CMD_NUDGE, magnitude)
+        )
+    count = magnitude if fwd is not None else -magnitude
+    plugin.recovery.answer(gcmd, ANSWER_NUDGE, CMD_NUDGE, count=count)

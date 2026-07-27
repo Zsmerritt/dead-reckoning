@@ -387,8 +387,18 @@ fn machine_inputs(
             // printer: fall back to the stock single `PROBE` (the
             // consensus touch is a [plr]-mode feature). See
             // `PlanConfig::legacy_single_probe`.
+            //
+            // For the same reason it resolves the interactive `ask` default
+            // to its documented automatic fallback `last` (skip-forward):
+            // `resume_candidate_policy` is a [plr] key the legacy path
+            // cannot carry, and the resume preview is presented through the
+            // [plr] plugin's confirm dialog — a legacy setup has no client
+            // to answer a preview pause, so attaching one would fail-closed
+            // abort every legacy recovery. `last` keeps legacy recoveries
+            // automatic, exactly as they were before the increment-3 flip.
             let plan_config = PlanConfig {
                 legacy_single_probe: true,
+                resume_candidate_policy: ResumePolicy::Last,
                 ..PlanConfig::default()
             };
             // Legacy mode cannot see the running config's macro sections,
@@ -629,10 +639,10 @@ fn plan_from_recovery(
         // SAME policy/preview path as LayerOnly, with a placeholder
         // LayerOnly confidence. That placeholder is consulted only on the
         // no-preview-set fallback (`resolve_resume_with_preview(None)`),
-        // where a coarse layer correctly degrades to manual — so `ask`
-        // (interim, no set) and any-policy `NoStops` still fall back to
-        // manual exactly as today, while `first`/`mid`/`last` with a usable
-        // set resume automatically from the anchor (MAJOR-2).
+        // where a coarse layer correctly degrades to manual — so any-policy
+        // `NoStops` still falls back to manual, while a usable set resumes:
+        // `first`/`mid`/`last` automatically from the anchor, and `ask`
+        // (increment 3) by attaching the interactive preview.
         Err(MatchError::Inconclusive { lines, layers }) => {
             say(&format!(
                 "pipeline: match inconclusive: {lines} candidate lines across layers \
@@ -658,19 +668,19 @@ fn plan_from_recovery(
     // wires the real excluded set (§E.3 pre-existing gap); until then
     // build_preview keeps all non-attributable stops (safe direction).
     //
-    // INTERIM (principal ruling pending — see the branch report): the
-    // interactive `ask` preview is NOT attached here yet. Turning it on
-    // flips the shipped DEFAULT from automatic skip-forward to an
-    // interactive pause, which makes a bare-CLI / headless recovery (whose
-    // fail-closed confirmer aborts every pause) ABORT ambiguous recoveries
-    // that auto-complete today. So `ask` resolves as `last` for now (its
-    // documented behavior), and only `first`/`mid`/`last` consult the set.
-    // The executor loop, writer, and socket vocabulary are all implemented
-    // and tested; flipping `ask` on is the one-line change of building the
-    // set for `Ask` too and passing it through as the attached preview.
+    // INCREMENT 3 — the `ask` flip (design §11). The set is now built for
+    // `ask` too and passed through, so `plan_recovery` ATTACHES it as the
+    // interactive preview (build.rs: only `ask` attaches; first/mid/last get
+    // a plain automatic plan at the anchor's offset). This ships the ruled
+    // default: `ask` = the interactive preview. A headless / bare-CLI
+    // recovery whose confirmer fail-closes now ABORTS an ambiguous resume
+    // rather than auto-completing it — deliberate: the dialog is the
+    // intended path, and `last` remains the explicit skip-forward for a
+    // headless setup that wants automatic completion. `ask` with NO stops
+    // (NoStops) still falls back to the resolver's `last` anchor, so an
+    // empty set never leaves the operator without a resume.
     let policy = plan_config.resume_candidate_policy;
-    let build_set = !matches!(policy, ResumePolicy::Ask)
-        && !matches!(match_result.confidence, MatchConfidence::UniqueLine { .. });
+    let build_set = !matches!(match_result.confidence, MatchConfidence::UniqueLine { .. });
     let preview_owned: Option<PreviewSet> = if build_set {
         match build_preview(
             &model,
@@ -1755,6 +1765,104 @@ G1 X60 Y60 E0.02
     /// per-line resolution. See
     /// [`an_early_print_cut_without_motion_evidence_falls_back_to_manual`]
     /// for the outcome that is deliberately accepted.
+    /// An ANCHORED fixture (motion evidence present, so the window is
+    /// consistent) whose committed extruder position is lowered to widen
+    /// the E band by a hair — enough to admit a 9th candidate line and tip
+    /// the layer-0/1 window from `AmbiguousWindow` (8) to
+    /// `MatchError::Inconclusive` (>8 across layers [0, 1]). The stop is at
+    /// the layer 0->1 boundary (crash at `G1 Z0.4`), so the `last` anchor
+    /// resumes at layer >= 1 and contact selection finds layer 0 below it —
+    /// the full Inconclusive -> policy -> Plan chain in one fixture.
+    fn inconclusive_fixture(tag: &str, committed_e: f64) -> (PathBuf, Config) {
+        let (dir, config) = fixture(tag);
+        let gcode_path = dir.join("part.gcode");
+        let mut writer = WalWriter::create(Vec::new(), &SegmentHeader::new(1, 1)).unwrap();
+        writer.append(&WalRecord::Heartbeat(heartbeat())).unwrap();
+        // Keep the anchoring trapq row: the window stays consistent (motion
+        // evidence exists), unlike the unanchored early-print shape.
+        writer
+            .append(&WalRecord::TrapqSegment(preceding_motion()))
+            .unwrap();
+        let mut early = crash_context(gcode_path.to_str().unwrap());
+        early.mono_ns = 1_000_000_000;
+        early.print_time = Some(6.0);
+        if let Some(vsd) = &mut early.virtual_sdcard {
+            vsd.file_position = 8;
+        }
+        early.gcode.position = vec![0.0, 0.0, 0.0, 0.0];
+        early.gcode.gcode_position = vec![0.0, 0.0, 0.0, 0.0];
+        writer.append(&WalRecord::Context(early)).unwrap();
+        let mut crash = crash_context(gcode_path.to_str().unwrap());
+        crash.gcode.position[3] = committed_e;
+        crash.gcode.gcode_position[3] = committed_e;
+        writer.append(&WalRecord::Context(crash)).unwrap();
+        std::fs::write(dir.join("wal-000001.plr"), writer.into_inner()).unwrap();
+        (dir, config)
+    }
+
+    /// THE FULL Inconclusive -> policy -> Plan CHAIN, in one test. The
+    /// matcher's confidence ladder throws away every candidate line as
+    /// `MatchError::Inconclusive` (>8 consistent lines across layers
+    /// [0, 1]); the pipeline routes that raw evidence through
+    /// `build_preview`, and — in this legacy-mode fixture, where `ask`
+    /// resolves to `last` — the `last` anchor lands on a layer-1 stop, which
+    /// contact selection can probe (layer 0 exists below it) and the planner
+    /// turns into a validated Plan. This is the headless win: a coarse
+    /// Inconclusive crash that used to be `ManualFallback` at the match call
+    /// now resumes automatically. Contrast
+    /// `an_early_print_cut_without_motion_evidence_falls_back_to_manual`,
+    /// where the same Inconclusive routing lands on LAYER 0 and correctly
+    /// declines (no layer below to probe).
+    #[test]
+    fn inconclusive_evidence_resolves_to_a_layer_ge_1_plan() {
+        // E=2.0 -> the E band admits ~10 candidate lines across layers
+        // [0, 1] (Inconclusive), with margin below the 8->9 tip so a small
+        // upstream change does not silently drop it back to AmbiguousWindow.
+        let (_dir, config) = inconclusive_fixture("inconclusive-plan", 2.0);
+        let (outcome, output) = run(&config);
+        let PipelineOutcome::Plan(bundle) = outcome else {
+            panic!("expected a Plan from Inconclusive evidence, got {outcome:?}\n{output}");
+        };
+        // The match was genuinely Inconclusive (the Err path), across two
+        // layers — not the AmbiguousWindow rung the other plan tests ride.
+        assert!(
+            output.contains("match inconclusive") && output.contains("across layers [0, 1]"),
+            "the evidence must reach the Inconclusive routing: {output}"
+        );
+        let count: usize = output
+            .lines()
+            .find(|l| l.contains("match inconclusive"))
+            .and_then(|l| l.split_whitespace().find_map(|w| w.parse().ok()))
+            .unwrap_or(0);
+        assert!(
+            count > 8,
+            "Inconclusive requires > ambiguity_limit: {output}"
+        );
+        // Legacy mode resolves `ask` -> `last`, so this is an AUTOMATIC
+        // resume: no interactive preview attached, a real resume line.
+        let plan = &bundle.plan;
+        assert!(
+            plan.preview.is_none(),
+            "legacy `last` is automatic: {output}"
+        );
+        assert!(plan.resume_preview_step_iff_spec());
+        // Layer >= 1 is proven structurally: the plan resolved a contact
+        // (probe) step, which requires a layer BELOW the resume — impossible
+        // at layer 0 (that is exactly why the early-print layer-0 fixture
+        // declines). The resume also lands at or past the layer-1 boundary.
+        assert!(
+            plan.first_index(plr_recovery::Phase::Probe).is_some(),
+            "a Plan from this evidence must have probed layer N-1: {output}"
+        );
+        assert!(
+            plan.resume_offset >= crash_offset(),
+            "resume {} must be at/after the layer-1 boundary {}: {output}",
+            plan.resume_offset,
+            crash_offset()
+        );
+        assert_eq!(plan.recovery_file.tail_offset, plan.resume_offset);
+    }
+
     fn early_print_fixture(tag: &str) -> (PathBuf, Config) {
         let (dir, config) = fixture(tag);
         let gcode_path = dir.join("part.gcode");
@@ -1829,12 +1937,19 @@ G1 X60 Y60 E0.02
         // The honestly-priced Δt leaves the window past per-line
         // granularity, so the matcher declines Inconclusive. MAJOR-2 routes
         // that raw evidence through the resume-preview path instead of
-        // failing at the match call; under the default `ask` (gated pending
-        // the interim decision) it falls to the resolver, which finds the
-        // layer too coarse to resume -> ManualFallback. The candidate count
-        // and granularity message now live in the routing NARRATION.
+        // failing at the match call. In LEGACY mode the increment-3
+        // pipeline resolves `ask` to `last` (legacy carries no [plr]), so
+        // the raw evidence builds a preview set and `last` anchors on a
+        // layer-0 stop — which contact selection then declines, because a
+        // layer-0 resume has no layer N-1 to probe under the nozzle. The
+        // outcome is unchanged (ManualFallback: an early-print cut cannot
+        // resume); only the decline reason moved from "match too coarse" to
+        // the honest "no probeable layer below layer 0". The candidate
+        // count and granularity message still live in the routing
+        // NARRATION (asserted below).
         assert!(
-            reason.contains("no safe resume point") && reason.contains("MatchTooCoarse"),
+            reason.contains("resume layer 0 out of range")
+                || (reason.contains("no safe resume point") && reason.contains("MatchTooCoarse")),
             "reason changed: {reason}\n{output}"
         );
         assert!(
@@ -1883,16 +1998,19 @@ G1 X60 Y60 E0.02
             panic!("expected a plan, got {outcome:?}\n{output}");
         };
         let plan = &bundle.plan;
-        // Ask-deferral with REAL evidence: this AmbiguousWindow fixture runs
-        // under the default `ask`, which currently resolves as `last`
-        // (skip-forward) with NO interactive preview attached — no
-        // ResumePreview step, no preview spec (interim, pending the
-        // default-flip ruling). The resume still lands at a real line
-        // (asserted below), i.e. an automatic plan, not a ManualFallback.
+        // This AmbiguousWindow fixture runs in LEGACY mode (klippy
+        // unreachable + a commissioned [machine]), where the increment-3
+        // pipeline resolves the interactive `ask` default to its automatic
+        // `last` fallback (legacy has no [plr] plugin to present a preview
+        // through — see `machine_inputs`). So a legacy recovery is an
+        // AUTOMATIC skip-forward plan: NO ResumePreview step, no preview
+        // spec, resume at a real line — not a ManualFallback and not a
+        // preview pause. `plr_mode_ask_attaches_the_resume_preview` covers
+        // the [plr]-mode default where the preview IS attached.
         assert!(
             plan.first_index(plr_recovery::Phase::ResumePreview)
                 .is_none(),
-            "ask-deferral must not attach a preview step: {output}"
+            "legacy `ask`->`last` must not attach a preview step: {output}"
         );
         assert!(plan.preview.is_none(), "{output}");
         assert!(plan.resume_preview_step_iff_spec());
@@ -2259,6 +2377,61 @@ M84
         // Live-config mode: the hash blessing is satisfied by
         // construction.
         assert_eq!(bundle.machine.config_hash, crate::plrcfg::LIVE_CONFIG_HASH);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn plr_mode_ask_attaches_the_resume_preview() {
+        // THE INCREMENT-3 `ask` FLIP, shipped. In [plr] mode the ratified
+        // default is `ask`, and the pipeline now BUILDS the preview set for
+        // it and passes it through, so `plan_recovery` attaches the
+        // interactive preview: a `Phase::ResumePreview` step and a preview
+        // spec, opening the reposition loop instead of resuming
+        // automatically. (Legacy mode still resolves ask->last — proven by
+        // `full_pipeline_reaches_a_validated_plan`, which is the SAME WAL in
+        // legacy mode and attaches NO preview.)
+        //
+        // The AmbiguousWindow "plan" fixture reaches the matcher with a
+        // small candidate set (not UniqueLine), so `build_preview` yields a
+        // usable set rather than NoStops — the condition for `ask` to attach.
+        let (_dir, config) = plr_fixture("plr-ask-preview", &[]);
+        let (outcome, output) = run(&config);
+        let PipelineOutcome::Plan(bundle) = outcome else {
+            panic!("expected a plan, got {outcome:?}\n{output}");
+        };
+        let plan = &bundle.plan;
+        assert!(
+            plan.preview.is_some(),
+            "the ratified `ask` default must attach a preview spec: {output}"
+        );
+        assert!(
+            plan.first_index(plr_recovery::Phase::ResumePreview)
+                .is_some(),
+            "`ask` must add a ResumePreview step: {output}"
+        );
+        // The structural invariant: step iff spec, and the step sits after
+        // the shifted-frame declare (an abort during preview invalidates the
+        // frame).
+        assert!(plan.resume_preview_step_iff_spec());
+        let preview = plan.preview.as_ref().expect("preview spec");
+        assert!(
+            !preview.stops.is_empty(),
+            "the preview must carry the nudge domain: {output}"
+        );
+        // The reps are a non-empty subset of the stops (the navigation
+        // anchors the operator steps between), and the default index opens
+        // on `last` (the skip-forward dry-run anchor) — a valid stop index.
+        assert!(!preview.representatives.is_empty(), "{output}");
+        assert!(
+            (preview.default_index as usize) < preview.stops.len(),
+            "default index out of range: {output}"
+        );
+        // The routing was narrated as `ask` attaching the preview, not a
+        // headless automatic resume.
+        assert!(
+            output.contains("machine config from the [plr] section"),
+            "{output}"
+        );
     }
 
     #[cfg(unix)]
