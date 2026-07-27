@@ -1008,76 +1008,16 @@ mod tests {
         assert!(err_json.contains("NoMatch"));
     }
 
-    /// The `collect_candidates` extraction is a *faithful* refactor: the
-    /// candidate list and skipped count `match_stop_point` exposes on its
-    /// `Ok` results are exactly what the shared helper returns for the
-    /// same validated input. This is the pin that lets the ladder and the
-    /// preview builder share one evaluate path. (The full pre-existing
-    /// matcher suite above, run unchanged, is the companion proof that the
-    /// refactor left observable behavior identical.)
-    ///
-    /// Mutation proof: dropping the `candidates.sort_by` in
-    /// `collect_candidates` reorders its output while `match_stop_point`
-    /// keeps exposing the same list — but the *existing* ordering tests
-    /// (`e_interval_disambiguates_retraced_geometry`, ranked candidates)
-    /// bite; and mutating the loop (e.g. not counting `skipped_unknown`)
-    /// makes the equality below fail directly.
-    #[test]
-    fn collect_candidates_matches_the_ladder_input() {
-        use proptest::prelude::*;
-        use proptest::test_runner::{Config, FileFailurePersistence, TestRunner};
-
-        let m = model_of(
-            "G90\nM83\nG92 E0\nG1 Z0.2 F7200\n;TYPE:Sparse infill\n\
-             G1 X20 Y20 F9000\nG1 X40 Y20 E0.5 F3000\nG1 X20 Y20 F9000\nG1 X40 Y20 E0.5 F3000\n\
-             G1 E-0.8 F2100\nG1 Z0.6 F7200\nG1 X10 Y0 F9000\nG1 Z0.2 F7200\nG1 E0.8 F2100\n\
-             G3 X0 Y10 I-10 E2 F1800\nG1 Z0.4 F7200\nG1 X20 Y10 E1 F3000\n",
-        );
-        let strat = (
-            -10.0f64..60.0,
-            0.0f64..40.0,
-            -10.0f64..60.0,
-            0.0f64..40.0,
-            proptest::option::of(0.0f64..3.0),
-            proptest::collection::vec(0.0f64..0.7, 0..3),
-        );
-        let mut runner = TestRunner::new(Config {
-            cases: 256,
-            failure_persistence: Some(Box::new(FileFailurePersistence::Off)),
-            ..Config::default()
-        });
-        runner
-            .run(&strat, |(x0, w, y0, h, e_mid, zs)| {
-                let evidence = StopEvidence {
-                    x: Interval {
-                        min: x0,
-                        max: x0 + w,
-                    },
-                    y: Interval {
-                        min: y0,
-                        max: y0 + h,
-                    },
-                    e: e_mid.map(|c| Interval {
-                        min: c - 0.2,
-                        max: c + 0.2,
-                    }),
-                    z_candidates: zs,
-                    window: ByteWindow {
-                        start: 0,
-                        end: None,
-                    },
-                };
-                let config = MatchConfig::default();
-                // Only meaningful once the shared validation passes (both
-                // consumers validate before calling collect_candidates).
-                prop_assume!(validate(&evidence, &config).is_ok());
-                let (cands, skipped) = collect_candidates(&m, &evidence, &config);
-                if let Ok(result) = match_stop_point(&m, &evidence, &config) {
-                    prop_assert_eq!(&result.candidates, &cands);
-                    prop_assert_eq!(result.skipped_unknown, skipped);
-                }
-                Ok(())
-            })
-            .unwrap();
-    }
+    // NOTE on the `collect_candidates` extraction's faithfulness: there is
+    // deliberately no "collect_candidates == match_stop_point's candidates"
+    // test. Since `match_stop_point` now *calls* `collect_candidates` and
+    // exposes its result verbatim (`result.candidates`/`skipped_unknown`),
+    // such a test compares f(x) to itself — a tautology that survives real
+    // mutations (e.g. dropping the `skipped_unknown` increment breaks both
+    // sides equally). Faithfulness rests instead on two honest witnesses: the
+    // reviewed byte-for-byte diff showing the loop body was moved unchanged
+    // and the ladder left intact, and the full pre-existing matcher suite
+    // above running green unchanged (its ordering and skipped-count tests —
+    // e.g. `e_interval_disambiguates_retraced_geometry` — bite the same
+    // mutations directly).
 }

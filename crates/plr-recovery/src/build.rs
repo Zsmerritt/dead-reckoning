@@ -1012,8 +1012,11 @@ fn resolve_resume_from_offset(
     let mv = model
         .first_deposition_at_or_after(base)
         .ok_or(FallbackReason::NoResumeDeposition)?;
-    let xyz_known = mv.start_known[0] && mv.start_known[1] && mv.start_known[2];
-    if !xyz_known || !mv.start.iter().all(|v| v.is_finite()) {
+    // The trusted-position gate is the shared `SimMove::start_position_known`
+    // predicate (X/Y/Z known + all-finite start), the single predicate the
+    // preview builder also applies to its nudge domain and resume baking, so
+    // a line this resolver refuses preview can neither hover nor bake.
+    if !mv.start_position_known() {
         return Err(FallbackReason::ResumePositionUnknown);
     }
     let on_infill = mv

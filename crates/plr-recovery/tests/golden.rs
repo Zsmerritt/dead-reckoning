@@ -2113,6 +2113,97 @@ fn resume_policy_selects_first_mid_last() {
     }
 }
 
+/// Cross-crate byte-identity pin (MAJOR-2 / MINOR-1): the preview default
+/// cursor (`last_index`) and the `mid` anchor COMMIT exactly the resume
+/// `select_resume_target_with_policy` commits for `Last`/`Mid` — even when
+/// the max matcher candidate is a TRAVEL line the extrusion-only preview
+/// stop set cannot hold. The divergence the reviewer found is confined to
+/// these anchors; `select_resume_target_with_policy` itself stays
+/// byte-identical to the historical selector (pinned above).
+#[test]
+fn preview_anchors_match_recovery_policy_resume_byte_for_byte() {
+    use plr_analyzer::{
+        build_layer_model, build_preview, match_stop_point, ByteWindow, Interval, MatchConfig,
+        ModelConfig, PreviewBounds, PreviewOutcome, StopEvidence,
+    };
+
+    // Crash-during-wipe: the latest matcher candidate (T3) is a travel.
+    // A  (candidate ext):  X10Y10 -> X40Y10 crosses the box.
+    // B  (non-cand ext):   X40Y10 -> X40Y60 leaves the box.
+    // T1 (non-cand travel):X40Y60 -> X40Y10.
+    // T2 (candidate travel):X40Y10 -> X25Y10 ends in the box.
+    // T3 (candidate travel):X25Y10 -> X10Y40 starts in the box.
+    // C  (non-cand ext):   X10Y40 -> X10Y60.
+    let text = "G90\nM83\nG1 Z0.2 F7200\n;TYPE:Sparse infill\n\
+        G1 X10 Y10 F9000\n\
+        G1 X40 Y10 E0.5 F1800\n\
+        G1 X40 Y60 E0.5 F1800\n\
+        G1 X40 Y10 F9000\n\
+        G1 X25 Y10 F9000\n\
+        G1 X10 Y40 F9000\n\
+        G1 X10 Y60 E0.5 F1800\n";
+    let m = build_layer_model(
+        plr_gcode::GcodeState::new(),
+        text.as_bytes(),
+        0,
+        &ModelConfig::default(),
+    );
+    let evidence = StopEvidence {
+        x: Interval {
+            min: 24.0,
+            max: 26.0,
+        },
+        y: Interval {
+            min: 9.8,
+            max: 10.2,
+        },
+        e: None,
+        z_candidates: vec![],
+        window: ByteWindow {
+            start: 0,
+            end: None,
+        },
+    };
+    let cfg = MatchConfig::default();
+    let result = match_stop_point(&m, &evidence, &cfg).expect("match");
+    let MatchConfidence::AmbiguousWindow { offsets } = &result.confidence else {
+        panic!("expected AmbiguousWindow, got {:?}", result.confidence);
+    };
+    let a_off = text.find("G1 X40 Y10 E0.5").unwrap() as u64;
+    assert_ne!(
+        *offsets.iter().max().unwrap(),
+        a_off,
+        "the max candidate is a travel line, not the extrusion A"
+    );
+
+    let PreviewOutcome::Preview(set) =
+        build_preview(&m, &evidence, &cfg, None, &PreviewBounds::default())
+    else {
+        panic!("expected a preview");
+    };
+
+    // The load-bearing equalities: each anchor's committed resume equals the
+    // recovery policy's resume for that policy.
+    let last = select_resume_target_with_policy(&m, &result, ResumePolicy::Last).unwrap();
+    assert_eq!(
+        set.stops[set.last_index as usize].resume_offset, last.offset,
+        "default cursor commits select_resume_target_with_policy(Last)'s resume"
+    );
+    let mid = select_resume_target_with_policy(&m, &result, ResumePolicy::Mid).unwrap();
+    assert_eq!(
+        set.stops[set.mid_index as usize].resume_offset, mid.offset,
+        "mid anchor commits select_resume_target_with_policy(Mid)'s resume"
+    );
+    // Last is still byte-identical to the historical selector (skip-forward
+    // resume unchanged), and the previewed default stop is the PREDECESSOR of
+    // the resume line, not the max EXTRUSION candidate (the pre-fix bug).
+    assert_eq!(last, select_resume_target(&m, &result).unwrap());
+    assert!(
+        set.stops[set.last_index as usize].offset < last.offset,
+        "the default stop precedes the resume it commits"
+    );
+}
+
 #[test]
 fn itinerary_preflight_catches_a_corrupted_probe_site() {
     use plr_recovery::{preflight_itinerary, ItineraryBounds, PlanRejection, ViolationKind};

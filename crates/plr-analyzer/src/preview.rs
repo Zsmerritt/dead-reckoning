@@ -164,9 +164,20 @@ pub enum PreviewOutcome {
     /// Evidence is not a normal crash — the caller degrades to manual
     /// fallback, exactly as an over-coarse match does today.
     TooWide(PreviewRefusal),
-    /// No candidate stop exists to anchor a preview: either the window
-    /// held no (finite, non-excluded) extrusion move, or none of them
+    /// No candidate stop exists to anchor a preview: the window held no
+    /// trusted-position, non-excluded extrusion move, or none of them
     /// matched the evidence. The caller degrades to manual fallback.
+    ///
+    /// Note the **all-travel-candidates** case (a crash mid-wipe where every
+    /// matcher candidate is a travel line): the stop domain is
+    /// extrusion-only, so no stop is a candidate and this variant is
+    /// returned — yet the automatic resolver *does* resolve (it skips forward
+    /// from the max travel candidate to the next deposition). Increment 2's
+    /// routing must therefore take a `first`/`mid`/`last` policy through
+    /// `plr-recovery`'s `select_resume_target_with_policy` (which resolves
+    /// over the offset list) rather than reading a resume out of this
+    /// `NoStops` outcome. Refusing preview here is the safe direction (manual
+    /// fallback), not a resume regression.
     NoStops,
     /// Evidence or config was non-finite / inverted — the same rejection
     /// [`crate::matcher::match_stop_point`] makes, surfaced as a typed
@@ -339,29 +350,121 @@ pub fn build_preview(
         });
     }
 
-    // Which lines matched the evidence (seeds `is_candidate`).
+    // Which lines matched the evidence — the distinct candidate LINE
+    // offsets (matcher.rs dedups one candidate per source line, travels
+    // included). This seeds `is_candidate` AND the policy anchors, and is
+    // the *identical population* `plr-recovery`'s `select_offset` picks over
+    // (`AmbiguousWindow.offsets` is built the same way), so the anchors
+    // resolve byte-for-byte to the recovery policy resumes.
     let candidate_offsets: std::collections::BTreeSet<u64> =
         candidates.iter().map(|c| c.offset).collect();
 
-    // Build the kept stop list: extrusion moves that are finite (a
-    // non-finite hover target is never safe — mirror evaluate()'s guard)
-    // and not attributed to a cancelled object (§A.4).
+    // Build the kept stop list (nudge domain), then the navigation anchors.
+    let stops = build_stops(model, &raw_domain, &candidate_offsets, exclusions);
+    if stops.is_empty() {
+        return PreviewOutcome::NoStops;
+    }
+
+    // Representatives seed from candidate stops only (§A.3).
+    let candidate_stops: Vec<&PreviewStop> = stops.iter().filter(|s| s.is_candidate).collect();
+    if candidate_stops.is_empty() {
+        return PreviewOutcome::NoStops;
+    }
+    let rep_inputs: Vec<RepInput> = candidate_stops
+        .iter()
+        .map(|s| RepInput {
+            index: s.index,
+            xy: s.xy,
+            offset: s.offset,
+        })
+        .collect();
+    let representatives = representatives(&rep_inputs, PREVIEW_MAX_REPS);
+
+    // Policy anchors (design §3). Each is derived to COMMIT byte-for-byte the
+    // resume `plr-recovery`'s `select_resume_target_with_policy` commits for
+    // that policy: pick the policy's base offset over the candidate LINE
+    // offsets (min / lower-median / max — `select_offset`'s convention,
+    // travels included), resolve the resume from it exactly as the resolver
+    // does, then map to the stop whose *acceptance* commits that resume (the
+    // deposition whose next resumable line is it). Anchoring on the resume,
+    // not the stop offset, is what makes `last` equal today's skip-forward
+    // even when the max candidate is a travel line the extrusion-only stop set
+    // cannot hold (MAJOR-2), and `mid` the per-line median rather than a
+    // chord-duplicated one (MINOR-1).
+    let sorted_offsets: Vec<u64> = candidate_offsets.iter().copied().collect();
+    let first_index = anchor_index(
+        &stops,
+        model,
+        &sorted_offsets,
+        AnchorPolicy::First,
+        exclusions,
+    );
+    let mid_index = anchor_index(
+        &stops,
+        model,
+        &sorted_offsets,
+        AnchorPolicy::Mid,
+        exclusions,
+    );
+    let last_index = anchor_index(
+        &stops,
+        model,
+        &sorted_offsets,
+        AnchorPolicy::Last,
+        exclusions,
+    );
+
+    PreviewOutcome::Preview(PreviewSet {
+        stops,
+        representatives,
+        first_index,
+        mid_index,
+        last_index,
+    })
+}
+
+/// Build the kept stop list (the nudge domain) from the raw in-window
+/// extrusion moves. A move is a selectable (hoverable) stop only if its
+/// start position is trusted — [`SimMove::start_position_known`], the same
+/// predicate the resume resolver refuses on — so preview never hovers the
+/// nozzle at a G28-stale coordinate the analyzer itself flags unreliable.
+/// Cancelled-object moves are dropped (§A.4). Each stop's `resume_offset`
+/// is baked here (see the inline notes for the §A.2 / §A.4 / MAJOR-1 rules).
+fn build_stops(
+    model: &LayerModel,
+    raw_domain: &[&SimMove],
+    candidate_offsets: &std::collections::BTreeSet<u64>,
+    exclusions: Option<&dyn ExclusionOracle>,
+) -> Vec<PreviewStop> {
     let mut stops: Vec<PreviewStop> = Vec::new();
     for mv in raw_domain {
-        if !mv.start.iter().all(|v| v.is_finite()) {
+        if !mv.start_position_known() {
             continue;
         }
         if is_excluded_move(mv, exclusions) {
             continue;
         }
+        // §A.2: resume at the next deposition line. §A.4 (D9): skip cancelled
+        // objects. MAJOR-1: the next kept deposition must also be a *trusted*
+        // position, mirroring the resolver's `ResumePositionUnknown` refusal —
+        // a line the resolver would refuse is never baked as a resume target.
+        let resume_offset = match first_kept_deposition_at_or_after(model, mv.span.end, exclusions)
+        {
+            // The next kept deposition is resumable — resume there.
+            Some(m) if m.start_position_known() => m.span.start,
+            // The next kept deposition exists but its position is untrusted:
+            // the resolver would refuse it, so this stop has no valid resume.
+            // Drop the stop rather than bake a refused target (MAJOR-1).
+            Some(_) => continue,
+            // No kept deposition remains after this stop (all later deposition
+            // excluded, or none at all): the print is complete past here —
+            // resume "past the end" at `span.end` (design §A.2).
+            None => mv.span.end,
+        };
         let feature = feature_of(model, mv);
-        // §A.2: resume at the next deposition line. §A.4: that next line
-        // must not itself be a cancelled object, or an accepted stop would
-        // resume straight into cancelled debris (the D9 hazard the whole
-        // exclusion filter exists to close). With no oracle this is
-        // byte-identical to `first_deposition_at_or_after(span.end)`.
-        let resume_offset = first_kept_deposition_at_or_after(model, mv.span.end, exclusions)
-            .map_or(mv.span.end, |m| m.span.start);
+        // Contiguous 0.. index over kept stops; the domain is bounded by
+        // `PREVIEW_MAX_STOPS` (2000) far below `u32::MAX`, so the saturating
+        // conversion is defensive and unreachable.
         let index = u32::try_from(stops.len()).unwrap_or(u32::MAX);
         stops.push(PreviewStop {
             index,
@@ -378,35 +481,113 @@ pub fn build_preview(
             is_candidate: candidate_offsets.contains(&mv.span.start),
         });
     }
+    stops
+}
 
-    // Candidate stops anchor everything (endpoints, first/mid/last, reps).
-    let mut candidate_stops: Vec<&PreviewStop> = stops.iter().filter(|s| s.is_candidate).collect();
-    if candidate_stops.is_empty() {
-        return PreviewOutcome::NoStops;
+/// The three set-policy anchors, resolved consistently with
+/// `plr-recovery`'s `select_offset` / `select_resume_target_with_policy`.
+#[derive(Debug, Clone, Copy)]
+enum AnchorPolicy {
+    /// Minimum candidate line offset.
+    First,
+    /// Lower-median candidate line offset (`median_index`).
+    Mid,
+    /// Maximum candidate line offset — the skip-forward default cursor.
+    Last,
+}
+
+/// The stop index for a set-policy anchor over `sorted_offsets` (the
+/// ascending distinct candidate line offsets — `select_offset`'s exact
+/// population, travels included, non-empty at the call site). The two
+/// reviewer rulings need two different mappings:
+///
+/// - **`Last`** is the interactive default cursor and the safe skip-forward,
+///   so its *committed resume* must equal `select_resume_target_with_policy(
+///   Last)` byte-for-byte even when the max candidate is a travel the stop
+///   set cannot hold (MAJOR-2). It maps to the stop whose acceptance commits
+///   that resume — the deposition whose next resumable line is the resolver's
+///   resume from the max candidate offset. With no oracle over a trusted next
+///   line the resolved offset equals `resolve_resume_from_offset(max)`.
+///
+/// - **`First`/`Mid`** are "may-reprint" reference cursors; the ruling
+///   (MINOR-1) is that they select over the per-line population, so arc chords
+///   (many stops, one line) do not skew the median. They map to the stop AT
+///   the selected candidate LINE. Their committed resume is that stop's next
+///   line, one line short of the resolver's resume from the same base — the
+///   documented "may re-print" boundary, immaterial for these warned policies
+///   and impossible to close whenever the selected line's predecessor is a
+///   non-stop (an `ExtrudeOnly` prime, or the earliest deposition).
+fn anchor_index(
+    stops: &[PreviewStop],
+    model: &LayerModel,
+    sorted_offsets: &[u64],
+    policy: AnchorPolicy,
+    exclusions: Option<&dyn ExclusionOracle>,
+) -> u32 {
+    match policy {
+        AnchorPolicy::Last => {
+            let base = sorted_offsets[sorted_offsets.len() - 1];
+            // The resolver's resume from `base`: first kept, trusted
+            // deposition at/after it (== `resolve_resume_from_offset(base)`
+            // with no oracle over a trusted line — the byte-identity pin).
+            if let Some(m) = first_kept_deposition_at_or_after(model, base, exclusions) {
+                if m.start_position_known() {
+                    // The stop that commits that resume (its predecessor);
+                    // else the stop AT the resume line (resumes one line
+                    // later — still the skip-forward direction).
+                    if let Some(idx) = stop_resuming_at(stops, m.span.start) {
+                        return idx;
+                    }
+                    if let Some(idx) = stop_at_offset(stops, m.span.start) {
+                        return idx;
+                    }
+                }
+            }
+            nearest_stop_at_or_before(stops, base)
+        }
+        AnchorPolicy::First | AnchorPolicy::Mid => {
+            let base = match policy {
+                AnchorPolicy::First => sorted_offsets[0],
+                _ => sorted_offsets[median_index(sorted_offsets.len())],
+            };
+            // The stop AT the selected candidate line (last chord if the line
+            // is an arc). If that line is a travel / extrude-only candidate
+            // with no stop, the nearest stop at or before it.
+            stop_at_offset(stops, base).unwrap_or_else(|| nearest_stop_at_or_before(stops, base))
+        }
     }
-    // Order candidate stops by (offset, index) for the policy anchors.
-    candidate_stops.sort_by_key(|s| (s.offset, s.index));
-    let first_index = candidate_stops[0].index;
-    let last_index = candidate_stops[candidate_stops.len() - 1].index;
-    let mid_index = candidate_stops[median_index(candidate_stops.len())].index;
+}
 
-    let rep_inputs: Vec<RepInput> = candidate_stops
+/// The stop whose baked `resume_offset` equals `resume` — the "last printed
+/// line" a resume at `resume` implies (its next resumable deposition is
+/// `resume`). Highest index among ties (arc chords sharing one source line),
+/// so the last chord wins. `None` when `resume` has no predecessor stop.
+fn stop_resuming_at(stops: &[PreviewStop], resume: u64) -> Option<u32> {
+    stops
         .iter()
-        .map(|s| RepInput {
-            index: s.index,
-            xy: s.xy,
-            offset: s.offset,
-        })
-        .collect();
-    let representatives = representatives(&rep_inputs, PREVIEW_MAX_REPS);
+        .rev()
+        .find(|s| s.resume_offset == resume)
+        .map(|s| s.index)
+}
 
-    PreviewOutcome::Preview(PreviewSet {
-        stops,
-        representatives,
-        first_index,
-        mid_index,
-        last_index,
-    })
+/// The stop AT `offset` (highest index among arc chords sharing the line),
+/// or `None` when no stop starts there (a travel / extrude-only line).
+fn stop_at_offset(stops: &[PreviewStop], offset: u64) -> Option<u32> {
+    stops
+        .iter()
+        .rev()
+        .find(|s| s.offset == offset)
+        .map(|s| s.index)
+}
+
+/// The last stop at or before `offset` (highest `(offset, index)`), or the
+/// earliest stop when none is — always a valid index over a non-empty set.
+fn nearest_stop_at_or_before(stops: &[PreviewStop], offset: u64) -> u32 {
+    stops
+        .iter()
+        .filter(|s| s.offset <= offset)
+        .max_by_key(|s| (s.offset, s.index))
+        .map_or(stops[0].index, |s| s.index)
 }
 
 /// The first depositing move at or after `offset` that is **not**
@@ -414,6 +595,13 @@ pub fn build_preview(
 /// [`LayerModel::first_deposition_at_or_after`]. Identical to it when
 /// `exclusions` is `None`. Used to bake a stop's `resume_offset` so an
 /// accepted resume never targets a cancelled line (§A.4).
+///
+/// Trusted-position admissibility (the resolver's `ResumePositionUnknown`
+/// gate) is applied by the *callers* to this function's result, not here:
+/// exclusion-skip is preview's own D9 addition, while the known-position
+/// gate mirrors the resolver, which refuses (does not skip past) an
+/// untrusted line — keeping the two concerns and their two skip/refuse
+/// semantics distinct.
 fn first_kept_deposition_at_or_after<'a>(
     model: &'a LayerModel,
     offset: u64,
@@ -508,11 +696,64 @@ mod tests {
         // than candidates); the three retraced extrusions are candidates.
         let candidate_count = set.stops.iter().filter(|s| s.is_candidate).count();
         assert_eq!(candidate_count, 3, "three retraced extrusions match");
-        // first/mid/last are candidate stops.
+        // Policy anchors are valid indices. `last` COMMITS today's
+        // skip-forward resume byte-for-byte (resume-mapped). `mid`/`first`
+        // SELECT over the per-line candidate population and land on the stop
+        // AT that line (here every candidate line is an extrusion stop).
+        let cfg = MatchConfig::default();
         for idx in [set.first_index, set.mid_index, set.last_index] {
-            assert!(set.stops[idx as usize].is_candidate);
+            assert!((idx as usize) < set.stops.len());
         }
-        assert!(set.first_index <= set.last_index);
+        assert_eq!(
+            set.stops[set.last_index as usize].resume_offset,
+            expected_policy_resume(&m, &ambig_evidence(), &cfg, AnchorPolicy::Last),
+            "last commits the resolver's skip-forward resume"
+        );
+        assert_eq!(
+            set.stops[set.mid_index as usize].offset,
+            candidate_line_base(&m, &ambig_evidence(), &cfg, AnchorPolicy::Mid),
+            "mid selects the per-line median candidate line"
+        );
+        assert_eq!(
+            set.stops[set.first_index as usize].offset,
+            candidate_line_base(&m, &ambig_evidence(), &cfg, AnchorPolicy::First),
+            "first selects the min candidate line"
+        );
+    }
+
+    /// The policy's base offset over the matcher's distinct candidate LINE
+    /// offsets (no oracle): min / lower-median / max — `select_offset`'s
+    /// population and convention.
+    fn candidate_line_base(
+        m: &LayerModel,
+        ev: &StopEvidence,
+        cfg: &MatchConfig,
+        which: AnchorPolicy,
+    ) -> u64 {
+        let (cands, _) = collect_candidates(m, ev, cfg);
+        let mut offs: Vec<u64> = cands.iter().map(|c| c.offset).collect();
+        offs.sort_unstable();
+        offs.dedup();
+        match which {
+            AnchorPolicy::First => offs[0],
+            AnchorPolicy::Mid => offs[median_index(offs.len())],
+            AnchorPolicy::Last => offs[offs.len() - 1],
+        }
+    }
+
+    /// [`candidate_line_base`] resolved to the resume the resolver would
+    /// commit (`first_deposition_at_or_after(base)`) — what the `last`
+    /// anchor's stop must commit as its `resume_offset`.
+    fn expected_policy_resume(
+        m: &LayerModel,
+        ev: &StopEvidence,
+        cfg: &MatchConfig,
+        which: AnchorPolicy,
+    ) -> u64 {
+        m.first_deposition_at_or_after(candidate_line_base(m, ev, cfg, which))
+            .expect("a deposition at/after a candidate offset")
+            .span
+            .start
     }
 
     #[test]
@@ -873,11 +1114,16 @@ mod tests {
     }
 
     #[test]
-    fn last_index_offset_equals_the_matchers_max_candidate() {
-        // The mutation-target pin: last_index selects the maximum-offset
-        // candidate stop, which is the offset today's skip-forward
-        // (AmbiguousWindow -> offsets.max()) is built from. Computed
-        // independently from match_stop_point, not from build_preview.
+    fn last_index_resume_equals_todays_skip_forward() {
+        // The mutation-target pin (MAJOR-2 hardened): the DEFAULT cursor's
+        // COMMITTED RESUME equals today's skip-forward resume —
+        // first_deposition_at_or_after(max candidate offset) — computed
+        // independently from match_stop_point. The pin is on the resume, not
+        // on the max extrusion STOP offset (the pre-fix bug): anchoring on
+        // the stop offset diverges the moment the max candidate is a travel
+        // line the extrusion-only stop set cannot hold. See the golden
+        // cross-crate travel-max pin for that shape; here AMBIG is
+        // all-extrusion but still catches the off-by-one the old pin missed.
         let m = model_of(AMBIG);
         let ev = ambig_evidence();
         let result = match_stop_point(&m, &ev, &MatchConfig::default()).expect("match");
@@ -885,6 +1131,11 @@ mod tests {
             panic!("expected an ambiguous window, got {:?}", result.confidence);
         };
         let expected_max = *offsets.iter().max().expect("non-empty");
+        let today_resume = m
+            .first_deposition_at_or_after(expected_max)
+            .expect("a deposition at/after the max candidate")
+            .span
+            .start;
         let PreviewOutcome::Preview(set) = build_preview(
             &m,
             &ev,
@@ -895,13 +1146,25 @@ mod tests {
             panic!("expected a preview");
         };
         assert_eq!(
-            set.stops[set.last_index as usize].offset, expected_max,
-            "last_index must point at the max-offset candidate stop"
+            set.stops[set.last_index as usize].resume_offset, today_resume,
+            "default cursor must commit today's skip-forward resume"
         );
-        // Mutation proof: had last_index used the MIN candidate, this
-        // would be the first extrusion offset, which differs.
+        // Mutation proof: the pre-fix last_index (max extrusion STOP) baked
+        // the deposition AFTER that stop as its resume — here `span.end`,
+        // which differs from `today_resume` (the max candidate line itself).
+        let last_stop = &set.stops[set.last_index as usize];
+        assert_ne!(
+            last_stop.offset, today_resume,
+            "the default cursor stop is the predecessor of the resume, not the resume line"
+        );
+        // And the resume differs from the min-candidate resume, so the pin
+        // can bite a selector that picked the wrong end.
         let min_off = *offsets.iter().min().expect("non-empty");
-        assert_ne!(expected_max, min_off, "min and max differ (pin can bite)");
+        let min_resume = m.first_deposition_at_or_after(min_off).unwrap().span.start;
+        assert_ne!(
+            today_resume, min_resume,
+            "min and max resumes differ (pin bites)"
+        );
     }
 
     fn text_offset(text: &str, needle: &str, nth: usize) -> u64 {
@@ -987,8 +1250,13 @@ mod tests {
 
     #[test]
     fn preview_invariants_hold_over_generated_evidence() {
-        // reps ⊆ stops; endpoints ∈ reps; |reps| ≤ 7; first/mid/last are
-        // candidate stops within range (design §10).
+        // reps ⊆ candidate stops; endpoints ∈ reps; |reps| ≤ 7; first/mid/
+        // last are valid indices (design §10). Resume byte-identity of the
+        // mid/last anchors is pinned by the deterministic tests below and the
+        // golden cross-crate pins, not here — over generated evidence a
+        // candidate set can collapse to the earliest deposition, where an
+        // accept-at-next cursor cannot represent "resume at the first line",
+        // so a blanket resume-equality assertion would be false.
         use proptest::prelude::*;
         use proptest::test_runner::{Config, FileFailurePersistence, TestRunner};
 
@@ -1034,13 +1302,12 @@ mod tests {
                         let hi = cands.iter().max_by_key(|s| (s.offset, s.index)).unwrap();
                         prop_assert!(set.representatives.contains(&lo.index));
                         prop_assert!(set.representatives.contains(&hi.index));
-                        // Policy anchors are candidate stops in range.
+                        // Policy anchors are valid stop indices (no longer
+                        // required to be candidate stops — they anchor on the
+                        // resume, not the offset).
                         for i in [set.first_index, set.mid_index, set.last_index] {
                             prop_assert!(i < n);
-                            prop_assert!(set.stops[i as usize].is_candidate);
                         }
-                        prop_assert_eq!(set.stops[set.first_index as usize].offset, lo.offset);
-                        prop_assert_eq!(set.stops[set.last_index as usize].offset, hi.offset);
                     }
                     Ok(())
                 },

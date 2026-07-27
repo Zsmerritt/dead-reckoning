@@ -201,6 +201,32 @@ impl SimMove {
     pub fn e_delta(&self) -> f64 {
         self.end[3] - self.start[3]
     }
+
+    /// True when this move's **start** position is trustworthy as a resume
+    /// or hover target: X, Y and Z are position-known (not a G28-stale
+    /// value the model kept but does not trust — see [`Self::start_known`])
+    /// **and** every start coordinate is finite.
+    ///
+    /// This is the *single* predicate behind both consumers that must
+    /// refuse an untrustworthy position: the resume-target resolver
+    /// (`plr_recovery`'s `resolve_resume_from_offset`, whose historical
+    /// inline check this replaces byte-for-byte —
+    /// `start_known[0..3]` all set and `start` all finite → else
+    /// `ResumePositionUnknown`) and the preview nudge domain / resume
+    /// baking (`crate::preview::build_preview`). Exposing it here means a
+    /// line one of them refuses the other cannot offer as a hover stop or
+    /// bake as a resume — the ninth-corollary "one predicate, two
+    /// consumers" the design's §A.1 requires. Post-G28 the model keeps
+    /// *finite* stale positions with `start_known == false`, so an
+    /// `is_finite()` check alone (what preview used before) is not enough;
+    /// the known flags are the load-bearing part.
+    #[must_use]
+    pub fn start_position_known(&self) -> bool {
+        self.start_known[0]
+            && self.start_known[1]
+            && self.start_known[2]
+            && self.start.iter().all(|v| v.is_finite())
+    }
 }
 
 /// One XY extrusion segment of a typed path (chord geometry only —

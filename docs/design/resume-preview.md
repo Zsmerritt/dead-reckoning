@@ -697,3 +697,15 @@ over the socket, after 3 the dialog UX lands.
 - The pre-existing `exclude_objects: &[]` gap (`pipeline.rs:625`) means preview's
   exclusion filter is inert until that is wired; until then it conservatively keeps
   all non-attributable stops (safe direction).
+- **Arc-chord nudge UX (increment 2/3).** A `G2`/`G3` arc decomposes into many
+  `SimMove` chords that all share the one source line's byte span, so the arc line
+  contributes several adjacent `PreviewStop`s at the *same* `offset` but different
+  hover XY. A ±1 nudge that steps between two chords of the same arc therefore moves
+  the hover point along the curve while the `offset`/`Line:` readout does **not**
+  change — the operator sees the nozzle-target coordinate shift but the byte offset
+  hold. Increment 2's prompt must show the per-chord hover XY (not only the offset)
+  so within-arc nudges give visible feedback, and increment 3's renderer must not
+  treat "offset unchanged" as "nudge had no effect." (Increment 1 note: the
+  first/mid/last anchors and the `last_index` skip-forward pin are unaffected — they
+  resolve on the committed *resume* offset, and `stop_resuming_at` breaks same-offset
+  ties toward the last chord.)
