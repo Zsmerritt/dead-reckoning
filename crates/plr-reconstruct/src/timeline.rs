@@ -116,6 +116,15 @@ pub enum IngestNote {
         /// Host-monotonic time the idle regime began (ns).
         mono_ns: u64,
     },
+    /// A GPIO edge signalled that the DC rail began failing at this
+    /// host-monotonic time ([`plr_wal::MarkerKind::PowerFailing`]). See
+    /// [`WalTimeline::power_failing_tail`] for what a *tail* occurrence
+    /// licenses; a non-tail one (motion follows it) is a spurious edge and
+    /// this note is the only trace it leaves.
+    PowerFailing {
+        /// Host-monotonic time the power-fail edge was journaled (ns).
+        mono_ns: u64,
+    },
     /// A marker written by a newer format revision was preserved as
     /// opaque and ignored.
     UnknownMarker {
@@ -206,6 +215,53 @@ pub struct WalTimeline {
 }
 
 impl WalTimeline {
+    /// `mono_ns` of a **tail** [`MarkerKind::PowerFailing`] — a
+    /// hold-up-backed GPIO power-fail edge with no motion recorded after
+    /// it — or `None`.
+    ///
+    /// This is the exact-T fact the rest of the reconstruction is built to
+    /// infer indirectly: the physical cut lies in
+    /// `[t, t + hold_up_margin]` on the host-monotonic axis, where `t` is
+    /// the returned value. The marker time is a *lower* bound on the cut
+    /// (power was still up when it was journaled, so motion can continue
+    /// for the hold-up margin afterward), so it can only ever tighten an
+    /// *upper* bound on the stop, never exclude the true stop. The frontier
+    /// cap ([`crate::stopset::compute_stop_set`]) consumes it as an
+    /// independent, tighter upper bound on `t_cut`; classification
+    /// ([`crate::window`]) reads it as decisive power-loss evidence.
+    ///
+    /// # Tail semantics, and why a spurious edge is dropped
+    ///
+    /// A `PowerFailing` marker counts only when **no motion record
+    /// postdates it** — the same "tail marker" rule
+    /// [`recorder_stopped_tail`](Self::recorder_stopped_tail) uses, applied
+    /// here on the monotonic axis: the marker qualifies iff its `mono_ns`
+    /// is at or after the newest motion record's
+    /// ([`last_motion_mono_ns`](Self::last_motion_mono_ns)). An EMI blip
+    /// that passes the watcher's debounce and journals a false marker while
+    /// the machine keeps printing leaves motion with a *later* `mono_ns`,
+    /// so this returns `None` and the false marker is discarded — it can
+    /// never narrow the window. The [`IngestNote::PowerFailing`] note still
+    /// records that the edge fired, so a spurious signal is visible in
+    /// `plrd scan` without being load-bearing.
+    ///
+    /// # Why a method, not a field
+    ///
+    /// [`WalTimeline`] exposes public fields and is struct-literal
+    /// constructed outside this crate, so adding a field would be a
+    /// breaking change; the value is derived on demand from the markers and
+    /// the newest-motion timestamp instead, both of which ingest already
+    /// stores.
+    #[must_use]
+    pub fn power_failing_tail(&self) -> Option<u64> {
+        self.markers
+            .iter()
+            .filter(|m| m.kind == MarkerKind::PowerFailing)
+            .map(|m| m.mono_ns)
+            .filter(|&mono| self.last_motion_mono_ns.is_none_or(|last| mono >= last))
+            .max()
+    }
+
     /// End of durable trapq knowledge: the maximum segment end time
     /// across the toolhead and extruder queues, or `None` when no finite
     /// segment exists. Rows are journaled as Klipper *plans* moves
@@ -332,6 +388,19 @@ pub fn ingest(scan: &RecoveryScan, heartbeat: Option<&HeartbeatRecovery>) -> Wal
                     // reconstruction verdict — see `IngestNote::RecordingQuiescent`.
                     MarkerKind::RecordingQuiescent => {
                         notes.push(IngestNote::RecordingQuiescent {
+                            mono_ns: marker.mono_ns,
+                        });
+                    }
+                    // Recorded here; promoted to `power_failing_tail` below
+                    // only if no motion follows it (a spurious edge with
+                    // motion after is discarded — see the field docs).
+                    // Noted here; whether it counts as a *tail* fact is
+                    // derived on demand by `WalTimeline::power_failing_tail`
+                    // (it must be a method, not a field — `WalTimeline` has
+                    // public fields and out-of-crate struct literals, so a
+                    // new field would be a breaking change).
+                    MarkerKind::PowerFailing => {
+                        notes.push(IngestNote::PowerFailing {
                             mono_ns: marker.mono_ns,
                         });
                     }
@@ -656,6 +725,58 @@ mod tests {
         let timeline = ingest(&both, None);
         assert_eq!(timeline.socket_lost_tail, Some(8));
         assert_eq!(timeline.recorder_stopped_tail, Some(9));
+    }
+
+    /// A genuine tail `PowerFailing` marker (no motion after it) is the
+    /// exact-T fact; a spurious one (motion postdates it) is dropped as
+    /// a tail fact but still noted. This is the honest-wide-never-narrow
+    /// property the reviewer named.
+    #[test]
+    fn power_failing_tail_is_a_tail_fact_and_a_spurious_edge_is_dropped() {
+        // Genuine: edge at mono 9, newest motion at mono 1 → tail.
+        let genuine = scan_of(vec![
+            WalRecord::TrapqSegment(trapq_segment("toolhead", 1.0, 0.5, 1)),
+            marker(9, MarkerKind::PowerFailing),
+        ]);
+        let timeline = ingest(&genuine, None);
+        assert_eq!(timeline.power_failing_tail(), Some(9));
+        // It is a data-quality NOTE regardless, so a spurious one is still
+        // visible in `plrd scan`.
+        assert!(timeline
+            .notes
+            .iter()
+            .any(|n| matches!(n, IngestNote::PowerFailing { mono_ns: 9 })));
+        // ...and it is not a clean shutdown.
+        assert!(!timeline.clean_shutdown);
+
+        // Spurious: an EMI blip journals the marker at mono 5, then the
+        // machine keeps printing (motion at mono 10). Motion postdates the
+        // marker, so it is NOT a tail fact — dropped, never narrowing.
+        let spurious = scan_of(vec![
+            marker(5, MarkerKind::PowerFailing),
+            WalRecord::TrapqSegment(trapq_segment("toolhead", 2.0, 0.5, 10)),
+        ]);
+        let timeline = ingest(&spurious, None);
+        assert_eq!(
+            timeline.power_failing_tail(),
+            None,
+            "a false marker with motion after it must not be a tail fact"
+        );
+        // But the edge is still noted (the contradiction is visible).
+        assert!(timeline
+            .notes
+            .iter()
+            .any(|n| matches!(n, IngestNote::PowerFailing { mono_ns: 5 })));
+
+        // No motion at all: an edge at mono 9 is still a tail fact.
+        let no_motion = scan_of(vec![marker(9, MarkerKind::PowerFailing)]);
+        assert_eq!(ingest(&no_motion, None).power_failing_tail(), Some(9));
+
+        // No power-fail marker: None.
+        let none = scan_of(vec![WalRecord::TrapqSegment(trapq_segment(
+            "toolhead", 1.0, 0.5, 1,
+        ))]);
+        assert_eq!(ingest(&none, None).power_failing_tail(), None);
     }
 
     #[test]

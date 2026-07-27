@@ -427,6 +427,30 @@ fn classify(
             evidence: ShutdownEvidence::SocketLostMarker { mono_ns },
         };
     }
+    // A tail power-fail GPIO edge is the cause of death itself, so it is
+    // decisive power-loss evidence and overrides the quiet-tail
+    // *inference* below. Without this, a power cut during a long dwell
+    // (motion stopped seconds ago, heartbeats kept beating until the edge)
+    // would satisfy `quiet_ns > quiet_tail_ns` and be misread as a
+    // power-*retained* klippy/MCU shutdown — the wrong cause, and the wrong
+    // downstream policy for a bed that was in fact losing power. It is
+    // placed AFTER the socket-loss marker on purpose: a dropped API socket
+    // is an earlier, more specific story (the recorder outlived klippy),
+    // and the power-fail edge does not contradict it. The resulting class
+    // is the ordinary `HostDeathOrPowerLoss`, which runs the full forward
+    // extension, so this only ever corrects a classification — it never
+    // narrows the stop set. `CrashClass` is deliberately left unchanged
+    // (it is matched exhaustively outside this crate); the exact-T fact is
+    // carried into the *window arithmetic* by the frontier cap
+    // (`crate::stopset`), not by a new class.
+    if timeline.power_failing_tail().is_some() {
+        return CrashClass::HostDeathOrPowerLoss {
+            torn_tail: matches!(
+                timeline.scan_end,
+                ScanEnd::TruncatedFrameHeader | ScanEnd::TruncatedPayload
+            ),
+        };
+    }
     if let Some(last_motion) = timeline.last_motion_mono_ns {
         let quiet_ns = heartbeat_mono_ns.saturating_sub(last_motion);
         if quiet_ns > config.quiet_tail_ns {
@@ -676,6 +700,49 @@ mod tests {
                     quiet_ns: 4_000_000_000
                 }
             }
+        );
+    }
+
+    #[test]
+    fn a_tail_power_fail_marker_overrides_the_quiet_tail_inference() {
+        // The exact scenario `power_loss_during_long_dwell_classifies_quiet`
+        // documents as an ambiguity — motion stopped 4 s before the newest
+        // heartbeat — but now with a hold-up GPIO edge at the tail. The
+        // quiet-tail INFERENCE would say "power retained"; the edge is the
+        // cause of death itself and forces the honest HostDeathOrPowerLoss.
+        let timeline = ingest_records(vec![
+            WalRecord::TrapqSegment(trapq_segment("toolhead", 9.0, 0.5, 1_000_000_000)),
+            WalRecord::Heartbeat(heartbeat_at(5_000_000_000, 10.0)),
+            WalRecord::Marker(Marker {
+                mono_ns: 5_100_000_000,
+                kind: MarkerKind::PowerFailing,
+            }),
+        ]);
+        let window = compute_stop_window(&timeline, None, &cfg()).unwrap();
+        assert_eq!(
+            window.class,
+            CrashClass::HostDeathOrPowerLoss { torn_tail: false },
+            "a tail power-fail edge is decisive power-loss evidence"
+        );
+    }
+
+    #[test]
+    fn a_spurious_power_fail_marker_does_not_change_classification() {
+        // A false edge mid-print (motion postdates it) is not a tail fact,
+        // so classification is exactly what it would be without the marker:
+        // here, an ordinary HostDeathOrPowerLoss (motion is recent).
+        let timeline = ingest_records(vec![
+            WalRecord::Marker(Marker {
+                mono_ns: 1_050_000_000,
+                kind: MarkerKind::PowerFailing,
+            }),
+            WalRecord::TrapqSegment(trapq_segment("toolhead", 9.0, 0.5, 1_100_000_000)),
+            WalRecord::Heartbeat(heartbeat_at(1_200_000_000, 10.0)),
+        ]);
+        let window = compute_stop_window(&timeline, None, &cfg()).unwrap();
+        assert_eq!(
+            window.class,
+            CrashClass::HostDeathOrPowerLoss { torn_tail: false }
         );
     }
 

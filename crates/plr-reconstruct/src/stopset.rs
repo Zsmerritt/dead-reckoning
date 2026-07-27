@@ -281,6 +281,21 @@
 //! because a useless-but-sound cap on a sparse legacy stream beats an
 //! unsound one.**
 //!
+//! **The power-fail exact-T term (independent, tighter).** When the crash
+//! epoch's tail carries a [`plr_wal::MarkerKind::PowerFailing`] edge with
+//! no motion after it ([`WalTimeline::power_failing_tail`]), the cut is
+//! bounded *directly*: `t_cut <= edge_print_time +
+//! POWER_FAIL_HOLD_UP_MARGIN_S`, the moment power began failing plus the
+//! admitted hold-up overshoot. This yields a second sound upper bound on
+//! `Δt = t_cut - t_ctx`, and the cap takes `min(priced Δt, power-fail Δt)`
+//! — sound because the minimum of two upper bounds is an upper bound, and
+//! decisive because the edge replaces the entire inferred tail chain
+//! (spacing + durability + draws + the un-priced terminal-stall residual)
+//! with the cause of death itself. It is applied only where the priced cap
+//! already holds (below); letting it survive a broken heartbeat tail or an
+//! observation gap on its own — it depends on neither — is a deliberately
+//! deferred follow-up, not built on this branch.
+//!
 //! **When the cap does not apply (guards; falls back to extension-only).**
 //! If any premise fails the cap is `None` and the high end is the extension
 //! resume offset alone:
@@ -333,6 +348,29 @@ use crate::window::{is_observation_gap, ns_to_s, StopWindow};
 /// understating the sample age cannot make the cap tight. See the
 /// module-level "Frontier cap".
 const SUBSCRIPTION_REFRESH_S: f64 = 0.25;
+
+/// Conservative hold-up margin, seconds: how long motion may keep
+/// executing *after* a [`plr_wal::MarkerKind::PowerFailing`] edge before
+/// the 24 V rail actually browns out and the MCU/heaters die.
+///
+/// The edge fires when power *begins* failing, so the physical cut is a
+/// print time `>= edge`; this margin is the admitted upper bound on how
+/// far past the edge the machine can still have moved (the DC-rail-fed
+/// hold-up module keeps the Pi alive `>= 1 s`, and the watcher's debounce
+/// re-read — a few ms — is dwarfed by it and folded in here). Used by the
+/// frontier cap: the cut is at most `edge_print_time + this`, an
+/// **independent, tighter** upper bound on `t_cut` than the priced
+/// `Δt_tail` chain. **Widening is safe**: a larger value only loosens the
+/// cap (never excludes the true stop), so it is set generously rather than
+/// tuned; 1.0 s comfortably covers observed rail-collapse behaviour while
+/// still trimming multiple seconds off the extension-only high end.
+///
+/// A `const`, not a config knob, deliberately: the brief calls for "a
+/// conservative hold-up margin constant, documented", and a single audited
+/// value avoids widening `ReconstructConfig` (a public, struct-literal-
+/// constructed type) for a bound whose only safe direction is "large
+/// enough".
+pub(crate) const POWER_FAIL_HOLD_UP_MARGIN_S: f64 = 1.0;
 
 /// A closed interval `[lo, hi]` (mm or mm-of-filament).
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -1296,6 +1334,26 @@ fn frontier_cap_offset(
     if !dt.is_finite() {
         return None;
     }
+    // Independent, tighter bound from a tail power-fail edge (exact-T). The
+    // cut is at most `edge_print_time + POWER_FAIL_HOLD_UP_MARGIN_S`, so
+    // `t_cut - t_ctx <= (edge_pt + margin) - anchor_pt`. Both this and the
+    // priced `Δt` above are sound upper bounds on `t_cut - t_ctx`, so their
+    // `min` is still a sound upper bound — it can only ever narrow the cap
+    // in the safe (containment-preserving) direction, and does so
+    // decisively because the marker replaces the whole inferred tail chain
+    // with the moment power actually began failing.
+    //
+    // Scope note (minimal, this branch): the power-fail bound is applied
+    // here, *after* the cap's existing premises (guards 1-3) have held, so
+    // it tightens an already-applicable cap rather than reviving one the
+    // guards refused. Making the power-fail bound survive a broken
+    // heartbeat tail or an observation gap on its own — it does not depend
+    // on either — is the deferred "exact mode" the brief holds for a
+    // follow-up; it is not built here.
+    let dt = match power_fail_dt(timeline, window, anchor_pt) {
+        Some(pf) => dt.min(pf),
+        None => dt,
+    };
 
     // Simulate forward from the frontier for `Δt` seconds. `simulate`'s
     // per-line timing is a lower bound on real durations, so it consumes at
@@ -1320,6 +1378,24 @@ fn frontier_cap_offset(
         .get(sim.lines_consumed)
         .map_or(tail_end, |l| l.span.end);
     Some(raw.max(slacked).min(tail_end))
+}
+
+/// The `Δt` upper bound implied by a **tail** power-fail edge, or `None`
+/// when there is none or it cannot be placed on the print-time axis.
+///
+/// A [`WalTimeline::power_failing_tail`] at host-monotonic `edge` maps to
+/// print time `edge_pt`; the physical cut is at most
+/// `edge_pt + POWER_FAIL_HOLD_UP_MARGIN_S` (the edge is a *lower* bound on
+/// the cut, the margin the admitted overshoot). Subtracting the anchor's
+/// print time gives an upper bound on `t_cut - t_ctx` = `Δt`. Clamped at 0
+/// (an edge that maps before the anchor means the cut is essentially at
+/// the frontier; the frontier + one line of skew still applies downstream)
+/// and required finite.
+fn power_fail_dt(timeline: &WalTimeline, window: &StopWindow, anchor_pt: f64) -> Option<f64> {
+    let edge = timeline.power_failing_tail()?;
+    let edge_pt = window.mono_ns_to_print_time(edge)?;
+    let dt = (edge_pt + POWER_FAIL_HOLD_UP_MARGIN_S) - anchor_pt;
+    dt.is_finite().then(|| dt.max(0.0))
 }
 
 /// The heartbeat tail's observed spacing, in nanoseconds — the widest gap
@@ -2887,6 +2963,71 @@ mod tests {
         assert_eq!(fw.end, cap, "the window high end must be the cap");
         assert!(fw.end < text.len() as u64, "cap must not reach EOF here");
         assert!(fw.start <= fw.end);
+    }
+
+    /// A tail power-fail edge collapses the window further through the
+    /// existing frontier-cap path: the same fixture, plus a
+    /// `PowerFailing` marker whose print time is ~`t_a`, produces a
+    /// strictly smaller cap (the exact-T bound `edge_pt + 1.0` undercuts
+    /// the priced `Δt`). A spurious marker (motion after it) changes
+    /// nothing. This is requirement 4's window collapse and the
+    /// honest-wide-never-narrow property in one place.
+    #[test]
+    fn a_tail_power_fail_edge_tightens_the_frontier_cap() {
+        let text = long_x_march();
+        let base = || {
+            base_records(
+                10.0,
+                10.1,
+                vec![WalRecord::Context(context_with_gcode(
+                    10_000_000_000,
+                    0,
+                    march_gcode(),
+                ))],
+            )
+        };
+        let tail = FileTail {
+            base_offset: 0,
+            bytes: text.as_bytes(),
+        };
+        let cap_of = |records: Vec<WalRecord>| -> u64 {
+            let timeline = ingest_records(records);
+            let window = compute_stop_window(&timeline, None, &cfg()).unwrap();
+            let set = compute_stop_set(&timeline, &window, Some(&tail), &cfg()).unwrap();
+            set.file_window.unwrap().end
+        };
+
+        let plain = cap_of(base());
+
+        // Genuine tail edge at mono 10.2 s (after the stepper at 10.1 s):
+        // maps to print time ~10.2, so the exact-T bound is ~11.2 - 10.0 =
+        // ~1.2 s, well under the priced Δt.
+        let mut with_edge = base();
+        with_edge.push(WalRecord::Marker(Marker {
+            mono_ns: 10_200_000_000,
+            kind: MarkerKind::PowerFailing,
+        }));
+        let capped = cap_of(with_edge);
+        assert!(
+            capped < plain,
+            "the power-fail edge must tighten the cap: {capped} !< {plain}"
+        );
+
+        // Spurious edge BEFORE the motion (mono 5 s < stepper 10.1 s): not
+        // a tail fact, so the cap is exactly the plain one — never narrower.
+        let mut spurious = base();
+        spurious.insert(
+            0,
+            WalRecord::Marker(Marker {
+                mono_ns: 5_000_000_000,
+                kind: MarkerKind::PowerFailing,
+            }),
+        );
+        assert_eq!(
+            cap_of(spurious),
+            plain,
+            "a spurious (non-tail) edge must not narrow the window"
+        );
     }
 
     #[test]
