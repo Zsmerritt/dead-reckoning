@@ -185,9 +185,136 @@
 //! leads execution by up to `max_processing_lead` (Klipper's lookahead
 //! buffering plus step-generation lead). The candidate window is
 //! therefore `[frontier recorded at or before t_a - max_processing_lead,
-//! extension resume offset]`: the low end is the newest frontier old
-//! enough that execution had certainly passed it by `t_a`; the high end
-//! is where the simulated extension stopped consuming.
+//! min(extension resume offset, frontier cap)]`: the low end is the newest
+//! frontier old enough that execution had certainly passed it by `t_a`;
+//! the high end is where the simulated extension stopped consuming, capped
+//! by the frontier bound below.
+//!
+//! # Frontier cap — the first deliberate narrowing of the high end
+//!
+//! The extension's `resume_offset` alone sets the high end to
+//! ~committed-motion + `extension_horizon` of simulated path, sized from
+//! motion *planning* ([`run_extension`]). That over-covers when the
+//! journaled trapq was planned far ahead of what the machine actually
+//! executed before the cut. A second, independent upper bound comes from
+//! the parser-leads-execution fact and tightens it.
+//!
+//! **The fact.** Klipper reads g-code in a single in-order stream whose
+//! reader (`virtual_sdcard.work_handler`) strictly leads physical
+//! execution: it runs ahead by at most `max_processing_lead`
+//! ([`crate::config::ReconstructConfig::max_processing_lead`], the
+//! lookahead buffer + step-gen lead). So at every instant the executed
+//! file offset is `<=` the parse frontier at that instant.
+//!
+//! **The bound.** Let `F` be the newest durable context's frontier
+//! (`virtual_sdcard.file_position`), captured at print time `t_ctx`, and
+//! let the physical cut be at print time `t_cut`. Then
+//!
+//! ```text
+//! P_stop = exec_offset(t_cut)
+//!        = exec_offset(t_ctx) + path physically executed over [t_ctx, t_cut]
+//!        <= F + path executable from F in Δt seconds        (Δt = t_cut − t_ctx)
+//! ```
+//!
+//! because `exec_offset(t_ctx) <= F` (parser leads) and execution reaches
+//! `F` no earlier than `t_ctx`, so the `[F, P_stop]` leg took at most `Δt`
+//! seconds. Simulating `Δt` seconds forward from `F` with
+//! [`plr_gcode::simulate`] — whose per-line time is a *lower* bound on the
+//! real duration — therefore consumes at least every line the machine
+//! could have executed, so its `resume_offset` is an *upper* bound on
+//! `P_stop`. The window's high end becomes `min(extension_resume, cap)`;
+//! the cap can only ever narrow, never widen.
+//!
+//! **Δt: the honest containment claim.** Containment does NOT rest on
+//! "no term errs short." It rests on this: **every *observable* contributor
+//! to `t_cut − t_ctx` is priced at its admitted maximum, and the sole
+//! *unobservable* residual is hazard-pinned.** `Δt = t_cut − t_ctx =
+//! staleness + Δt_tail`:
+//!
+//! * `staleness = max(0, t_a − t_ctx)` — the anchor context's measured age
+//!   relative to the newest durable heartbeat `t_a` (`window.t_a`). A
+//!   frontier that stopped being durable well before `t_a` (dropped
+//!   contexts, a torn context tail) makes this large, which *loosens* the
+//!   cap. Clamped at 0: an anchor newer than `t_a` is closer to the cut, so
+//!   the tail term already covers it.
+//! * `Δt_tail` bounds `t_cut − t_a` as a sum of four priced terms plus one
+//!   pinned residual:
+//!   1. **Record spacing** — the widest gap the heartbeat tail actually
+//!      shows ([`heartbeat_tail_spacing_ns`]), *not* a nominal period. The
+//!      newest durable heartbeat can trail the cut by about the recent
+//!      cadence; guard 3 has already refused a tail whose newest gap
+//!      exceeds `heartbeat_period_ns * heartbeat_gap_tolerance`, so this is
+//!      bounded by `period * gap_tolerance`. Pricing the nominal 1× period
+//!      was the review's blocker: it is neither what modern 10 Hz WALs show
+//!      (~0.1 s) nor what guard 3 admits (3.0×).
+//!   2. **Batch durability lag** — the newest *durable* heartbeat trails
+//!      the newest *written* one, because `plrd::walsvc` appends heartbeat
+//!      records with `SyncPolicy::Batched` and `fdatasync`s on a batch
+//!      cadence (`Config::batch_sync_ms`, 0.5 s default). Priced from
+//!      [`ReconstructConfig::durability_lag_ns`], which `plrd` derives from
+//!      that same `batch_sync_ms` — never restated crate-locally.
+//!   3. **Two independent subscription draws**, `2 * SUBSCRIPTION_REFRESH`
+//!      (`webhooks.py:469`, 0.25 s each). The heartbeat's `print_time` and
+//!      the anchor context's `file_position` come from *separate*
+//!      `QueryStatusHelper` samples, each up to one refresh stale, and the
+//!      clock correlation absorbs only the heartbeat's draw.
+//!
+//! **The terminal-stall residual (hazard pin, not priced).** One
+//! contributor is unobservable: if `plrd` itself stalls (stops appending
+//! heartbeats) while klippy keeps executing, the terminal gap `t_cut − t_a`
+//! can exceed the widest *observed* tail gap without leaving any evidence,
+//! *provided it stays below the observation-gap threshold* (a larger stall
+//! surfaces as a `SubscriptionGap`/`SocketLost` and trips guard 2). Below
+//! that threshold there is nothing in the WAL to price against, so — as the
+//! epoch work documented its marker-less-restart pin — this residual is
+//! **acknowledged, not guarded**: under a sub-threshold terminal writer
+//! stall the cap can understate `Δt`. `terminal_writer_stall_residual_is_pinned`
+//! constructs the shape and asserts the residual exists. Every other path
+//! is priced.
+//!
+//! **Modern-WAL margin (worked).** On the real 10 Hz capture the observed
+//! tail spacing is small, so `Δt_tail ≈ (tail gap) + 0.5 (durability) +
+//! 0.5 (two draws) ≈ 1.3 s`, and the cap stays decisively useful (it trims
+//! 3.3–4.7 s of over-covered horizon on the two real crashes). A legacy
+//! 1 Hz stream shows wider gaps, so `Δt_tail` can approach `3.0 (tail) +
+//! 1.0 = 4.0 s`; there the cap may narrow to a near-no-op — **acceptable,
+//! because a useless-but-sound cap on a sparse legacy stream beats an
+//! unsound one.**
+//!
+//! **When the cap does not apply (guards; falls back to extension-only).**
+//! If any premise fails the cap is `None` and the high end is the extension
+//! resume offset alone:
+//!
+//! * `anchor_pt` unplaceable on the print-time axis — staleness is
+//!   unmeasurable ([`Degradation::anchor_time_unknown`]).
+//! * an observation gap overlaps the window
+//!   ([`Degradation::observation_gap`]: a `SubscriptionGap`/`SocketLost`
+//!   means motion could have advanced past `t_a` unobserved for longer than
+//!   the tail spacing prices — this is the observable half of the stall
+//!   above, and it trips here).
+//! * the heartbeat tail is broken — the newest inter-heartbeat gap exceeds
+//!   `heartbeat_period_ns * heartbeat_gap_tolerance`, so `t_a` is a stale
+//!   island ([`heartbeat_tail_spacing_ns`] returns `None`).
+//!
+//! **The one-line skew (edge case a).** `virtual_sdcard.file_position`
+//! can lag `gcode_move`'s `last_position` by exactly one line
+//! ([`plr_wal::GcodeState::position`] docs): the true frontier can be
+//! `F + 1` line. The cap therefore adds **one line of slack** to its
+//! computed offset — the safe (looser) direction — so a stop on the
+//! skewed line is never excluded.
+//!
+//! **The stalled frontier (edge case b) is loose, never tight.** When the
+//! reader stalls mid-long-move `F` sits still while queued motion
+//! executes, so `t_ctx` can postdate the frontier's execution by seconds.
+//! The derivation never assumed otherwise: `Δt` bounds `t_cut − t_ctx`
+//! regardless, and `simulate`'s per-line lower-bound timing keeps the
+//! resume offset an upper bound on `P_stop`. A stall can only make the cap
+//! looser (a larger true `Δt` than the machine used), never tighter.
+//!
+//! **Epoch isolation (edge case c).** The cap reads only `anchor`,
+//! `window.t_a`, and `timeline.heartbeats`, all of which
+//! [`crate::reconstruct`] has already narrowed to the crash epoch before
+//! ingestion — an older boot's frontier or heartbeat can never feed it.
 
 use plr_gcode::{scan_z_events, simulate, GcodeState, Line, LineIter, StopReason, ZScanConfig};
 use plr_wal::{Context, TrapqSegment};
@@ -196,6 +323,16 @@ use crate::config::ReconstructConfig;
 use crate::error::{ContextDefect, ReconstructError};
 use crate::timeline::WalTimeline;
 use crate::window::{is_observation_gap, ns_to_s, StopWindow};
+
+/// Klipper's subscription refresh period, seconds
+/// (`SUBSCRIPTION_REFRESH_TIME = .25`, `klippy/webhooks.py:469`): the
+/// `QueryStatusHelper` re-queries subscribed objects on this timer, so any
+/// single status sample (the one that fed the newest heartbeat, or the
+/// anchor context) can be up to this stale relative to the instant its
+/// values were true in Klipper. Added to the frontier cap's `Δt_tail` so
+/// understating the sample age cannot make the cap tight. See the
+/// module-level "Frontier cap".
+const SUBSCRIPTION_REFRESH_S: f64 = 0.25;
 
 /// A closed interval `[lo, hi]` (mm or mm-of-filament).
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -347,6 +484,14 @@ pub struct ExtensionSummary {
     pub resume_offset: Option<u64>,
     /// Why the simulation stopped consuming input.
     pub stop: StopReason,
+    /// The frontier cap that was applied to the offset window's high end,
+    /// when its premises held (see the module-level "Frontier cap"):
+    /// `F + path executable in Δt`, plus one line of skew slack. `None`
+    /// when the cap did not apply (a hazard pin fired) — the high end is
+    /// then [`Self::resume_offset`] alone. Surfaced for reporting the
+    /// before/after delta; the effective window high end is
+    /// `min(resume_offset, frontier_cap)`.
+    pub frontier_cap: Option<u64>,
 }
 
 /// How much confidence downstream matching can place in the result.
@@ -1056,6 +1201,18 @@ fn run_extension(
     let (xy, e_internal) = extension_xy_e(&anchor_state, &sim.moves, degradation);
     let e_file = extension_file_e(&anchor_state, consumed, degradation);
 
+    let frontier_cap = frontier_cap_offset(
+        timeline,
+        window,
+        anchor_pt,
+        &anchor_state,
+        &lines,
+        vsd.file_position,
+        tail_end,
+        config,
+        degradation.observation_gap,
+    );
+
     Ok(Some(ExtensionResult {
         summary: ExtensionSummary {
             anchor_offset: vsd.file_position,
@@ -1064,12 +1221,152 @@ fn run_extension(
             lines_consumed: sim.lines_consumed,
             resume_offset: sim.resume_offset,
             stop: sim.stop,
+            frontier_cap,
         },
         z,
         xy,
         e_internal,
         e_file: Some(e_file),
     }))
+}
+
+/// The frontier cap: an upper bound on the physical stop offset derived
+/// from the parser-leads-execution fact, or `None` when a premise fails
+/// (the caller then leaves the offset-window high end at the extension
+/// resume offset alone). See the module-level "Frontier cap" for the full
+/// derivation and the conservatism of every term.
+///
+/// `anchor_pt` is the anchor context's print time (`None` when it could
+/// not be placed on the print-time axis); `anchor_state` and `lines` are
+/// the extension's own seed state and file lines *from the frontier
+/// forward*, reused verbatim so the cap simulates exactly the path the
+/// extension did, only for a shorter `Δt`. `observation_gap` is the flag
+/// [`compute_stop_set`] computed before the extension ran.
+#[allow(clippy::too_many_arguments)]
+fn frontier_cap_offset(
+    timeline: &WalTimeline,
+    window: &StopWindow,
+    anchor_pt: Option<f64>,
+    anchor_state: &GcodeState,
+    lines: &[Line],
+    frontier: u64,
+    tail_end: u64,
+    config: &ReconstructConfig,
+    observation_gap: bool,
+) -> Option<u64> {
+    // Guard 1: without the anchor's print time the staleness term is
+    // unmeasurable, so `Δt` cannot be bounded — fall back.
+    let anchor_pt = anchor_pt.filter(|pt| pt.is_finite())?;
+    // Guard 2: an observation gap means motion could have advanced past
+    // `t_a` unobserved for longer than a heartbeat spacing, voiding the
+    // `Δt_tail` premise.
+    if observation_gap {
+        return None;
+    }
+    let t_a = window.t_a;
+    if !t_a.is_finite() {
+        return None;
+    }
+    // Guard 3 AND the spacing term in one tail walk: a broken tail (the
+    // newest heartbeat is a stale island) refuses the cap; otherwise the
+    // terminal gap `t_cut - t_a` is priced at the widest gap the tail
+    // actually shows — evidence, not a nominal period.
+    let spacing_ns = heartbeat_tail_spacing_ns(timeline, config)?;
+
+    let staleness = (t_a - anchor_pt).max(0.0);
+    // Δt_tail bounds `t_cut - t_a`. Every OBSERVABLE contributor is priced
+    // at its admitted maximum (see the module-level "Frontier cap"):
+    //   * record spacing — the widest gap the heartbeat tail shows (guard 3
+    //     above has already refused a tail whose newest gap exceeds
+    //     tolerance, so this is bounded by `period * gap_tolerance`);
+    //   * batch durability lag — one `fdatasync` batch, because the newest
+    //     DURABLE heartbeat trails the newest WRITTEN one (`plrd::walsvc`
+    //     appends heartbeat records `SyncPolicy::Batched`); config-derived,
+    //     never a literal here;
+    //   * two independent 0.25 s subscription draws — the heartbeat's status
+    //     sample AND the anchor context's `file_position` sample are each up
+    //     to `SUBSCRIPTION_REFRESH` stale, and the clock correlation absorbs
+    //     only the heartbeat's draw, not the anchor's.
+    // The sole UNOBSERVABLE contributor — a terminal writer stall below the
+    // observation-gap threshold — is hazard-pinned, not priced (see the
+    // module doc's "terminal-stall residual").
+    let dt_tail =
+        ns_to_s(spacing_ns) + ns_to_s(config.durability_lag_ns) + 2.0 * SUBSCRIPTION_REFRESH_S;
+    let dt = staleness + dt_tail;
+    if !dt.is_finite() {
+        return None;
+    }
+
+    // Simulate forward from the frontier for `Δt` seconds. `simulate`'s
+    // per-line timing is a lower bound on real durations, so it consumes at
+    // least every line executable in `Δt` — its resume offset is an upper
+    // bound on the executed offset. The line that pushes cumulative time
+    // over `Δt` is itself consumed (the check is post-line), which already
+    // contributes toward, but is not relied on for, the skew slack below.
+    let mut sim_config = config.sim.clone();
+    sim_config.max_duration = Some(dt);
+    let mut state = anchor_state.clone();
+    let sim = simulate(&mut state, lines, &sim_config);
+    let raw = sim.resume_offset.unwrap_or(frontier).max(frontier);
+
+    // Edge case (a), the one-line sampling skew: `file_position` can lag
+    // `gcode_move.last_position` by exactly one line
+    // (`plr_wal::GcodeState::position`), so the true frontier may be one
+    // line past `frontier`. Add one line of slack — the end of the first
+    // line the `Δt` simulation did NOT consume — which is `>= raw` and the
+    // safe (looser) direction. When every line was consumed there is no
+    // further line, so the tail end is the honest cap.
+    let slacked = lines
+        .get(sim.lines_consumed)
+        .map_or(tail_end, |l| l.span.end);
+    Some(raw.max(slacked).min(tail_end))
+}
+
+/// The heartbeat tail's observed spacing, in nanoseconds — the widest gap
+/// between consecutive durable heartbeats over the contiguous run ending at
+/// the newest sample — or `None` when the tail is broken (the newest gap
+/// exceeds `heartbeat_period_ns * heartbeat_gap_tolerance`, so `t_a` is a
+/// stale island) or there are no samples.
+///
+/// This serves the frontier cap two ways at once: a `None` result is guard
+/// 3 (refuse the cap), and a `Some(gap)` result is the cap's spacing term —
+/// the terminal gap `t_cut - t_a` priced at the widest gap the tail
+/// actually shows rather than a nominal period. So a dense 10 Hz stream
+/// (small gaps) keeps a tight cap and a sparse stream honestly loosens it.
+///
+/// The walk stops at the first over-tolerance gap going backward: an early
+/// idle→active coverage break does not inflate the recent-cadence estimate,
+/// but if that break IS the newest gap, `t_a` is isolated and the cap is
+/// refused. A single sample carries no gap evidence, so the conservative
+/// tolerance spacing (the widest the guard would admit) is returned; zero
+/// samples cannot reach the cap (the pipeline errors first) and are refused.
+fn heartbeat_tail_spacing_ns(timeline: &WalTimeline, config: &ReconstructConfig) -> Option<u64> {
+    let hbs = &timeline.heartbeats;
+    let n = hbs.len();
+    #[allow(
+        clippy::cast_precision_loss,
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss
+    )]
+    let tol_ns = (config.heartbeat_period_ns as f64 * config.heartbeat_gap_tolerance) as u64;
+    match n {
+        0 => None,
+        1 => Some(tol_ns),
+        _ => {
+            let mut max_gap_ns = 0_u64;
+            for i in (1..n).rev() {
+                let gap_ns = hbs[i].mono_ns.saturating_sub(hbs[i - 1].mono_ns);
+                if gap_ns > tol_ns {
+                    if i == n - 1 {
+                        return None; // newest gap broken: t_a is a stale island
+                    }
+                    break; // an older coverage break ends the contiguous tail
+                }
+                max_gap_ns = max_gap_ns.max(gap_ns);
+            }
+            Some(max_gap_ns)
+        }
+    }
 }
 
 /// Exact Z enumeration over exactly the consumed lines: the anchor
@@ -1394,10 +1691,19 @@ fn offset_window(
 ) -> Option<OffsetWindow> {
     let anchor_vsd = anchor.virtual_sdcard.as_ref()?;
     let start = floor.map_or(anchor_vsd.file_position, |f| f.file_position);
-    let end = extension
+    let uncapped = extension
         .and_then(|e| e.summary.resume_offset)
         .unwrap_or(anchor_vsd.file_position)
         .max(anchor_vsd.file_position);
+    // The frontier cap can only narrow the high end, never widen it, and
+    // never below the frontier itself (a valid stop position). When it did
+    // not apply the high end is the extension resume offset alone. See the
+    // module-level "Frontier cap".
+    let end = extension
+        .and_then(|e| e.summary.frontier_cap)
+        .map_or(uncapped, |cap| {
+            uncapped.min(cap.max(anchor_vsd.file_position))
+        });
     Some(OffsetWindow {
         start: start.min(end),
         end,
@@ -2514,5 +2820,465 @@ mod tests {
             .count();
         assert_eq!(wal_plateaus, 1, "identical plateaus merged");
         assert!(set.z_candidates.windows(2).all(|w| w[0].z.lo <= w[1].z.lo));
+    }
+
+    // ------------------------------------------------------------------
+    // Frontier cap (Part 1). See the module-level "Frontier cap".
+    // ------------------------------------------------------------------
+
+    /// A long file of equal 5 mm X moves from the anchor's X50, one per
+    /// line — enough path that neither the extension horizon nor Δt
+    /// reaches EOF, so the cap can be observed narrowing.
+    fn long_x_march() -> String {
+        use std::fmt::Write as _;
+        let mut s = String::new();
+        for i in 1..=80 {
+            let _ = writeln!(s, "G1 X{} Y50 F3000", 50 + 5 * i);
+        }
+        s
+    }
+
+    /// The default anchor gcode at (50, 50, 0.2), E 100, absolute.
+    fn march_gcode() -> WalGcodeState {
+        WalGcodeState {
+            speed_factor: 1.0,
+            speed: 3000.0,
+            extrude_factor: 1.0,
+            absolute_coordinates: true,
+            absolute_extrude: true,
+            homing_origin: vec![0.0; 4],
+            position: vec![50.0, 50.0, 0.2, 100.0],
+            gcode_position: vec![50.0, 50.0, 0.2, 100.0],
+        }
+    }
+
+    #[test]
+    fn frontier_cap_narrows_the_offset_window_below_the_extension() {
+        // Fresh anchor at pt 10 (t_a = 10, staleness 0). No trapq, so the
+        // extension start falls to the reader-lead bound (t_a - 3 = 7) and
+        // the horizon is 2 + (10.1 - 7) = 5.1 s of simulated path; the cap
+        // is only Δt = 0 + 1.0 (heartbeat spacing) + 0.25 = 1.25 s.
+        let text = long_x_march();
+        let records = base_records(
+            10.0,
+            10.1,
+            vec![WalRecord::Context(context_with_gcode(
+                10_000_000_000,
+                0,
+                march_gcode(),
+            ))],
+        );
+        let timeline = ingest_records(records);
+        let window = compute_stop_window(&timeline, None, &cfg()).unwrap();
+        let tail = FileTail {
+            base_offset: 0,
+            bytes: text.as_bytes(),
+        };
+        let set = compute_stop_set(&timeline, &window, Some(&tail), &cfg()).unwrap();
+        let ext = set.extension.clone().expect("extension ran");
+        let fw = set.file_window.unwrap();
+
+        let cap = ext.frontier_cap.expect("cap applied on a clean tail");
+        let uncapped = ext.resume_offset.expect("extension consumed lines");
+        assert!(
+            cap < uncapped,
+            "cap {cap} did not narrow below the extension resume {uncapped}"
+        );
+        assert_eq!(fw.end, cap, "the window high end must be the cap");
+        assert!(fw.end < text.len() as u64, "cap must not reach EOF here");
+        assert!(fw.start <= fw.end);
+    }
+
+    #[test]
+    fn frontier_cap_slack_is_exactly_one_line() {
+        use plr_gcode::{simulate, Line, LineIter};
+        // Same fresh-anchor march. Recompute the Δt the cap runs — from the
+        // config's own terms, not a hardcoded number — and prove the window
+        // high end is exactly one line past where that simulation stopped
+        // (the one-line skew slack, edge case a; no more, no less).
+        let text = long_x_march();
+        let records = base_records(
+            10.0,
+            10.1,
+            vec![WalRecord::Context(context_with_gcode(
+                10_000_000_000,
+                0,
+                march_gcode(),
+            ))],
+        );
+        let timeline = ingest_records(records);
+        let window = compute_stop_window(&timeline, None, &cfg()).unwrap();
+        let tail = FileTail {
+            base_offset: 0,
+            bytes: text.as_bytes(),
+        };
+        let set = compute_stop_set(&timeline, &window, Some(&tail), &cfg()).unwrap();
+        let fw = set.file_window.unwrap();
+
+        // Δt = staleness + spacing + durability + 2·refresh. For this
+        // fresh-anchor fixture the anchor's print time equals t_a, so
+        // staleness is 0; the single heartbeat yields the conservative
+        // tolerance spacing (no cadence evidence). Derived via the cap's own
+        // spacing helper so the two cannot drift.
+        #[allow(clippy::cast_precision_loss)]
+        let spacing_s = super::heartbeat_tail_spacing_ns(&timeline, &cfg()).unwrap() as f64 / 1e9;
+        #[allow(clippy::cast_precision_loss)]
+        let durability_s = cfg().durability_lag_ns as f64 / 1e9;
+        let dt = spacing_s + durability_s + 2.0 * super::SUBSCRIPTION_REFRESH_S;
+
+        let anchor_state = anchor_state_from_context(&march_gcode()).unwrap();
+        let lines: Vec<Line> = LineIter::new(text.as_bytes(), 0).collect();
+        let mut sc = cfg().sim.clone();
+        sc.max_duration = Some(dt);
+        let mut st = anchor_state.clone();
+        let sim = simulate(&mut st, &lines, &sc);
+        let raw = sim.resume_offset.unwrap();
+        let with_slack = lines[sim.lines_consumed].span.end;
+        assert!(with_slack > raw, "test needs a further line to exist");
+        assert_eq!(
+            fw.end, with_slack,
+            "cap must add exactly one line of skew slack (raw {raw}, Δt {dt})"
+        );
+    }
+
+    /// Reviewer probe (platform: `plr-reconstruct`). The blocker was that
+    /// pricing `Δt_tail` at the nominal 1× period (+ one draw) excluded
+    /// reachable file on a legacy 1 Hz stream (~54 B / ~3 lines). With the
+    /// batch durability lag and the second subscription draw priced, the cap
+    /// now CONTAINS that file. Heartbeats 1 s apart, fresh anchor
+    /// (staleness 0): observed spacing 1.0 s, so `Δt_tail` = 1.0 + 0.5
+    /// (durability) + 0.5 (two draws) = 2.0 s, versus the old-too-tight
+    /// 1.0 + 0.25 = 1.25 s.
+    #[test]
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    fn legacy_1hz_cap_contains_what_the_nominal_bound_excluded() {
+        use plr_gcode::{simulate, Line, LineIter};
+        let text = long_x_march();
+        let mono = |pt: f64| (pt * 1e9) as u64;
+        let records = vec![
+            WalRecord::Heartbeat(heartbeat_at(mono(8.0), 8.0)),
+            WalRecord::Heartbeat(heartbeat_at(mono(9.0), 9.0)),
+            WalRecord::Heartbeat(heartbeat_at(mono(10.0), 10.0)),
+            WalRecord::StepperRange(stepper_range_with_clock(
+                "stepper_z",
+                10.0,
+                FREQ,
+                mono(10.0),
+            )),
+            WalRecord::Context(context_with_gcode(mono(10.0), 0, march_gcode())),
+        ];
+        let timeline = ingest_records(records);
+        let window = compute_stop_window(&timeline, None, &cfg()).unwrap();
+        let tail = FileTail {
+            base_offset: 0,
+            bytes: text.as_bytes(),
+        };
+        let set = compute_stop_set(&timeline, &window, Some(&tail), &cfg()).unwrap();
+        let fw = set.file_window.unwrap();
+
+        let anchor_state = anchor_state_from_context(&march_gcode()).unwrap();
+        let lines: Vec<Line> = LineIter::new(text.as_bytes(), 0).collect();
+        let offset_for = |dt: f64| -> u64 {
+            let mut sc = cfg().sim.clone();
+            sc.max_duration = Some(dt);
+            let mut st = anchor_state.clone();
+            simulate(&mut st, &lines, &sc).resume_offset.unwrap()
+        };
+        let old_too_tight = offset_for(1.0 + 0.25);
+        let new_correct = offset_for(1.0 + 0.5 + 0.5);
+        assert!(
+            new_correct > old_too_tight,
+            "the priced-in terms must reach further file (old {old_too_tight}, new {new_correct})"
+        );
+        assert!(
+            fw.end >= new_correct,
+            "the cap must now CONTAIN the file the nominal bound excluded \
+             (old {old_too_tight}, new {new_correct}, cap {})",
+            fw.end
+        );
+    }
+
+    /// Reviewer probe (platform: `plr-reconstruct`). Guard 3 admits gaps up
+    /// to 3.0× the 1 s basis; a 2.9 s terminal gap is admitted and the
+    /// spacing term must be priced at the observed 2.9 s, not the nominal
+    /// 1 s. A 3.1 s gap exceeds tolerance and the cap falls back.
+    #[test]
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    fn frontier_cap_prices_a_wide_but_admitted_tail_gap_and_refuses_a_broken_one() {
+        let text = long_x_march();
+        let mono = |pt: f64| (pt * 1e9) as u64;
+        let build = |gap: f64| {
+            ingest_records(vec![
+                WalRecord::Heartbeat(heartbeat_at(mono(10.0 - gap), 10.0 - gap)),
+                WalRecord::Heartbeat(heartbeat_at(mono(10.0), 10.0)),
+                WalRecord::StepperRange(stepper_range_with_clock(
+                    "stepper_z",
+                    10.0,
+                    FREQ,
+                    mono(10.0),
+                )),
+                WalRecord::Context(context_with_gcode(mono(10.0), 0, march_gcode())),
+            ])
+        };
+        let tail = FileTail {
+            base_offset: 0,
+            bytes: text.as_bytes(),
+        };
+
+        // 2.9 s gap: admitted; spacing priced at the observed 2.9 s.
+        let tl = build(2.9);
+        let window = compute_stop_window(&tl, None, &cfg()).unwrap();
+        let set = compute_stop_set(&tl, &window, Some(&tail), &cfg()).unwrap();
+        assert!(
+            set.extension.as_ref().unwrap().frontier_cap.is_some(),
+            "a 2.9 s gap is within the 3.0 s tolerance — cap applies"
+        );
+        #[allow(clippy::cast_precision_loss)]
+        let spacing_s = super::heartbeat_tail_spacing_ns(&tl, &cfg()).unwrap() as f64 / 1e9;
+        assert!(
+            (spacing_s - 2.9).abs() < 1e-6,
+            "spacing must be the observed 2.9 s, got {spacing_s}"
+        );
+
+        // 3.1 s gap: exceeds tolerance — the tail is broken, cap falls back.
+        let tl2 = build(3.1);
+        let window2 = compute_stop_window(&tl2, None, &cfg()).unwrap();
+        let set2 = compute_stop_set(&tl2, &window2, Some(&tail), &cfg()).unwrap();
+        assert!(
+            set2.extension.as_ref().unwrap().frontier_cap.is_none(),
+            "a 3.1 s gap breaks the tail — cap must refuse"
+        );
+    }
+
+    /// The terminal-stall residual pin (platform: `plr-reconstruct`). The one
+    /// unpriced contributor: a terminal writer stall (`plrd` stops appending
+    /// heartbeats while klippy keeps executing) below the observation-gap
+    /// threshold leaves no evidence, so the cap — which prices `Δt_tail` from
+    /// the OBSERVED heartbeat cadence — is blind to how far motion actually
+    /// extended past `t_a`. This pins the residual: a dense tail yields a
+    /// small `Δt_tail` while durable motion extends much further past `t_a`.
+    /// Acknowledged, not guarded (see the module doc).
+    #[test]
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::cast_precision_loss
+    )]
+    fn terminal_writer_stall_residual_is_pinned() {
+        let mono = |pt: f64| (pt * 1e9) as u64;
+        let mut records = Vec::new();
+        // Dense 10 Hz tail ending at t_a = 10.0 (0.1 s gaps).
+        for i in 0..=20u64 {
+            let pt = 10.0 - 0.1 * (20 - i) as f64;
+            records.push(WalRecord::Heartbeat(heartbeat_at(mono(pt), pt)));
+        }
+        // Durable motion (a dumped-ahead plan) reaching 2.0 s past t_a, with
+        // NO further heartbeat and NO SubscriptionGap marker.
+        records.push(WalRecord::StepperRange(stepper_range_with_clock(
+            "stepper_z",
+            12.0,
+            FREQ,
+            mono(12.0),
+        )));
+        records.push(WalRecord::Context(context_with_gcode(
+            mono(10.0),
+            0,
+            march_gcode(),
+        )));
+        let timeline = ingest_records(records);
+
+        let dt_tail = super::heartbeat_tail_spacing_ns(&timeline, &cfg()).unwrap() as f64 / 1e9
+            + cfg().durability_lag_ns as f64 / 1e9
+            + 2.0 * super::SUBSCRIPTION_REFRESH_S;
+        let motion_past_ta = 12.0 - 10.0;
+        assert!(
+            motion_past_ta > dt_tail,
+            "residual pin: motion can reach {motion_past_ta}s past t_a while Δt_tail prices \
+             only {dt_tail}s from the observed cadence — a sub-threshold terminal stall is \
+             unpriced and unguarded"
+        );
+    }
+
+    #[test]
+    fn frontier_cap_falls_back_on_an_observation_gap() {
+        // A subscription gap overlapping the window voids the Δt_tail
+        // premise: the cap must not apply, and the high end is the
+        // extension resume offset alone (today's behavior).
+        let text = long_x_march();
+        let records = base_records(
+            10.0,
+            10.1,
+            vec![
+                WalRecord::Marker(Marker {
+                    mono_ns: 9_800_000_000,
+                    kind: MarkerKind::SubscriptionGap {
+                        start_mono_ns: 9_500_000_000,
+                        end_mono_ns: 9_800_000_000,
+                    },
+                }),
+                WalRecord::Context(context_with_gcode(10_000_000_000, 0, march_gcode())),
+            ],
+        );
+        let timeline = ingest_records(records);
+        let window = compute_stop_window(&timeline, None, &cfg()).unwrap();
+        let tail = FileTail {
+            base_offset: 0,
+            bytes: text.as_bytes(),
+        };
+        let set = compute_stop_set(&timeline, &window, Some(&tail), &cfg()).unwrap();
+        let ext = set.extension.clone().unwrap();
+        assert!(set.degradation.observation_gap);
+        assert!(ext.frontier_cap.is_none(), "cap must fall back on a gap");
+        assert_eq!(
+            set.file_window.unwrap().end,
+            ext.resume_offset.unwrap(),
+            "high end must be the uncapped extension resume"
+        );
+    }
+
+    #[test]
+    fn frontier_cap_falls_back_on_a_broken_heartbeat_tail() {
+        // The two newest heartbeats are 5 s apart (> 1.0 * 3.0 tolerance):
+        // t_a may be a stale island far from the cut, so the cap refuses.
+        let text = long_x_march();
+        let mut records = base_records(
+            10.0,
+            10.1,
+            vec![WalRecord::Context(context_with_gcode(
+                10_000_000_000,
+                0,
+                march_gcode(),
+            ))],
+        );
+        // An older, isolated heartbeat: the newest inter-sample gap becomes
+        // 10 - 5 = 5 s.
+        records.push(WalRecord::Heartbeat(heartbeat_at(5_000_000_000, 5.0)));
+        let timeline = ingest_records(records);
+        let window = compute_stop_window(&timeline, None, &cfg()).unwrap();
+        let tail = FileTail {
+            base_offset: 0,
+            bytes: text.as_bytes(),
+        };
+        let set = compute_stop_set(&timeline, &window, Some(&tail), &cfg()).unwrap();
+        let ext = set.extension.clone().unwrap();
+        assert!(
+            ext.frontier_cap.is_none(),
+            "cap must fall back on a broken heartbeat tail"
+        );
+        assert_eq!(set.file_window.unwrap().end, ext.resume_offset.unwrap());
+    }
+
+    #[test]
+    fn frontier_cap_guard_refuses_without_anchor_time() {
+        use plr_gcode::{Line, LineIter};
+        // Guard 1 is a type-level possibility the ingest finiteness filter
+        // prevents end-to-end (a finite mono always maps to a finite print
+        // time), so it is exercised at the function boundary directly:
+        // `anchor_pt = None` must yield no cap.
+        let text = long_x_march();
+        let records = base_records(
+            10.0,
+            10.1,
+            vec![WalRecord::Context(context_with_gcode(
+                10_000_000_000,
+                0,
+                march_gcode(),
+            ))],
+        );
+        let timeline = ingest_records(records);
+        let window = compute_stop_window(&timeline, None, &cfg()).unwrap();
+        let anchor_state = anchor_state_from_context(&march_gcode()).unwrap();
+        let lines: Vec<Line> = LineIter::new(text.as_bytes(), 0).collect();
+        let cap = super::frontier_cap_offset(
+            &timeline,
+            &window,
+            None, // anchor time unknown
+            &anchor_state,
+            &lines,
+            0,
+            text.len() as u64,
+            &cfg(),
+            false,
+        );
+        assert!(cap.is_none(), "no anchor time => no cap");
+        // And the positive control: with the anchor time present, it does
+        // apply — so the guard, not some other refusal, is what fired.
+        let cap_ok = super::frontier_cap_offset(
+            &timeline,
+            &window,
+            Some(10.0),
+            &anchor_state,
+            &lines,
+            0,
+            text.len() as u64,
+            &cfg(),
+            false,
+        );
+        assert!(cap_ok.is_some());
+    }
+
+    #[test]
+    fn stalled_frontier_keeps_the_cap_loose_not_tight() {
+        // Edge case (b): the reader stalled on one long move, so the
+        // frontier's execution began at pt 16 while the snapshot is at 20.
+        // The cap simulates only Δt from the frontier, but because Δt
+        // bounds t_cut - t_ctx regardless of the stall and simulate's
+        // per-line timing is a lower bound, the cap can only be loose. The
+        // window must still contain the stalled long move's span and never
+        // collapse below the frontier.
+        let text = concat!(
+            "G1 X200 Y200 E5 F3000\n",
+            "G1 X210 Y200 E6\n",
+            "G1 X220 Y200 E7\n",
+            "G1 X230 Y200 E8\n",
+            "G1 X240 Y200 E9\n",
+        );
+        let preceding = trapq_segment_xyz(
+            "toolhead",
+            10.0,
+            6.0,
+            [0.0, 0.0, 0.2],
+            [1.0, 0.0, 0.0],
+            20.0,
+            10_000_000_000,
+        );
+        let gcode = WalGcodeState {
+            speed_factor: 1.0,
+            speed: 3000.0,
+            extrude_factor: 1.0,
+            absolute_coordinates: true,
+            absolute_extrude: true,
+            homing_origin: vec![0.0; 4],
+            position: vec![50.0, 50.0, 0.2, 4.0],
+            gcode_position: vec![50.0, 50.0, 0.2, 4.0],
+        };
+        let records = base_records(
+            20.0,
+            20.1,
+            vec![
+                WalRecord::TrapqSegment(preceding),
+                WalRecord::Context(context_with_gcode(20_000_000_000, 0, gcode)),
+            ],
+        );
+        let timeline = ingest_records(records);
+        let window = compute_stop_window(&timeline, None, &cfg()).unwrap();
+        let tail = FileTail {
+            base_offset: 0,
+            bytes: text.as_bytes(),
+        };
+        let set = compute_stop_set(&timeline, &window, Some(&tail), &cfg()).unwrap();
+        let fw = set.file_window.unwrap();
+        // The long first move (4.24 s) alone exceeds Δt = 1.25 s, so the
+        // Δt sim consumes it (post-check) plus one skew line: the cap sits
+        // at or past the second line boundary, never below the frontier.
+        assert!(fw.start <= fw.end);
+        assert!(fw.contains(0), "frontier must remain a candidate");
+        let first_line_end = text.find('\n').unwrap() as u64 + 1;
+        assert!(
+            fw.end >= first_line_end,
+            "the stalled long move must stay inside the window: end {} < {}",
+            fw.end,
+            first_line_end
+        );
     }
 }

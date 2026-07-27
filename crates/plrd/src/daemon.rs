@@ -588,6 +588,8 @@ mod tests {
                 fans: Vec::new(),
                 exclude: None,
                 print_state: None,
+                current_layer: None,
+                total_layer: None,
             }))
             .unwrap();
         std::fs::write(config.wal_dir.join("wal-000001.plr"), writer.into_inner()).unwrap();
@@ -1005,6 +1007,8 @@ G1 X60 Y60 E900 F1800
                 fans: Vec::new(),
                 exclude: None,
                 print_state: None,
+                current_layer: None,
+                total_layer: None,
             }))
             .unwrap();
         if recorder_stopped {

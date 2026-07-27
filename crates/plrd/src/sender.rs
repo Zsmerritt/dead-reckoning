@@ -576,6 +576,8 @@ mod tests {
                 excluded: excluded.iter().map(|s| (*s).to_owned()).collect(),
                 current: None,
             })),
+            current_layer: None,
+            total_layer: None,
         })
     }
 

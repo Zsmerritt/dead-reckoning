@@ -19,8 +19,9 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use plr_reconstruct::{
-    reconstruct, select_crash_epoch, CrashClass, EpochBoundaryKind, PossibleStopSet,
-    ReceiveSeqObservation, ReconstructInputs, Reconstruction, StopWindow,
+    anchor_state_from_context, reconstruct, select_crash_epoch, CrashClass, EpochBoundaryKind,
+    PossibleStopSet, ReceiveSeqObservation, ReconstructInputs, Reconstruction,
+    RecoveryReconstruction, StopWindow,
 };
 use plr_wal::{
     recover_heartbeat, scan_read, HeartbeatRecovery, RecordKind, RecoveryScan, ScanEnd, WalRecord,
@@ -122,6 +123,7 @@ pub fn run_scan(
         Ok(Reconstruction::Recovery(recovery)) => {
             report_window(&mut w, &recovery.window);
             report_stop_set(&mut w, &recovery.stop_set);
+            report_layer_attribution(&mut w, &recovery, file_tail_bytes.as_deref());
         }
         Err(e) => {
             w.line(&format!("reconstruction: not possible: {e}"));
@@ -478,6 +480,114 @@ fn report_stop_set(w: &mut Report<'_>, set: &PossibleStopSet) {
     ));
 }
 
+/// Part 2: map the (cap-narrowed) offset window through a layer model
+/// built from the anchor context + print file, and report which layer(s)
+/// the stop can be in, with the slicer mark (Part 3) as an upper-bound
+/// cross-check. Needs the print file; `file_bytes` is `None` when it was
+/// unreadable (an offline scan on a machine without the gcode), in which
+/// case attribution is honestly reported as unavailable.
+fn report_layer_attribution(
+    w: &mut Report<'_>,
+    recovery: &RecoveryReconstruction,
+    file_bytes: Option<&[u8]>,
+) {
+    let Some(window) = recovery.stop_set.file_window.as_ref() else {
+        w.line("  layer attribution: no offset window to map");
+        return;
+    };
+    let Some(bytes) = file_bytes else {
+        w.line("  layer attribution: unavailable (print file not readable — no layer model)");
+        return;
+    };
+    let file = recovery
+        .timeline
+        .contexts
+        .iter()
+        .rev()
+        .find_map(|c| c.virtual_sdcard.as_ref().map(|v| v.file_path.clone()));
+    let Some(file) = file else {
+        w.line("  layer attribution: unavailable (no context names a print file)");
+        return;
+    };
+    let Some(anchor) =
+        crate::detect::anchor_context(&recovery.timeline.contexts, &file, Some(window.start))
+    else {
+        w.line("  layer attribution: unavailable (no anchor context at/before the window)");
+        return;
+    };
+    let base_offset = anchor
+        .virtual_sdcard
+        .as_ref()
+        .map_or(0, |v| v.file_position);
+    let Ok(base_usize) = usize::try_from(base_offset) else {
+        w.line("  layer attribution: unavailable (context offset overflow)");
+        return;
+    };
+    if base_usize > bytes.len() {
+        w.line("  layer attribution: unavailable (context offset beyond the file — wrong file?)");
+        return;
+    }
+    let Ok(state) = anchor_state_from_context(&anchor.gcode) else {
+        w.line("  layer attribution: unavailable (anchor context state invalid)");
+        return;
+    };
+    let model = plr_analyzer::build_layer_model(
+        state,
+        &bytes[base_usize..],
+        base_offset,
+        &plr_analyzer::ModelConfig::default(),
+    );
+    // OffsetWindow.end is inclusive; layers_in_window takes an exclusive end.
+    let wl = model.layers_in_window(window.start, Some(window.end.saturating_add(1)));
+    // `Layer::index` is window-relative; it equals an absolute file layer
+    // only when the model spans from file start. The slicer mark is
+    // absolute, so the cross-check is valid only then (see
+    // `pipeline::narrate_layer_attribution` for the full rationale).
+    let absolute = base_offset == 0;
+    if absolute {
+        w.line(&format!(
+            "  layer attribution: {} (layer model from byte {base_offset}: {} layers)",
+            wl.describe(),
+            model.layers.len()
+        ));
+    } else {
+        w.line(&format!(
+            "  layer attribution: stop spans {} geometric layer(s){} (layer model from byte \
+             {base_offset}: {} layers; layer numbers window-relative to the anchor, not absolute)",
+            wl.layers.len(),
+            if wl.before_first {
+                " plus the pre-first-layer preamble"
+            } else {
+                ""
+            },
+            model.layers.len()
+        ));
+    }
+    match anchor.current_layer {
+        None => w.line(
+            "  slicer layer marks: unavailable (no SET_PRINT_STATS_INFO); geometry carries the answer",
+        ),
+        Some(mark) => {
+            let of = anchor.total_layer.map_or_else(String::new, |t| format!(" of {t}"));
+            if !absolute {
+                w.line(&format!(
+                    "  slicer reported current_layer={mark}{of} (absolute); no consistency check — \
+                     the attribution above is window-relative to a mid-file anchor"
+                ));
+            } else if wl.mark_is_consistent(mark) {
+                w.line(&format!(
+                    "  slicer layer mark: current_layer={mark}{of} (upper bound; consistent cross-check)"
+                ));
+            } else {
+                w.line(&format!(
+                    "  NOTE slicer layer mark current_layer={mark}{of} is below every attributed \
+                     layer (upper-bound violation; trusting geometry)"
+                ));
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{merge_scans, run_scan, segment_file_name, segment_index};
@@ -547,6 +657,8 @@ mod tests {
             fans: Vec::new(),
             exclude: None,
             print_state: None,
+            current_layer: None,
+            total_layer: None,
         }
     }
 
@@ -660,6 +772,79 @@ mod tests {
         assert!(
             report.contains("forward extension disabled"),
             "missing print file must be reported: {report}"
+        );
+    }
+
+    /// Builds a readable two-layer print + a WAL that reconstructs to a
+    /// RECOVERY whose anchor context sits at `ctx_pos`, carrying the given
+    /// slicer mark. Returns the scan report.
+    fn layer_attr_report(tag: &str, ctx_pos: u64, mark: Option<u32>) -> String {
+        let dir = temp_dir(tag);
+        let gcode = "G90\nM83\nG1 Z0.2 F7200\nG1 X10 Y10 F9000\nG1 X20 Y10 E1 F1800\n\
+                     G1 Z0.4 F7200\nG1 X10 Y10 F9000\nG1 X20 Y10 E1\n";
+        let gpath = dir.join("part.gcode");
+        std::fs::write(&gpath, gcode).unwrap();
+        let path_str = gpath.to_str().unwrap().to_owned();
+        let mut ctx = context(5_000_000_000, ctx_pos, &path_str);
+        ctx.current_layer = mark;
+        ctx.total_layer = mark.map(|_| 120);
+        let full = write_segment(
+            &dir,
+            1,
+            &[
+                WalRecord::Heartbeat(heartbeat(3, 5_000_000_000, 42.0)),
+                WalRecord::Context(ctx),
+                WalRecord::Marker(Marker {
+                    mono_ns: 5_100_000_000,
+                    kind: MarkerKind::Resubscribed,
+                }),
+            ],
+        );
+        // Tear the tail: a realistic power-loss shape → RECOVERY.
+        std::fs::write(dir.join(segment_file_name(1)), &full[..full.len() - 5]).unwrap();
+        scan_to_string(&dir)
+    }
+
+    /// Part 2 in the scan report: with the print file readable, a layer
+    /// model is built and the offset window is attributed to layer(s).
+    /// MAJOR-fix case: at a **mid-file** anchor the geometric layer numbers
+    /// are window-relative, so the absolute slicer mark gets NO consistency
+    /// verdict — it is reported verbatim. (This is the case whose absence of
+    /// a mid-file test let the relative-vs-absolute bug through.)
+    #[test]
+    fn mid_file_recovery_reports_the_mark_verbatim_without_a_verdict() {
+        let pos = "G90\nM83\nG1 Z0.2 F7200\nG1 X10 Y10 F9000\n".len() as u64; // start of the layer-0 deposit line, mid-file
+        assert!(pos > 0);
+        let report = layer_attr_report("layerattr-mid", pos, Some(99));
+        assert!(report.contains("RECOVERY"), "{report}");
+        assert!(
+            !report.contains("layer attribution: unavailable"),
+            "a readable file must build a model: {report}"
+        );
+        // Mid-file: window-relative attribution, mark reported verbatim.
+        assert!(report.contains("window-relative"), "{report}");
+        assert!(
+            report.contains("current_layer=99") && report.contains("no consistency check"),
+            "a mid-file anchor must NOT emit a consistency verdict: {report}"
+        );
+        assert!(
+            !report.contains("consistent cross-check"),
+            "no absolute cross-check is possible mid-file: {report}"
+        );
+    }
+
+    /// The companion: when the anchor sits at **file start** (`base_offset
+    /// == 0`) the window ordinals ARE absolute, so the upper-bound
+    /// cross-check is valid and fires — here a large mark is trivially
+    /// consistent.
+    #[test]
+    fn file_start_recovery_runs_the_absolute_mark_cross_check() {
+        let report = layer_attr_report("layerattr-start", 0, Some(99));
+        assert!(report.contains("RECOVERY"), "{report}");
+        assert!(report.contains("layer model from byte 0"), "{report}");
+        assert!(
+            report.contains("current_layer=99") && report.contains("consistent cross-check"),
+            "a file-start anchor must run the absolute cross-check: {report}"
         );
     }
 

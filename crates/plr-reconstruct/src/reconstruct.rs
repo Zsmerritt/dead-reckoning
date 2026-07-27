@@ -436,6 +436,69 @@ mod tests {
         }
     }
 
+    /// Edge case (c): the frontier cap must read only crash-epoch data.
+    /// An older boot carrying a giant frontier is partitioned away before
+    /// ingestion, so the cap — which reads the anchor context, `t_a`, and
+    /// the heartbeat stream — can never take it. If it leaked, the window
+    /// high end would blow out to (or past) the giant offset.
+    #[test]
+    fn frontier_cap_reads_only_crash_epoch_frontier() {
+        use std::fmt::Write as _;
+        let mut text = String::new();
+        for i in 1..=80 {
+            let _ = writeln!(text, "G1 X{} Y50 F3000", 50 + 5 * i);
+        }
+        // Old boot at a high mono/print time with a 900_000-byte frontier.
+        let old_boot = vec![
+            WalRecord::Heartbeat(heartbeat_at(40_000 * S, 60_000.0)),
+            WalRecord::Context(context_at(40_000 * S, 900_000)),
+            WalRecord::StepperRange(stepper_range("stepper_z", 60_000.0, 40_000 * S)),
+        ];
+        // Crash boot: fresh low clock, frontier at offset 0, dense
+        // heartbeats so the cap's tail-continuity guard passes.
+        let crash = vec![
+            WalRecord::Heartbeat(heartbeat_at(20 * S, 10.0)),
+            WalRecord::Heartbeat(heartbeat_at(21 * S, 10.5)),
+            WalRecord::StepperRange(stepper_range("stepper_z", 10.3, 21 * S)),
+            WalRecord::Context(context_at(21 * S, 0)),
+        ];
+        let full = scan_of_segments(vec![old_boot, crash]);
+        let out = reconstruct(
+            &ReconstructInputs {
+                scan: &full,
+                heartbeat: None,
+                file_tail: Some(FileTail {
+                    base_offset: 0,
+                    bytes: text.as_bytes(),
+                }),
+                receive_seq: None,
+            },
+            &ReconstructConfig::default(),
+        )
+        .unwrap();
+        let Reconstruction::Recovery(r) = out else {
+            panic!("expected Recovery");
+        };
+        assert!(r.stop_set.degradation.cross_epoch_evidence_discarded);
+        let fw = r.stop_set.file_window.unwrap();
+        assert!(
+            fw.end <= text.len() as u64,
+            "cap leaked a cross-epoch frontier: end {} exceeds the crash file {}",
+            fw.end,
+            text.len()
+        );
+        // The cap actually applied (narrowed below EOF): proof it ran on
+        // the crash frontier, not that it merely defaulted.
+        assert!(r
+            .stop_set
+            .extension
+            .as_ref()
+            .unwrap()
+            .frontier_cap
+            .is_some());
+        assert!(fw.end < text.len() as u64);
+    }
+
     #[test]
     fn clean_shutdown_reports_distinctly_without_prerequisites() {
         // No heartbeat, no context: a clean shutdown still reports

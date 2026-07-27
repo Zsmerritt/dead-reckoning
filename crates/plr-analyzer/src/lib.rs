@@ -65,7 +65,7 @@ pub use matcher::{
 };
 pub use model::{
     build_layer_model, classify_feature_type, FeatureClass, Layer, LayerModel, ModelConfig,
-    ModelStop, MoveKind, SimMove, TypedPath, XySegment,
+    ModelStop, MoveKind, SimMove, TypedPath, WindowLayers, XySegment,
 };
 pub use structure::{
     assess_contact_point, BoundingBox, ClearRun, ContactMode, CriterionCheck, FootprintTrace,

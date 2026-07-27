@@ -198,6 +198,8 @@ fn any_context() -> impl Strategy<Value = Context> {
                     speed: target,
                 }],
                 exclude,
+                current_layer: None,
+                total_layer: None,
             },
         )
 }
@@ -283,6 +285,7 @@ fn any_config() -> impl Strategy<Value = ReconstructConfig> {
             heartbeat_period_ns: 1,
             heartbeat_gap_tolerance: 1.0,
             z_merge_tolerance: tol,
+            durability_lag_ns: 500_000_000,
             sim: SimConfig {
                 max_velocity: sim[0],
                 max_accel: sim[1],
