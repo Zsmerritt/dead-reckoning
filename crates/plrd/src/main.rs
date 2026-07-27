@@ -41,6 +41,11 @@ mod pipeline;
 // elsewhere (there is no Unix-socket transport off Unix).
 mod plrcfg;
 mod recover;
+// WAL retention: the pruning policy is pure and cross-platform (tested on
+// both platforms and against the real capture); its production caller,
+// `run_pruning`, is the Linux-only daemon and is itself `#[cfg(linux)]`.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+mod retention;
 mod scan;
 
 // These compile on every platform (their logic and tests are pure), but
