@@ -1,7 +1,7 @@
 //! The top-level orchestration: scan + heartbeat + file tail in,
 //! [`Reconstruction`] out.
 
-use plr_wal::{HeartbeatRecovery, RecoveryScan};
+use plr_wal::{HeartbeatRecovery, Marker, MarkerKind, RecoveryScan};
 
 use crate::config::ReconstructConfig;
 use crate::epoch::{select_crash_epoch, EpochSpan};
@@ -31,6 +31,16 @@ pub struct ReconstructInputs<'a> {
     /// The newest durable widened `receive_seq` observation, if the
     /// daemon persisted one. Applied strictly as a time bound on `t_b`.
     pub receive_seq: Option<ReceiveSeqObservation>,
+    /// Host-monotonic time of a power-fail edge from the watcher's sidecar
+    /// (`plrd`'s `powerfail` writes it, `crate::powerfail::decode_power_fail_edge`
+    /// reads it), when one validated. This is the **first, channel-bypassing**
+    /// durable copy of the edge; the WAL `PowerFailing` marker (if the FIFO
+    /// drained in time) is the richer second copy. Epoch-admitted exactly
+    /// like [`Self::heartbeat`] and folded into the timeline's markers, so
+    /// the two copies converge on
+    /// [`WalTimeline::power_failing_tail`](crate::WalTimeline::power_failing_tail).
+    /// `None` when no sidecar exists or it failed to validate.
+    pub power_fail_edge_mono_ns: Option<u64>,
 }
 
 /// A full recovery reconstruction: timeline, window, stop set, and the
@@ -113,8 +123,30 @@ pub fn reconstruct(
     let receive_seq = inputs
         .receive_seq
         .filter(|obs| epoch_admits(epoch, is_newest, obs.mono_ns));
+    // The power-fail sidecar is a WRITE-ONCE EVENT file, NOT a
+    // continuously-rewritten one like the heartbeat/receive-seq sidecars,
+    // so `epoch_admits`' semantics are wrong for it (they were the root
+    // cause of two review majors). An event file is credible only when it
+    // is ADJACENT TO THE TAIL IT KILLED: see [`sidecar_admits`].
+    let power_fail_edge = inputs
+        .power_fail_edge_mono_ns
+        .filter(|mono| sidecar_admits(epoch, *mono));
 
-    let timeline = ingest(&scan, heartbeat);
+    let mut timeline = ingest(&scan, heartbeat);
+    // Fold the sidecar copy in as a `PowerFailing` marker so it and the WAL
+    // marker (if the FIFO drained in time to journal one) converge on the
+    // single `WalTimeline::power_failing_tail` path — which dedups (takes
+    // the max) and applies the neutralization uniformly. Done after ingest
+    // so it cannot disturb the `clean_shutdown` determination: a deliberate
+    // clean shutdown with a stale sidecar around must still read as clean.
+    if let Some(edge) = power_fail_edge {
+        if !timeline.clean_shutdown {
+            timeline.markers.push(Marker {
+                mono_ns: edge,
+                kind: MarkerKind::PowerFailing,
+            });
+        }
+    }
     if timeline.clean_shutdown {
         return Ok(Reconstruction::CleanShutdown(Box::new(timeline)));
     }
@@ -169,6 +201,53 @@ fn epoch_admits(epoch: Option<&EpochSpan>, is_newest: bool, mono_ns: u64) -> boo
     }
 }
 
+/// How far *before* the crash epoch's durable tail a genuine power-fail
+/// edge may still sit, seconds. When the WAL FIFO DID drain, the
+/// `PowerFailing` marker (`mono_ns == edge`) becomes the epoch's own tail,
+/// so `edge == max_mono`; this slack only absorbs a record already in
+/// flight nudging `max_mono` a beat past the edge, plus clock jitter. One
+/// WAL-heartbeat interval (~1 s at defaults) covers it with margin —
+/// especially since the daemon suppresses further beats once the marker is
+/// processed (`plrd::walsvc`), so `max_mono` rarely exceeds the edge at all.
+const SIDECAR_ADMIT_SMALL_SLACK_S: f64 = 1.0;
+
+/// How far *after* the crash epoch's durable tail a genuine power-fail
+/// edge may sit, seconds. This is the whole point of the sidecar: when the
+/// FIFO backlog does NOT drain (the stalling-disk case), the edge postdates
+/// the last DURABLE record by however stale the durable tail was — bounded
+/// by the drain/stall worst case this module documents (~0.4–4 s) plus the
+/// ≥1 s hold-up. 10 s covers the legacy worst case with margin. A generous
+/// bound is safe against the stale-old-boot hazard because `CLOCK_MONOTONIC`
+/// resets each boot, so a prior boot's edge is astronomically far from a
+/// later crash's tail — and the daemon deletes a consumed sidecar at
+/// startup anyway (`plrd::daemon`), so a stale one never lingers to a
+/// second crash.
+const SIDECAR_ADMIT_DRAIN_SLACK_S: f64 = 10.0;
+
+/// Whether a power-fail sidecar edge is credible for THIS crash epoch.
+///
+/// The sidecar is a write-once event file, so — unlike the heartbeat file
+/// ([`epoch_admits`]) — it is not "the newest process's rewrite". It is
+/// credible only when it lands **adjacent to the durable tail it killed**:
+/// `edge ∈ [max_mono − small_slack, max_mono + drain_slack]`. A genuine
+/// edge always lands just past that tail (the backlog it outran); a stale
+/// edge from an earlier event lands nowhere near a later crash's tail.
+///
+/// Crucially this is anchored to the epoch's OWN tail and does **not**
+/// branch on `is_newest`, so it returns the SAME verdict whether the crash
+/// epoch is the newest (boot-time detection, before reboot) or superseded
+/// (a later `plrd scan`/`recover`, after reboot) — closing the
+/// two-answers-for-one-event split. With no epoch (empty scan) nothing is
+/// admitted.
+fn sidecar_admits(epoch: Option<&EpochSpan>, edge: u64) -> bool {
+    let Some(e) = epoch else { return false };
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let small = (SIDECAR_ADMIT_SMALL_SLACK_S * 1e9) as u64;
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let drain = (SIDECAR_ADMIT_DRAIN_SLACK_S * 1e9) as u64;
+    edge >= e.max_mono_ns.saturating_sub(small) && edge <= e.max_mono_ns.saturating_add(drain)
+}
+
 #[cfg(test)]
 mod tests {
     use plr_wal::{ExcludeObjectDef, ExcludeState, Marker, MarkerKind, WalRecord};
@@ -193,7 +272,129 @@ mod tests {
             heartbeat: None,
             file_tail: None,
             receive_seq: None,
+            power_fail_edge_mono_ns: None,
         }
+    }
+
+    /// The sidecar copy of the edge is consumed even when NO WAL
+    /// `PowerFailing` marker survived (the FIFO never drained one), and a
+    /// STALE sidecar from an older event is rejected by the same epoch
+    /// admission the heartbeat file gets — it must never pre-stamp a new
+    /// crash. (Reader-consumes-whichever + epoch discipline, MAJOR-1.)
+    #[test]
+    fn a_sidecar_power_fail_edge_is_epoch_admitted_and_folded_in() {
+        // `crash_epoch_records()` has its durable tail at 21 s, so the
+        // admission band is [20 s, 31 s]. Fold-in works with NO WAL marker
+        // present — only the sidecar carries the edge.
+        let scan = scan_of(crash_epoch_records());
+        let tail_of = |edge: u64| -> Option<u64> {
+            let inputs = ReconstructInputs {
+                power_fail_edge_mono_ns: Some(edge),
+                ..inputs(&scan)
+            };
+            let Reconstruction::Recovery(recovery) =
+                reconstruct(&inputs, &ReconstructConfig::default()).unwrap()
+            else {
+                panic!("expected a recovery");
+            };
+            recovery.timeline.power_failing_tail()
+        };
+
+        // Genuine: just past the durable tail (the backlog it outran).
+        assert_eq!(
+            tail_of(22 * S),
+            Some(22 * S),
+            "an edge adjacent to the crash tail is admitted, WAL marker or not"
+        );
+    }
+
+    /// **MAJOR-A probe as a committed test.** A write-once sidecar left by
+    /// an EARLIER boot (a 3-day-uptime event) is far ABOVE a later crash's
+    /// tail, so the tail-anchored band rejects it — it cannot flip that
+    /// crash's class. (The old lower-bound-only admission accepted it.) An
+    /// edge well BELOW the tail is rejected too.
+    #[test]
+    fn a_stale_sidecar_far_from_the_crash_tail_is_rejected() {
+        let scan = scan_of(crash_epoch_records()); // tail 21 s, band [20 s, 31 s]
+        let tail_of = |edge: u64| -> Option<u64> {
+            let inputs = ReconstructInputs {
+                power_fail_edge_mono_ns: Some(edge),
+                ..inputs(&scan)
+            };
+            let Reconstruction::Recovery(recovery) =
+                reconstruct(&inputs, &ReconstructConfig::default()).unwrap()
+            else {
+                panic!("expected a recovery");
+            };
+            recovery.timeline.power_failing_tail()
+        };
+        // Stale-ABOVE: a 3-day-uptime sidecar from an earlier boot.
+        assert_eq!(
+            tail_of(21 * S + 3 * 86_400 * S),
+            None,
+            "a stale old-boot edge far above the tail must be rejected"
+        );
+        // Stale-BELOW: an edge well before the tail.
+        assert_eq!(
+            tail_of(5 * S),
+            None,
+            "an edge far below the tail is rejected"
+        );
+    }
+
+    /// **MAJOR-B probe as a committed test.** When the WAL marker died with
+    /// the backlog, only the sidecar carries the edge, which POSTDATES the
+    /// crash epoch's durable tail. The verdict must be the SAME whether the
+    /// crash epoch is the newest partition (boot-time detection) or
+    /// superseded by a later idle boot (a subsequent `plrd scan`/`recover`)
+    /// — the old code answered `Some` then `None` for the same event.
+    #[test]
+    fn a_sidecar_only_edge_gives_the_same_answer_before_and_after_reboot() {
+        const EDGE: u64 = 22 * S; // just past the 21 s durable tail
+
+        // Boot-time detection: the crash epoch is the NEWEST partition.
+        let boot = scan_of(crash_epoch_records());
+        let boot_inputs = ReconstructInputs {
+            power_fail_edge_mono_ns: Some(EDGE),
+            ..inputs(&boot)
+        };
+        let Reconstruction::Recovery(boot_r) =
+            reconstruct(&boot_inputs, &ReconstructConfig::default()).unwrap()
+        else {
+            panic!("expected a recovery");
+        };
+
+        // After a reboot: a fresh idle boot (mono reset, not printing)
+        // makes the crash epoch SUPERSEDED.
+        let idle_boot = vec![
+            WalRecord::Heartbeat(heartbeat_at(5 * S, 1.0)),
+            WalRecord::Context({
+                let mut c = context_at(5 * S, 0);
+                c.virtual_sdcard = None;
+                c
+            }),
+        ];
+        let after = scan_of_segments(vec![crash_epoch_records(), idle_boot]);
+        let after_inputs = ReconstructInputs {
+            power_fail_edge_mono_ns: Some(EDGE),
+            ..inputs(&after)
+        };
+        let Reconstruction::Recovery(after_r) =
+            reconstruct(&after_inputs, &ReconstructConfig::default()).unwrap()
+        else {
+            panic!("expected a recovery");
+        };
+
+        assert_eq!(
+            boot_r.timeline.power_failing_tail(),
+            Some(EDGE),
+            "boot detect must admit the genuine sidecar edge"
+        );
+        assert_eq!(
+            after_r.timeline.power_failing_tail(),
+            boot_r.timeline.power_failing_tail(),
+            "the same event must give the same answer after reboot"
+        );
     }
 
     const S: u64 = 1_000_000_000; // one second in ns
@@ -352,6 +553,7 @@ mod tests {
                 heartbeat: Some(&file),
                 file_tail: None,
                 receive_seq: None,
+                power_fail_edge_mono_ns: None,
             },
             &ReconstructConfig::default(),
         )
@@ -472,6 +674,7 @@ mod tests {
                     bytes: text.as_bytes(),
                 }),
                 receive_seq: None,
+                power_fail_edge_mono_ns: None,
             },
             &ReconstructConfig::default(),
         )
@@ -656,6 +859,7 @@ mod tests {
                 bytes: file,
             }),
             receive_seq: None,
+            power_fail_edge_mono_ns: None,
         };
         let outcome = reconstruct(&inputs, &ReconstructConfig::default()).unwrap();
         let Reconstruction::Recovery(recovery) = outcome else {

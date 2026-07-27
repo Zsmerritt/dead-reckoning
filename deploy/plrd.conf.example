@@ -90,6 +90,44 @@ moonraker_url = ws://127.0.0.1:7125/websocket
 control_socket = /var/lib/plrd/plrd.sock
 
 # ----------------------------------------------------------------------
+# POWER-FAILING GPIO watcher ([power_fail_gpio]) — OPTIONAL, OFF BY DEFAULT.
+#
+# If you have hardware that raises a GPIO edge the instant mains power
+# begins failing — a DC-rail-fed hold-up module that keeps the Pi alive
+# for >= ~1 s after the edge — plrd can watch that line on a dedicated
+# thread and, the moment it fires, journal a durable PowerFailing marker
+# stamped with the exact time power began failing. That timestamp turns
+# power-loss recovery from inference into arithmetic: the plan already on
+# disk, plus the exact stop time.
+#
+# The watcher NEVER commands the printer on the edge (the MCU and heaters
+# die with the 24 V rail on their own; commanding a browning-out machine
+# is forbidden). It only journals + fsyncs, then cleanly exits the daemon.
+#
+# This is a DAEMON-SIDE setting: it lives here in plrd.conf, NOT in
+# printer.cfg's [plr] section, so it is outside the plugin's daemon_keys
+# contract (exactly like wal_retention_bytes above).
+#
+# ABSENT SECTION = FEATURE ENTIRELY OFF (the default). Leave the whole
+# section commented out unless you have wired the hardware. When present,
+# chip, line, and active_edge are ALL REQUIRED (plrd refuses rather than
+# guess the polarity of a safety signal); debounce_ms defaults to 5.
+#
+#   chip          GPIO character device, e.g. /dev/gpiochip0        (required)
+#   line          line offset on that chip                          (required)
+#   active_edge   edge that means "power failing": rising | falling (required)
+#   debounce_ms   re-read delay to reject an EMI blip, ms  [0, 500]  (5)
+#
+# Example (a power-good line that falls to logic-low on failure, on
+# gpiochip0 line 23):
+#
+# [power_fail_gpio]
+# chip = /dev/gpiochip0
+# line = 23
+# active_edge = falling
+# debounce_ms = 5
+
+# ----------------------------------------------------------------------
 # LEGACY machine snapshot ([machine]).
 #
 # PREFERRED SETUP: add a [plr] section to printer.cfg instead (see the

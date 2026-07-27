@@ -116,6 +116,15 @@ pub enum IngestNote {
         /// Host-monotonic time the idle regime began (ns).
         mono_ns: u64,
     },
+    /// A GPIO edge signalled that the DC rail began failing at this
+    /// host-monotonic time ([`plr_wal::MarkerKind::PowerFailing`]). See
+    /// [`WalTimeline::power_failing_tail`] for what a *tail* occurrence
+    /// licenses; a non-tail one (motion follows it) is a spurious edge and
+    /// this note is the only trace it leaves.
+    PowerFailing {
+        /// Host-monotonic time the power-fail edge was journaled (ns).
+        mono_ns: u64,
+    },
     /// A marker written by a newer format revision was preserved as
     /// opaque and ignored.
     UnknownMarker {
@@ -206,6 +215,92 @@ pub struct WalTimeline {
 }
 
 impl WalTimeline {
+    /// `mono_ns` of a **tail** [`MarkerKind::PowerFailing`] — a
+    /// hold-up-backed GPIO power-fail edge with no motion recorded after
+    /// it — or `None`.
+    ///
+    /// This is the exact-T fact the rest of the reconstruction is built to
+    /// infer indirectly: the physical cut lies in
+    /// `[t, t + hold_up_margin]` on the host-monotonic axis, where `t` is
+    /// the returned value. The marker time is a *lower* bound on the cut
+    /// (power was still up when it was journaled, so motion can continue
+    /// for the hold-up margin afterward), so it can only ever tighten an
+    /// *upper* bound on the stop, never exclude the true stop. The frontier
+    /// cap ([`crate::stopset::compute_stop_set`]) consumes it as an
+    /// independent, tighter upper bound on `t_cut`; classification
+    /// ([`crate::window`]) reads it as decisive power-loss evidence.
+    ///
+    /// # Neutralization: positive proof of surviving power, not just motion
+    ///
+    /// A `PowerFailing` marker counts only when **no liveness record
+    /// outlived the hold-up window**: the marker is neutralized if any
+    /// heartbeat, context, or motion record carries `mono_ns > edge +
+    /// hold_up_margin`. Such a record is positive proof the machine was
+    /// alive *after* the edge could physically have cut it, so the edge was
+    /// spurious (an EMI blip past the debounce) or stale — either way it
+    /// must not tighten anything.
+    ///
+    /// This is deliberately broader than "no *motion* after the edge": a
+    /// false edge followed by an hour of **heartbeats** and no motion would
+    /// pass a motion-only filter yet is plainly not a real power loss.
+    /// Motion, contexts, and heartbeats all count as liveness. Records
+    /// *within* `[edge, edge + margin]` do **not** neutralize — brief motion
+    /// during the hold-up is exactly what the margin models. The
+    /// [`IngestNote::PowerFailing`] note records the edge regardless, so a
+    /// neutralized signal is still visible in `plrd scan`.
+    ///
+    /// # Pinned residual: the unrecorded restart gap (hazard, not closed)
+    ///
+    /// Neutralization can only see **recorded** evidence. One composition
+    /// evades it: a false-but-persistent edge trips the watcher's best-effort
+    /// **clean daemon exit** (`plrd`'s power-fail path), so `plrd` is down
+    /// for the systemd restart gap (~2–10 s) during which motion is
+    /// structurally unrecorded; if a *real* power cut then lands inside that
+    /// gap, no later record exists to neutralize the stale edge, and the cap
+    /// can place the stop up to one margin before the true cut. The
+    /// preconditions are narrow (a persistent false edge AND a real cut
+    /// within the restart gap), but two of the steps are caused by this
+    /// design, so it is **acknowledged, not guarded** — the same treatment
+    /// as `stopset`'s terminal-writer-stall residual. Closing it would
+    /// require recording across a window in which the daemon is deliberately
+    /// dead, which it cannot.
+    ///
+    /// # Why a method, not a field
+    ///
+    /// [`WalTimeline`] exposes public fields and is struct-literal
+    /// constructed outside this crate, so adding a field would be a
+    /// breaking change; the value is derived on demand from the markers and
+    /// the liveness timestamps, all of which ingest already stores.
+    #[must_use]
+    pub fn power_failing_tail(&self) -> Option<u64> {
+        // Margin on the host-monotonic axis (print-time seconds ≈ mono
+        // seconds at unit slope; the margin is a conservative upper bound
+        // regardless). Single source of truth in `stopset`.
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let margin_ns = (crate::stopset::POWER_FAIL_HOLD_UP_MARGIN_S * 1e9) as u64;
+        let newest_survivor = self.newest_liveness_mono_ns();
+        self.markers
+            .iter()
+            .filter(|m| m.kind == MarkerKind::PowerFailing)
+            .map(|m| m.mono_ns)
+            .filter(|&edge| newest_survivor.is_none_or(|s| s <= edge.saturating_add(margin_ns)))
+            .max()
+    }
+
+    /// Newest `mono_ns` across records that **prove the machine kept
+    /// executing** — motion, contexts, and heartbeats. Markers are excluded
+    /// (a lifecycle note is not execution). Used by
+    /// [`power_failing_tail`](Self::power_failing_tail) to neutralize an
+    /// edge that liveness outlived.
+    fn newest_liveness_mono_ns(&self) -> Option<u64> {
+        let newest_hb = self.heartbeats.iter().map(|h| h.mono_ns).max();
+        let newest_ctx = self.contexts.iter().map(|c| c.mono_ns).max();
+        [self.last_motion_mono_ns, newest_hb, newest_ctx]
+            .into_iter()
+            .flatten()
+            .max()
+    }
+
     /// End of durable trapq knowledge: the maximum segment end time
     /// across the toolhead and extruder queues, or `None` when no finite
     /// segment exists. Rows are journaled as Klipper *plans* moves
@@ -332,6 +427,19 @@ pub fn ingest(scan: &RecoveryScan, heartbeat: Option<&HeartbeatRecovery>) -> Wal
                     // reconstruction verdict — see `IngestNote::RecordingQuiescent`.
                     MarkerKind::RecordingQuiescent => {
                         notes.push(IngestNote::RecordingQuiescent {
+                            mono_ns: marker.mono_ns,
+                        });
+                    }
+                    // Recorded here; promoted to `power_failing_tail` below
+                    // only if no motion follows it (a spurious edge with
+                    // motion after is discarded — see the field docs).
+                    // Noted here; whether it counts as a *tail* fact is
+                    // derived on demand by `WalTimeline::power_failing_tail`
+                    // (it must be a method, not a field — `WalTimeline` has
+                    // public fields and out-of-crate struct literals, so a
+                    // new field would be a breaking change).
+                    MarkerKind::PowerFailing => {
+                        notes.push(IngestNote::PowerFailing {
                             mono_ns: marker.mono_ns,
                         });
                     }
@@ -656,6 +764,87 @@ mod tests {
         let timeline = ingest(&both, None);
         assert_eq!(timeline.socket_lost_tail, Some(8));
         assert_eq!(timeline.recorder_stopped_tail, Some(9));
+    }
+
+    /// A genuine tail `PowerFailing` marker (nothing outlives the hold-up
+    /// margin) is the exact-T fact; an edge that ANY liveness record —
+    /// motion, context, OR heartbeat — outlives past the margin is
+    /// neutralized but still noted. This is the honest-wide-never-narrow
+    /// property, broadened per review beyond motion-only.
+    #[test]
+    fn power_failing_tail_neutralizes_on_any_liveness_past_the_margin() {
+        // margin is 1 s; edge at 5 s, later evidence at 8 s (> 1 s past)
+        // neutralizes; evidence within [5, 6] s does not.
+        const EDGE: u64 = 5_000_000_000;
+        const PAST_MARGIN: u64 = 8_000_000_000; // 3 s after the edge
+        const WITHIN_MARGIN: u64 = 5_500_000_000; // 0.5 s after the edge
+
+        // Genuine: edge at 5 s, newest liveness (motion) predates it → tail.
+        let genuine = scan_of(vec![
+            WalRecord::TrapqSegment(trapq_segment("toolhead", 1.0, 0.5, 1_000_000_000)),
+            marker(EDGE, MarkerKind::PowerFailing),
+        ]);
+        let timeline = ingest(&genuine, None);
+        assert_eq!(timeline.power_failing_tail(), Some(EDGE));
+        assert!(!timeline.clean_shutdown);
+        assert!(timeline
+            .notes
+            .iter()
+            .any(|n| matches!(n, IngestNote::PowerFailing { mono_ns: EDGE })));
+
+        // Neutralized by MOTION past the margin.
+        let by_motion = scan_of(vec![
+            marker(EDGE, MarkerKind::PowerFailing),
+            WalRecord::TrapqSegment(trapq_segment("toolhead", 2.0, 0.5, PAST_MARGIN)),
+        ]);
+        assert_eq!(ingest(&by_motion, None).power_failing_tail(), None);
+
+        // Neutralized by a HEARTBEAT past the margin, with NO motion at all
+        // — the exact hole a motion-only filter left (reviewer's probe:
+        // marker + an hour of heartbeats).
+        let by_heartbeat = scan_of(vec![
+            marker(EDGE, MarkerKind::PowerFailing),
+            WalRecord::Heartbeat(heartbeat_at(PAST_MARGIN, 9.0)),
+        ]);
+        let timeline = ingest(&by_heartbeat, None);
+        assert_eq!(
+            timeline.power_failing_tail(),
+            None,
+            "a heartbeat past the margin is positive proof power survived"
+        );
+        // Still noted (the contradiction is visible in `plrd scan`).
+        assert!(timeline
+            .notes
+            .iter()
+            .any(|n| matches!(n, IngestNote::PowerFailing { mono_ns: EDGE })));
+
+        // Neutralized by a CONTEXT past the margin.
+        let by_context = scan_of(vec![
+            marker(EDGE, MarkerKind::PowerFailing),
+            WalRecord::Context(context_at(PAST_MARGIN, 0)),
+        ]);
+        assert_eq!(ingest(&by_context, None).power_failing_tail(), None);
+
+        // Evidence WITHIN the margin does NOT neutralize — brief motion
+        // during the hold-up is exactly what the margin models.
+        let within = scan_of(vec![
+            marker(EDGE, MarkerKind::PowerFailing),
+            WalRecord::TrapqSegment(trapq_segment("toolhead", 2.0, 0.5, WITHIN_MARGIN)),
+        ]);
+        assert_eq!(ingest(&within, None).power_failing_tail(), Some(EDGE));
+
+        // No liveness at all: an edge is still a tail fact.
+        let alone = scan_of(vec![marker(EDGE, MarkerKind::PowerFailing)]);
+        assert_eq!(ingest(&alone, None).power_failing_tail(), Some(EDGE));
+
+        // No power-fail marker: None.
+        let none = scan_of(vec![WalRecord::TrapqSegment(trapq_segment(
+            "toolhead",
+            1.0,
+            0.5,
+            1_000_000_000,
+        ))]);
+        assert_eq!(ingest(&none, None).power_failing_tail(), None);
     }
 
     #[test]

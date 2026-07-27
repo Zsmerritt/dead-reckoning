@@ -762,6 +762,7 @@ fn run_case(scenario: &Scenario) -> Result<(), TestCaseError> {
             bytes: text.as_bytes(),
         }),
         receive_seq: obs,
+        power_fail_edge_mono_ns: None,
     };
     let config = ReconstructConfig {
         mcu_freq: scenario.with_mcu_freq.then_some(MCU_FREQ),
@@ -936,6 +937,7 @@ fn clean_shutdown_marker_reports_distinctly() {
                 bytes: text.as_bytes(),
             }),
             receive_seq: None,
+            power_fail_edge_mono_ns: None,
         },
         &ReconstructConfig {
             mcu_freq: Some(MCU_FREQ),

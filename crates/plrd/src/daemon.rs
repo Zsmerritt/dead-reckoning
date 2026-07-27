@@ -43,6 +43,12 @@ fn wal_cfg(config: &Config) -> WalSvcCfg {
 
 /// Runs the daemon until a signal or a fatal error. Returns the process
 /// exit code.
+// Linear composition (bind control socket, boot detection, retention,
+// spawn WAL thread + power-fail watcher, build the runtime, select on
+// client/signal/power-fail, then the shutdown sequence). Splitting it would
+// scatter the ownership of `sender`/`config` across helpers for no clarity
+// gain — same call the project already made for `ctrlsock::cmd_recover_execute`.
+#[allow(clippy::too_many_lines)]
 pub fn run(config_path: &Path) -> u8 {
     let config = match Config::load(config_path) {
         Ok(config) => config,
@@ -75,6 +81,26 @@ pub fn run(config_path: &Path) -> u8 {
     // executes anything — it only writes a state file and announces.
     let announcement = boot_detection(&config);
 
+    // Power-fail sidecar lifecycle: it is a WRITE-ONCE event file, so once
+    // this boot's detection has CONSUMED it (the read happens inside
+    // `boot_detection` above, via `detect` -> `scan::load_power_fail_edge`),
+    // it must be deleted — a consumed genuine edge already lives on in
+    // detection's output (`pending_recovery.json`), and a stale/inert file
+    // left behind would poison a LATER crash's early-uptime reconstruction
+    // (the admission band's tail-anchor plus this deletion together close
+    // that hazard). Ordering is load-bearing: this runs strictly AFTER the
+    // read above and never before it, so a genuine edge is never dropped
+    // before it is used. Failure to delete is logged, never fatal — the
+    // same posture as the `pending_recovery.json` clear sites.
+    if let Err(e) = std::fs::remove_file(config.power_fail_sidecar_file()) {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            eprintln!(
+                "plrd: could not delete consumed power-fail sidecar {} (continuing): {e}",
+                config.power_fail_sidecar_file().display()
+            );
+        }
+    }
+
     // WAL retention: prune superseded old sessions down to the configured
     // cap. This MUST run here — after boot detection (which also reads the
     // previous session's tail) and BEFORE the WAL service spawns — so the
@@ -87,7 +113,41 @@ pub fn run(config_path: &Path) -> u8 {
     let retention_url = config.moonraker_url.clone();
 
     let (tx, rx) = std::sync::mpsc::sync_channel::<WalCmd>(config.channel_capacity);
+    // A clone for the power-fail watcher (below) to journal its marker on
+    // the same never-dropped path. Cloned before `WalSender` takes `tx`.
+    let watcher_tx = tx.clone();
     let wal_thread = walsvc::spawn(wal_cfg(&config), rx);
+
+    // The power-failing GPIO watcher (dormant unless `[power_fail_gpio]` is
+    // configured — the operator's hold-up hardware does not exist yet). Its
+    // best-effort clean-exit hook fires `powerfail_exit`, which the
+    // runtime's `select!` below treats as a THIRD stop reason: distinct
+    // from a SIGTERM/SIGINT signal because it must NOT journal a
+    // `RecorderStopped` marker (that suppresses recovery — the exact wrong
+    // outcome after a real power loss), yet must still take the final WAL
+    // sync. `note_stop_reason` is the precedent for a side-channel WAL
+    // writer; this is a second one, journaling directly to the WAL thread.
+    let powerfail_exit = std::sync::Arc::new(tokio::sync::Notify::new());
+    if let Some(pf) = config.power_fail_gpio.clone() {
+        let exit = std::sync::Arc::clone(&powerfail_exit);
+        let response = crate::powerfail::WalChannelResponse::new(
+            config.power_fail_sidecar_file(),
+            watcher_tx,
+            // Best-effort tier: signal the clean exit. Runs only after the
+            // watcher's mandatory tier has journaled the marker (see
+            // `powerfail::run_watcher`), so it can never delay it.
+            Box::new(move || exit.notify_one()),
+        );
+        // Detached: the thread blocks on the GPIO edge for the daemon's
+        // life (or ends after firing once). Not joined — process exit at
+        // shutdown reaps a thread blocked in a kernel edge read.
+        drop(crate::powerfail::spawn(pf, response));
+        eprintln!("plrd: power-fail GPIO watcher armed");
+    } else {
+        // No hardware configured: drop the spare sender so it does not keep
+        // the WAL channel alive independently of `WalSender`.
+        drop(watcher_tx);
+    }
 
     // The daemon is operational once the WAL service owns its files —
     // Klipper being down is a normal state it records around.
@@ -131,6 +191,8 @@ pub fn run(config_path: &Path) -> u8 {
     let moonraker_url = config.moonraker_url.clone();
     // Set only on the signal path — see the recorder-stopped marker below.
     let mut graceful = false;
+    // Set only on the power-fail watcher's clean-exit path — see below.
+    let mut power_fail = false;
     let client_result = runtime.block_on(async {
         // The control server runs beside the recorder. Its handlers do
         // heavy work on spawn_blocking and its executions await
@@ -154,10 +216,26 @@ pub fn run(config_path: &Path) -> u8 {
                 graceful = true;
                 Ok(())
             }
+            () = powerfail_exit.notified() => {
+                power_fail = true;
+                Ok(())
+            }
         }
     });
 
-    note_stop_reason(&mut sender, graceful);
+    if journals_recorder_stopped(graceful, power_fail) {
+        note_stop_reason(&mut sender, graceful);
+    } else if power_fail {
+        // The watcher already journaled and fsync'd the PowerFailing
+        // marker (its mandatory tier). This is a CLEAN exit — final WAL
+        // sync below — but deliberately NOT a graceful *recorder* stop:
+        // journaling `RecorderStopped` here would suppress the very
+        // recovery announcement the power loss must produce.
+        eprintln!(
+            "plrd: power-fail clean exit — the PowerFailing marker is journaled; \
+             not writing a recorder-stopped marker"
+        );
+    }
 
     // Final durability: ask the WAL thread to sync and exit, then judge
     // by its verdict.
@@ -203,6 +281,21 @@ pub fn run(config_path: &Path) -> u8 {
 /// `WalSender::shutdown`, so the shutdown's final `fdatasync` makes it
 /// durable. A dead WAL thread (`WalGone`) means nothing can be journaled
 /// at all, which costs one spurious announcement — logged, never fatal.
+/// Whether a stop should journal the graceful recorder-stopped marker.
+///
+/// Only a graceful signal (SIGTERM/SIGINT) does. A **power-fail** clean
+/// exit must not — a `RecorderStopped` marker suppresses the recovery
+/// announcement, which is the exact wrong outcome after a real power loss
+/// (the `PowerFailing` marker + sidecar already record the truth). A
+/// client-ended or fatal stop journals nothing either. `power_fail` wins
+/// over `graceful` defensively, though the `select!` sets at most one.
+///
+/// Extracted so the third `select!` arm's decision is unit-testable
+/// without driving the whole async runtime (see the test below).
+const fn journals_recorder_stopped(graceful: bool, power_fail: bool) -> bool {
+    graceful && !power_fail
+}
+
 fn note_stop_reason(sender: &mut WalSender, graceful: bool) {
     if !graceful {
         return;
@@ -801,6 +894,31 @@ mod tests {
         drop(rx);
         let mut sender = crate::sender::WalSender::new(tx);
         super::note_stop_reason(&mut sender, true);
+    }
+
+    /// The third `select!` arm's decision, unit-tested directly (the arm
+    /// itself sets `power_fail` and `run` gates `note_stop_reason` behind
+    /// this): only a graceful, non-power-fail stop journals
+    /// `RecorderStopped`. A power-fail clean exit never does — that would
+    /// suppress the recovery a power loss must announce.
+    #[test]
+    fn only_a_graceful_non_power_fail_stop_journals_recorder_stopped() {
+        assert!(
+            super::journals_recorder_stopped(true, false),
+            "a SIGTERM/SIGINT stop journals RecorderStopped"
+        );
+        assert!(
+            !super::journals_recorder_stopped(false, true),
+            "a power-fail clean exit must not"
+        );
+        assert!(
+            !super::journals_recorder_stopped(false, false),
+            "a client-ended / fatal stop journals nothing"
+        );
+        // Defensive: power-fail wins over a stray graceful flag (the
+        // select! sets at most one, but the marker must never suppress a
+        // power-loss recovery).
+        assert!(!super::journals_recorder_stopped(true, true));
     }
 
     #[test]

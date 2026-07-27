@@ -41,8 +41,30 @@
 //! `type_annotations_present` and `config_hash` are **not** config keys:
 //! the former is observed from the actual print file (`;TYPE:` scan) and
 //! the latter is computed from `klipper_config_path` at recover time.
+//!
+//! # The `[power_fail_gpio]` section — a daemon-side key, like `wal_retention_bytes`
+//!
+//! The optional `[power_fail_gpio]` section configures the power-failing
+//! GPIO watcher ([`crate::powerfail`]). It is a **daemon-side** setting,
+//! parsed here and consumed only inside `plrd`, so the klippy
+//! `daemon_keys.py` contract does **not** apply to it — exactly as it does
+//! not apply to `wal_retention_bytes`. `daemon_keys.py` governs the
+//! `[plr]` options an operator writes in *printer.cfg* that the Klipper
+//! plugin must *declare* so klippy publishes them into
+//! `configfile.settings.plr` for `plrd::plrcfg` to read; a key that lives
+//! only in *plrd.conf* (this file) never travels that path, is never read
+//! from `configfile.settings`, and so must not appear in `DAEMON_KEYS`
+//! (verified: neither `wal_retention_bytes` nor any `power_fail_gpio.*`
+//! key is in `klippy_plugin/plr/daemon_keys.py`).
+//!
+//! **Absent section = feature entirely off** (the default): the operator's
+//! hold-up hardware does not exist yet, so this ships dormant. When the
+//! section *is* present, `chip`, `line`, and `active_edge` are all
+//! required (refuse, never guess a safety-relevant polarity); `debounce_ms`
+//! defaults to [`PowerFailGpio::DEFAULT_DEBOUNCE_MS`].
 
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 /// All daemon settings, with defaults suitable for a stock Klipper host.
 #[derive(Debug, Clone, PartialEq)]
@@ -99,6 +121,76 @@ pub struct Config {
     pub control_socket: PathBuf,
     /// The `[machine]` section (see the module docs table).
     pub machine: MachineSection,
+    /// The optional `[power_fail_gpio]` section. `None` — the default —
+    /// means the power-failing GPIO watcher is entirely off (the
+    /// operator's hold-up hardware does not exist yet; this ships
+    /// dormant). See [`PowerFailGpio`] and [`crate::powerfail`].
+    pub power_fail_gpio: Option<PowerFailGpio>,
+}
+
+/// Which GPIO edge signals that the DC rail has begun failing.
+///
+/// The `active_edge` a `[power_fail_gpio]` section declares is
+/// **required**, never defaulted: a hold-up module may signal failure
+/// with a power-good line going low (a falling edge) or a dedicated
+/// fault line going high (a rising edge), and guessing the polarity of a
+/// safety signal is exactly the quiet mistake this config refuses to
+/// make. The confirmation re-read after the debounce checks that the line
+/// still reads the *asserted* level (high for [`Rising`](Self::Rising),
+/// low for [`Falling`](Self::Falling)); a blip that has already relaxed is
+/// treated as spurious.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PowerFailEdge {
+    /// Power-failing is signalled by a low→high transition; the asserted
+    /// level is high.
+    Rising,
+    /// Power-failing is signalled by a high→low transition; the asserted
+    /// level is low.
+    Falling,
+}
+
+/// The `[power_fail_gpio]` section: a dedicated Linux thread watches this
+/// GPIO line for the edge a hold-up module raises when power begins
+/// failing (see [`crate::powerfail`]). A **daemon-side** setting — parsed
+/// here, consumed only in `plrd`, outside the `daemon_keys.py` contract
+/// (module docs).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PowerFailGpio {
+    /// GPIO character-device chip path, e.g. `/dev/gpiochip0`. Required.
+    pub chip: PathBuf,
+    /// Line offset on that chip. Required.
+    pub line: u32,
+    /// Which edge means "power is failing". Required (see
+    /// [`PowerFailEdge`]).
+    pub active_edge: PowerFailEdge,
+    /// Debounce re-read window: after the edge the watcher waits this long
+    /// and re-reads the line, journaling the marker only if the asserted
+    /// level persists. Defaults to
+    /// [`DEFAULT_DEBOUNCE_MS`](Self::DEFAULT_DEBOUNCE_MS).
+    pub debounce: Duration,
+}
+
+impl PowerFailGpio {
+    /// Default debounce window (ms) — a few milliseconds absorbs the EMI
+    /// blip of a browning-out rail without materially delaying the
+    /// mandatory tier (a false marker degrades honest-wide anyway; see
+    /// [`crate::powerfail`]).
+    pub const DEFAULT_DEBOUNCE_MS: u64 = 5;
+    /// Upper bound on a sane debounce window (ms). The hold-up budget is
+    /// ~1 s; a debounce anywhere near it would eat the window it exists to
+    /// protect. Refused above this, never clamped.
+    pub const MAX_DEBOUNCE_MS: u64 = 500;
+
+    /// A section-in-progress with sentinel required fields and the default
+    /// debounce; `parse` finalises and `validate` domain-checks it.
+    fn incomplete() -> Self {
+        Self {
+            chip: PathBuf::new(),
+            line: 0,
+            active_edge: PowerFailEdge::Falling,
+            debounce: Duration::from_millis(Self::DEFAULT_DEBOUNCE_MS),
+        }
+    }
 }
 
 /// One Z stepper entry from the `[machine]` section.
@@ -179,6 +271,7 @@ impl Default for Config {
             moonraker_url: "ws://127.0.0.1:7125/websocket".to_owned(),
             control_socket: PathBuf::from("/var/lib/plrd/plrd.sock"),
             machine: MachineSection::default(),
+            power_fail_gpio: None,
         }
     }
 }
@@ -197,6 +290,17 @@ impl Config {
     #[must_use]
     pub fn receive_seq_file(&self) -> PathBuf {
         self.wal_dir.join("receive_seq.bin")
+    }
+
+    /// The power-fail sidecar path (not configurable; lives next to the
+    /// segments like the other sidecars). The power-fail watcher
+    /// (`crate::powerfail`) writes the edge timestamp here as its first,
+    /// channel-bypassing durability copy; recovery reads it back
+    /// (epoch-admitted like the heartbeat file). Basename must match
+    /// `crate::scan::POWER_FAIL_FILE_NAME`.
+    #[must_use]
+    pub fn power_fail_sidecar_file(&self) -> PathBuf {
+        self.wal_dir.join("power_fail.bin")
     }
 
     /// Reads and parses a config file.
@@ -223,6 +327,7 @@ impl Config {
                 };
                 section = match name.trim() {
                     "machine" => Some("machine"),
+                    "power_fail_gpio" => Some("power_fail_gpio"),
                     other => return Err(format!("line {lineno}: unknown section `[{other}]`")),
                 };
                 continue;
@@ -242,6 +347,22 @@ impl Config {
                 .apply(&full_key, value)
                 .map_err(|e| format!("line {lineno}: {e}"))?;
             seen.push(full_key);
+        }
+        // `[power_fail_gpio]` required-key presence: the section-in-progress
+        // built lazily in `apply` cannot tell a sentinel `line = 0` from an
+        // explicit one, so presence (not value) is checked here against the
+        // keys actually seen. Refuse, never guess — the polarity especially.
+        if config.power_fail_gpio.is_some() {
+            for required in ["chip", "line", "active_edge"] {
+                let key = format!("power_fail_gpio.{required}");
+                if !seen.iter().any(|k| k == &key) {
+                    return Err(format!(
+                        "`[power_fail_gpio]` is present but `{required}` is not set; \
+                         chip, line and active_edge are all required (omit the whole \
+                         section to leave the feature off)"
+                    ));
+                }
+            }
         }
         config.validate()?;
         Ok(config)
@@ -305,9 +426,38 @@ impl Config {
             "machine.virtual_sdcard_root" => {
                 self.machine.virtual_sdcard_root = Some(value.to_owned());
             }
+            "power_fail_gpio.chip" => {
+                self.power_fail_gpio_mut().chip = parse_path(value)?;
+            }
+            "power_fail_gpio.line" => {
+                self.power_fail_gpio_mut().line = u32::try_from(parse_u64(value)?)
+                    .map_err(|_| "line does not fit in u32".to_owned())?;
+            }
+            "power_fail_gpio.active_edge" => {
+                self.power_fail_gpio_mut().active_edge = match value {
+                    "rising" => PowerFailEdge::Rising,
+                    "falling" => PowerFailEdge::Falling,
+                    other => {
+                        return Err(format!(
+                            "active_edge `{other}` is not `rising` or `falling`"
+                        ))
+                    }
+                };
+            }
+            "power_fail_gpio.debounce_ms" => {
+                self.power_fail_gpio_mut().debounce = Duration::from_millis(parse_u64(value)?);
+            }
             other => return Err(format!("unknown key `{other}`")),
         }
         Ok(())
+    }
+
+    /// The `[power_fail_gpio]` section, created (with sentinel required
+    /// fields) on first touch. Finalised by presence checks in
+    /// [`Self::parse`] and domain checks in [`Self::validate`].
+    fn power_fail_gpio_mut(&mut self) -> &mut PowerFailGpio {
+        self.power_fail_gpio
+            .get_or_insert_with(PowerFailGpio::incomplete)
     }
 
     /// Domain checks; every rule states its reason.
@@ -346,6 +496,20 @@ impl Config {
         }
         if self.trapq_queues.is_empty() {
             return Err("trapq_queues must name at least one queue".to_owned());
+        }
+        if let Some(pf) = &self.power_fail_gpio {
+            // `chip` non-empty is already enforced by `parse_path`; the
+            // presence of the key is enforced in `parse`. Here: the
+            // debounce band. Refuse (not clamp), like every other knob.
+            let debounce_ms = u64::try_from(pf.debounce.as_millis()).unwrap_or(u64::MAX);
+            if debounce_ms > PowerFailGpio::MAX_DEBOUNCE_MS {
+                return Err(format!(
+                    "power_fail_gpio.debounce_ms ({}) must be <= {}: a debounce near the \
+                     ~1 s hold-up budget would eat the window it protects",
+                    debounce_ms,
+                    PowerFailGpio::MAX_DEBOUNCE_MS
+                ));
+            }
         }
         Ok(())
     }
@@ -628,5 +792,77 @@ virtual_sdcard_root = /home/pi/printer_data/gcodes
             Config::parse("z_steppers = stepper_z\n[machine]\nz_steppers = stepper_z:mcu").unwrap();
         assert_eq!(config.z_steppers, vec!["stepper_z"]);
         assert_eq!(config.machine.z_steppers[0].mcu.as_deref(), Some("mcu"));
+    }
+
+    #[test]
+    fn power_fail_gpio_absent_is_off_by_default() {
+        // The whole point of the dormant default: no section, feature off.
+        assert_eq!(Config::parse("").unwrap().power_fail_gpio, None);
+        assert_eq!(Config::default().power_fail_gpio, None);
+    }
+
+    #[test]
+    fn power_fail_gpio_section_parses_and_defaults_debounce() {
+        use super::{PowerFailEdge, PowerFailGpio};
+        let config = Config::parse(
+            "[power_fail_gpio]\nchip = /dev/gpiochip0\nline = 23\nactive_edge = falling\n",
+        )
+        .unwrap();
+        let pf = config.power_fail_gpio.expect("section present");
+        assert_eq!(pf.chip, PathBuf::from("/dev/gpiochip0"));
+        assert_eq!(pf.line, 23);
+        assert_eq!(pf.active_edge, PowerFailEdge::Falling);
+        assert_eq!(
+            pf.debounce,
+            std::time::Duration::from_millis(PowerFailGpio::DEFAULT_DEBOUNCE_MS)
+        );
+        // Explicit debounce and the rising polarity round-trip too.
+        let config = Config::parse(
+            "[power_fail_gpio]\nchip = /dev/gpiochip1\nline = 5\nactive_edge = rising\n\
+             debounce_ms = 12\n",
+        )
+        .unwrap();
+        let pf = config.power_fail_gpio.unwrap();
+        assert_eq!(pf.active_edge, PowerFailEdge::Rising);
+        assert_eq!(pf.debounce, std::time::Duration::from_millis(12));
+    }
+
+    #[test]
+    fn power_fail_gpio_requires_chip_line_and_edge() {
+        // Present-but-incomplete refuses; it never guesses a required
+        // field (least of all the polarity of a safety signal).
+        for text in [
+            "[power_fail_gpio]\nline = 1\nactive_edge = falling",
+            "[power_fail_gpio]\nchip = /dev/gpiochip0\nactive_edge = falling",
+            "[power_fail_gpio]\nchip = /dev/gpiochip0\nline = 1",
+            "[power_fail_gpio]\ndebounce_ms = 5",
+        ] {
+            let err = Config::parse(text).unwrap_err();
+            assert!(
+                err.contains("is not set") && err.contains("required"),
+                "text {text:?} gave {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn power_fail_gpio_rejects_bad_values() {
+        // Unknown edge, non-integer line, out-of-band debounce, unknown key.
+        for text in [
+            "[power_fail_gpio]\nchip = /dev/gpiochip0\nline = 1\nactive_edge = sideways",
+            "[power_fail_gpio]\nchip = /dev/gpiochip0\nline = notanumber\nactive_edge = falling",
+            "[power_fail_gpio]\nchip = /dev/gpiochip0\nline = 1\nactive_edge = falling\n\
+             debounce_ms = 100000",
+            "[power_fail_gpio]\nchip = /dev/gpiochip0\nline = 1\nactive_edge = falling\nbogus = 1",
+            "[power_fail_gpio]\nchip =\nline = 1\nactive_edge = falling",
+        ] {
+            assert!(Config::parse(text).is_err(), "accepted: {text}");
+        }
+        // The debounce band boundary is accepted.
+        assert!(Config::parse(
+            "[power_fail_gpio]\nchip = /dev/gpiochip0\nline = 1\nactive_edge = falling\n\
+             debounce_ms = 500"
+        )
+        .is_ok());
     }
 }
