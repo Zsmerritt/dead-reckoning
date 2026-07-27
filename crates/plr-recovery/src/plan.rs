@@ -195,6 +195,26 @@ pub enum Phase {
     /// Emitted only when `confirm_z_before_resume` is set; the daemon
     /// pauses for confirmation AFTER this step's verifications pass.
     ZConfirmStandoff,
+    /// 7a″ — the interactive RESUME-POINT PREVIEW entry (`[plr]`
+    /// `resume_candidate_policy = ask`, design §D). Present iff the plan
+    /// carries a [`RecoveryPlan::preview`]; sits AFTER the frame is fully
+    /// declared (post [`Self::TrueZDeclare`]/[`Self::ZConfirmStandoff`]) so
+    /// an abort/timeout during the reposition loop invalidates the Z frame
+    /// exactly as a [`Self::ZConfirmStandoff`] abort would (the nozzle has
+    /// been driven around the part).
+    ///
+    /// This one step is the LIFT to the single hover plane
+    /// ([`RuntimeComputation::HoverPlane`] — `min(z_max, max(current_z,
+    /// hover_target_z))`, an absolute floor above every stop that CANNOT
+    /// descend) plus the cool-down `M104 S{preview_nozzle_temp}` (§E.2).
+    /// The daemon then runs the XY-only reposition loop against
+    /// [`RecoveryPlan::preview`]; there is no per-stop Z step in the
+    /// vocabulary, so never-descend is structural, not checked.
+    ///
+    /// Under `policy = ask` the preview SUBSUMES the standalone
+    /// [`Self::ZConfirmStandoff`] (the operator's Accept IS the Z
+    /// confirmation — ruling), so the two are never both emitted.
+    ResumePreview,
     /// 7b — load the bed-mesh profile (probe already done).
     MeshLoad,
     /// 7c — final true-frame declaration.
@@ -229,6 +249,7 @@ impl Phase {
             Phase::StepperEnable => "stepper-enable",
             Phase::RecoveryAccel => "recovery-accel",
             Phase::ZConfirmStandoff => "z-confirm-standoff",
+            Phase::ResumePreview => "resume-preview",
             Phase::RecoveryAccelRestore => "recovery-accel-restore",
             Phase::ImmediateBedHeat => "immediate-bed-heat",
             Phase::BelievedZDeclare => "believed-z-declare",
@@ -379,6 +400,9 @@ pub enum AbortReason {
     RecoveryAccelRestoreFailed,
     /// The operator Z-confirmation standoff lift failed.
     ZConfirmStandoffFailed,
+    /// The resume-preview hover-plane lift or cool-down failed (the entry
+    /// to the XY reposition loop, design §D.2).
+    ResumePreviewFailed,
     /// The immediate (non-blocking) bed/nozzle heat commands did not
     /// take effect (their targets were not set).
     ImmediateBedHeatFailed,
@@ -428,6 +452,7 @@ impl AbortReason {
             AbortReason::RecoveryAccelFailed => "recovery-accel-failed",
             AbortReason::RecoveryAccelRestoreFailed => "recovery-accel-restore-failed",
             AbortReason::ZConfirmStandoffFailed => "z-confirm-standoff-failed",
+            AbortReason::ResumePreviewFailed => "resume-preview-failed",
             AbortReason::ImmediateBedHeatFailed => "immediate-bed-heat-failed",
             AbortReason::BelievedZDeclareFailed => "believed-z-declare-failed",
             AbortReason::HomingFailed => "homing-failed",
@@ -618,6 +643,26 @@ pub enum RuntimeComputation {
         /// The Z rail's `position_max`, mm, when known.
         z_max: Option<f64>,
     },
+    /// Read `toolhead.position[2]` **before** the step's commands run and
+    /// substitute `min(max(current_z, target_z), z_max)` for
+    /// [`PARK_Z_PLACEHOLDER`] — the resume-preview hover plane
+    /// ([`hover_plane_at`], design §E.1).
+    ///
+    /// Unlike [`Self::ParkZ`], the floor is an ABSOLUTE `target_z`
+    /// (`max` over the preview stops of their g-code Z plus
+    /// `preview_standoff`), not a relative delta: the single hover plane
+    /// must sit above EVERY stop's geometry regardless of where the probe
+    /// left the nozzle. The `max(current_z, …)` term makes never-descend a
+    /// structural fact — a nozzle already higher than the plane stays put
+    /// rather than being driven down to it — and the `min(…, z_max)` term
+    /// keeps the lift inside the Z rail exactly as `ParkZ` does.
+    HoverPlane {
+        /// Absolute g-code-frame floor for the plane, mm: the highest stop
+        /// Z plus the standoff. Baked at plan time.
+        target_z: f64,
+        /// The Z rail's `position_max`, mm, when known.
+        z_max: Option<f64>,
+    },
 }
 
 /// Evaluates [`RuntimeComputation::ParkZ`]: the rail-clamped absolute park
@@ -648,6 +693,48 @@ pub fn park_z_at(current_z: f64, delta_z: f64, z_max: Option<f64>) -> Result<f64
         return Err(RecoveryError::NonFinite { field: "park_z" });
     }
     Ok(target)
+}
+
+/// Evaluates [`RuntimeComputation::HoverPlane`]: the resume-preview hover
+/// plane `min(max(current_z, target_z), z_max)`.
+///
+/// The plane sits at least at `target_z` (above every stop's geometry) and
+/// at least at `current_z` (never a descent), then is clamped down to the
+/// Z rail. Because the result is `>= current_z` always, this is a lift or a
+/// no-op, never a move toward the part — the never-descend guarantee §E.1
+/// makes structural.
+///
+/// # Errors
+///
+/// [`RecoveryError::NonFinite`] on any non-finite input or result — the
+/// daemon must abort, never substitute, on such an error.
+pub fn hover_plane_at(
+    current_z: f64,
+    target_z: f64,
+    z_max: Option<f64>,
+) -> Result<f64, RecoveryError> {
+    if !current_z.is_finite() {
+        return Err(RecoveryError::NonFinite { field: "current_z" });
+    }
+    if !target_z.is_finite() {
+        return Err(RecoveryError::NonFinite { field: "target_z" });
+    }
+    // At least the absolute floor, and at least where the nozzle already is.
+    let mut plane = target_z.max(current_z);
+    if let Some(zm) = z_max {
+        if !zm.is_finite() {
+            return Err(RecoveryError::NonFinite { field: "z_max" });
+        }
+        // Clamp DOWN to the rail, but never below the current Z — a z_max
+        // beneath the nozzle must not command a descent into the part.
+        plane = plane.min(zm).max(current_z);
+    }
+    if !plane.is_finite() {
+        return Err(RecoveryError::NonFinite {
+            field: "hover_plane",
+        });
+    }
+    Ok(plane)
 }
 
 /// One strictly ordered recovery step.
@@ -815,6 +902,22 @@ pub enum PlanWarning {
         /// The ignored value, mm/s².
         accel_probe: f64,
     },
+    /// The Z rail (`position_max`) sits so close above the highest preview
+    /// stop that the hover plane cannot give the requested standoff: at
+    /// runtime [`hover_plane_at`] clamps down to the rail, so the nozzle
+    /// hovers with LESS clearance than `preview_standoff` asked for (and,
+    /// if the rail is at or below the geometry, essentially none). Advisory,
+    /// not a refusal — the plane still never descends into the part (it is
+    /// clamped to at least the current Z) — but the operator should know the
+    /// visual gap will be smaller than configured rather than discover it
+    /// silently (design §E.1).
+    PreviewStandoffSqueezed {
+        /// The clearance the rail actually allows above the highest stop,
+        /// mm (`position_max − max_stop_z`; may be `<= 0`).
+        available: f64,
+        /// The standoff that was requested, mm (`preview_standoff`).
+        requested: f64,
+    },
 }
 
 impl PlanWarning {
@@ -935,7 +1038,105 @@ impl PlanWarning {
                  touch_accel owns the contact acceleration",
                 fmt_num(*accel_probe)
             ),
+            PlanWarning::PreviewStandoffSqueezed {
+                available,
+                requested,
+            } => format!(
+                "the Z rail leaves only {} mm above the highest preview stop, less than the \
+                 requested {} mm standoff; the hover will clamp lower (it still never descends)",
+                fmt_num(*available),
+                fmt_num(*requested)
+            ),
         }
+    }
+}
+
+/// The recovery-file late-binding for ONE preview stop (design §4). Baked
+/// at plan time, PARALLEL to [`PreviewSpec::stops`] (binding `i` binds stop
+/// `i`), because the entry moves depend on the stop's resume position in
+/// the g-code frame — which the plan builder knows and the analyzer's
+/// [`plr_analyzer::PreviewStop`] does not carry (it has no E coordinate and
+/// no origin/extrude-factor frame).
+///
+/// On preview Accept the daemon's recovery-file writer swaps this stop's
+/// [`Self::tail_offset`] and [`Self::entry_commands`] into the plan's
+/// [`crate::resume_file::RecoveryFileSpec`] template and generates the file
+/// — so the same [`crate::build::build_entry_commands`] derivation the
+/// non-preview path uses builds every stop's entry moves (one formatter, no
+/// drift). A separate accept-time formatter is deliberately avoided.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PreviewBinding {
+    /// The verbatim-tail byte offset in the ORIGINAL file if this stop is
+    /// accepted — `PreviewStop::resume_offset` for the same stop, so the
+    /// generated file's tail matches the previewed resume byte-for-byte.
+    pub tail_offset: u64,
+    /// The entry-move commands (travel above the part, descend, prime,
+    /// restore modes/feedrate) targeting THIS stop's resume XY/Z/E, built
+    /// by the plan builder's [`crate::build::build_entry_commands`].
+    pub entry_commands: Vec<String>,
+}
+
+/// The interactive resume-point preview the daemon drives at
+/// [`Phase::ResumePreview`] (design §D). Present on a plan iff
+/// `resume_candidate_policy = ask` produced a usable preview set.
+///
+/// The stop list and navigation anchors mirror the analyzer's
+/// [`plr_analyzer::PreviewSet`] verbatim; the hover geometry, the cool-down
+/// target, and the per-stop recovery [`Self::bindings`] are added here
+/// because they need the plan builder's g-code frame and [`PlanConfig`],
+/// which the analyzer has neither of.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PreviewSpec {
+    /// The full nudge domain — every navigable stop, execution order.
+    /// Identical to [`plr_analyzer::PreviewSet::stops`].
+    pub stops: Vec<plr_analyzer::PreviewStop>,
+    /// Representative stop indices (into [`Self::stops`]) the operator
+    /// steps through with next/prev. Identical to
+    /// [`plr_analyzer::PreviewSet::representatives`].
+    pub representatives: Vec<u32>,
+    /// Policy `first` anchor — the minimum-offset candidate stop's index.
+    pub first_index: u32,
+    /// Policy `mid` anchor — the median-offset candidate stop's index.
+    pub mid_index: u32,
+    /// Policy `last` anchor — the skip-forward stop's index (the resume it
+    /// commits equals today's `select_resume_target`).
+    pub last_index: u32,
+    /// The cursor the reposition loop OPENS on: [`Self::last_index`], the
+    /// safe skip-forward default. An operator who just accepts gets the
+    /// same resume a headless `last` would.
+    pub default_index: u32,
+    /// Per-stop recovery-file late-binding, PARALLEL to [`Self::stops`].
+    pub bindings: Vec<PreviewBinding>,
+    /// The hover-plane absolute floor, g-code frame, mm: the highest stop's
+    /// g-code Z plus `preview_standoff`. The daemon lifts to
+    /// `min(z_max, max(current_z, hover_target_z))` once at entry
+    /// ([`RuntimeComputation::HoverPlane`]) and never lowers.
+    pub hover_target_z: f64,
+    /// The Z rail `position_max`, mm, when known — the hover-plane ceiling.
+    pub z_max: Option<f64>,
+    /// The `M104` target commanded on preview entry so a nozzle hovering
+    /// for minutes cannot ooze (§E.2) — resolved
+    /// [`PlanConfig::preview_nozzle_temp_c`].
+    pub cool_nozzle_temp: f64,
+    /// Feedrate, mm/min, for the XY reposition moves the loop sends between
+    /// answers (`config.travel_feed`). The repositions ride the single
+    /// hover plane, clear of all geometry, so the ordinary travel feed is
+    /// safe.
+    pub travel_feed: f64,
+}
+
+impl PreviewSpec {
+    /// The default-cursor stop (the safe skip-forward), the point dry-run
+    /// renders the file preview against and the loop opens on.
+    #[must_use]
+    pub fn default_stop(&self) -> Option<&plr_analyzer::PreviewStop> {
+        self.stops.get(self.default_index as usize)
+    }
+
+    /// The recovery-file binding for stop `index`, when in range.
+    #[must_use]
+    pub fn binding(&self, index: u32) -> Option<&PreviewBinding> {
+        self.bindings.get(index as usize)
     }
 }
 
@@ -1001,6 +1202,18 @@ pub struct RecoveryPlan {
     /// recovery is already half-executed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gcode_barrier_timeout_s: Option<f64>,
+    /// The interactive resume-point preview (design §D), present iff
+    /// `resume_candidate_policy = ask` produced a usable preview set. When
+    /// present the plan carries a [`Phase::ResumePreview`] step (the hover
+    /// lift + cool-down) and the daemon drives the XY-only reposition loop
+    /// against this before selecting the recovery file; when absent the
+    /// plan is the ordinary automatic one (first/mid/last, or ask with no
+    /// preview available — see the pipeline routing).
+    ///
+    /// `skip_serializing_if` keeps a non-preview plan byte-identical to one
+    /// produced before the field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preview: Option<PreviewSpec>,
     /// Non-fatal observations.
     pub warnings: Vec<PlanWarning>,
 }
@@ -1282,6 +1495,44 @@ impl RecoveryPlan {
             .is_some_and(|s| s.phase == Phase::RecoveryFileSelect)
     }
 
+    /// The [`Phase::ResumePreview`] step exists in the plan exactly when
+    /// [`Self::preview`] carries a spec, and vice versa: a preview the
+    /// executor cannot enter (no step) and a step with nothing to drive (no
+    /// spec) are both malformed plans (design §D.2).
+    #[must_use]
+    pub fn resume_preview_step_iff_spec(&self) -> bool {
+        self.first_index(Phase::ResumePreview).is_some() == self.preview.is_some()
+    }
+
+    /// The resume-preview step (when present) sits AFTER the true-Z declare
+    /// and BEFORE the recovery-file select — i.e. after the frame is fully
+    /// declared, so an abort during the reposition loop invalidates the Z
+    /// frame exactly as a `ZConfirmStandoff` abort would (design §D.2 /
+    /// §6). Vacuous when there is no preview step.
+    #[must_use]
+    pub fn resume_preview_after_true_z(&self) -> bool {
+        let Some(preview) = self.first_index(Phase::ResumePreview) else {
+            return true;
+        };
+        let after_declare = self
+            .first_index(Phase::TrueZDeclare)
+            .is_some_and(|tz| tz < preview);
+        let before_select = self
+            .first_index(Phase::RecoveryFileSelect)
+            .is_some_and(|sel| preview < sel);
+        after_declare && before_select
+    }
+
+    /// The `ask`-policy preview SUBSUMES the standalone Z-confirm pause
+    /// (ruling §E.4): the two never coexist. A plan with both a
+    /// [`Phase::ResumePreview`] and a [`Phase::ZConfirmStandoff`] step
+    /// would pause twice for the same Z, so this refuses it.
+    #[must_use]
+    pub fn preview_subsumes_z_confirm(&self) -> bool {
+        !(self.first_index(Phase::ResumePreview).is_some()
+            && self.first_index(Phase::ZConfirmStandoff).is_some())
+    }
+
     /// Every step in `phase`, in order.
     pub fn steps_in_phase(&self, phase: Phase) -> impl Iterator<Item = &RecoveryStep> {
         self.steps.iter().filter(move |s| s.phase == phase)
@@ -1409,9 +1660,44 @@ mod tests {
     #![allow(clippy::float_cmp)]
 
     use super::{
-        fmt_num, true_z_at_halt, AbortReason, Phase, PlanWarning, Predicate, TriggerSource,
-        TrueZFormula,
+        fmt_num, hover_plane_at, true_z_at_halt, AbortReason, Phase, PlanWarning, Predicate,
+        TriggerSource, TrueZFormula,
     };
+
+    #[test]
+    fn hover_plane_never_descends_and_clears_geometry() {
+        // The §10 attack #3: a stop Z that would make the hover descend.
+        // The hover plane is min(z_max, max(current_z, target_z)), so it is
+        // ALWAYS >= current_z (never a descent) and >= target_z unless the
+        // rail forces it lower — and even then never below current.
+        //
+        // target_z is the highest stop's g-code Z plus the standoff; the
+        // reviewer crafts a "high-then-low layer order" so max(stop.z) is
+        // large. That only RAISES target_z, so the plane rises — it cannot
+        // be driven down toward a low stop.
+        let cases = [
+            // (current_z, target_z, z_max, expected)
+            (0.3, 5.0, Some(200.0), 5.0), // ordinary post-probe lift
+            (8.0, 5.0, Some(200.0), 8.0), // already above the plane: stay
+            (0.3, 5.0, Some(4.0), 4.0),   // rail below target: clamp to rail
+            (0.3, 5.0, Some(0.1), 0.3),   // rail below current: never descend
+            (5.0, 5.0, Some(200.0), 5.0), // exactly at the plane
+            (0.0, 0.0, None, 0.0),        // no rail known
+        ];
+        for (current, target, z_max, want) in cases {
+            let got = hover_plane_at(current, target, z_max).unwrap();
+            assert!(
+                (got - want).abs() < 1e-12,
+                "hover_plane_at({current}, {target}, {z_max:?}) = {got}, want {want}"
+            );
+            assert!(got >= current - 1e-12, "hover plane must never descend");
+        }
+        // Non-finite inputs are refused (the daemon aborts, never
+        // substitutes a bad Z).
+        assert!(hover_plane_at(f64::NAN, 5.0, None).is_err());
+        assert!(hover_plane_at(0.0, f64::INFINITY, None).is_err());
+        assert!(hover_plane_at(0.0, 5.0, Some(f64::NAN)).is_err());
+    }
 
     #[test]
     fn fmt_num_trims_and_normalizes() {

@@ -232,6 +232,7 @@ fn build_scenario(s: &Scenario) -> RecoveryPlan {
         exclude_objects: &excludes,
         clean_nozzle_macro_present: true,
         purge_macro_present: false,
+        preview: None,
     };
     match plan_recovery(&inputs, &config) {
         Ok(PlanOutcome::Plan(plan)) => *plan,
@@ -669,6 +670,7 @@ proptest! {
             exclude_objects: &excludes,
             clean_nozzle_macro_present: true,
             purge_macro_present: false,
+            preview: None,
         };
         // Must not panic; a produced plan must be finite everywhere.
         if let Ok(PlanOutcome::Plan(plan)) = plan_recovery(&inputs, &PlanConfig::default()) {
@@ -712,6 +714,7 @@ proptest! {
             exclude_objects: &[],
             clean_nozzle_macro_present: true,
             purge_macro_present: false,
+            preview: None,
         };
         prop_assert!(plan_recovery(&inputs, &config).is_err());
     }

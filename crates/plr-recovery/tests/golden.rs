@@ -4,7 +4,9 @@
 
 mod common;
 
-use plr_analyzer::{ContactOutcome, DeclineReason, MatchConfidence};
+use plr_analyzer::{
+    ContactOutcome, DeclineReason, FeatureClass, MatchConfidence, PreviewSet, PreviewStop,
+};
 use plr_recovery::{
     plan_recovery, select_resume_target, select_resume_target_with_policy, Diagnose,
     ExcludeObjectDef, FallbackReason, FileTemps, OvershootTerm, Phase, PlanConfig, PlanInputs,
@@ -51,6 +53,7 @@ fn build_plan_with(
         exclude_objects: &[],
         clean_nozzle_macro_present: true,
         purge_macro_present: false,
+        preview: None,
     };
     match plan_recovery(&inputs, config) {
         Ok(PlanOutcome::Plan(plan)) => *plan,
@@ -74,6 +77,7 @@ fn clean_shutdown_produces_no_plan() {
         exclude_objects: &[],
         clean_nozzle_macro_present: true,
         purge_macro_present: false,
+        preview: None,
     };
     assert_eq!(
         plan_recovery(&inputs, &PlanConfig::default()).unwrap(),
@@ -421,6 +425,169 @@ fn noise_floor_speed_mismatch_warns_but_never_refuses() {
         .any(|w| matches!(w, plr_recovery::PlanWarning::NoiseFloorSpeedMismatch { .. })));
 }
 
+/// A two-stop preview over the fixture model: the first stop on layer 0,
+/// the LAST/default stop on layer 1 whose `resume_offset` is the same
+/// layer-1 deposition the policy-Last resolver commits — so the plan's
+/// recovery file (rendered against `last`) and this stop's binding agree.
+fn fixture_preview_set() -> PreviewSet {
+    let l0 = offset_of("G1 X10 Y10 E1 F1800", 0);
+    let l0_next = offset_of("G1 X30 Y10 E1", 0);
+    let l1 = offset_of("G1 X10 Y10 E1 F1800", 1);
+    let stops = vec![
+        PreviewStop {
+            index: 0,
+            offset: l0,
+            resume_offset: l0_next,
+            xy: [10.0, 10.0],
+            z: 0.2,
+            layer: Some(0),
+            feature: FeatureClass::InternalInfill,
+            on_infill: true,
+            is_candidate: true,
+        },
+        PreviewStop {
+            index: 1,
+            offset: l1,
+            // The layer-1 deposition the Last policy resolves to (== the
+            // plan's resume_offset), so the default binding matches the file.
+            resume_offset: l1,
+            xy: [10.0, 10.0],
+            z: 0.4,
+            layer: Some(1),
+            feature: FeatureClass::InternalInfill,
+            on_infill: true,
+            is_candidate: true,
+        },
+    ];
+    PreviewSet {
+        stops,
+        representatives: vec![0, 1],
+        first_index: 0,
+        mid_index: 0,
+        last_index: 1,
+    }
+}
+
+#[test]
+fn ask_policy_with_a_preview_set_builds_a_preview_plan() {
+    let set = fixture_preview_set();
+    let reconstruction = recovery(stop_set(&[0.4]), wal_context(plain_transforms()));
+    let contact = contact_at(0.4);
+    let match_result = match_at(resume_offset());
+    let model = model();
+    // confirm_z_before_resume is ALSO set: the preview must SUBSUME it.
+    let config = PlanConfig {
+        resume_candidate_policy: ResumePolicy::Ask,
+        confirm_z_before_resume: true,
+        ..PlanConfig::default()
+    };
+    let inputs = PlanInputs {
+        machine: &machine_tap(),
+        reconstruction: &reconstruction,
+        contact: &contact,
+        match_result: &match_result,
+        model: &model,
+        file_temps: FileTemps::default(),
+        exclude_objects: &[],
+        clean_nozzle_macro_present: true,
+        purge_macro_present: false,
+        preview: Some(&set),
+    };
+    let PlanOutcome::Plan(plan) = plan_recovery(&inputs, &config).unwrap() else {
+        panic!("expected a plan");
+    };
+
+    // The plan carries the preview, and the invariants hold.
+    let preview = plan.preview.as_ref().expect("preview attached");
+    assert!(plan.resume_preview_step_iff_spec());
+    assert!(plan.resume_preview_after_true_z());
+    assert!(plan.preview_subsumes_z_confirm());
+    // The ResumePreview step exists and the subsumed Z-confirm does NOT.
+    assert!(plan.first_index(Phase::ResumePreview).is_some());
+    assert!(plan.first_index(Phase::ZConfirmStandoff).is_none());
+
+    // The entry step lifts to the hover plane (never-descend HoverPlane)
+    // and cools the nozzle; there is no per-stop Z step (never-descend is
+    // structural — the one Z motion is this lift).
+    let step = plan
+        .steps_in_phase(Phase::ResumePreview)
+        .next()
+        .expect("preview step");
+    assert!(matches!(
+        step.compute,
+        Some(RuntimeComputation::HoverPlane { .. })
+    ));
+    assert!(step.commands.iter().any(|c| c.starts_with("M104 S")));
+
+    // Per-stop bindings are parallel to stops, and the default (last) stop
+    // commits the same resume the plan's recovery file was rendered against.
+    assert_eq!(preview.bindings.len(), preview.stops.len());
+    assert_eq!(preview.default_index, preview.last_index);
+    let default_binding = preview.binding(preview.default_index).unwrap();
+    assert_eq!(default_binding.tail_offset, plan.resume_offset);
+    assert_eq!(plan.recovery_file.tail_offset, plan.resume_offset);
+    // The default stop resolved a real deposition, so its entry moves exist
+    // and drive to the resume XY.
+    assert!(!default_binding.entry_commands.is_empty());
+    // The hover plane's absolute floor is the highest stop's Z plus the
+    // resolved standoff (= entry_hop default 1.0), in the INTERNAL frame —
+    // the frame the lift executes in (step 7a″ precedes RestoreFrame's
+    // SET_GCODE_OFFSET) and the frame the XY repositions ride. So
+    // target_z = 0.4 (internal layer-1 Z) + 1.0 = 1.4, INDEPENDENT of the
+    // fixture's non-zero g-code origin Z (0.05). This is the MAJOR-1
+    // regression pin: the old code subtracted origin_z and landed 1.35 (the
+    // g-code frame), which on a positive-Z-offset print hovered into the
+    // part. The nonzero origin is exactly the case that catches the mix.
+    let RuntimeComputation::HoverPlane { target_z, .. } = step.compute.unwrap() else {
+        unreachable!()
+    };
+    assert!((target_z - 1.4).abs() < 1e-9, "target_z = {target_z}");
+}
+
+#[test]
+fn non_ask_policy_with_a_set_resumes_at_the_anchor_without_a_preview() {
+    // `first` + a supplied set produces a PLAIN automatic plan (no preview,
+    // no ResumePreview step) resuming at the set's `first_index` ANCHOR.
+    // This is how a coarse match — whose match-result confidence carries no
+    // line the resolver could pick — still resumes automatically for
+    // first/mid/last: the analyzer recovered the candidate stops the
+    // matcher ladder discarded, and the anchor indexes them. The
+    // match_result is irrelevant when a set is present (the anchor wins).
+    let set = fixture_preview_set();
+    let reconstruction = recovery(stop_set(&[0.4]), wal_context(plain_transforms()));
+    let contact = contact_at(0.4);
+    let match_result = match_at(resume_offset());
+    let model = model();
+    let config = PlanConfig {
+        resume_candidate_policy: ResumePolicy::First,
+        ..PlanConfig::default()
+    };
+    let inputs = PlanInputs {
+        machine: &machine_tap(),
+        reconstruction: &reconstruction,
+        contact: &contact,
+        match_result: &match_result,
+        model: &model,
+        file_temps: FileTemps::default(),
+        exclude_objects: &[],
+        clean_nozzle_macro_present: true,
+        purge_macro_present: false,
+        preview: Some(&set),
+    };
+    let PlanOutcome::Plan(plan) = plan_recovery(&inputs, &config).unwrap() else {
+        panic!("expected a plan");
+    };
+    assert!(
+        plan.preview.is_none(),
+        "non-ask policy must not attach a preview"
+    );
+    assert!(plan.first_index(Phase::ResumePreview).is_none());
+    // Resumed at the set's first anchor (stop 0), whose resume_offset is
+    // the layer-0 second deposition — not any match_result line.
+    let first_stop = &set.stops[set.first_index as usize];
+    assert_eq!(plan.resume_offset, first_stop.resume_offset);
+}
+
 #[test]
 fn drag_without_noise_floor_is_rejected_with_the_calibration_hint() {
     let mut machine = machine_adxl_drag();
@@ -439,6 +606,7 @@ fn drag_without_noise_floor_is_rejected_with_the_calibration_hint() {
         exclude_objects: &[],
         clean_nozzle_macro_present: true,
         purge_macro_present: false,
+        preview: None,
     };
     let Err(RecoveryError::MachineRejected { failures }) =
         plan_recovery(&inputs, &PlanConfig::default())
@@ -505,6 +673,7 @@ fn legacy_single_probe_preserves_the_per_probe_readback() {
             exclude_objects: &[],
             clean_nozzle_macro_present: true,
             purge_macro_present: false,
+            preview: None,
         };
         match plan_recovery(&inputs, &legacy) {
             Ok(PlanOutcome::Plan(plan)) => *plan,
@@ -562,6 +731,7 @@ fn hop_ambiguity_widens_the_envelope() {
             exclude_objects: &[],
             clean_nozzle_macro_present: true,
             purge_macro_present: false,
+            preview: None,
         };
         match plan_recovery(&inputs, &PlanConfig::default()).unwrap() {
             PlanOutcome::Plan(plan) => envelopes.push(plan.envelope.envelope),
@@ -590,6 +760,7 @@ fn declined_contact_zone_degrades_to_typed_manual_fallback() {
         exclude_objects: &[],
         clean_nozzle_macro_present: true,
         purge_macro_present: false,
+        preview: None,
     };
     let outcome = plan_recovery(&inputs, &PlanConfig::default()).unwrap();
     assert_eq!(
@@ -622,6 +793,7 @@ fn layer_only_match_degrades_to_typed_manual_fallback() {
         exclude_objects: &[],
         clean_nozzle_macro_present: true,
         purge_macro_present: false,
+        preview: None,
     };
     let outcome = plan_recovery(&inputs, &PlanConfig::default()).unwrap();
     assert_eq!(
@@ -698,6 +870,7 @@ fn subdirectory_print_file_is_a_typed_error() {
         exclude_objects: &[],
         clean_nozzle_macro_present: true,
         purge_macro_present: false,
+        preview: None,
     };
     assert!(matches!(
         plan_recovery(&inputs, &PlanConfig::default()),
@@ -724,6 +897,7 @@ fn machine_rejection_lists_every_failure() {
         exclude_objects: &[],
         clean_nozzle_macro_present: true,
         purge_macro_present: false,
+        preview: None,
     };
     let Err(RecoveryError::MachineRejected { failures }) =
         plan_recovery(&inputs, &PlanConfig::default())
@@ -755,6 +929,7 @@ fn exclude_objects_are_restored_between_m23_and_m26() {
         exclude_objects: &excludes,
         clean_nozzle_macro_present: true,
         purge_macro_present: false,
+        preview: None,
     };
     let PlanOutcome::Plan(plan) = plan_recovery(&inputs, &PlanConfig::default()).unwrap() else {
         panic!("expected plan");
@@ -836,6 +1011,7 @@ fn no_clean_nozzle_macro_requires_confirmation_and_emits_no_command() {
         exclude_objects: &[],
         clean_nozzle_macro_present: false,
         purge_macro_present: false,
+        preview: None,
     };
     let PlanOutcome::Plan(plan) = plan_recovery(&inputs, &PlanConfig::default()).unwrap() else {
         panic!("expected plan");
@@ -970,6 +1146,7 @@ fn configured_reheat_park_is_used_without_a_warning() {
         exclude_objects: &[],
         clean_nozzle_macro_present: true,
         purge_macro_present: false,
+        preview: None,
     };
     let PlanOutcome::Plan(plan) = plan_recovery(&inputs, &config).unwrap() else {
         panic!("expected plan");
@@ -1109,6 +1286,7 @@ fn out_of_bounds_configured_park_is_refused_by_preflight() {
         exclude_objects: &[],
         clean_nozzle_macro_present: true,
         purge_macro_present: false,
+        preview: None,
     };
     assert!(matches!(
         plan_recovery(&inputs, &config),
@@ -1553,6 +1731,7 @@ fn plan_for(
         exclude_objects: &[],
         clean_nozzle_macro_present: true,
         purge_macro_present: false,
+        preview: None,
     };
     plan_recovery(&inputs, config).map(|_| ())
 }
@@ -1600,6 +1779,7 @@ fn purge_macro_present_owns_the_purge() {
         exclude_objects: &[],
         clean_nozzle_macro_present: true,
         purge_macro_present: true,
+        preview: None,
     };
     let PlanOutcome::Plan(plan) = plan_recovery(&inputs, &config).unwrap() else {
         panic!("expected plan");
@@ -1638,6 +1818,7 @@ fn a_missing_purge_macro_refuses_to_plan() {
         exclude_objects: &[],
         clean_nozzle_macro_present: true,
         purge_macro_present: false,
+        preview: None,
     };
     let err = plan_recovery(&inputs, &config).unwrap_err();
     assert!(

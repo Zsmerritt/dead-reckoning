@@ -193,6 +193,11 @@ pub enum ConfirmKind {
     ZHeight,
     /// The `debug_confirm_each_step` per-step pause.
     StepDebug,
+    /// The interactive resume-point preview reposition pause (design §D):
+    /// the toolhead is hovering over a candidate resume point and the
+    /// operator answers with a [`PreviewAnswer`] (accept / next / prev /
+    /// nudge / abort), NOT the binary continue/abort.
+    Preview,
 }
 
 impl ConfirmKind {
@@ -203,6 +208,46 @@ impl ConfirmKind {
             ConfirmKind::Diagnosis => "diagnosis",
             ConfirmKind::ZHeight => "z-height",
             ConfirmKind::StepDebug => "step-debug",
+            ConfirmKind::Preview => "preview",
+        }
+    }
+}
+
+/// The answer to a resume-preview reposition pause (design §D.1).
+///
+/// Deliberately a SEPARATE type from [`ConfirmAnswer`]: the binary `ask`
+/// stays binary (continue/abort), and preview's richer vocabulary — jump
+/// to the next/previous representative, nudge ±1/±10 stops along the
+/// toolpath, accept the current point — never leaks into it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PreviewAnswer {
+    /// Commit the current stop as the resume point.
+    Accept,
+    /// Jump the cursor to the next representative.
+    NextRep,
+    /// Jump the cursor to the previous representative.
+    PrevRep,
+    /// Nudge the cursor by this many stops along the toolpath (±1 fine,
+    /// ±10 coarse); clamped to the stop-list bounds.
+    Nudge(i32),
+    /// Stop; abort the recovery.
+    Abort,
+    /// Nobody answered within the deadline. Treated exactly as
+    /// [`Self::Abort`], distinguished only for the transcript.
+    TimedOut,
+}
+
+impl PreviewAnswer {
+    /// Stable tag carried in the transcript.
+    #[must_use]
+    pub fn tag(self) -> &'static str {
+        match self {
+            PreviewAnswer::Accept => "accept",
+            PreviewAnswer::NextRep => "next",
+            PreviewAnswer::PrevRep => "prev",
+            PreviewAnswer::Nudge(_) => "nudge",
+            PreviewAnswer::Abort => "abort",
+            PreviewAnswer::TimedOut => "timeout",
         }
     }
 }
@@ -279,6 +324,56 @@ pub trait Confirmer: Send {
         &'a mut self,
         point: &'a ConfirmPoint,
     ) -> Pin<Box<dyn Future<Output = ConfirmAnswer> + Send + 'a>>;
+
+    /// Puts a resume-preview reposition `point` to the operator and returns
+    /// their [`PreviewAnswer`] (design §D). The DEFAULT refuses with
+    /// [`PreviewAnswer::Abort`]: a confirmer that does not implement the
+    /// interactive protocol (the CLI's [`AbortConfirmer`], every test fake)
+    /// declines rather than committing a resume point nobody chose — the
+    /// same fail-closed direction `confirm`'s non-interactive callers take.
+    /// Only [`crate::ctrlsock::SocketConfirmer`] overrides it to drive the
+    /// real accept/next/prev/nudge loop.
+    fn confirm_preview<'a>(
+        &'a mut self,
+        _point: &'a ConfirmPoint,
+    ) -> Pin<Box<dyn Future<Output = PreviewAnswer> + Send + 'a>> {
+        Box::pin(async { PreviewAnswer::Abort })
+    }
+}
+
+/// Materialises and writes the generated recovery file for a resume point
+/// chosen at execute time (design §4, the late-binding seam).
+///
+/// Under `resume_candidate_policy = ask` the resume point is not known
+/// until the operator accepts in the preview loop, so the file cannot be
+/// pre-generated at dry-run. The executor calls [`Self::write_for`] with
+/// the accepted stop's binding, THEN proceeds to the `M23`/`M24` steps that
+/// select the now-materialised file.
+///
+/// Dry-run is handed a [`NoopFileWriter`], which HOLDS NO filesystem
+/// capability — so "dry-run cannot write the recovery file" is a type fact,
+/// not a discipline (design §4 / §10 attack #5, the twelfth corollary):
+/// the writer the dry-run path owns simply cannot write.
+pub trait RecoveryFileWriter: Send {
+    /// Generate the recovery file for `binding` (the accepted stop's tail
+    /// offset + entry moves) and write it. `Err(reason)` aborts the
+    /// recovery through the ordinary path (frame invalidated — the pause
+    /// sits past the shifted-frame declare).
+    fn write_for(&mut self, binding: &plr_recovery::PreviewBinding) -> Result<(), String>;
+}
+
+/// A [`RecoveryFileWriter`] that writes nothing — the dry-run path's writer.
+///
+/// It carries no path, no bytes, no filesystem handle: the dry-run code
+/// literally cannot materialise a file through it. This is the type-level
+/// enforcement of "dry-run never writes" (design §4).
+pub struct NoopFileWriter;
+
+impl RecoveryFileWriter for NoopFileWriter {
+    fn write_for(&mut self, _binding: &plr_recovery::PreviewBinding) -> Result<(), String> {
+        // Intentionally does nothing: a dry-run has no file to write.
+        Ok(())
+    }
 }
 
 /// Re-establishes exclusive control of Klipper's g-code channel at every
@@ -723,6 +818,7 @@ impl FrameGuard for NoFrameGuard {
 /// persist (see [`FrameGuard`]). `exclusivity` is re-asserted before every
 /// step's commands go out (see [`Exclusivity`] for why once is not enough).
 #[allow(clippy::too_many_arguments)] // one collaborator per safety invariant
+#[allow(clippy::too_many_lines)] // linear step loop + the two post-step hooks
 pub async fn execute(
     plan: &RecoveryPlan,
     client: &mut MoonrakerClient,
@@ -731,6 +827,7 @@ pub async fn execute(
     confirmer: &mut dyn Confirmer,
     frame_guard: &mut dyn FrameGuard,
     exclusivity: &mut dyn Exclusivity,
+    writer: &mut dyn RecoveryFileWriter,
     transcript: &mut Transcript<'_>,
 ) -> ExecOutcome {
     transcript.entry(&json!({
@@ -850,6 +947,34 @@ pub async fn execute(
         if step.phase == Phase::ZConfirmStandoff {
             let point = z_confirm_point(client, plan, step, computed).await;
             if let Some(cause) = ask(point, confirm_deadline, confirmer, transcript).await {
+                return finish_abort(
+                    client, step, cause, &cleanups, accel, shifted_id, transcript,
+                )
+                .await;
+            }
+        }
+        // The resume-preview reposition loop runs AFTER the hover lift +
+        // cool-down step has run and verified (design §D.2). The nozzle is
+        // at the single hover plane; the loop only ever moves in XY there.
+        // Accept materialises the recovery file for the chosen stop (via
+        // `writer`) then falls through to the M23/M24 steps; abort/timeout
+        // aborts with the Z frame invalidated (the step sits past
+        // ShiftedFrame). A plan without a preview skips this entirely.
+        if step.phase == Phase::ResumePreview {
+            if let Some(cause) = run_preview_loop(
+                plan,
+                client,
+                options,
+                confirmer,
+                exclusivity,
+                writer,
+                barrier_budget,
+                confirm_deadline,
+                step,
+                transcript,
+            )
+            .await
+            {
                 return finish_abort(
                     client, step, cause, &cleanups, accel, shifted_id, transcript,
                 )
@@ -1037,6 +1162,305 @@ async fn ask(
     }
 }
 
+/// The diagnosis code a preview abort/timeout records.
+const PREVIEW_CODE: &str = "resume_preview";
+
+/// The resume-preview reposition loop (design §D.2). Runs AFTER the hover
+/// lift + cool-down step; the nozzle is at the single hover plane and every
+/// reposition is XY-only there (never-descend is structural — there is no
+/// per-stop Z move). `None` means the operator accepted (and the recovery
+/// file for the chosen stop has been written — execution proceeds to the
+/// `M23`/`M24` steps); `Some(cause)` aborts (abort/timeout/exclusivity/
+/// write failure), and because this step sits past `ShiftedFrame` the abort
+/// invalidates the Z frame.
+#[allow(clippy::too_many_arguments)] // one collaborator per concern, as execute()
+#[allow(clippy::too_many_lines)] // the reposition loop + its answer arms
+async fn run_preview_loop(
+    plan: &RecoveryPlan,
+    client: &mut MoonrakerClient,
+    _options: &ExecOptions,
+    confirmer: &mut dyn Confirmer,
+    exclusivity: &mut dyn Exclusivity,
+    writer: &mut dyn RecoveryFileWriter,
+    barrier_budget: Duration,
+    deadline: Duration,
+    step: &RecoveryStep,
+    transcript: &mut Transcript<'_>,
+) -> Option<StopCause> {
+    // A ResumePreview step with no spec is a malformed plan
+    // (`resume_preview_step_iff_spec`); treat it as nothing to drive rather
+    // than panic (`?` returns None = no abort cause).
+    let spec = plan.preview.as_ref()?;
+    let len = spec.stops.len();
+    if len == 0 {
+        return None;
+    }
+    let last = len - 1;
+    // The loop opens on the skip-forward default (clamped defensively).
+    let mut cursor = index_usize(spec.default_index).min(last);
+    let mut rep_ptr = nearest_rep_ptr(&spec.representatives, cursor);
+    loop {
+        // ELEVENTH COROLLARY: re-take the exclusivity barrier before EVERY
+        // reposition send. Each answer is a human-time gap up to the
+        // confirm deadline; a preview that reasserts once at entry is the
+        // bug. `reassert_exclusivity` is the exact same call the step loop
+        // makes, so the fake `Exclusivity` counts one recheck per send.
+        if let Some(cause) =
+            reassert_exclusivity(step, exclusivity, client, barrier_budget, transcript).await
+        {
+            return Some(cause);
+        }
+        let cur = &spec.stops[cursor];
+        let command = format!(
+            "G1 X{} Y{} F{}",
+            fmt_num(cur.xy[0]),
+            fmt_num(cur.xy[1]),
+            fmt_num(spec.travel_feed)
+        );
+        transcript.entry(&json!({
+            "event": "preview-reposition",
+            "step": step.id,
+            "cursor": cursor,
+            "offset": cur.offset,
+            "command": command,
+        }));
+        if let Err(e) = client.gcode_script(&command).await {
+            let message = e.to_string();
+            let failure = StepFailure::classify(&message);
+            return Some(StopCause::CommandFailed { failure, message });
+        }
+        let point = preview_point(spec, cursor, step);
+        match ask_preview(point, deadline, confirmer, transcript).await {
+            PreviewAnswer::Accept => {
+                // Materialise the recovery file for THIS stop, then fall
+                // through so the M23/M24 steps select it (design §4).
+                let Some(binding) = spec.binding(cursor_u32(cursor)) else {
+                    return Some(StopCause::ComputeFailed(
+                        "accepted preview stop has no recovery binding".to_owned(),
+                    ));
+                };
+                // Refuse to accept a stop with no resumable line (empty
+                // entry moves — a past-the-end or all-excluded-after stop):
+                // resuming from it would depend on the still-unwired
+                // exclusion restore and leave the nozzle blind. The detail
+                // map marks such stops `acceptable:false` so a UI grays out
+                // accept; this is the backstop for a console operator who
+                // accepts one anyway. Clean abort (frame invalid → re-plan).
+                if binding.entry_commands.is_empty() {
+                    transcript.entry(&json!({
+                        "event": "preview-accept-refused",
+                        "step": step.id,
+                        "cursor": cursor,
+                        "reason": "stop has no resumable line (empty entry moves)",
+                    }));
+                    return Some(StopCause::ComputeFailed(
+                        "the accepted preview stop has no resumable line after it; \
+                         nudge to a stop with printing still ahead and accept that"
+                            .to_owned(),
+                    ));
+                }
+                transcript.entry(&json!({
+                    "event": "preview-accept",
+                    "step": step.id,
+                    "cursor": cursor,
+                    "resume_offset": binding.tail_offset,
+                }));
+                if let Err(reason) = writer.write_for(binding) {
+                    transcript.entry(&json!({
+                        "event": "preview-write-failed",
+                        "step": step.id,
+                        "reason": reason,
+                    }));
+                    return Some(StopCause::ComputeFailed(format!(
+                        "recovery file write failed on accept: {reason}"
+                    )));
+                }
+                return None;
+            }
+            PreviewAnswer::NextRep => {
+                if !spec.representatives.is_empty() {
+                    rep_ptr = (rep_ptr + 1).min(spec.representatives.len() - 1);
+                    cursor = index_usize(spec.representatives[rep_ptr]).min(last);
+                }
+            }
+            PreviewAnswer::PrevRep => {
+                if !spec.representatives.is_empty() {
+                    rep_ptr = rep_ptr.saturating_sub(1);
+                    cursor = index_usize(spec.representatives[rep_ptr]).min(last);
+                }
+            }
+            PreviewAnswer::Nudge(delta) => {
+                // Clamp the cursor to the stop list (design §D.1: ±1/±10),
+                // using saturating usize arithmetic (no signed casts).
+                let step_by = index_usize(delta.unsigned_abs());
+                cursor = if delta < 0 {
+                    cursor.saturating_sub(step_by)
+                } else {
+                    cursor.saturating_add(step_by).min(last)
+                };
+                rep_ptr = nearest_rep_ptr(&spec.representatives, cursor);
+            }
+            // Abort/timeout: past ShiftedFrame, so the caller's finish_abort
+            // invalidates the Z frame — the nozzle has been driven around
+            // the part and Z trust must be re-established (design §D.2 / §6).
+            PreviewAnswer::Abort => {
+                return Some(StopCause::ConfirmationDeclined {
+                    kind: ConfirmKind::Preview,
+                    code: PREVIEW_CODE,
+                });
+            }
+            PreviewAnswer::TimedOut => {
+                return Some(StopCause::ConfirmationTimedOut {
+                    kind: ConfirmKind::Preview,
+                    code: PREVIEW_CODE,
+                });
+            }
+        }
+    }
+}
+
+/// A stop index (`u32`) as a `usize`, saturating (the preview domain is
+/// bounded by `PREVIEW_MAX_STOPS`, far below either type's max, so the
+/// saturation is unreachable — it only avoids a lossy `as` cast).
+fn index_usize(index: u32) -> usize {
+    usize::try_from(index).unwrap_or(usize::MAX)
+}
+
+/// A cursor (`usize`) as a `u32` stop index, saturating (see
+/// [`index_usize`] for why the saturation is unreachable).
+fn cursor_u32(cursor: usize) -> u32 {
+    u32::try_from(cursor).unwrap_or(u32::MAX)
+}
+
+/// The index into `reps` of the representative nearest `cursor` (by stop
+/// index distance). `0` when there are no representatives — the loop then
+/// relies on nudge to move the cursor.
+fn nearest_rep_ptr(reps: &[u32], cursor: usize) -> usize {
+    reps.iter()
+        .enumerate()
+        .min_by_key(|(_, &r)| index_usize(r).abs_diff(cursor))
+        .map_or(0, |(i, _)| i)
+}
+
+/// Builds the [`ConfirmPoint`] for the stop at `cursor`: the `detail` map
+/// the socket renders (offset / line-position / XY / Z / layer / feature /
+/// `is_candidate` / rep-position / re-print warning), documented field-for-
+/// field so increment 3's plugin can read it byte-for-byte (design §D.3 /
+/// §10 attack #7). See `ctrlsock`'s producer docs for the field contract.
+fn preview_point(
+    spec: &plr_recovery::PreviewSpec,
+    cursor: usize,
+    step: &RecoveryStep,
+) -> ConfirmPoint {
+    let cur = &spec.stops[cursor];
+    // Advisory re-print warning: the cursor is EARLIER than the safe
+    // skip-forward default, so accepting re-prints geometry that may exist.
+    let before_default = cursor < index_usize(spec.default_index);
+    let diagnosis = Diagnosis::new(
+        PREVIEW_CODE,
+        Tier::Advisory,
+        format!(
+            "hovering over stop {} of {} at X{} Y{} (byte {}); move to the ragged edge on \
+             the part, then accept",
+            cursor + 1,
+            spec.stops.len(),
+            fmt_num(cur.xy[0]),
+            fmt_num(cur.xy[1]),
+            cur.offset,
+        ),
+        if before_default {
+            "this point is BEFORE the safe skip-forward line; accepting re-prints existing \
+             geometry (the nozzle plows the printed wall)"
+                .to_owned()
+        } else {
+            "accepting resumes at the next deposition line after this point (skip-forward)"
+                .to_owned()
+        },
+        "Answer accept to resume here, next/prev to step between representative points, \
+         nudge +/-1 (fine) or +/-10 (coarse) to move along the toolpath, or abort to stop."
+            .to_owned(),
+    );
+    ConfirmPoint {
+        kind: ConfirmKind::Preview,
+        step_id: step.id,
+        phase: step.phase.name().to_owned(),
+        diagnosis,
+        detail: preview_detail(spec, cursor),
+        deadline: Duration::ZERO,
+    }
+}
+
+/// The current-stop `detail` map — the increment-3 plugin contract
+/// (design §D.3). Every field here is consumed by `ctrlsock`'s
+/// `report_pause`; the field names and shapes are fixed.
+fn preview_detail(spec: &plr_recovery::PreviewSpec, cursor: usize) -> Value {
+    let cur = &spec.stops[cursor];
+    json!({
+        // Byte offset of this deposition line (safe for M26; updates every
+        // reposition — adjacent stops can be <1mm apart, so the offset, not
+        // visible motion, is the alignment feedback).
+        "offset": cur.offset,
+        // Where a resume STARTS if this stop is accepted.
+        "resume_offset": cur.resume_offset,
+        // Hover target, Klipper-internal frame.
+        "xy": [cur.xy[0], cur.xy[1]],
+        "z": cur.z,
+        "layer": cur.layer,
+        // Feature class name (infill/wall/...) for the prompt.
+        "feature": format!("{:?}", cur.feature),
+        "on_infill": cur.on_infill,
+        // Whether this stop matched the evidence (vs a nudge-only line).
+        "is_candidate": cur.is_candidate,
+        // Rep position "stop N of M" (1-based N).
+        "position": cursor + 1,
+        "count": spec.stops.len(),
+        // Advisory: cursor is earlier than the skip-forward default →
+        // accepting risks re-printing existing geometry.
+        "before_skip_forward": cursor < index_usize(spec.default_index),
+        // Whether this stop can be accepted: false for a stop with no
+        // resumable line (empty entry moves — nothing to print past it),
+        // which the executor also refuses on accept. A UI should gray out
+        // accept when this is false.
+        "acceptable": spec
+            .binding(cursor_u32(cursor))
+            .is_some_and(|b| !b.entry_commands.is_empty()),
+    })
+}
+
+/// Puts one preview reposition point to the confirmer, bounded by a FRESH
+/// full deadline per pause (design §D.2: the operator gets the whole budget
+/// per interaction, not a shrinking global one), and records the question
+/// and answer in the transcript. Mirrors [`ask`] but for [`PreviewAnswer`].
+async fn ask_preview(
+    mut point: ConfirmPoint,
+    deadline: Duration,
+    confirmer: &mut dyn Confirmer,
+    transcript: &mut Transcript<'_>,
+) -> PreviewAnswer {
+    point.deadline = deadline;
+    transcript.entry(&json!({
+        "event": "confirm-pause",
+        "kind": point.kind.tag(),
+        "step": point.step_id,
+        "phase": point.phase,
+        "diagnosis": point.diagnosis,
+        "detail": point.detail,
+        "deadline_s": point.deadline.as_secs_f64(),
+    }));
+    let bound = point.deadline;
+    let answer = tokio::time::timeout(bound, confirmer.confirm_preview(&point))
+        .await
+        .unwrap_or(PreviewAnswer::TimedOut);
+    transcript.entry(&json!({
+        "event": "confirm-answer",
+        "kind": point.kind.tag(),
+        "step": point.step_id,
+        "code": point.diagnosis.code,
+        "answer": answer.tag(),
+    }));
+    answer
+}
+
 /// The `debug_confirm_each_step` question: this step, its commands, and
 /// what will be verified afterwards.
 fn step_debug_point(step: &RecoveryStep) -> ConfirmPoint {
@@ -1098,7 +1522,8 @@ async fn z_confirm_point(
             RuntimeComputation::TrueZ(f) => Some(f),
             RuntimeComputation::RecordMaxAccel
             | RuntimeComputation::RecordMachineAccel
-            | RuntimeComputation::ParkZ { .. } => None,
+            | RuntimeComputation::ParkZ { .. }
+            | RuntimeComputation::HoverPlane { .. } => None,
         });
     let derivation = formula.map_or_else(
         || "unavailable (no true-Z step in this plan)".to_owned(),
@@ -1441,6 +1866,28 @@ async fn resolve_compute(
                 Err(e) => Err(StopCause::ComputeFailed(e.to_string())),
             }
         }
+        Some(RuntimeComputation::HoverPlane { target_z, z_max }) => {
+            // Read the CURRENT Z (before the lift) and compute the
+            // resume-preview hover plane. Like ParkZ this is a lift or a
+            // no-op — never a descent — but the floor is an ABSOLUTE
+            // target_z above every stop rather than a relative delta.
+            let current_z = query_number(client, "toolhead", "position.2").await?;
+            match plr_recovery::hover_plane_at(current_z, target_z, z_max) {
+                Ok(hover_z) => {
+                    transcript.entry(&json!({
+                        "event": "compute",
+                        "step": step.id,
+                        "current_z": current_z,
+                        "target_z": target_z,
+                        "z_max": z_max,
+                        "hover_plane": hover_z,
+                    }));
+                    Ok(Some(hover_z))
+                }
+                // Never substitute on error (plr-recovery contract).
+                Err(e) => Err(StopCause::ComputeFailed(e.to_string())),
+            }
+        }
         Some(RuntimeComputation::RecordMaxAccel) => {
             // Read BEFORE the step's SET_VELOCITY_LIMIT clamps it, and
             // persist in the PHASE slot for the restore step / abort
@@ -1588,15 +2035,20 @@ pub(crate) mod tests {
     use super::{
         dry_run, evaluate, execute, lookup, AbortConfirmer, ConfirmAnswer, ConfirmKind,
         ConfirmPoint, Confirmer, Exclusivity, ExecOptions, ExecOutcome, FrameGuard, NoExclusivity,
-        NoFrameGuard, StepFailure, StopCause, Transcript,
+        NoFrameGuard, NoopFileWriter, PreviewAnswer, RecoveryFileWriter, StepFailure, StopCause,
+        Transcript,
     };
     use crate::moonraker::MoonrakerClient;
     use crate::testmoon::FakeMoonraker;
+    use plr_analyzer::{FeatureClass, PreviewStop};
     use plr_recovery::{
         compute_envelope, AbortReason, EnvelopeParams, FailureAction, Phase, Predicate,
-        RecoveryPlan, RecoveryStep, RuntimeComputation, TriggerSource, TrueZFormula, Verification,
+        PreviewBinding, PreviewSpec, RecoveryPlan, RecoveryStep, RuntimeComputation, TriggerSource,
+        TrueZFormula, Verification,
     };
     use serde_json::{json, Value};
+    use std::future::Future;
+    use std::pin::Pin;
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
@@ -1685,6 +2137,7 @@ pub(crate) mod tests {
             debug_confirm_each_step: false,
             confirm_timeout_s: None,
             gcode_barrier_timeout_s: None,
+            preview: None,
             warnings: vec![],
         }
     }
@@ -1792,6 +2245,7 @@ pub(crate) mod tests {
             .await
             .unwrap();
         let mut buffer = Vec::new();
+        let mut writer = NoopFileWriter;
         let outcome = {
             let mut transcript = Transcript::new(&mut buffer);
             execute(
@@ -1802,6 +2256,7 @@ pub(crate) mod tests {
                 confirmer,
                 frame_guard,
                 exclusivity,
+                &mut writer,
                 &mut transcript,
             )
             .await
@@ -3350,5 +3805,309 @@ pub(crate) mod tests {
         assert!(transcript.contains("probe_no_trigger"), "{transcript}");
         assert!(transcript.contains("envelope_margin"), "{transcript}");
         assert!(transcript.contains("\"tier\":\"hard\""), "{transcript}");
+    }
+
+    // ---- resume-preview reposition loop (design §D.2, §10 attacks) -----
+
+    /// A preview confirmer that plays a scripted sequence of answers.
+    struct ScriptedPreviewConfirmer {
+        answers: std::collections::VecDeque<PreviewAnswer>,
+    }
+    impl Confirmer for ScriptedPreviewConfirmer {
+        fn confirm<'a>(
+            &'a mut self,
+            _point: &'a ConfirmPoint,
+        ) -> Pin<Box<dyn Future<Output = ConfirmAnswer> + Send + 'a>> {
+            Box::pin(async { ConfirmAnswer::Abort })
+        }
+        fn confirm_preview<'a>(
+            &'a mut self,
+            _point: &'a ConfirmPoint,
+        ) -> Pin<Box<dyn Future<Output = PreviewAnswer> + Send + 'a>> {
+            let answer = self.answers.pop_front().unwrap_or(PreviewAnswer::Abort);
+            Box::pin(async move { answer })
+        }
+    }
+
+    /// A writer that records every binding it is asked to materialise.
+    #[derive(Clone, Default)]
+    struct RecordingWriter {
+        offsets: Arc<Mutex<Vec<u64>>>,
+    }
+    impl RecoveryFileWriter for RecordingWriter {
+        fn write_for(&mut self, binding: &PreviewBinding) -> Result<(), String> {
+            self.offsets.lock().unwrap().push(binding.tail_offset);
+            Ok(())
+        }
+    }
+
+    /// An exclusivity fake that counts how many times it was re-checked —
+    /// the §10 attack #2 instrument (calls must equal step sends +
+    /// repositions, so a preview that reasserts once fails this).
+    #[derive(Clone, Default)]
+    struct CountingExclusivity {
+        count: Arc<Mutex<u32>>,
+    }
+    impl Exclusivity for CountingExclusivity {
+        fn recheck<'a>(
+            &'a mut self,
+            _client: &'a mut MoonrakerClient,
+            _budget: Duration,
+        ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+            *self.count.lock().unwrap() += 1;
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    fn preview_stop(index: u32, offset: u64, resume_offset: u64) -> PreviewStop {
+        PreviewStop {
+            index,
+            offset,
+            resume_offset,
+            xy: [10.0 + f64::from(index), 20.0],
+            z: 0.4,
+            layer: Some(1),
+            feature: FeatureClass::InternalInfill,
+            on_infill: true,
+            is_candidate: true,
+        }
+    }
+
+    /// A three-stop preview spec; bindings' tail offsets are 100/200/300.
+    fn preview_spec() -> PreviewSpec {
+        PreviewSpec {
+            stops: vec![
+                preview_stop(0, 100, 100),
+                preview_stop(1, 200, 200),
+                preview_stop(2, 300, 300),
+            ],
+            representatives: vec![0, 2],
+            first_index: 0,
+            mid_index: 1,
+            last_index: 2,
+            default_index: 2,
+            bindings: vec![
+                PreviewBinding {
+                    tail_offset: 100,
+                    entry_commands: vec!["G1 X10 Y20".to_owned()],
+                },
+                PreviewBinding {
+                    tail_offset: 200,
+                    entry_commands: vec!["G1 X11 Y20".to_owned()],
+                },
+                PreviewBinding {
+                    tail_offset: 300,
+                    entry_commands: vec!["G1 X12 Y20".to_owned()],
+                },
+            ],
+            hover_target_z: 0.5,
+            z_max: Some(300.0),
+            cool_nozzle_temp: 150.0,
+            travel_feed: 6000.0,
+        }
+    }
+
+    fn resume_preview_step(id: u32) -> RecoveryStep {
+        RecoveryStep {
+            id,
+            phase: Phase::ResumePreview,
+            summary: "preview".to_owned(),
+            commands: vec![
+                "G90".to_owned(),
+                "G1 Z{park_z} F1200".to_owned(),
+                "M104 S150".to_owned(),
+            ],
+            pre_verify: vec![],
+            // No post-verify: the fake's position (0.75) already exceeds
+            // the hover target (0.5), so HoverPlane resolves to 0.75 and
+            // the lift is a no-op — the loop is what this test exercises.
+            verify: vec![],
+            compute: Some(RuntimeComputation::HoverPlane {
+                target_z: 0.5,
+                z_max: Some(300.0),
+            }),
+            cleanup_commands: vec![],
+            on_failure: FailureAction::Abort {
+                reason: AbortReason::ResumePreviewFailed,
+            },
+        }
+    }
+
+    fn shifted_frame_step(id: u32) -> RecoveryStep {
+        RecoveryStep {
+            id,
+            phase: Phase::ShiftedFrame,
+            summary: "shifted".to_owned(),
+            commands: vec!["SET_KINEMATIC_POSITION Z=1".to_owned()],
+            pre_verify: vec![],
+            verify: vec![],
+            compute: None,
+            cleanup_commands: vec![],
+            on_failure: FailureAction::Abort {
+                reason: AbortReason::ShiftedFrameNotDeclared,
+            },
+        }
+    }
+
+    fn preview_plan(steps: Vec<RecoveryStep>) -> RecoveryPlan {
+        RecoveryPlan {
+            steps,
+            envelope: compute_envelope(
+                EnvelopeParams {
+                    expected_gap: 0.5,
+                    overshoot: plr_recovery::OvershootTerm::PostTriggerTravel { probe_speed: 1.0 },
+                    margin: 0.5,
+                },
+                -2.0,
+            )
+            .expect("envelope"),
+            resume_file: "x_RECOVERY.gcode".to_owned(),
+            resume_offset: 300,
+            requires_clean_nozzle_confirmation: false,
+            recovery_file: plr_recovery::RecoveryFileSpec::default(),
+            debug_confirm_each_step: false,
+            confirm_timeout_s: None,
+            gcode_barrier_timeout_s: None,
+            preview: Some(preview_spec()),
+            warnings: vec![],
+        }
+    }
+
+    async fn run_preview(
+        plan: &RecoveryPlan,
+        fake: &FakeMoonraker,
+        confirmer: &mut dyn Confirmer,
+        exclusivity: &mut dyn Exclusivity,
+        writer: &mut dyn RecoveryFileWriter,
+    ) -> ExecOutcome {
+        let mut client = MoonrakerClient::connect(&fake.url(), Duration::from_secs(5))
+            .await
+            .unwrap();
+        let mut buffer = Vec::new();
+        let mut transcript = Transcript::new(&mut buffer);
+        execute(
+            plan,
+            &mut client,
+            &fast_options(),
+            &mut |_| true,
+            confirmer,
+            &mut NoFrameGuard,
+            exclusivity,
+            writer,
+            &mut transcript,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn preview_accept_writes_the_chosen_stop_once_and_rechecks_per_reposition() {
+        let fake = FakeMoonraker::spawn(happy_handler).await;
+        // Open on last (index 2); nudge -1 twice to index 0, then accept.
+        let mut confirmer = ScriptedPreviewConfirmer {
+            answers: [
+                PreviewAnswer::Nudge(-1),
+                PreviewAnswer::Nudge(-1),
+                PreviewAnswer::Accept,
+            ]
+            .into(),
+        };
+        let writer = RecordingWriter::default();
+        let excl = CountingExclusivity::default();
+        let plan = preview_plan(vec![resume_preview_step(1)]);
+        let outcome = run_preview(
+            &plan,
+            &fake,
+            &mut confirmer,
+            &mut excl.clone(),
+            &mut writer.clone(),
+        )
+        .await;
+        assert!(matches!(outcome, ExecOutcome::Completed { .. }));
+        // Writer called EXACTLY once, with the accepted stop's tail offset
+        // (index 0 → 100), never the default (index 2 → 300).
+        assert_eq!(*writer.offsets.lock().unwrap(), vec![100]);
+        // One step recheck + one recheck per reposition (3 repositions:
+        // cursor 2, 1, 0). A preview that reasserted exclusivity once would
+        // score 2, not 4 (§10 attack #2).
+        assert_eq!(*excl.count.lock().unwrap(), 4);
+    }
+
+    #[tokio::test]
+    async fn preview_abort_invalidates_the_frame_and_never_writes() {
+        let fake = FakeMoonraker::spawn(happy_handler).await;
+        let mut confirmer = ScriptedPreviewConfirmer {
+            answers: [PreviewAnswer::Abort].into(),
+        };
+        let writer = RecordingWriter::default();
+        // ShiftedFrame (id 1) precedes ResumePreview (id 2): the abort sits
+        // past the frame declare, so frame_invalid MUST be true (§10 #4).
+        let plan = preview_plan(vec![shifted_frame_step(1), resume_preview_step(2)]);
+        let outcome = run_preview(
+            &plan,
+            &fake,
+            &mut confirmer,
+            &mut NoExclusivity,
+            &mut writer.clone(),
+        )
+        .await;
+        let ExecOutcome::Aborted {
+            frame_invalid,
+            phase,
+            ..
+        } = outcome
+        else {
+            panic!("expected an abort, got {outcome:?}");
+        };
+        assert!(frame_invalid, "preview abort must invalidate the Z frame");
+        assert_eq!(phase, "resume-preview");
+        assert!(
+            writer.offsets.lock().unwrap().is_empty(),
+            "an aborted preview must never write a recovery file"
+        );
+    }
+
+    #[tokio::test]
+    async fn preview_accept_of_an_unresumable_stop_is_refused_and_never_writes() {
+        // MINOR-1 backstop: a stop with no resumable line (empty entry
+        // moves — nothing to print past it) must be refused on accept, not
+        // resumed blind. Clean abort, no file written.
+        let fake = FakeMoonraker::spawn(happy_handler).await;
+        let mut confirmer = ScriptedPreviewConfirmer {
+            answers: [PreviewAnswer::Accept].into(),
+        };
+        let writer = RecordingWriter::default();
+        let mut spec = preview_spec();
+        // The default stop (index 2, opened on) has empty entry moves.
+        spec.bindings[2].entry_commands.clear();
+        let mut plan = preview_plan(vec![resume_preview_step(1)]);
+        plan.preview = Some(spec);
+        let outcome = run_preview(
+            &plan,
+            &fake,
+            &mut confirmer,
+            &mut NoExclusivity,
+            &mut writer.clone(),
+        )
+        .await;
+        assert!(
+            matches!(outcome, ExecOutcome::Aborted { .. }),
+            "{outcome:?}"
+        );
+        assert!(
+            writer.offsets.lock().unwrap().is_empty(),
+            "an unresumable stop must never be written"
+        );
+    }
+
+    #[tokio::test]
+    async fn dry_run_holds_a_writer_that_cannot_write() {
+        // The type fact (§10 attack #5): NoopFileWriter — the dry-run
+        // path's writer — has no path, no bytes, and its write is a no-op.
+        let mut writer = NoopFileWriter;
+        let binding = PreviewBinding {
+            tail_offset: 42,
+            entry_commands: vec![],
+        };
+        assert!(writer.write_for(&binding).is_ok());
     }
 }

@@ -64,16 +64,18 @@ use std::io::Write;
 use std::path::Path;
 
 use plr_analyzer::{
-    build_layer_model, match_stop_point, select_contact_zone, ByteWindow, ContactConfig,
-    ContactOutcome, Interval, LayerModel, MatchConfig, ModelConfig, StopEvidence,
+    build_layer_model, build_preview, match_stop_point, select_contact_zone, ByteWindow,
+    ContactConfig, ContactOutcome, Interval, LayerModel, MatchConfidence, MatchConfig, MatchError,
+    MatchResult, ModelConfig, PreviewBounds, PreviewOutcome, PreviewSet, StopEvidence,
 };
 use plr_reconstruct::{
     anchor_state_from_context, reconstruct, select_crash_epoch, FileTail, PossibleStopSet,
     ReconstructInputs, Reconstruction, RecoveryReconstruction,
 };
 use plr_recovery::{
-    plan_recovery, select_resume_target, validate_machine, MachineConfig, MachineRejection,
-    PlanConfig, PlanInputs, PlanOutcome, ProbeConfig, ProbeKind, RecoveryPlan, ZStepper,
+    plan_recovery, resolve_resume_with_preview, validate_machine, MachineConfig, MachineRejection,
+    PlanConfig, PlanInputs, PlanOutcome, ProbeConfig, ProbeKind, RecoveryPlan, ResumePolicy,
+    ZStepper,
 };
 use plr_wal::crc32c;
 
@@ -113,6 +115,15 @@ pub struct PlanBundle {
     pub sdcard_root: std::path::PathBuf,
     /// The original print file's basename, for that re-resolve.
     pub recovery_source_name: String,
+    /// The original print file's raw bytes — carried ONLY for a preview
+    /// (`ask`) plan, where the recovery file cannot be pre-generated
+    /// because the resume point is not known until the operator accepts in
+    /// the reposition loop (design §4). The execute path's
+    /// [`crate::executor::RecoveryFileWriter`] rebuilds the file from these
+    /// bytes plus the plan's `recovery_file` template on Accept. `None` for
+    /// an ordinary plan (its content is already in
+    /// [`Self::recovery_file_content`], written before execution).
+    pub original_file_bytes: Option<Vec<u8>>,
 }
 
 /// Every outcome the pipeline can reach. Only `Plan` is executable.
@@ -540,6 +551,7 @@ pub(crate) fn report_machine_mode(config: &Config, out: &mut dyn Write) {
 /// The analysis half: model, match, contact, plan. Infallible in the
 /// `Result` sense — every failure is itself a typed outcome.
 #[allow(clippy::too_many_arguments)] // the analysis half threads several borrowed inputs
+#[allow(clippy::too_many_lines)] // linear analysis pipeline + policy routing
 fn plan_from_recovery(
     recovery: &RecoveryReconstruction,
     machine: &MachineConfig,
@@ -602,20 +614,99 @@ fn plan_from_recovery(
         );
     };
     let match_result = match match_stop_point(&model, &evidence, &MatchConfig::default()) {
-        Ok(result) => result,
+        Ok(result) => {
+            say(&format!(
+                "pipeline: match confidence {:?} ({} candidates)",
+                result.confidence,
+                result.candidates.len()
+            ));
+            result
+        }
+        // Inconclusive is the design's NAMED common real-crash shape (many
+        // consistent lines across 1-4 layers): the confidence ladder
+        // discards every line, but `build_preview` works from the raw
+        // evidence and never needed the match result. Route it into the
+        // SAME policy/preview path as LayerOnly, with a placeholder
+        // LayerOnly confidence. That placeholder is consulted only on the
+        // no-preview-set fallback (`resolve_resume_with_preview(None)`),
+        // where a coarse layer correctly degrades to manual — so `ask`
+        // (interim, no set) and any-policy `NoStops` still fall back to
+        // manual exactly as today, while `first`/`mid`/`last` with a usable
+        // set resume automatically from the anchor (MAJOR-2).
+        Err(MatchError::Inconclusive { lines, layers }) => {
+            say(&format!(
+                "pipeline: match inconclusive: {lines} candidate lines across layers \
+                 {layers:?}; routing the raw evidence through the resume-point preview"
+            ));
+            MatchResult {
+                candidates: Vec::new(),
+                confidence: MatchConfidence::LayerOnly {
+                    layer: layers.first().copied().unwrap_or(0),
+                },
+                skipped_unknown: 0,
+            }
+        }
         Err(e) => return PipelineOutcome::ManualFallback(format!("stop-point match failed: {e}")),
     };
-    say(&format!(
-        "pipeline: match confidence {:?} ({} candidates)",
-        match_result.confidence,
-        match_result.candidates.len()
-    ));
 
-    let (resume, contact) =
-        match resume_and_contact(&model, &match_result, &evidence, contact_config, say) {
-            Ok(pair) => pair,
-            Err(outcome) => return outcome,
-        };
+    // Resume-point routing by `resume_candidate_policy` (design §D / §11).
+    // The preview builder is the parallel path (§A.1); it recovers the
+    // candidate stops the matcher's confidence ladder discards on a coarse
+    // match, so `first`/`mid`/`last` resume automatically from the set's
+    // anchor — the headless win. A UniqueLine ignores policy entirely (one
+    // line, nothing to pick). Exclusions are `None` until the pipeline
+    // wires the real excluded set (§E.3 pre-existing gap); until then
+    // build_preview keeps all non-attributable stops (safe direction).
+    //
+    // INTERIM (principal ruling pending — see the branch report): the
+    // interactive `ask` preview is NOT attached here yet. Turning it on
+    // flips the shipped DEFAULT from automatic skip-forward to an
+    // interactive pause, which makes a bare-CLI / headless recovery (whose
+    // fail-closed confirmer aborts every pause) ABORT ambiguous recoveries
+    // that auto-complete today. So `ask` resolves as `last` for now (its
+    // documented behavior), and only `first`/`mid`/`last` consult the set.
+    // The executor loop, writer, and socket vocabulary are all implemented
+    // and tested; flipping `ask` on is the one-line change of building the
+    // set for `Ask` too and passing it through as the attached preview.
+    let policy = plan_config.resume_candidate_policy;
+    let build_set = !matches!(policy, ResumePolicy::Ask)
+        && !matches!(match_result.confidence, MatchConfidence::UniqueLine { .. });
+    let preview_owned: Option<PreviewSet> = if build_set {
+        match build_preview(
+            &model,
+            &evidence,
+            &MatchConfig::default(),
+            None,
+            &PreviewBounds::default(),
+        ) {
+            PreviewOutcome::Preview(set) => Some(set),
+            // first/mid/last with NoStops fall back to the resolver (never
+            // read a resume out of NoStops — increment-1 binding note);
+            // TooWide / invalid degrade to manual.
+            PreviewOutcome::NoStops => None,
+            other => {
+                return PipelineOutcome::ManualFallback(format!(
+                    "resume preview declined ({other:?}); manual recovery required"
+                ))
+            }
+        }
+    } else {
+        None
+    };
+    let preview = preview_owned.as_ref();
+
+    let (resume, contact) = match resume_and_contact(
+        &model,
+        &match_result,
+        policy,
+        preview,
+        &evidence,
+        contact_config,
+        say,
+    ) {
+        Ok(pair) => pair,
+        Err(outcome) => return outcome,
+    };
 
     // usize conversion validated by `anchored_model`.
     let base_usize = usize::try_from(base_offset).unwrap_or(usize::MAX);
@@ -642,6 +733,7 @@ fn plan_from_recovery(
         exclude_objects: &[],
         clean_nozzle_macro_present,
         purge_macro_present,
+        preview,
     };
     match plan_recovery(&plan_inputs, plan_config) {
         Ok(PlanOutcome::NoRecoveryNeeded) => PipelineOutcome::CleanShutdown,
@@ -742,6 +834,15 @@ fn finalize_recovery_file(
 
     let recovery_file_path = root_path.join(&plan.recovery_file.name);
     let recovery_source_name = plan.recovery_file.source_name.clone();
+    // A preview plan carries the original bytes so the accept-time writer
+    // can rebuild the file for the chosen stop (§4). An ordinary plan does
+    // not — its content is `generated.content`, written before execution —
+    // so it keeps the bundle small.
+    let original_file_bytes = if plan.preview.is_some() {
+        Some(file_bytes.to_vec())
+    } else {
+        None
+    };
     Ok(PlanBundle {
         plan,
         file_path: String::new(),
@@ -750,21 +851,30 @@ fn finalize_recovery_file(
         recovery_file_path,
         sdcard_root: root_path.to_path_buf(),
         recovery_source_name,
+        original_file_bytes,
     })
 }
 
 /// Picks the resume target and the probe contact zone, narrating the
 /// candidate count. `Err` carries the manual-fallback outcome.
+///
+/// The resume is resolved through the SAME `resolve_resume_with_preview`
+/// selector the plan builder uses (policy + optional preview set), so the
+/// contact zone is chosen for the exact layer the plan will resume on — no
+/// drift between the two.
 fn resume_and_contact(
     model: &plr_analyzer::LayerModel,
-    match_result: &plr_analyzer::MatchResult,
+    match_result: &MatchResult,
+    policy: ResumePolicy,
+    preview: Option<&PreviewSet>,
     evidence: &StopEvidence,
     contact_config: &ContactConfig,
     say: &mut dyn FnMut(&str),
 ) -> Result<(plr_recovery::ResumeTarget, ContactOutcome), PipelineOutcome> {
-    let resume = select_resume_target(model, match_result).map_err(|reason| {
-        PipelineOutcome::ManualFallback(format!("no safe resume point: {reason:?}"))
-    })?;
+    let resume =
+        resolve_resume_with_preview(model, match_result, policy, preview).map_err(|reason| {
+            PipelineOutcome::ManualFallback(format!("no safe resume point: {reason:?}"))
+        })?;
     let Some(resume_layer) = resume.layer else {
         return Err(PipelineOutcome::ManualFallback(
             "resume point has no layer attribution; contact selection impossible".to_owned(),
@@ -1716,23 +1826,33 @@ G1 X60 Y60 E0.02
         let PipelineOutcome::ManualFallback(reason) = outcome else {
             panic!("expected ManualFallback, got {outcome:?}\n{output}");
         };
-        // The honestly-priced Δt leaves the window past per-line granularity,
-        // so the matcher declines — not contact selection.
+        // The honestly-priced Δt leaves the window past per-line
+        // granularity, so the matcher declines Inconclusive. MAJOR-2 routes
+        // that raw evidence through the resume-preview path instead of
+        // failing at the match call; under the default `ask` (gated pending
+        // the interim decision) it falls to the resolver, which finds the
+        // layer too coarse to resume -> ManualFallback. The candidate count
+        // and granularity message now live in the routing NARRATION.
         assert!(
-            reason.contains("stop-point match failed")
-                && reason.contains("below layer granularity"),
+            reason.contains("no safe resume point") && reason.contains("MatchTooCoarse"),
             "reason changed: {reason}\n{output}"
         );
+        assert!(
+            output.contains("match inconclusive")
+                && output.contains("candidate lines across layers"),
+            "the inconclusive routing must be narrated: {output}"
+        );
         // Re-armed numeric guard: the reader-lead widening leaves > 12
-        // candidate lines. A cap that over-narrows (the review's blocker)
-        // would drop this below 12 and fail here.
-        let count: usize = reason
-            .split_whitespace()
-            .find_map(|w| w.parse().ok())
+        // candidate lines (parsed from the narration now). A cap that
+        // over-narrows (the review's blocker) would drop this below 12.
+        let count: usize = output
+            .lines()
+            .find(|l| l.contains("match inconclusive"))
+            .and_then(|l| l.split_whitespace().find_map(|w| w.parse().ok()))
             .unwrap_or(0);
         assert!(
             count >= 12,
-            "only {count} candidate lines — an over-narrowing cap is back: {reason}"
+            "only {count} candidate lines — an over-narrowing cap is back: {output}"
         );
         // Containment: the window LOW end is still the frontier (byte 8).
         // The matcher declined, so there is no AmbiguousWindow offsets line;
@@ -1763,6 +1883,19 @@ G1 X60 Y60 E0.02
             panic!("expected a plan, got {outcome:?}\n{output}");
         };
         let plan = &bundle.plan;
+        // Ask-deferral with REAL evidence: this AmbiguousWindow fixture runs
+        // under the default `ask`, which currently resolves as `last`
+        // (skip-forward) with NO interactive preview attached — no
+        // ResumePreview step, no preview spec (interim, pending the
+        // default-flip ruling). The resume still lands at a real line
+        // (asserted below), i.e. an automatic plan, not a ManualFallback.
+        assert!(
+            plan.first_index(plr_recovery::Phase::ResumePreview)
+                .is_none(),
+            "ask-deferral must not attach a preview step: {output}"
+        );
+        assert!(plan.preview.is_none(), "{output}");
+        assert!(plan.resume_preview_step_iff_spec());
         // The plan honors every structural invariant plr-recovery
         // promises.
         assert!(plan.idle_timeout_first(), "{output}");

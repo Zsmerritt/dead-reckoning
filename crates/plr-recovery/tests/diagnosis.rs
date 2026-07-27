@@ -289,6 +289,13 @@ fn every_plan_warning() -> Vec<(PlanWarning, Tier)> {
             PlanWarning::AccelEntryNotAppliedToFile { accel_entry: 600.0 },
             Tier::Advisory,
         ),
+        (
+            PlanWarning::PreviewStandoffSqueezed {
+                available: 0.3,
+                requested: 1.0,
+            },
+            Tier::Advisory,
+        ),
     ]
 }
 
@@ -422,6 +429,7 @@ fn tier_of_plan_warning(w: &PlanWarning) -> Tier {
         | PlanWarning::UnrestorableFan { .. }
         | PlanWarning::UnsafeOverrideActive { .. }
         | PlanWarning::AccelProbeIgnoredOnTouchPath { .. }
+        | PlanWarning::PreviewStandoffSqueezed { .. }
         | PlanWarning::AccelEntryNotAppliedToFile { .. } => Tier::Advisory,
         PlanWarning::PurgeZBelowResume { .. }
         | PlanWarning::NoiseFloorSpeedMismatch { .. }
@@ -495,11 +503,11 @@ fn every_prereq_failure_variant_yields_a_usable_diagnosis() {
 #[test]
 fn every_plan_warning_variant_yields_a_usable_diagnosis() {
     let all = every_plan_warning();
-    // 15 variants, two of which appear twice because their tier depends
+    // 16 variants, two of which appear twice because their tier depends
     // on the data they carry.
     assert_eq!(
         all.len(),
-        17,
+        18,
         "a sample value was removed from this list; it must exercise every arm"
     );
     for (warning, tier) in &all {

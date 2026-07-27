@@ -145,7 +145,8 @@ use std::time::Duration;
 
 use crate::config::Config;
 use crate::executor::{
-    dry_run, execute, AbortConfirmer, Confirmer, ExecOptions, ExecOutcome, FrameGuard, Transcript,
+    dry_run, execute, AbortConfirmer, Confirmer, ExecOptions, ExecOutcome, FrameGuard,
+    NoopFileWriter, RecoveryFileWriter, Transcript,
 };
 use crate::moonraker::MoonrakerClient;
 use crate::pipeline::{run_pipeline, PipelineOutcome, PlanBundle};
@@ -410,6 +411,7 @@ impl StepGate for AutoGate {
 /// control socket: Moonraker reachability, klippy ready + printer
 /// idle, transcript-or-refuse, abort on any failed verification. Only
 /// the per-step confirmation policy differs (`gate`).
+#[allow(clippy::too_many_lines)] // the fixed gate stack + the writer selection
 pub(crate) async fn execute_with_gates(
     bundle: &PlanBundle,
     config: &Config,
@@ -515,6 +517,27 @@ pub(crate) async fn execute_with_gates(
     let mut exclusivity = BarrierGate {
         restore_timeout: exec_options.temp_timeout,
     };
+    // The recovery-file writer: for a PREVIEW plan it holds the spec
+    // template + original bytes + target path and materialises the file on
+    // the operator's Accept (§4). For an ordinary plan the file is already
+    // on disk (write_recovery_file above), so a no-op writer is handed in —
+    // and because the plan carries no ResumePreview step, it is never even
+    // called. The type makes "no preview → nothing to write here" explicit.
+    let mut writer: Box<dyn RecoveryFileWriter> = match (
+        bundle.plan.preview.is_some(),
+        bundle.original_file_bytes.clone(),
+    ) {
+        (true, Some(original)) => Box::new(DiskRecoveryFileWriter {
+            spec: bundle.plan.recovery_file.clone(),
+            original,
+            path: bundle.recovery_file_path.clone(),
+            timestamp: recovery_file_timestamp(),
+        }),
+        // A preview plan with no captured bytes is a construction bug; a
+        // no-op writer means Accept would fail the write and abort cleanly
+        // rather than resume against a file that was never generated.
+        _ => Box::new(NoopFileWriter),
+    };
     let outcome = {
         let mut transcript = Transcript::new(&mut transcript_file);
         execute(
@@ -525,6 +548,7 @@ pub(crate) async fn execute_with_gates(
             confirmer,
             &mut frame_guard,
             &mut exclusivity,
+            writer.as_mut(),
             &mut transcript,
         )
         .await
@@ -705,6 +729,73 @@ fn create_new_write(path: &std::path::Path, content: &[u8]) -> std::io::Result<O
     }
 }
 
+/// Wall-clock timestamp string for a generated recovery file's header.
+fn recovery_file_timestamp() -> String {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+        .to_string()
+}
+
+/// The execute-path [`RecoveryFileWriter`] for a PREVIEW plan (design §4).
+/// It captures the recovery-file spec TEMPLATE, the original print bytes,
+/// the target path, and a header timestamp; on the operator's Accept it
+/// swaps the chosen stop's binding into the template and writes the file.
+///
+/// This is the ONLY thing that ever writes a preview plan's recovery file,
+/// and it exists only on the execute path — a dry-run is handed a
+/// [`NoopFileWriter`] instead, so "dry-run cannot write" is enforced by the
+/// type it holds, not by a runtime check.
+struct DiskRecoveryFileWriter {
+    /// The recovery-file spec template (everything except the
+    /// offset-dependent tail + resume-XY entry moves).
+    spec: plr_recovery::RecoveryFileSpec,
+    /// The original print file's raw bytes (the verbatim tail source).
+    original: Vec<u8>,
+    /// The already-resolved target path in the sdcard root.
+    path: std::path::PathBuf,
+    /// Header timestamp.
+    timestamp: String,
+}
+
+impl RecoveryFileWriter for DiskRecoveryFileWriter {
+    fn write_for(&mut self, binding: &plr_recovery::PreviewBinding) -> Result<(), String> {
+        // Late-bind the two offset-dependent fields into the template — the
+        // ONLY difference between stops — then generate and write. The
+        // entry commands were built by plr-recovery's build_entry_commands,
+        // the same formatter the non-preview path uses, so the generated
+        // file matches the previewed stop byte-for-byte (§10 attack #12).
+        let mut spec = self.spec.clone();
+        spec.tail_offset = binding.tail_offset;
+        spec.entry_commands.clone_from(&binding.entry_commands);
+        spec.plan_id = format!("plr-{}", binding.tail_offset);
+        let generated = plr_recovery::build_recovery_file(&spec, &self.original, &self.timestamp);
+        // Defence in depth: the heating gate must still hold for the
+        // late-bound file (it is offset-independent, but a regression here
+        // would ship an unheated resume).
+        if let Err(v) = plr_recovery::verify_heating_gate(&generated, &spec) {
+            return Err(format!(
+                "generated recovery file violates the heating gate: {v}"
+            ));
+        }
+        match create_new_write(&self.path, &generated.content) {
+            Ok(Some(())) => Ok(()),
+            // The planned name was taken since planning. Rare (the name was
+            // resolved moments ago and preview is interactive); refuse
+            // rather than clobber a file that appeared — the abort is clean
+            // and re-runnable.
+            Ok(None) => Err(format!(
+                "recovery file path {} already exists; refusing to overwrite",
+                self.path.display()
+            )),
+            Err(e) => Err(format!(
+                "cannot write recovery file {}: {e}",
+                self.path.display()
+            )),
+        }
+    }
+}
+
 /// The `WriteRecoveryFile` phase gate: writes the generated recovery file
 /// into the sdcard root BEFORE any step runs (before step 1). A write
 /// failure aborts the recovery before any motion; the final path is
@@ -721,6 +812,23 @@ fn write_recovery_file(
     transcript_file: &mut std::fs::File,
     out: &mut (dyn Write + Send),
 ) -> bool {
+    // A PREVIEW (`ask`) plan cannot be written here: its resume point is
+    // not known until the operator accepts in the reposition loop, so the
+    // file is materialised there by the injected RecoveryFileWriter
+    // (design §4). Skipping this pre-write is deliberate — the file simply
+    // does not exist until Accept, and dry-run never had one either.
+    if bundle.plan.preview.is_some() {
+        let _ = writeln!(
+            transcript_file,
+            "{}",
+            serde_json::json!({
+                "event": "recovery-file-deferred",
+                "reason": "resume preview: file is generated on operator accept",
+                "path": bundle.recovery_file_path.display().to_string(),
+            })
+        );
+        return true;
+    }
     let mut path = bundle.recovery_file_path.clone();
     for attempt in 0..RECOVERY_NAME_RETRIES {
         match create_new_write(&path, &bundle.recovery_file_content) {
@@ -1104,6 +1212,7 @@ mod tests {
             recovery_file_path: dir.join("x_RECOVERY.gcode"),
             sdcard_root: dir.to_path_buf(),
             recovery_source_name: "x.gcode".to_owned(),
+            original_file_bytes: None,
         }))
     }
 
@@ -1652,6 +1761,7 @@ mod tests {
             ),
             sdcard_root: std::path::PathBuf::from("/nonexistent-plrd-dir-xyzzy"),
             recovery_source_name: "x.gcode".to_owned(),
+            original_file_bytes: None,
         };
         let (code, output) = run_drive(
             &PipelineOutcome::Plan(Box::new(bundle)),
@@ -1922,6 +2032,7 @@ mod tests {
             recovery_file_path: config.wal_dir.join("x_RECOVERY.gcode"),
             sdcard_root: config.wal_dir.clone(),
             recovery_source_name: "x.gcode".to_owned(),
+            original_file_bytes: None,
         };
         let opts = fast_recover(true, true, false);
         let mut out = Vec::new();
@@ -2093,6 +2204,7 @@ mod tests {
             recovery_file_path: config.wal_dir.join("x_RECOVERY.gcode"),
             sdcard_root: config.wal_dir.clone(),
             recovery_source_name: "x.gcode".to_owned(),
+            original_file_bytes: None,
         }
     }
 

@@ -1305,6 +1305,31 @@ impl Diagnose for crate::plan::PlanWarning {
                 ),
             )
             .measured("accel_probe", *accel_probe, "mm/s^2"),
+            W::PreviewStandoffSqueezed {
+                available,
+                requested,
+            } => Diagnosis::new(
+                "preview_standoff_squeezed",
+                Tier::Advisory,
+                format!(
+                    "the Z rail leaves only {} mm above the highest preview stop, below the \
+                     requested {} mm standoff",
+                    fmt_num(*available),
+                    fmt_num(*requested)
+                ),
+                "The resume-point preview hovers at one plane above the printed geometry. \
+                 That plane is clamped to the machine's Z rail (position_max), and here the \
+                 rail sits so close above the tallest candidate stop that the full standoff \
+                 does not fit. The hover is still safe — it never descends into the part, and \
+                 the offset readout, not the visual gap, is the alignment feedback — but the \
+                 nozzle will look closer to the part than the standoff you configured.",
+                "Raise the Z rail's `position_max` if the machine physically allows it, or \
+                 lower `preview_standoff` to a value that fits, or accept the warning — the \
+                 preview and the resume are unaffected."
+                    .to_owned(),
+            )
+            .measured("available_standoff", *available, "mm")
+            .expected("preview_standoff", Some(*requested), None, "mm"),
         }
     }
 }

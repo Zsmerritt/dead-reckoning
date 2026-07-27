@@ -204,7 +204,9 @@ use serde_json::{json, Map, Value};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::config::Config;
-use crate::executor::{AbortConfirmer, ConfirmAnswer, ConfirmPoint, Confirmer, ExecOptions};
+use crate::executor::{
+    AbortConfirmer, ConfirmAnswer, ConfirmPoint, Confirmer, ExecOptions, PreviewAnswer,
+};
 use crate::pipeline::{self, MachineSource, PipelineOutcome};
 use crate::recover::{self, AutoGate, RecoverOptions};
 use crate::EXIT_OK;
@@ -245,7 +247,19 @@ struct PauseNotice {
     /// deliberately not used: a client needs to know how long is left, and
     /// an NTP step must not be able to answer that question wrongly.
     raised_at: std::time::Instant,
-    answer: tokio::sync::oneshot::Sender<ConfirmAnswer>,
+    answer: tokio::sync::oneshot::Sender<PauseAnswer>,
+}
+
+/// The answer travelling back down a [`PauseNotice`]'s channel. Unified so
+/// the single-flight machinery (one outstanding pause, one `oneshot`) is
+/// unchanged by preview beyond the vocabulary widening (design §D.3): a
+/// binary `ask` pause carries [`Self::Binary`], a preview reposition pause
+/// carries [`Self::Preview`]. A confirmer that receives the wrong variant
+/// (which `cmd_recover_confirm` never sends — it chooses by the outstanding
+/// pause's kind) fails closed to abort.
+enum PauseAnswer {
+    Binary(ConfirmAnswer),
+    Preview(PreviewAnswer),
 }
 
 /// The [`Confirmer`] the socket installs under `on_confirm: "ask"`:
@@ -290,7 +304,47 @@ impl Confirmer for SocketConfirmer {
                 self.observed.clear_pause();
                 return ConfirmAnswer::Abort;
             }
-            let answer = rx.await.unwrap_or(ConfirmAnswer::Abort);
+            let answer = match rx.await {
+                Ok(PauseAnswer::Binary(a)) => a,
+                // A closed channel or a preview answer to a binary pause
+                // (which cannot happen — cmd_recover_confirm sends by kind)
+                // both fail closed: an unanswerable question is not a yes.
+                _ => ConfirmAnswer::Abort,
+            };
+            self.observed.clear_pause();
+            answer
+        })
+    }
+
+    fn confirm_preview<'a>(
+        &'a mut self,
+        point: &'a ConfirmPoint,
+    ) -> Pin<Box<dyn Future<Output = PreviewAnswer> + Send + 'a>> {
+        Box::pin(async move {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            let notice = PauseNotice {
+                token: next_token(),
+                kind: point.kind.tag(),
+                step_id: point.step_id,
+                phase: point.phase.clone(),
+                diagnosis: point.diagnosis.clone(),
+                detail: point.detail.clone(),
+                deadline: point.deadline,
+                raised_at: std::time::Instant::now(),
+                answer: tx,
+            };
+            self.observed.publish_pause(&notice);
+            if self.pauses.send(notice).await.is_err() {
+                self.observed.clear_pause();
+                return PreviewAnswer::Abort;
+            }
+            let answer = match rx.await {
+                Ok(PauseAnswer::Preview(a)) => a,
+                // Fail closed: a closed channel or a binary answer to a
+                // preview pause both abort (never commit a resume nobody
+                // chose).
+                _ => PreviewAnswer::Abort,
+            };
             self.observed.clear_pause();
             answer
         })
@@ -1143,20 +1197,59 @@ async fn cmd_recover_execute(state: &CtrlState, args: &Map<String, Value>) -> Va
 
 /// `recover_confirm`: answers the outstanding confirm-point and reports
 /// whatever happens next.
+/// The [`ConfirmKind::Preview`] tag, as it appears in a [`PauseNotice`]'s
+/// `kind` — the discriminator `cmd_recover_confirm` uses to choose the
+/// answer vocabulary.
+const PREVIEW_KIND_TAG: &str = "preview";
+
+/// Parses a resume-preview reposition answer from the socket args (design
+/// §D.3 / §F.2). Vocabulary: `accept` / `next` / `prev` / `abort`, and
+/// `nudge` with a signed integer `count` (the console `PLR_RECOVER_NUDGE
+/// FWD=/BACK=` maps to +n / -n). `Err(msg)` is a malformed answer.
+fn parse_preview_answer(args: &Map<String, Value>) -> Result<PreviewAnswer, String> {
+    match args.get("answer").and_then(Value::as_str) {
+        Some("accept") => Ok(PreviewAnswer::Accept),
+        Some("next") => Ok(PreviewAnswer::NextRep),
+        Some("prev") => Ok(PreviewAnswer::PrevRep),
+        Some("abort") => Ok(PreviewAnswer::Abort),
+        Some("nudge") => {
+            let count = args.get("count").and_then(Value::as_i64).ok_or_else(|| {
+                "recover_confirm \"nudge\" requires an integer \"count\"".to_owned()
+            })?;
+            let count = i32::try_from(count)
+                .map_err(|_| "recover_confirm \"count\" is out of range".to_owned())?;
+            if count == 0 {
+                return Err("recover_confirm \"nudge\" count must be non-zero".to_owned());
+            }
+            Ok(PreviewAnswer::Nudge(count))
+        }
+        _ => Err("recover_confirm (preview) requires \"answer\": \
+                  accept | next | prev | nudge | abort"
+            .to_owned()),
+    }
+}
+
 async fn cmd_recover_confirm(state: &CtrlState, args: &Map<String, Value>) -> Value {
     let Some(token) = args.get("token").and_then(Value::as_str) else {
         return error_response("malformed", "recover_confirm requires a string \"token\"");
     };
-    let answer = match args.get("answer").and_then(Value::as_str) {
-        Some("continue") => ConfirmAnswer::Continue,
-        Some("abort") => ConfirmAnswer::Abort,
+    // The answer must be one of the recognized verbs across BOTH
+    // vocabularies — checked before the lock so an absent or nonsense
+    // answer reports the same "malformed" it always has, whether or not
+    // anything is paused. Whether a recognized verb is valid for the
+    // OUTSTANDING pause's kind (binary continue/abort vs preview
+    // accept/next/prev/nudge) is decided below, once the lock reveals the
+    // kind.
+    match args.get("answer").and_then(Value::as_str) {
+        Some("continue" | "abort" | "accept" | "next" | "prev" | "nudge") => {}
         _ => {
             return error_response(
                 "malformed",
-                "recover_confirm requires \"answer\": \"continue\" or \"abort\"",
+                "recover_confirm requires \"answer\": continue|abort (binary) or \
+                 accept|next|prev|nudge|abort (preview)",
             )
         }
-    };
+    }
     let Ok(mut slot) = state.session.try_lock() else {
         return error_response("busy", "the paused execution is being answered already");
     };
@@ -1181,6 +1274,33 @@ async fn cmd_recover_confirm(state: &CtrlState, args: &Map<String, Value>) -> Va
             "that token does not match the outstanding confirmation",
         );
     }
+    // The answer vocabulary depends on which KIND of pause is outstanding
+    // (design §D.3): a binary `ask`/diagnosis/step-debug/z-height pause
+    // takes continue/abort; the resume PREVIEW pause takes the reposition
+    // verbs accept/next/prev/nudge/abort (`nudge` carrying a signed
+    // `count`). A wrong-vocabulary answer is malformed — but the pause is
+    // put back first so a typo does not consume the outstanding question.
+    let answer = if outstanding.kind == PREVIEW_KIND_TAG {
+        match parse_preview_answer(args) {
+            Ok(a) => PauseAnswer::Preview(a),
+            Err(msg) => {
+                session.outstanding = Some(outstanding);
+                return error_response("malformed", &msg);
+            }
+        }
+    } else {
+        match args.get("answer").and_then(Value::as_str) {
+            Some("continue") => PauseAnswer::Binary(ConfirmAnswer::Continue),
+            Some("abort") => PauseAnswer::Binary(ConfirmAnswer::Abort),
+            _ => {
+                session.outstanding = Some(outstanding);
+                return error_response(
+                    "malformed",
+                    "recover_confirm requires \"answer\": \"continue\" or \"abort\"",
+                );
+            }
+        }
+    };
     if outstanding.answer.send(answer).is_err() {
         // The pause timed out between the lookup and the send. The
         // execution is already aborting; report it as expired rather than
@@ -2069,6 +2189,41 @@ mod tests {
             transcript.contains("\"answer\":\"continue\""),
             "{transcript}"
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_preview_verb_on_a_binary_pause_is_refused_and_the_pause_survives() {
+        // The answer vocabulary is chosen by the OUTSTANDING pause's kind
+        // (design §D.3). A preview verb (`accept`) is a recognized verb but
+        // wrong for a binary z-height pause: it must be refused WITHOUT
+        // consuming the question, so the operator can still answer it
+        // correctly. This is the wrong-kind-refused-with-pause-restored
+        // guard (the same shape protects a binary verb on a preview pause).
+        let (path, _wal_dir, fake) = spawn_confirm_server(
+            "confirm-wrong-kind",
+            &[("confirm_z_before_resume", json!(true))],
+        )
+        .await;
+        let paused = roundtrip(&path, EXECUTE_ASK).await;
+        assert_eq!(
+            paused["data"]["confirm_kind"],
+            json!("z-height"),
+            "{paused}"
+        );
+        let token = paused["data"]["resume_token"].as_str().unwrap().to_owned();
+
+        // A preview verb on the binary pause: malformed, pause NOT consumed.
+        let refused = roundtrip(&path, &confirm_request(&token, "accept")).await;
+        assert_eq!(refused["ok"], json!(false), "{refused}");
+        assert_eq!(refused["data"]["outcome"], json!("malformed"), "{refused}");
+
+        // The SAME token still answers `continue`, and the recovery
+        // completes — proof the wrong-kind answer did not consume it.
+        let done = roundtrip(&path, &confirm_request(&token, "continue")).await;
+        assert_eq!(done["ok"], json!(true), "{done}");
+        assert_eq!(done["data"]["outcome"], json!("completed"), "{done}");
+        assert!(fake.gcode_sent().iter().any(|c| c == "M24"), "{done}");
     }
 
     #[cfg(unix)]
