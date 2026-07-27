@@ -749,8 +749,24 @@ mod linux_tests {
         );
         eprintln!("power-fail mandatory tier latency (edge -> marker durable): {latency:?}");
 
-        // The heartbeat file's second sync advanced its sequence: both
-        // fsyncs of the mandatory tier happened.
+        // The heartbeat file's second sync advances its sequence: both
+        // fsyncs of the mandatory tier happen. That second sync is a
+        // separate write the WAL thread performs *after* the marker's own
+        // fdatasync, inside the same `handle()` call — waiting for the
+        // marker above (needed for the latency measurement) says nothing
+        // about whether this second write has landed yet. Under CI load
+        // the WAL thread can be descheduled between the two, so poll for
+        // the sequence to actually advance instead of reading immediately
+        // once the marker appears — otherwise this reads the pre-edge
+        // value and reports a false "(0 -> 0)"-style non-advance that is a
+        // test race, not a missed sync.
+        wait_until(Duration::from_secs(5), || {
+            plr_wal::recover_heartbeat(&std::fs::read(&hb_path).unwrap())
+                .unwrap()
+                .heartbeat
+                .sequence
+                > seq_before
+        });
         let seq_after = plr_wal::recover_heartbeat(&std::fs::read(&hb_path).unwrap())
             .unwrap()
             .heartbeat
