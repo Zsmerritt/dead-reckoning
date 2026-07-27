@@ -1093,6 +1093,11 @@ pub struct PreviewSpec {
     /// for minutes cannot ooze (§E.2) — resolved
     /// [`PlanConfig::preview_nozzle_temp_c`].
     pub cool_nozzle_temp: f64,
+    /// Feedrate, mm/min, for the XY reposition moves the loop sends between
+    /// answers (`config.travel_feed`). The repositions ride the single
+    /// hover plane, clear of all geometry, so the ordinary travel feed is
+    /// safe.
+    pub travel_feed: f64,
 }
 
 impl PreviewSpec {

@@ -540,22 +540,18 @@ fn ask_policy_with_a_preview_set_builds_a_preview_plan() {
 }
 
 #[test]
-fn non_ask_policy_ignores_a_preview_set_and_stays_automatic() {
-    // `first` picks the minimum-offset resume and produces a PLAIN plan:
-    // no preview, no ResumePreview step, even though a set was supplied.
+fn non_ask_policy_with_a_set_resumes_at_the_anchor_without_a_preview() {
+    // `first` + a supplied set produces a PLAIN automatic plan (no preview,
+    // no ResumePreview step) resuming at the set's `first_index` ANCHOR.
+    // This is how a coarse match — whose match-result confidence carries no
+    // line the resolver could pick — still resumes automatically for
+    // first/mid/last: the analyzer recovered the candidate stops the
+    // matcher ladder discarded, and the anchor indexes them. The
+    // match_result is irrelevant when a set is present (the anchor wins).
     let set = fixture_preview_set();
     let reconstruction = recovery(stop_set(&[0.4]), wal_context(plain_transforms()));
     let contact = contact_at(0.4);
-    // An ambiguous window so first != last actually bites.
-    let a = offset_of("G1 X10 Y10 E1 F1800", 1);
-    let b = offset_of("G1 X30 Y10 E1", 1);
-    let match_result = plr_analyzer::MatchResult {
-        candidates: vec![],
-        confidence: MatchConfidence::AmbiguousWindow {
-            offsets: vec![a, b],
-        },
-        skipped_unknown: 0,
-    };
+    let match_result = match_at(resume_offset());
     let model = model();
     let config = PlanConfig {
         resume_candidate_policy: ResumePolicy::First,
@@ -581,12 +577,10 @@ fn non_ask_policy_ignores_a_preview_set_and_stays_automatic() {
         "non-ask policy must not attach a preview"
     );
     assert!(plan.first_index(Phase::ResumePreview).is_none());
-    // `first` resolved the minimum offset (a), byte-identical to the
-    // policy resolver — the headless automatic win.
-    let want =
-        select_resume_target_with_policy(&model, &match_result, ResumePolicy::First).unwrap();
-    assert_eq!(plan.resume_offset, want.offset);
-    assert_eq!(plan.resume_offset, a);
+    // Resumed at the set's first anchor (stop 0), whose resume_offset is
+    // the layer-0 second deposition — not any match_result line.
+    let first_stop = &set.stops[set.first_index as usize];
+    assert_eq!(plan.resume_offset, first_stop.resume_offset);
 }
 
 #[test]

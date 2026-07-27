@@ -439,6 +439,7 @@ fn opt_str(section: &Map<String, Value>, key: &str, default: &str) -> Result<Str
 impl PlrSettings {
     /// Parses `configfile.settings.plr`. See the type docs for the
     /// required/optional split.
+    #[allow(clippy::too_many_lines)] // one flat read per documented [plr] key
     pub fn parse(plr: &Map<String, Value>) -> Result<Self, String> {
         let probe_method = plr
             .get("probe_method")

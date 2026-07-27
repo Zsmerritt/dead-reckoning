@@ -51,7 +51,7 @@ pub mod preheat;
 pub mod resume_file;
 
 pub use build::{
-    plan_recovery, preflight_generated_file, select_resume_target,
+    plan_recovery, preflight_generated_file, resolve_resume_with_preview, select_resume_target,
     select_resume_target_with_policy, ExcludeObjectDef, FallbackReason, PlanConfig, PlanInputs,
     PlanOutcome, ResumePolicy, ResumeTarget, ACCEL_MAX, ACCEL_MIN, CONFIRM_TIMEOUT_DEFAULT,
     CONFIRM_TIMEOUT_DEFAULT_S, CONFIRM_TIMEOUT_MAX_S, CONFIRM_TIMEOUT_MIN_S, DRAG_TEMP_FLOOR,
@@ -73,9 +73,10 @@ pub use machine::{
     ProbeKind, ValidatedMachine, ZStepper,
 };
 pub use plan::{
-    fmt_num, park_z_at, true_z_at_halt, AbortReason, FailureAction, Phase, PlanWarning, Predicate,
-    RecoveryPlan, RecoveryStep, RuntimeComputation, TriggerSource, TrueZFormula, Verification,
-    MACHINE_ACCEL_PLACEHOLDER, PARK_Z_PLACEHOLDER, RESTORE_ACCEL_PLACEHOLDER, TRUE_Z_PLACEHOLDER,
+    fmt_num, hover_plane_at, park_z_at, true_z_at_halt, AbortReason, FailureAction, Phase,
+    PlanWarning, Predicate, PreviewBinding, PreviewSpec, RecoveryPlan, RecoveryStep,
+    RuntimeComputation, TriggerSource, TrueZFormula, Verification, MACHINE_ACCEL_PLACEHOLDER,
+    PARK_Z_PLACEHOLDER, RESTORE_ACCEL_PLACEHOLDER, TRUE_Z_PLACEHOLDER,
 };
 pub use preflight::{
     preflight_itinerary, preflight_recovery_file, BoundsViolation, ItineraryBounds, PlanRejection,

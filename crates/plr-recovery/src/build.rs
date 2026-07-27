@@ -1227,6 +1227,55 @@ pub fn select_resume_target_with_policy(
     resolve_resume_from_offset(model, base)
 }
 
+/// Resolves the resume target under the policy, given the pipeline's
+/// optional [`plr_analyzer::PreviewSet`] (design §3, and the increment-1
+/// binding note). The ONE resume selector for a policy + optional set, so
+/// the pipeline's contact-zone layer and the plan's resume can never drift.
+///
+/// * With a set, the resume comes from the policy's ANCHOR stop
+///   (`first`/`mid`/`last_index`; `ask` opens on `last`), resolved
+///   D9-safely — trusted only when it lands EXACTLY on the anchor stop's
+///   baked `resume_offset`, else [`FallbackReason::NoResumeDeposition`]. A
+///   coarse match (`LayerOnly`/`Inconclusive`) resumes automatically this
+///   way: the analyzer recovered the candidate stops the matcher ladder
+///   discarded.
+/// * With no set (the pipeline got `NoStops` and fell back — never read a
+///   resume out of a `NoStops`), it defers to
+///   [`select_resume_target_with_policy`] over the match result.
+///
+/// # Errors
+///
+/// A typed [`FallbackReason`], as [`select_resume_target_with_policy`].
+pub fn resolve_resume_with_preview(
+    model: &LayerModel,
+    result: &MatchResult,
+    policy: ResumePolicy,
+    preview: Option<&plr_analyzer::PreviewSet>,
+) -> Result<ResumeTarget, FallbackReason> {
+    match preview {
+        Some(set) => {
+            let anchor = match policy {
+                ResumePolicy::First => set.first_index,
+                ResumePolicy::Mid => set.mid_index,
+                ResumePolicy::Last | ResumePolicy::Ask => set.last_index,
+            };
+            let stop = set
+                .stops
+                .get(anchor as usize)
+                .ok_or(FallbackReason::NoResumeDeposition)?;
+            match resolve_resume_from_offset(model, stop.resume_offset) {
+                Ok(target) if target.offset == stop.resume_offset => Ok(target),
+                // Past-the-end stop, or one whose next deposition is
+                // untrusted / an excluded object — refuse rather than
+                // resume somewhere the analyzer did not vet (D9).
+                Ok(_) => Err(FallbackReason::ResumePositionUnknown),
+                Err(reason) => Err(reason),
+            }
+        }
+        None => select_resume_target_with_policy(model, result, policy),
+    }
+}
+
 /// Everything [`plan_recovery`] consumes. All borrowed; no I/O.
 #[derive(Debug, Clone, Copy)]
 pub struct PlanInputs<'a> {
@@ -2769,26 +2818,40 @@ pub fn plan_recovery(
         });
     }
 
-    // Policy-aware resume selection (design §3). `first`/`mid`/`last` pick
-    // the corresponding offset from an ambiguous set — this alone turns a
-    // coarse match that used to be a ManualFallback into an automatic
-    // resume (the headless win). `ask` resolves as `last` (the safe
-    // skip-forward), which is exactly the point the preview renders and the
-    // loop opens on, so the recovery-file spec / entry moves below are
-    // built against it and the daemon late-binds to the accepted stop.
-    let resume = match select_resume_target_with_policy(
+    // Policy-aware resume selection (design §3, and the increment-1 binding
+    // note). Two sources, one convention:
+    //
+    // * When the pipeline supplied a PREVIEW SET, the resume comes from the
+    //   set's own policy ANCHOR (`first`/`mid`/`last_index`, and `ask` opens
+    //   on `last`). This is how a coarse match (`LayerOnly` /
+    //   `Inconclusive`) — where the matcher's confidence carries no line the
+    //   resolver could pick — still resumes automatically for `first/mid/last`
+    //   and previews for `ask`: the analyzer recovered the candidate stops
+    //   the ladder discarded, and the anchors index them. The resume is
+    //   resolved D9-safely (trusted only when it lands exactly on the
+    //   anchor stop's baked resume_offset).
+    // * With NO set (the pipeline got `NoStops` and fell back for
+    //   first/mid/last — "never read a resume out of NoStops"), the resume
+    //   comes from `select_resume_target_with_policy` over the match result.
+    //
+    // `ask` resolves as `last` (the skip-forward the preview opens on and
+    // dry-run renders against); the daemon late-binds to the accepted stop.
+    // One selector, shared with the pipeline's contact-zone step so both
+    // resolve the identical resume (no drift).
+    let policy = config.resume_candidate_policy;
+    let resume = match resolve_resume_with_preview(
         inputs.model,
         inputs.match_result,
-        config.resume_candidate_policy,
+        policy,
+        inputs.preview,
     ) {
         Ok(resume) => resume,
         Err(reason) => return Ok(PlanOutcome::ManualFallback { reason }),
     };
-    // A preview is attached only under `ask` AND when the pipeline supplied
-    // a usable set. Any other policy is a plain automatic plan (no preview
-    // step, no loop), so a non-`ask` caller that also passed a set does not
-    // accidentally get an interactive plan.
-    let preview_set = match config.resume_candidate_policy {
+    // The interactive preview is ATTACHED to the plan only under `ask`; a
+    // `first`/`mid`/`last` caller that passed a set gets a PLAIN automatic
+    // plan at the anchor's offset (no preview step, no motion loop).
+    let preview_set = match policy {
         ResumePolicy::Ask => inputs.preview,
         ResumePolicy::First | ResumePolicy::Mid | ResumePolicy::Last => None,
     };
@@ -3025,6 +3088,7 @@ fn build_preview_spec(
         hover_target_z: entry.target_z,
         z_max: ctx.machine.axis_limits.z_max,
         cool_nozzle_temp: entry.cool_nozzle_temp,
+        travel_feed: ctx.cfg.travel_feed,
     })
 }
 
