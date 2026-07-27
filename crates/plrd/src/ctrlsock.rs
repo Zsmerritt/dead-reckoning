@@ -2193,6 +2193,41 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn a_preview_verb_on_a_binary_pause_is_refused_and_the_pause_survives() {
+        // The answer vocabulary is chosen by the OUTSTANDING pause's kind
+        // (design §D.3). A preview verb (`accept`) is a recognized verb but
+        // wrong for a binary z-height pause: it must be refused WITHOUT
+        // consuming the question, so the operator can still answer it
+        // correctly. This is the wrong-kind-refused-with-pause-restored
+        // guard (the same shape protects a binary verb on a preview pause).
+        let (path, _wal_dir, fake) = spawn_confirm_server(
+            "confirm-wrong-kind",
+            &[("confirm_z_before_resume", json!(true))],
+        )
+        .await;
+        let paused = roundtrip(&path, EXECUTE_ASK).await;
+        assert_eq!(
+            paused["data"]["confirm_kind"],
+            json!("z-height"),
+            "{paused}"
+        );
+        let token = paused["data"]["resume_token"].as_str().unwrap().to_owned();
+
+        // A preview verb on the binary pause: malformed, pause NOT consumed.
+        let refused = roundtrip(&path, &confirm_request(&token, "accept")).await;
+        assert_eq!(refused["ok"], json!(false), "{refused}");
+        assert_eq!(refused["data"]["outcome"], json!("malformed"), "{refused}");
+
+        // The SAME token still answers `continue`, and the recovery
+        // completes — proof the wrong-kind answer did not consume it.
+        let done = roundtrip(&path, &confirm_request(&token, "continue")).await;
+        assert_eq!(done["ok"], json!(true), "{done}");
+        assert_eq!(done["data"]["outcome"], json!("completed"), "{done}");
+        assert!(fake.gcode_sent().iter().any(|c| c == "M24"), "{done}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn answering_abort_stops_cleanly_and_honors_the_frame_rule() {
         let (path, wal_dir, fake) = spawn_confirm_server(
             "confirm-z-abort",

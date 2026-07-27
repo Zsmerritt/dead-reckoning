@@ -561,13 +561,19 @@ control_socket = /var/lib/plrd/plrd.sock
 #                          mid   — resume at the median plausible line (by
 #                                  file offset). May re-print; warned like
 #                                  first.
-#                          ask   — DEFAULT. Drive the nozzle to a safe
-#                                  hover over each candidate and let you
-#                                  step / nudge to the ragged edge on the
-#                                  part, then Accept. Needs an interactive
-#                                  caller (the Klipper plugin over the
-#                                  control socket). `plrd recover --execute`
-#                                  from the CLI answers every pause "abort".
+#                          ask   — DEFAULT. INTERIM BEHAVIOUR: the daemon
+#                                  currently resolves `ask` the same as
+#                                  `last` (safe skip-forward) — the
+#                                  interactive hover-and-nudge preview is
+#                                  implemented but not yet turned on pending
+#                                  a decision about changing the shipped
+#                                  default. When enabled it will drive the
+#                                  nozzle to a safe hover over each candidate
+#                                  and let you step / nudge to the ragged
+#                                  edge, then Accept, over the control socket
+#                                  (the Klipper plugin, increment 3). Until
+#                                  then, set `last`/`first`/`mid` explicitly
+#                                  to choose the automatic behaviour you want.
 #                          An unknown spelling REFUSES at config-read time
 #                          (it is not guessed): a typo on a headless
 #                          printer must not silently fall to the wrong

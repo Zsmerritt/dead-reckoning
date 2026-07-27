@@ -65,8 +65,8 @@ use std::path::Path;
 
 use plr_analyzer::{
     build_layer_model, build_preview, match_stop_point, select_contact_zone, ByteWindow,
-    ContactConfig, ContactOutcome, Interval, LayerModel, MatchConfidence, MatchConfig, MatchResult,
-    ModelConfig, PreviewBounds, PreviewOutcome, PreviewSet, StopEvidence,
+    ContactConfig, ContactOutcome, Interval, LayerModel, MatchConfidence, MatchConfig, MatchError,
+    MatchResult, ModelConfig, PreviewBounds, PreviewOutcome, PreviewSet, StopEvidence,
 };
 use plr_reconstruct::{
     anchor_state_from_context, reconstruct, select_crash_epoch, FileTail, PossibleStopSet,
@@ -614,14 +614,40 @@ fn plan_from_recovery(
         );
     };
     let match_result = match match_stop_point(&model, &evidence, &MatchConfig::default()) {
-        Ok(result) => result,
+        Ok(result) => {
+            say(&format!(
+                "pipeline: match confidence {:?} ({} candidates)",
+                result.confidence,
+                result.candidates.len()
+            ));
+            result
+        }
+        // Inconclusive is the design's NAMED common real-crash shape (many
+        // consistent lines across 1-4 layers): the confidence ladder
+        // discards every line, but `build_preview` works from the raw
+        // evidence and never needed the match result. Route it into the
+        // SAME policy/preview path as LayerOnly, with a placeholder
+        // LayerOnly confidence. That placeholder is consulted only on the
+        // no-preview-set fallback (`resolve_resume_with_preview(None)`),
+        // where a coarse layer correctly degrades to manual — so `ask`
+        // (interim, no set) and any-policy `NoStops` still fall back to
+        // manual exactly as today, while `first`/`mid`/`last` with a usable
+        // set resume automatically from the anchor (MAJOR-2).
+        Err(MatchError::Inconclusive { lines, layers }) => {
+            say(&format!(
+                "pipeline: match inconclusive: {lines} candidate lines across layers \
+                 {layers:?}; routing the raw evidence through the resume-point preview"
+            ));
+            MatchResult {
+                candidates: Vec::new(),
+                confidence: MatchConfidence::LayerOnly {
+                    layer: layers.first().copied().unwrap_or(0),
+                },
+                skipped_unknown: 0,
+            }
+        }
         Err(e) => return PipelineOutcome::ManualFallback(format!("stop-point match failed: {e}")),
     };
-    say(&format!(
-        "pipeline: match confidence {:?} ({} candidates)",
-        match_result.confidence,
-        match_result.candidates.len()
-    ));
 
     // Resume-point routing by `resume_candidate_policy` (design §D / §11).
     // The preview builder is the parallel path (§A.1); it recovers the
@@ -1800,23 +1826,33 @@ G1 X60 Y60 E0.02
         let PipelineOutcome::ManualFallback(reason) = outcome else {
             panic!("expected ManualFallback, got {outcome:?}\n{output}");
         };
-        // The honestly-priced Δt leaves the window past per-line granularity,
-        // so the matcher declines — not contact selection.
+        // The honestly-priced Δt leaves the window past per-line
+        // granularity, so the matcher declines Inconclusive. MAJOR-2 routes
+        // that raw evidence through the resume-preview path instead of
+        // failing at the match call; under the default `ask` (gated pending
+        // the interim decision) it falls to the resolver, which finds the
+        // layer too coarse to resume -> ManualFallback. The candidate count
+        // and granularity message now live in the routing NARRATION.
         assert!(
-            reason.contains("stop-point match failed")
-                && reason.contains("below layer granularity"),
+            reason.contains("no safe resume point") && reason.contains("MatchTooCoarse"),
             "reason changed: {reason}\n{output}"
         );
+        assert!(
+            output.contains("match inconclusive")
+                && output.contains("candidate lines across layers"),
+            "the inconclusive routing must be narrated: {output}"
+        );
         // Re-armed numeric guard: the reader-lead widening leaves > 12
-        // candidate lines. A cap that over-narrows (the review's blocker)
-        // would drop this below 12 and fail here.
-        let count: usize = reason
-            .split_whitespace()
-            .find_map(|w| w.parse().ok())
+        // candidate lines (parsed from the narration now). A cap that
+        // over-narrows (the review's blocker) would drop this below 12.
+        let count: usize = output
+            .lines()
+            .find(|l| l.contains("match inconclusive"))
+            .and_then(|l| l.split_whitespace().find_map(|w| w.parse().ok()))
             .unwrap_or(0);
         assert!(
             count >= 12,
-            "only {count} candidate lines — an over-narrowing cap is back: {reason}"
+            "only {count} candidate lines — an over-narrowing cap is back: {output}"
         );
         // Containment: the window LOW end is still the frontier (byte 8).
         // The matcher declined, so there is no AmbiguousWindow offsets line;
@@ -1847,6 +1883,19 @@ G1 X60 Y60 E0.02
             panic!("expected a plan, got {outcome:?}\n{output}");
         };
         let plan = &bundle.plan;
+        // Ask-deferral with REAL evidence: this AmbiguousWindow fixture runs
+        // under the default `ask`, which currently resolves as `last`
+        // (skip-forward) with NO interactive preview attached — no
+        // ResumePreview step, no preview spec (interim, pending the
+        // default-flip ruling). The resume still lands at a real line
+        // (asserted below), i.e. an automatic plan, not a ManualFallback.
+        assert!(
+            plan.first_index(plr_recovery::Phase::ResumePreview)
+                .is_none(),
+            "ask-deferral must not attach a preview step: {output}"
+        );
+        assert!(plan.preview.is_none(), "{output}");
+        assert!(plan.resume_preview_step_iff_spec());
         // The plan honors every structural invariant plr-recovery
         // promises.
         assert!(plan.idle_timeout_first(), "{output}");

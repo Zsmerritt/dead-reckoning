@@ -2903,11 +2903,17 @@ pub fn plan_recovery(
     // Resolve the preview entry geometry (design §E.1) before Ctx, since
     // build_steps decides whether to emit the preview lift or the Z-confirm
     // lift from it. The single hover plane's absolute floor is the highest
-    // stop's g-code Z plus the resolved standoff; every stop's Z is finite
-    // (the builder only emits trusted-position stops), so `fold` over the
-    // finite set with a finite standoff is finite. The cool-down target is
-    // the ruled probe-hold default unless the operator set one.
-    let origin_z = gcode.origin[2];
+    // stop's Z plus the resolved standoff, in the INTERNAL (Klipper) frame —
+    // the same frame the loop's XY repositions ride (they send `stop.xy`
+    // verbatim), and the frame the lift actually executes in: the
+    // ResumePreview step runs at step 7a″, BEFORE `RestoreFrame` re-applies
+    // `SET_GCODE_OFFSET`, so g-code offsets are still zero. Subtracting
+    // `origin_z` here would land the plane in the g-code frame and, on a
+    // print with a stored positive Z offset, hover AT OR BELOW the printed
+    // top (physical clearance would be `standoff − origin_z`) and drag
+    // laterally through the part (MAJOR-1). Every stop's Z is finite (the
+    // builder only emits trusted-position stops), so `fold` over the finite
+    // set with a finite standoff is finite.
     let preview_entry = preview_set.and_then(|set| {
         let max_stop_z = set
             .stops
@@ -2917,7 +2923,22 @@ pub fn plan_recovery(
         if !max_stop_z.is_finite() {
             return None;
         }
-        let target_z = (max_stop_z - origin_z) + config.preview_standoff_mm();
+        let requested = config.preview_standoff_mm();
+        // Advisory (design §E.1): when the Z rail sits closer above the
+        // tallest stop than the requested standoff, `hover_plane_at` clamps
+        // the plane down to the rail and the operator gets LESS gap than
+        // configured — say so at plan time rather than let them discover it
+        // silently. The hover still never descends (clamped to >= current).
+        if let Some(zmax) = machine.axis_limits.z_max {
+            let available = zmax - max_stop_z;
+            if available < requested {
+                warnings.push(PlanWarning::PreviewStandoffSqueezed {
+                    available,
+                    requested,
+                });
+            }
+        }
+        let target_z = max_stop_z + requested;
         Some(PreviewEntry {
             target_z,
             cool_nozzle_temp: config.preview_nozzle_temp_c(&machine.probe.kind),

@@ -674,10 +674,29 @@ Linux gate authoritative — `scripts/gates-linux.sh`, plrd included).
   rule; offset-refresh; console fallbacks; `docs/operations.md`.
 - Green: `pytest` + ruff. The console path is the acceptance floor; dialog buttons
   are the enhancement.
+- **Carried over from increment 2 (obligation):** the current preview stop is
+  published on every pause through `report_pause`'s `detail` map (the field
+  contract above), but the `recover_state` status-poll mirror (`ctrlsock`'s
+  `Observed`/`LivePause`/`StateSnapshot`) still carries only token / kind / step /
+  deadline, NOT the stop. Increment 3's `PLR_STATUS` reshow reads `recover_state`,
+  so increment 3 must extend that mirror to carry the current stop's `detail` (or
+  the plugin must reshow from the last `report_pause` payload instead). Increment 2
+  left `report_pause` — the authoritative per-pause producer — complete; only the
+  poll mirror is deferred.
+- **Also carried over (decision):** increment 2 implemented and tested the whole
+  motion loop / writer / socket vocabulary but did NOT turn the interactive `ask`
+  path on in the pipeline, because doing so flips the shipped default from
+  automatic skip-forward to an interactive pause (a bare-CLI / headless recovery
+  then aborts ambiguous resumes that auto-complete today). `ask` resolves as `last`
+  in the interim; `first`/`mid`/`last` deliver the headless win. Flipping `ask` on
+  is a one-line pipeline change (build the preview set for `Ask` too and pass it
+  through as the attached preview) plus retargeting the automatic-completion tests
+  to an explicit policy.
 
 Order 1 → 2 → 3. Each merges to `main` independently; after 1 the analyzer can
-produce preview sets, after 2 a headless operator has working `first/mid/last/ask`
-over the socket, after 3 the dialog UX lands.
+produce preview sets, after 2 a headless operator has working `first/mid/last`
+over the socket (and `ask` once the default-flip is ruled), after 3 the dialog UX
+lands.
 
 ---
 

@@ -902,6 +902,22 @@ pub enum PlanWarning {
         /// The ignored value, mm/s².
         accel_probe: f64,
     },
+    /// The Z rail (`position_max`) sits so close above the highest preview
+    /// stop that the hover plane cannot give the requested standoff: at
+    /// runtime [`hover_plane_at`] clamps down to the rail, so the nozzle
+    /// hovers with LESS clearance than `preview_standoff` asked for (and,
+    /// if the rail is at or below the geometry, essentially none). Advisory,
+    /// not a refusal — the plane still never descends into the part (it is
+    /// clamped to at least the current Z) — but the operator should know the
+    /// visual gap will be smaller than configured rather than discover it
+    /// silently (design §E.1).
+    PreviewStandoffSqueezed {
+        /// The clearance the rail actually allows above the highest stop,
+        /// mm (`position_max − max_stop_z`; may be `<= 0`).
+        available: f64,
+        /// The standoff that was requested, mm (`preview_standoff`).
+        requested: f64,
+    },
 }
 
 impl PlanWarning {
@@ -1021,6 +1037,15 @@ impl PlanWarning {
                 "accel_probe ({} mm/s^2) is ignored on the consensus-touch path; \
                  touch_accel owns the contact acceleration",
                 fmt_num(*accel_probe)
+            ),
+            PlanWarning::PreviewStandoffSqueezed {
+                available,
+                requested,
+            } => format!(
+                "the Z rail leaves only {} mm above the highest preview stop, less than the \
+                 requested {} mm standoff; the hover will clamp lower (it still never descends)",
+                fmt_num(*available),
+                fmt_num(*requested)
             ),
         }
     }

@@ -529,14 +529,19 @@ fn ask_policy_with_a_preview_set_builds_a_preview_plan() {
     // The default stop resolved a real deposition, so its entry moves exist
     // and drive to the resume XY.
     assert!(!default_binding.entry_commands.is_empty());
-    // The hover plane's absolute floor is the highest stop's G-CODE Z plus
-    // the resolved standoff (= entry_hop default 1.0). The fixture WAL
-    // g-code origin Z is 0.05, so the layer-1 stop (internal Z 0.4) maps to
-    // g-code 0.35, and target_z = 0.35 + 1.0 = 1.35.
+    // The hover plane's absolute floor is the highest stop's Z plus the
+    // resolved standoff (= entry_hop default 1.0), in the INTERNAL frame —
+    // the frame the lift executes in (step 7a″ precedes RestoreFrame's
+    // SET_GCODE_OFFSET) and the frame the XY repositions ride. So
+    // target_z = 0.4 (internal layer-1 Z) + 1.0 = 1.4, INDEPENDENT of the
+    // fixture's non-zero g-code origin Z (0.05). This is the MAJOR-1
+    // regression pin: the old code subtracted origin_z and landed 1.35 (the
+    // g-code frame), which on a positive-Z-offset print hovered into the
+    // part. The nonzero origin is exactly the case that catches the mix.
     let RuntimeComputation::HoverPlane { target_z, .. } = step.compute.unwrap() else {
         unreachable!()
     };
-    assert!((target_z - 1.35).abs() < 1e-9, "target_z = {target_z}");
+    assert!((target_z - 1.4).abs() < 1e-9, "target_z = {target_z}");
 }
 
 #[test]

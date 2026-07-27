@@ -1174,6 +1174,7 @@ const PREVIEW_CODE: &str = "resume_preview";
 /// write failure), and because this step sits past `ShiftedFrame` the abort
 /// invalidates the Z frame.
 #[allow(clippy::too_many_arguments)] // one collaborator per concern, as execute()
+#[allow(clippy::too_many_lines)] // the reposition loop + its answer arms
 async fn run_preview_loop(
     plan: &RecoveryPlan,
     client: &mut MoonrakerClient,
@@ -1238,6 +1239,26 @@ async fn run_preview_loop(
                         "accepted preview stop has no recovery binding".to_owned(),
                     ));
                 };
+                // Refuse to accept a stop with no resumable line (empty
+                // entry moves — a past-the-end or all-excluded-after stop):
+                // resuming from it would depend on the still-unwired
+                // exclusion restore and leave the nozzle blind. The detail
+                // map marks such stops `acceptable:false` so a UI grays out
+                // accept; this is the backstop for a console operator who
+                // accepts one anyway. Clean abort (frame invalid → re-plan).
+                if binding.entry_commands.is_empty() {
+                    transcript.entry(&json!({
+                        "event": "preview-accept-refused",
+                        "step": step.id,
+                        "cursor": cursor,
+                        "reason": "stop has no resumable line (empty entry moves)",
+                    }));
+                    return Some(StopCause::ComputeFailed(
+                        "the accepted preview stop has no resumable line after it; \
+                         nudge to a stop with printing still ahead and accept that"
+                            .to_owned(),
+                    ));
+                }
                 transcript.entry(&json!({
                     "event": "preview-accept",
                     "step": step.id,
@@ -1396,6 +1417,13 @@ fn preview_detail(spec: &plr_recovery::PreviewSpec, cursor: usize) -> Value {
         // Advisory: cursor is earlier than the skip-forward default →
         // accepting risks re-printing existing geometry.
         "before_skip_forward": cursor < index_usize(spec.default_index),
+        // Whether this stop can be accepted: false for a stop with no
+        // resumable line (empty entry moves — nothing to print past it),
+        // which the executor also refuses on accept. A UI should gray out
+        // accept when this is false.
+        "acceptable": spec
+            .binding(cursor_u32(cursor))
+            .is_some_and(|b| !b.entry_commands.is_empty()),
     })
 }
 
@@ -4035,6 +4063,39 @@ pub(crate) mod tests {
         assert!(
             writer.offsets.lock().unwrap().is_empty(),
             "an aborted preview must never write a recovery file"
+        );
+    }
+
+    #[tokio::test]
+    async fn preview_accept_of_an_unresumable_stop_is_refused_and_never_writes() {
+        // MINOR-1 backstop: a stop with no resumable line (empty entry
+        // moves — nothing to print past it) must be refused on accept, not
+        // resumed blind. Clean abort, no file written.
+        let fake = FakeMoonraker::spawn(happy_handler).await;
+        let mut confirmer = ScriptedPreviewConfirmer {
+            answers: [PreviewAnswer::Accept].into(),
+        };
+        let writer = RecordingWriter::default();
+        let mut spec = preview_spec();
+        // The default stop (index 2, opened on) has empty entry moves.
+        spec.bindings[2].entry_commands.clear();
+        let mut plan = preview_plan(vec![resume_preview_step(1)]);
+        plan.preview = Some(spec);
+        let outcome = run_preview(
+            &plan,
+            &fake,
+            &mut confirmer,
+            &mut NoExclusivity,
+            &mut writer.clone(),
+        )
+        .await;
+        assert!(
+            matches!(outcome, ExecOutcome::Aborted { .. }),
+            "{outcome:?}"
+        );
+        assert!(
+            writer.offsets.lock().unwrap().is_empty(),
+            "an unresumable stop must never be written"
         );
     }
 
