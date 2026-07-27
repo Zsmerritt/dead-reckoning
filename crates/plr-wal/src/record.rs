@@ -987,6 +987,50 @@ pub enum MarkerKind {
     /// resumes — at the first motion or print activity; the resumed dense
     /// heartbeat stream is the liveness proof from there.
     RecordingQuiescent,
+    /// **A GPIO edge signalled that the DC rail has begun failing.**
+    ///
+    /// Written by the power-failing watcher ([`plrd`'s `powerfail`
+    /// module]) the instant a hold-up-backed GPIO raises its edge, before
+    /// anything else: the daemon journals this marker (with the edge's
+    /// host-monotonic time in [`Marker::mono_ns`]) and `fdatasync`s it
+    /// immediately, inside the ~1 s the Pi survives on hold-up power. No
+    /// printer command is ever sent on the edge — the MCU and heaters die
+    /// with the 24 V rail on their own.
+    ///
+    /// # What it establishes: exact-T, not inference
+    ///
+    /// Every other liveness signal in this log is indirect (the newest
+    /// heartbeat, the committed-motion boundary, a quiet tail). This
+    /// marker is the *cause of death itself*, stamped with the moment it
+    /// began. Because durable plan capture already runs 1.7–2.5 s ahead of
+    /// execution on the real capture, the plan-at-T is on disk before the
+    /// edge; T (when power began failing) was the only unknown, and this
+    /// supplies it.
+    ///
+    /// # Error direction (the reader must preserve it)
+    ///
+    /// The marker time is a **lower bound on the physical cut**: power was
+    /// still up when it was journaled, so motion can continue for the
+    /// hold-up margin afterward. Reconstruction therefore treats the cut
+    /// as lying in `[marker_mono_ns, marker_mono_ns + hold_up_margin]`,
+    /// which widens correctly — it can only *loosen* an upper bound on the
+    /// stop offset, never exclude the true stop.
+    ///
+    /// # A spurious edge is honest-wide, never narrow
+    ///
+    /// An EMI blip that passes the debounce and journals a false marker
+    /// while the machine keeps printing leaves **motion records after the
+    /// marker**. Reconstruction only ever treats this as a tail fact when
+    /// no motion follows it (see
+    /// `plr_reconstruct::WalTimeline::power_failing_tail`), so a false
+    /// marker mid-print is discarded exactly as a stale `CleanShutdown` or
+    /// a non-tail `RecorderStopped` is — it can never narrow the window.
+    ///
+    /// Old-reader safe: a reader built before this variant existed maps
+    /// the `{"kind":"PowerFailing"}` tag to [`Unknown`](MarkerKind::Unknown)
+    /// via `#[serde(other)]` and keeps scanning (proven in the WAL-compat
+    /// harness against `git archive 4a63eef`).
+    PowerFailing,
     /// A marker kind written by a newer format revision; preserved as
     /// opaque. Never written by this version except when round-tripping.
     #[serde(other)]
@@ -1399,11 +1443,47 @@ mod tests {
             MarkerKind::ExclusionUpdateLost,
             MarkerKind::RecorderStopped,
             MarkerKind::RecordingQuiescent,
+            MarkerKind::PowerFailing,
             MarkerKind::Unknown,
         ] {
             let record = WalRecord::Marker(Marker { mono_ns: 9, kind });
             assert_eq!(roundtrip(&record), record);
         }
+    }
+
+    #[test]
+    fn power_failing_marker_wire_tag_is_stable_and_old_reader_safe() {
+        // The exact bytes an old reader (pre-`PowerFailing`) sees. Its
+        // `#[serde(other)]` arm maps this tag to `MarkerKind::Unknown` and
+        // it keeps scanning — the forward-compatibility contract, proven
+        // against a `git archive 4a63eef` binary in the WAL-compat harness
+        // (tests/wal_compat.rs). Pinning the string here turns an
+        // accidental rename into a failing test rather than a silent
+        // format break.
+        let marker = Marker {
+            mono_ns: 42,
+            kind: MarkerKind::PowerFailing,
+        };
+        let json = serde_json::to_string(&marker).unwrap();
+        // `Marker.kind` is an internally-tagged enum, so the variant tag
+        // nests under the struct's own `kind` field (same shape as
+        // `unknown_marker_kind_decodes_as_unknown`).
+        assert_eq!(json, r#"{"mono_ns":42,"kind":{"kind":"PowerFailing"}}"#);
+        // And the same bytes decode back to the same kind in this reader.
+        assert_eq!(serde_json::from_str::<Marker>(&json).unwrap(), marker);
+    }
+
+    /// The precise decode an old reader performs: a `PowerFailing` tag it
+    /// has never heard of degrades to `Unknown` (simulated here, since the
+    /// current reader *does* know the tag; the real old binary runs in the
+    /// WAL-compat harness). This mirrors
+    /// `unknown_marker_kind_decodes_as_unknown`.
+    #[test]
+    fn a_future_power_marker_still_degrades_to_unknown() {
+        let json = r#"{"mono_ns": 7, "kind": {"kind": "PowerBrownoutStage2"}}"#;
+        let marker: Marker = serde_json::from_str(json).unwrap();
+        assert_eq!(marker.kind, MarkerKind::Unknown);
+        assert_eq!(marker.mono_ns, 7);
     }
 
     #[test]
