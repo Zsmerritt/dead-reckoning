@@ -65,7 +65,7 @@
 
 use std::collections::BTreeMap;
 
-use plr_recovery::{MachineConfig, PlanConfig, ProbeConfig, ProbeKind, ZStepper};
+use plr_recovery::{MachineConfig, PlanConfig, ProbeConfig, ProbeKind, ResumePolicy, ZStepper};
 use serde_json::{Map, Value};
 
 /// Sentinel used for both `config_hash` and `validated_config_hash` in
@@ -248,6 +248,22 @@ pub struct PlrSettings {
     /// Klipper's g-code mutex before refusing, seconds. `None` uses the
     /// daemon default.
     pub gcode_barrier_timeout_s: Option<f64>,
+    /// `resume_candidate_policy` — `first`|`mid`|`last`|`ask` (default
+    /// `ask`): which stop in an ambiguous candidate set becomes the resume
+    /// point, and whether the interactive preview runs. Parsed with the
+    /// same explicit-choice check as [`Self::probe_method`] — an unknown
+    /// spelling refuses at parse time rather than being guessed.
+    pub resume_candidate_policy: ResumePolicy,
+    /// `preview_standoff` — the XY-hover plane's standoff above the highest
+    /// preview stop, mm. `None` (absent or wrong-typed, tolerant) derives
+    /// it from `entry_hop`. Range-checked (non-negative) by
+    /// [`PlanConfig::validate`], never clamped here.
+    pub preview_standoff: Option<f64>,
+    /// `preview_nozzle_temp` — the nozzle target commanded on preview entry
+    /// so it cannot ooze during deliberation, °C. `None` (absent or
+    /// wrong-typed, tolerant) derives it from the plan's probe hold
+    /// temperature. Range-checked by [`PlanConfig::validate`].
+    pub preview_nozzle_temp: Option<f64>,
     /// Operator attestation autosaved by the plugin's `PLR_SETUP`.
     pub self_locking_z: bool,
     /// Autosaved probe resolution, mm; `None` before first calibration.
@@ -384,6 +400,31 @@ fn unsafe_flag(section: &Map<String, Value>, key: &str) -> bool {
         == Some(true)
 }
 
+/// Maps the `resume_candidate_policy` string to its [`ResumePolicy`] with
+/// the same explicit-choice discipline as `probe_method`: a known spelling
+/// → its variant, anything else → a hard refusal naming the four legal
+/// values. A silent guess would let a typo
+/// (`resume_candidate_policy = lastt`) resolve to the interactive default
+/// on a headless printer — exactly the automatic-vs-manual divergence this
+/// key exists to remove.
+///
+/// The value itself is read by `opt_str(plr, "resume_candidate_policy",
+/// "ask")` at the call site so the boot-guard test's key extractor
+/// (`test_daemon_keys.py`, which greps for `opt_str(plr, "…"`) sees the
+/// key — routing the read through a bespoke helper would hide it and
+/// defeat the guard.
+fn resume_policy_from(s: &str) -> Result<ResumePolicy, String> {
+    match s {
+        "first" => Ok(ResumePolicy::First),
+        "mid" => Ok(ResumePolicy::Mid),
+        "last" => Ok(ResumePolicy::Last),
+        "ask" => Ok(ResumePolicy::Ask),
+        other => Err(format!(
+            "[plr] resume_candidate_policy {other:?} is not first, mid, last, or ask"
+        )),
+    }
+}
+
 /// Reads a defaulted string option.
 fn opt_str(section: &Map<String, Value>, key: &str, default: &str) -> Result<String, String> {
     match section.get(key) {
@@ -503,6 +544,18 @@ impl PlrSettings {
             ),
             confirm_timeout_s: opt_opt_f64(plr, "confirm_timeout_s"),
             gcode_barrier_timeout_s: opt_opt_f64(plr, "gcode_barrier_timeout_s"),
+            // Resume-preview keys. The policy is an explicit-choice enum
+            // (refused, not guessed, on an unknown spelling); the two
+            // numeric derived-default keys are tolerant Option floats (like
+            // the FROZEN recovery-UX keys) with their bands enforced by
+            // PlanConfig::validate.
+            resume_candidate_policy: resume_policy_from(&opt_str(
+                plr,
+                "resume_candidate_policy",
+                "ask",
+            )?)?,
+            preview_standoff: opt_opt_f64(plr, "preview_standoff"),
+            preview_nozzle_temp: opt_opt_f64(plr, "preview_nozzle_temp"),
             self_locking_z,
             probe_resolution,
             noise_floor,
@@ -578,6 +631,9 @@ impl PlrSettings {
             unsafe_allow_purge_z_below_bed: self.unsafe_allow_purge_z_below_bed,
             confirm_timeout_s: self.confirm_timeout_s,
             gcode_barrier_timeout_s: self.gcode_barrier_timeout_s,
+            resume_candidate_policy: self.resume_candidate_policy,
+            preview_standoff: self.preview_standoff,
+            preview_nozzle_temp: self.preview_nozzle_temp,
             // [plr] mode: the plugin (and its PLR_TOUCH command) is
             // present, so the consensus touch is used.
             legacy_single_probe: false,

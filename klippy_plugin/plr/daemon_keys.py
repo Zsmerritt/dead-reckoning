@@ -156,6 +156,16 @@ DAEMON_KEYS = collections.OrderedDict(
         ("confirm_z_before_resume", BOOLEAN),
         ("debug_confirm_each_step", BOOLEAN),
         ("confirm_timeout_s", FLOAT),
+        # --- resume-point preview (plrd bands: enum first|mid|last|ask /
+        # preview_standoff >= 0 / preview_nozzle_temp [0, max_probe_nozzle_temp])
+        # `resume_candidate_policy` is a STRING enum: plrd refuses an
+        # unknown spelling (plrcfg.rs `resume_policy_from`), klippy only
+        # needs it to parse as a string.  The two numeric keys are FLOATs
+        # (plrd fields `Option<f64>`), bands enforced in
+        # PlanConfig::validate. ---
+        ("resume_candidate_policy", STRING),
+        ("preview_standoff", FLOAT),
+        ("preview_nozzle_temp", FLOAT),
         # --- exclusive g-code access (plrd band [5, 600]) ---
         ("gcode_barrier_timeout_s", FLOAT),
         # The system's ONE hard-refusal escape hatch.  Spelled exactly as

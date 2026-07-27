@@ -337,6 +337,40 @@ pub struct PlanConfig {
     /// with [`RecoveryError::GcodeBarrierTimeoutOutOfRange`], never
     /// clamped.
     pub gcode_barrier_timeout_s: Option<f64>,
+    /// `[plr]` key `resume_candidate_policy` (`first`|`mid`|`last`|`ask`,
+    /// default `ask`) — which stop in an ambiguous candidate set becomes
+    /// the resume point, and whether the interactive preview runs (design
+    /// `docs/design/resume-preview.md` §3). The enum's own explicit-choice
+    /// parse (in `plrd`'s `plrcfg.rs`, like `probe_method`) refuses any
+    /// spelling outside the four; nothing to range-check here.
+    #[serde(default, skip_serializing_if = "ResumePolicy::is_default")]
+    pub resume_candidate_policy: ResumePolicy,
+    /// `[plr]` key `preview_standoff` — the height, mm, the single XY-hover
+    /// plane sits above the highest preview stop (design §E.1). `None`
+    /// derives it from [`Self::entry_hop`] (the ruled default), so the
+    /// hover plane clears geometry by the same safe standoff the Z-confirm
+    /// lift uses. Resolve with [`Self::preview_standoff_mm`].
+    ///
+    /// Range `[0.0, ∞)` when set (a negative standoff would lower the
+    /// hover plane INTO the part); refused with [`RecoveryError::NonFinite`]
+    /// / [`RecoveryError::InvalidPlanConfig`], never clamped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preview_standoff: Option<f64>,
+    /// `[plr]` key `preview_nozzle_temp` — the nozzle target, °C, commanded
+    /// on preview entry so a nozzle hovering over the part for minutes of
+    /// deliberation cannot ooze onto it (design §E.2). `None` derives it
+    /// from the plan's probe hold temperature (the ruling: probe temps are
+    /// non-oozing by design and the nozzle is already there, so
+    /// reheat-from-probe beats reheat-from-cold; on a cold-drag machine the
+    /// hold is `None` and this resolves to `0`). `0` is a legal explicit
+    /// value (cool fully, extra caution). Resolve with
+    /// [`Self::preview_nozzle_temp_c`].
+    ///
+    /// Range `[0.0, max_probe_nozzle_temp]` when set — a preview target
+    /// above the probe ceiling would defeat the non-ooze purpose; refused
+    /// with [`RecoveryError::InvalidPlanConfig`], never clamped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preview_nozzle_temp: Option<f64>,
 }
 
 /// Default [`PlanConfig::confirm_timeout_s`].
@@ -542,6 +576,27 @@ impl PlanConfig {
             ProbeKind::Tap | ProbeKind::LoadCell => Some(self.commanded_probe_temp()),
         }
     }
+
+    /// The resolved preview hover-plane standoff, mm (design §E.1): the
+    /// operator's [`Self::preview_standoff`] when set, else [`Self::entry_hop`]
+    /// (the ruled default). Never negative for a validated config.
+    #[must_use]
+    pub fn preview_standoff_mm(&self) -> f64 {
+        self.preview_standoff.unwrap_or(self.entry_hop)
+    }
+
+    /// The resolved preview cool-down nozzle target, °C (design §E.2,
+    /// ruled): the operator's [`Self::preview_nozzle_temp`] when set, else
+    /// the probe hold temperature the nozzle is already at when preview
+    /// begins (post-probe), or `0` on a cold-drag machine that holds no
+    /// probe temperature. `0` therefore means "cool fully" whether it was
+    /// the explicit choice or the cold-drag fall-through — the safe
+    /// direction either way.
+    #[must_use]
+    pub fn preview_nozzle_temp_c(&self, kind: &ProbeKind) -> f64 {
+        self.preview_nozzle_temp
+            .unwrap_or_else(|| self.probe_hold_target(kind).unwrap_or(0.0))
+    }
 }
 
 impl Default for PlanConfig {
@@ -604,6 +659,14 @@ impl Default for PlanConfig {
             unsafe_allow_purge_z_below_bed: false,
             confirm_timeout_s: None,
             gcode_barrier_timeout_s: None,
+            // Preview keys OFF/derived by default: an unconfigured machine
+            // gets `ask` (the ruled default — which resolves as `last`
+            // skip-forward until increment 3's dialog lands), a hover
+            // standoff equal to `entry_hop`, and a preview cool target
+            // equal to whatever the probe holds at.
+            resume_candidate_policy: ResumePolicy::Ask,
+            preview_standoff: None,
+            preview_nozzle_temp: None,
         }
     }
 }
@@ -854,6 +917,41 @@ impl PlanConfig {
                 }
             }
         }
+        // Preview hover-plane standoff: non-negative and finite when set.
+        // A negative standoff would lower the single hover plane BELOW the
+        // highest stop — INTO the part — which is the exact never-descend
+        // guarantee §E.1 exists to make structural, so it is refused (a
+        // violating input: `preview_standoff = -1.0`), never clamped.
+        if let Some(s) = self.preview_standoff {
+            if !s.is_finite() {
+                return Err(RecoveryError::NonFinite {
+                    field: "preview_standoff",
+                });
+            }
+            if s < 0.0 {
+                return Err(RecoveryError::InvalidPlanConfig {
+                    field: "preview_standoff",
+                });
+            }
+        }
+        // Preview cool-down nozzle target: finite, in
+        // `[0, max_probe_nozzle_temp]` when set. A target ABOVE the probe
+        // ceiling would be a hot, oozing nozzle over the part for minutes —
+        // defeating the whole purpose of the cool-down (a violating input:
+        // `preview_nozzle_temp = 250` on a machine with the default 150 °C
+        // ceiling). Refused, never clamped; `0` (cool fully) stays legal.
+        if let Some(t) = self.preview_nozzle_temp {
+            if !t.is_finite() {
+                return Err(RecoveryError::NonFinite {
+                    field: "preview_nozzle_temp",
+                });
+            }
+            if t < 0.0 || t > self.max_probe_nozzle_temp {
+                return Err(RecoveryError::InvalidPlanConfig {
+                    field: "preview_nozzle_temp",
+                });
+            }
+        }
         // probe_speed: non-finite values fall out of the band check in
         // compute_envelope; nothing to do here.
         Ok(())
@@ -994,10 +1092,20 @@ pub enum ResumePolicy {
 }
 
 impl Default for ResumePolicy {
-    /// The ruled default is `Ask` (interactive preview); it resolves as
-    /// `Last` until the preview plan lands.
+    /// The ruled default is `Ask` (interactive preview).
     fn default() -> Self {
         Self::Ask
+    }
+}
+
+impl ResumePolicy {
+    /// `true` when this is the default (`Ask`). Used by
+    /// [`PlanConfig`]'s `skip_serializing_if` so a config that does not set
+    /// `resume_candidate_policy` serializes byte-identically to one built
+    /// before the key existed.
+    #[must_use]
+    pub fn is_default(&self) -> bool {
+        matches!(self, ResumePolicy::Ask)
     }
 }
 
@@ -2996,6 +3104,69 @@ mod tests {
                 "{field} = {v} must be rejected"
             );
         }
+    }
+
+    #[test]
+    fn preview_keys_are_refused_not_clamped() {
+        assert!(PlanConfig::default().validate().is_ok());
+        // preview_standoff: non-negative when set. A negative standoff
+        // would lower the single hover plane INTO the part — the exact
+        // never-descend guarantee this refusal makes structural.
+        check(
+            "preview_standoff",
+            |c, v| c.preview_standoff = Some(v),
+            &[0.0, 1.0, 25.0],
+            &[-0.01, -1.0],
+        );
+        // preview_nozzle_temp: [0, max_probe_nozzle_temp] when set. The
+        // upper bad value (250 > the default 150 °C ceiling) is a hot,
+        // oozing nozzle over the part — the fired-guard input.
+        check(
+            "preview_nozzle_temp",
+            |c, v| c.preview_nozzle_temp = Some(v),
+            &[0.0, 100.0, 150.0],
+            &[-1.0, 150.01, 250.0],
+        );
+        // Non-finite is the other refusal (NonFinite, not InvalidPlanConfig).
+        for field in ["preview_standoff", "preview_nozzle_temp"] {
+            let mut c = PlanConfig::default();
+            if field == "preview_standoff" {
+                c.preview_standoff = Some(f64::NAN);
+            } else {
+                c.preview_nozzle_temp = Some(f64::INFINITY);
+            }
+            assert!(
+                matches!(c.validate(), Err(RecoveryError::NonFinite { field: f }) if f == field),
+                "{field} non-finite must be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn preview_resolvers_apply_the_ruled_defaults() {
+        use crate::machine::ProbeKind;
+        let mut c = PlanConfig::default();
+        // preview_standoff unset -> entry_hop; set -> the value.
+        assert!((c.preview_standoff_mm() - c.entry_hop).abs() < 1e-9);
+        c.preview_standoff = Some(3.5);
+        assert!((c.preview_standoff_mm() - 3.5).abs() < 1e-9);
+        // preview_nozzle_temp unset -> the probe hold temp; a tap machine
+        // holds at commanded_probe_temp, a cold-drag machine at 0.
+        let mut c = PlanConfig::default();
+        assert!(
+            (c.preview_nozzle_temp_c(&ProbeKind::Tap) - c.commanded_probe_temp()).abs() < 1e-9,
+            "tap preview default follows the probe hold temp"
+        );
+        c.drag_nozzle_temp = 0.0;
+        assert!(
+            c.preview_nozzle_temp_c(&ProbeKind::AdxlDrag {
+                chip: String::new()
+            }) < 1e-9,
+            "cold-drag preview default is 0 (nothing to hold)"
+        );
+        // An explicit 0 stays 0 (extra-caution cool) regardless of probe.
+        c.preview_nozzle_temp = Some(0.0);
+        assert!(c.preview_nozzle_temp_c(&ProbeKind::Tap) < 1e-9);
     }
 
     #[test]

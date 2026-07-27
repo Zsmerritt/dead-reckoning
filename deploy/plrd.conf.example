@@ -543,6 +543,67 @@ control_socket = /var/lib/plrd/plrd.sock
 #                          frame ambiguous.
 #
 # ----------------------------------------------------------------------
+# RESUME-POINT SELECTION + PREVIEW
+#
+#   When a crash reconstructs to a WINDOW of plausible resume lines rather
+#   than a single one (the common case for a real power loss), this picks
+#   which line the recovery resumes at.
+#
+#   resume_candidate_policy    (ask)  first | mid | last | ask
+#                          last  — resume at the LATEST plausible line
+#                                  (skip-forward). Never double-prints;
+#                                  leaves at most a sub-line void. The safe
+#                                  automatic default, no prompt.
+#                          first — resume at the EARLIEST plausible line.
+#                                  RE-PRINTS geometry that may already
+#                                  exist (the nozzle plows the wall). Kept,
+#                                  warned plainly.
+#                          mid   — resume at the median plausible line (by
+#                                  file offset). May re-print; warned like
+#                                  first.
+#                          ask   — DEFAULT. Drive the nozzle to a safe
+#                                  hover over each candidate and let you
+#                                  step / nudge to the ragged edge on the
+#                                  part, then Accept. Needs an interactive
+#                                  caller (the Klipper plugin over the
+#                                  control socket). `plrd recover --execute`
+#                                  from the CLI answers every pause "abort".
+#                          An unknown spelling REFUSES at config-read time
+#                          (it is not guessed): a typo on a headless
+#                          printer must not silently fall to the wrong
+#                          automatic behaviour.
+#                          `first`/`mid`/`last` convert coarse matches that
+#                          used to fall back to MANUAL recovery into an
+#                          automatic resume — the headless win — with no
+#                          motion loop and no dialog.
+#
+#   The preview (policy = ask) NEVER descends: it lifts once to a single
+#   hover plane above the highest candidate and only ever moves in XY
+#   there. Aborting or timing out during the preview invalidates the Z
+#   frame (it sits after the shifted-frame declare — the nozzle has been
+#   driven around the part), so a fresh dry run is then required before any
+#   resume. When confirm_z_before_resume is ALSO set, the preview's Accept
+#   IS the Z confirmation — the standalone Z-confirm pause is subsumed.
+#
+#   preview_standoff       (= entry_hop) height, mm, of the hover plane
+#                          above the highest preview stop. Non-negative;
+#                          out-of-band REFUSES rather than clamping. The
+#                          alignment feedback is the OFFSET readout, not the
+#                          visible gap (adjacent lines can be <1 mm apart),
+#                          so a larger gap over a low first layer is fine.
+#   preview_nozzle_temp    (= probe hold temp) nozzle target, °C, commanded
+#                          when the preview starts so a nozzle hovering for
+#                          minutes of deliberation cannot ooze onto the
+#                          part. The default is whatever the probe held at
+#                          (a non-oozing temperature by design, and the
+#                          nozzle is already there — cheaper to reheat from
+#                          than from cold); set 0 to cool fully for extra
+#                          caution. Band [0, max_probe_nozzle_temp]; the
+#                          recovery file does the real print-temp reheat
+#                          after you Accept, so a cool preview costs no net
+#                          recovery time.
+#
+# ----------------------------------------------------------------------
 # EXCLUSIVE G-CODE ACCESS — OPTIONAL
 #
 #   Before each step's commands go out, plrd proves it has Klipper's
