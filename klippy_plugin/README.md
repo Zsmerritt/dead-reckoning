@@ -83,9 +83,10 @@ the consensus-touch tunables (`touch_samples`, `touch_sample_range`,
 `purge_speed`, `purge_retract`), `drag_nozzle_temp`, the acceleration
 overrides (`recovery_accel`, `accel_home`, `accel_travel`, `accel_probe`,
 `accel_entry`), the confirm-points (`confirm_z_before_resume`,
-`debug_confirm_each_step`, `confirm_timeout_s`), the exclusive-g-code-access
-barrier (`gcode_barrier_timeout_s`) and the one hard-refusal
-escape hatch `UNSAFE_allow_purge_z_below_bed`. Each is documented — with
+`debug_confirm_each_step`, `confirm_timeout_s`), the resume-point preview
+(`resume_candidate_policy`, `preview_standoff`, `preview_nozzle_temp`), the
+exclusive-g-code-access barrier (`gcode_barrier_timeout_s`) and the one
+hard-refusal escape hatch `UNSAFE_allow_purge_z_below_bed`. Each is documented — with
 its band, its default and the physics behind it — in
 [`deploy/plrd.conf.example`](../deploy/plrd.conf.example); `plrd` reads
 them and is the sole authority on their values.
@@ -376,7 +377,7 @@ dialog at all:
 | `PLR_RECOVER_CONTINUE` | proceed despite what plrd reported |
 | `PLR_RECOVER_ABORT` | stop the recovery cleanly, here |
 
-There are three kinds of confirm-point, and the prompt asks a different
+There are four kinds of confirm-point, and the prompt asks a different
 question for each:
 
 - a **`Tier::Confirmable` diagnosis** — "continue despite this?". Every
@@ -391,6 +392,21 @@ question for each:
   required before any resume.
 - **`debug_confirm_each_step`** (a `[plr]` key) — "run the next step?"
   before every step, listing that step's exact commands.
+- the **resume-point preview** (`resume_candidate_policy = ask`, the
+  default) — "where did printing stop?": plrd hovers over a candidate
+  resume point and asks you to align to the ragged edge on the part. This
+  one is *not* the binary continue/abort pair — it has its own reposition
+  vocabulary, all plain g-code so the console is still the floor:
+  `PLR_RECOVER_ACCEPT` (resume here), `PLR_RECOVER_NEXT` /
+  `PLR_RECOVER_PREV` (step between candidate stops),
+  `PLR_RECOVER_NUDGE FWD=<n>` / `BACK=<n>` (`n` = 1 fine or 10 coarse; move
+  one/ten deposition lines along the toolpath), and `PLR_RECOVER_ABORT`.
+  The offset/XY/layer/feature readout is re-emitted every reposition
+  because adjacent stops can be sub-millimetre apart. See
+  [Aligning the resume point](../docs/operations.md#aligning-the-resume-point-the-preview)
+  for the walkthrough and the policy table. Sending a preview verb to a
+  binary pause (or `continue` to a preview) is refused with the pause left
+  intact, so a mistyped answer never loses the question.
 
 Only one question is ever outstanding, and plrd runs exactly one recovery
 at a time. `PLR_STATUS` re-states the outstanding question in full —

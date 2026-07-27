@@ -300,9 +300,75 @@ inline.
    offers to continue anyway (`PLR_RECOVER_CONTINUE`) or stop
    (`PLR_RECOVER_ABORT`). So does `confirm_z_before_resume` if you set it,
    which is the last moment a human can compare plrd's believed Z against
-   the actual nozzle. Unanswered questions abort cleanly on plrd's own
-   `confirm_timeout_s`; that abort invalidates the Z frame, so a fresh dry
-   run is required before retrying.
+   the actual nozzle. And when the crash reconstructs to a coarse window
+   (the common case), plrd opens the **resume-point preview** and asks you
+   to align to the ragged edge on the part — see
+   [Aligning the resume point](#aligning-the-resume-point-the-preview).
+   Unanswered questions abort cleanly on plrd's own `confirm_timeout_s`;
+   that abort invalidates the Z frame, so a fresh dry run is required before
+   retrying.
+
+### Aligning the resume point (the preview)
+
+A real crash rarely reconstructs to a single resume line — it reconstructs
+to a *window* of a few hundred candidate lines across one to four layers,
+too coarse for automatic per-line matching. Rather than give up, plrd turns
+that window into a short interactive **preview**: it lifts to a safe hover
+height, travels to a candidate XY, and asks you to align the resume point to
+the **ragged edge on the part** — the physical mark where extrusion stopped.
+This is the shipped default (`resume_candidate_policy = ask`).
+
+**`resume_candidate_policy`** (`[plr]`) chooses how the resume point is
+picked from that window:
+
+| policy | what it does | safety | prompts? |
+|---|---|---|---|
+| `ask` (default) | interactive preview — you align to the ragged edge | operator-chosen; the nudge domain is wider than the matched set, so the true edge is always reachable | yes, interactive |
+| `last` | resume at the last candidate line (skip-forward) | **safe**: never double-prints; leaves at most a sub-line void | no, automatic |
+| `first` | resume at the first candidate line | **re-prints geometry that may exist** — the nozzle plows the printed wall | no, automatic + loud warning |
+| `mid` | resume at the median candidate line | may re-print | no, automatic + warning |
+
+A **headless / bare-CLI** setup (no plugin dialog, or a scripted recovery)
+should set `last`: it gives an automatic skip-forward resume with no pause to
+answer. Legacy `/etc/plrd.conf` mode has no `[plr]` section and no dialog, so
+it resolves `ask` to `last` automatically. `ask` is for a supervised console
+recovery where you can look at the part.
+
+**Driving the preview from the console.** Every button in the dialog fires a
+plain g-code command, and on a client with no dialog these commands *are* the
+interface — the console is the floor, not a fallback:
+
+- **`PLR_RECOVER_ACCEPT`** — resume from the shown point (plrd generates the
+  recovery file from it and starts the print).
+- **`PLR_RECOVER_NEXT`** / **`PLR_RECOVER_PREV`** — step between the
+  representative candidate stops (3–7 spread across the window).
+- **`PLR_RECOVER_NUDGE FWD=<n>`** / **`BACK=<n>`** (`n` = `1` fine or `10`
+  coarse) — move the hover point one/ten deposition lines *along the
+  toolpath*. This is how you reach the true edge even when it fell just
+  outside the matched set.
+- **`PLR_RECOVER_ABORT`** — stop the recovery.
+
+Each pause re-prints the current stop's readout — byte offset, hover XY,
+layer, and feature — **every reposition**, because adjacent stops can be less
+than a millimetre apart and you must not rely on seeing the nozzle move. Lost
+the dialog? `PLR_STATUS` re-emits the current stop's full readout. A point
+*before* the safe skip-forward line is flagged: accepting it re-prints
+existing geometry.
+
+**Never descends; cool while you think.** The preview lifts once to a single
+hover plane above every candidate's Z and only ever moves in XY there — it
+never drives toward the part, so no stop can produce a descent. Because
+deliberation can take minutes, plrd cools the nozzle on entry
+(`preview_nozzle_temp`, default 0) so a hot nozzle cannot ooze onto the part
+while you study the edge; the recovery file does its own reheat + purge after
+you accept, so there is no net time cost. The standoff means even a drip
+cannot bridge to the part.
+
+**Abort during preview invalidates the frame.** The preview runs after the
+shifted-frame is declared and the nozzle has been driven around the part, so
+aborting or timing out during it invalidates the Z frame — **a fresh dry run
+re-establishes it** before any resume. This is the same rule as any other
+confirm-point timeout; nothing about the preview is special here.
 
 ### Manual fallback
 
