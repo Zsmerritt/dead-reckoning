@@ -41,6 +41,11 @@ pub const HEARTBEAT_FILE_NAME: &str = "heartbeat.bin";
 /// Receive-seq sidecar file name inside the WAL directory.
 pub const RECEIVE_SEQ_FILE_NAME: &str = "receive_seq.bin";
 
+/// Power-fail sidecar file name inside the WAL directory (the power-fail
+/// watcher's first, channel-bypassing durability copy of the edge time).
+/// Must match `crate::config::Config::power_fail_sidecar_file`'s basename.
+pub const POWER_FAIL_FILE_NAME: &str = "power_fail.bin";
+
 /// File name of the WAL segment with the given index.
 // The builder half lives beside the parser for symmetry; its production
 // caller (`walsvc`) is Linux-only, so off-Linux only tests reach it.
@@ -100,6 +105,7 @@ pub fn run_scan(
     let heartbeat = read_heartbeat(&mut w, &heartbeat_path);
 
     let receive_seq = read_receive_seq(&mut w, &wal_dir.join(RECEIVE_SEQ_FILE_NAME));
+    let power_fail_edge_mono_ns = load_power_fail_edge(&wal_dir.join(POWER_FAIL_FILE_NAME));
 
     let file_tail_bytes = read_file_tail(&mut w, &merged);
     let file_tail = file_tail_bytes
@@ -114,6 +120,7 @@ pub fn run_scan(
         heartbeat: heartbeat.as_ref(),
         file_tail,
         receive_seq,
+        power_fail_edge_mono_ns,
     };
     match reconstruct(&inputs, &crate::convert::reconstruct_config(None)) {
         Ok(Reconstruction::CleanShutdown(_)) => {
@@ -221,6 +228,13 @@ pub(crate) fn load_receive_seq(path: &Path) -> Option<ReceiveSeqObservation> {
         mono_ns,
         widened_seq,
     })
+}
+
+/// Loads the power-fail sidecar (edge `mono_ns`) without printing; `None`
+/// when absent, torn, or foreign — the conservative direction (a missing
+/// edge only widens reconstruction). `crate::powerfail` owns the codec.
+pub(crate) fn load_power_fail_edge(path: &Path) -> Option<u64> {
+    crate::powerfail::decode_power_fail_edge(&std::fs::read(path).ok()?)
 }
 
 /// The half-open `[start, end)` index range of the crash epoch within a

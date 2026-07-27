@@ -1,7 +1,7 @@
 //! The top-level orchestration: scan + heartbeat + file tail in,
 //! [`Reconstruction`] out.
 
-use plr_wal::{HeartbeatRecovery, RecoveryScan};
+use plr_wal::{HeartbeatRecovery, Marker, MarkerKind, RecoveryScan};
 
 use crate::config::ReconstructConfig;
 use crate::epoch::{select_crash_epoch, EpochSpan};
@@ -31,6 +31,16 @@ pub struct ReconstructInputs<'a> {
     /// The newest durable widened `receive_seq` observation, if the
     /// daemon persisted one. Applied strictly as a time bound on `t_b`.
     pub receive_seq: Option<ReceiveSeqObservation>,
+    /// Host-monotonic time of a power-fail edge from the watcher's sidecar
+    /// (`plrd`'s `powerfail` writes it, `crate::powerfail::decode_power_fail_edge`
+    /// reads it), when one validated. This is the **first, channel-bypassing**
+    /// durable copy of the edge; the WAL `PowerFailing` marker (if the FIFO
+    /// drained in time) is the richer second copy. Epoch-admitted exactly
+    /// like [`Self::heartbeat`] and folded into the timeline's markers, so
+    /// the two copies converge on
+    /// [`WalTimeline::power_failing_tail`](crate::WalTimeline::power_failing_tail).
+    /// `None` when no sidecar exists or it failed to validate.
+    pub power_fail_edge_mono_ns: Option<u64>,
 }
 
 /// A full recovery reconstruction: timeline, window, stop set, and the
@@ -113,8 +123,29 @@ pub fn reconstruct(
     let receive_seq = inputs
         .receive_seq
         .filter(|obs| epoch_admits(epoch, is_newest, obs.mono_ns));
+    // The power-fail sidecar is an out-of-band single-event file like the
+    // heartbeat file, so it gets the same epoch admission: a sidecar left
+    // by an OLD power event must never pre-stamp a NEW crash's
+    // reconstruction.
+    let power_fail_edge = inputs
+        .power_fail_edge_mono_ns
+        .filter(|mono| epoch_admits(epoch, is_newest, *mono));
 
-    let timeline = ingest(&scan, heartbeat);
+    let mut timeline = ingest(&scan, heartbeat);
+    // Fold the sidecar copy in as a `PowerFailing` marker so it and the WAL
+    // marker (if the FIFO drained in time to journal one) converge on the
+    // single `WalTimeline::power_failing_tail` path — which dedups (takes
+    // the max) and applies the neutralization uniformly. Done after ingest
+    // so it cannot disturb the `clean_shutdown` determination: a deliberate
+    // clean shutdown with a stale sidecar around must still read as clean.
+    if let Some(edge) = power_fail_edge {
+        if !timeline.clean_shutdown {
+            timeline.markers.push(Marker {
+                mono_ns: edge,
+                kind: MarkerKind::PowerFailing,
+            });
+        }
+    }
     if timeline.clean_shutdown {
         return Ok(Reconstruction::CleanShutdown(Box::new(timeline)));
     }
@@ -193,7 +224,62 @@ mod tests {
             heartbeat: None,
             file_tail: None,
             receive_seq: None,
+            power_fail_edge_mono_ns: None,
         }
+    }
+
+    /// The sidecar copy of the edge is consumed even when NO WAL
+    /// `PowerFailing` marker survived (the FIFO never drained one), and a
+    /// STALE sidecar from an older event is rejected by the same epoch
+    /// admission the heartbeat file gets — it must never pre-stamp a new
+    /// crash. (Reader-consumes-whichever + epoch discipline, MAJOR-1.)
+    #[test]
+    fn a_sidecar_power_fail_edge_is_epoch_admitted_and_folded_in() {
+        // A crash-epoch scan with no WAL PowerFailing marker at all.
+        let scan = scan_of(vec![
+            WalRecord::Heartbeat(heartbeat_at(1_000_000_000, 10.0)),
+            WalRecord::Context(context_at(1_000_000_000, 0)),
+            WalRecord::TrapqSegment(trapq_segment("toolhead", 10.0, 0.1, 1_000_000_000)),
+        ]);
+
+        // Admitted: at/after the epoch floor, within the hold-up margin of
+        // the tail. Folded in and surfaced as the power-fail tail even
+        // though the WAL carries no such marker.
+        let admitted = ReconstructInputs {
+            power_fail_edge_mono_ns: Some(1_200_000_000),
+            ..inputs(&scan)
+        };
+        let Reconstruction::Recovery(recovery) =
+            reconstruct(&admitted, &ReconstructConfig::default()).unwrap()
+        else {
+            panic!("expected a recovery");
+        };
+        assert_eq!(
+            recovery.timeline.power_failing_tail(),
+            Some(1_200_000_000),
+            "the sidecar edge is consumed with no WAL marker present"
+        );
+        assert_eq!(
+            recovery.window.class,
+            CrashClass::HostDeathOrPowerLoss { torn_tail: false }
+        );
+
+        // Stale: a sidecar left by an OLDER event (mono below this crash
+        // epoch's floor) is rejected — never admitted, never folded in.
+        let stale = ReconstructInputs {
+            power_fail_edge_mono_ns: Some(1),
+            ..inputs(&scan)
+        };
+        let Reconstruction::Recovery(recovery) =
+            reconstruct(&stale, &ReconstructConfig::default()).unwrap()
+        else {
+            panic!("expected a recovery");
+        };
+        assert_eq!(
+            recovery.timeline.power_failing_tail(),
+            None,
+            "a stale, out-of-epoch sidecar must not pre-stamp this crash"
+        );
     }
 
     const S: u64 = 1_000_000_000; // one second in ns
@@ -352,6 +438,7 @@ mod tests {
                 heartbeat: Some(&file),
                 file_tail: None,
                 receive_seq: None,
+                power_fail_edge_mono_ns: None,
             },
             &ReconstructConfig::default(),
         )
@@ -472,6 +559,7 @@ mod tests {
                     bytes: text.as_bytes(),
                 }),
                 receive_seq: None,
+                power_fail_edge_mono_ns: None,
             },
             &ReconstructConfig::default(),
         )
@@ -656,6 +744,7 @@ mod tests {
                 bytes: file,
             }),
             receive_seq: None,
+            power_fail_edge_mono_ns: None,
         };
         let outcome = reconstruct(&inputs, &ReconstructConfig::default()).unwrap();
         let Reconstruction::Recovery(recovery) = outcome else {

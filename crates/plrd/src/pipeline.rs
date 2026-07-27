@@ -223,6 +223,9 @@ pub fn run_pipeline(config: &Config, out: &mut dyn Write) -> Result<PipelineOutc
         }
     };
     let receive_seq = scan::load_receive_seq(&config.receive_seq_file());
+    // The power-fail sidecar (the watcher's channel-bypassing edge copy):
+    // recovery's exact-T fact, epoch-admitted inside reconstruct.
+    let power_fail_edge_mono_ns = scan::load_power_fail_edge(&config.power_fail_sidecar_file());
 
     // The print file is optional until we know recovery is needed: a
     // clean shutdown must classify as clean even with no file around.
@@ -249,6 +252,7 @@ pub fn run_pipeline(config: &Config, out: &mut dyn Write) -> Result<PipelineOutc
             bytes,
         }),
         receive_seq,
+        power_fail_edge_mono_ns,
     };
     let recovery = match reconstruct(&inputs, &crate::convert::reconstruct_config(Some(config))) {
         Ok(Reconstruction::CleanShutdown(_)) => return Ok(PipelineOutcome::CleanShutdown),

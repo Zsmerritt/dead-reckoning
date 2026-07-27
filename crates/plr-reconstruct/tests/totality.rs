@@ -349,6 +349,7 @@ proptest! {
                 mono_ns,
                 widened_seq,
             }),
+            power_fail_edge_mono_ns: None,
         };
         // Any Result is acceptable; a panic fails the test.
         let _ = reconstruct(&inputs, &config);

@@ -111,6 +111,7 @@ pub fn run(config_path: &Path) -> u8 {
     if let Some(pf) = config.power_fail_gpio.clone() {
         let exit = std::sync::Arc::clone(&powerfail_exit);
         let response = crate::powerfail::WalChannelResponse::new(
+            config.power_fail_sidecar_file(),
             watcher_tx,
             // Best-effort tier: signal the clean exit. Runs only after the
             // watcher's mandatory tier has journaled the marker (see
@@ -202,7 +203,9 @@ pub fn run(config_path: &Path) -> u8 {
         }
     });
 
-    if power_fail {
+    if journals_recorder_stopped(graceful, power_fail) {
+        note_stop_reason(&mut sender, graceful);
+    } else if power_fail {
         // The watcher already journaled and fsync'd the PowerFailing
         // marker (its mandatory tier). This is a CLEAN exit — final WAL
         // sync below — but deliberately NOT a graceful *recorder* stop:
@@ -212,8 +215,6 @@ pub fn run(config_path: &Path) -> u8 {
             "plrd: power-fail clean exit — the PowerFailing marker is journaled; \
              not writing a recorder-stopped marker"
         );
-    } else {
-        note_stop_reason(&mut sender, graceful);
     }
 
     // Final durability: ask the WAL thread to sync and exit, then judge
@@ -260,6 +261,21 @@ pub fn run(config_path: &Path) -> u8 {
 /// `WalSender::shutdown`, so the shutdown's final `fdatasync` makes it
 /// durable. A dead WAL thread (`WalGone`) means nothing can be journaled
 /// at all, which costs one spurious announcement — logged, never fatal.
+/// Whether a stop should journal the graceful recorder-stopped marker.
+///
+/// Only a graceful signal (SIGTERM/SIGINT) does. A **power-fail** clean
+/// exit must not — a `RecorderStopped` marker suppresses the recovery
+/// announcement, which is the exact wrong outcome after a real power loss
+/// (the `PowerFailing` marker + sidecar already record the truth). A
+/// client-ended or fatal stop journals nothing either. `power_fail` wins
+/// over `graceful` defensively, though the `select!` sets at most one.
+///
+/// Extracted so the third `select!` arm's decision is unit-testable
+/// without driving the whole async runtime (see the test below).
+const fn journals_recorder_stopped(graceful: bool, power_fail: bool) -> bool {
+    graceful && !power_fail
+}
+
 fn note_stop_reason(sender: &mut WalSender, graceful: bool) {
     if !graceful {
         return;
@@ -858,6 +874,31 @@ mod tests {
         drop(rx);
         let mut sender = crate::sender::WalSender::new(tx);
         super::note_stop_reason(&mut sender, true);
+    }
+
+    /// The third `select!` arm's decision, unit-tested directly (the arm
+    /// itself sets `power_fail` and `run` gates `note_stop_reason` behind
+    /// this): only a graceful, non-power-fail stop journals
+    /// `RecorderStopped`. A power-fail clean exit never does — that would
+    /// suppress the recovery a power loss must announce.
+    #[test]
+    fn only_a_graceful_non_power_fail_stop_journals_recorder_stopped() {
+        assert!(
+            super::journals_recorder_stopped(true, false),
+            "a SIGTERM/SIGINT stop journals RecorderStopped"
+        );
+        assert!(
+            !super::journals_recorder_stopped(false, true),
+            "a power-fail clean exit must not"
+        );
+        assert!(
+            !super::journals_recorder_stopped(false, false),
+            "a client-ended / fatal stop journals nothing"
+        );
+        // Defensive: power-fail wins over a stray graceful flag (the
+        // select! sets at most one, but the marker must never suppress a
+        // power-loss recovery).
+        assert!(!super::journals_recorder_stopped(true, true));
     }
 
     #[test]

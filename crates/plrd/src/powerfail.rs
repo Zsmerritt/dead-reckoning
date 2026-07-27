@@ -24,7 +24,41 @@
 //! with the 24 V rail on their own, and commanding a browning-out machine
 //! is forbidden. Nothing in this module talks to the printer.
 //!
-//! # Why blocking, never dropping
+//! # Two durability copies: sidecar first, WAL marker second
+//!
+//! The mandatory tier writes the edge time **twice**, and the ordering is
+//! load-bearing:
+//!
+//! 1. **Sidecar (first, channel-bypassing).** The watcher thread itself
+//!    writes an 8-byte edge timestamp to a tiny fixed-size file on its
+//!    *own* fd (`tmp` + `rename` + `fsync` + dir `fsync`, the
+//!    `detect::write_frame_invalid` pattern). Its cost is bounded by ~2
+//!    disk syncs **regardless of the WAL channel's backlog**, so it holds
+//!    even in the exact situation the feature exists for: a stalling disk
+//!    with a full motion queue.
+//! 2. **WAL marker (second, richer).** The `PowerFailing` marker then goes
+//!    through the WAL channel (below) so the edge lands *inside* the log's
+//!    own ordered record stream, next to the surrounding motion.
+//!
+//! **Why the sidecar is not optional.** The WAL send returns when **one**
+//! channel slot frees, but the marker only becomes *durable* after the WAL
+//! thread drains the entire FIFO backlog ahead of it — there is no mpsc
+//! priority. Measured empty-queue latency is ~2 ms; a full motion queue on
+//! a healthy disk was measured at ~19 ms; and on the project's documented
+//! 100–500 ms SD stalls the drain's own heartbeat catch-up syncs plus the
+//! queued fsync-bearing operations can total **~0.4–4 s**, which *exceeds
+//! the ≥1 s hold-up floor* — and a full queue only ever happens *because*
+//! the disk is stalling, so that worst case correlates with the trigger.
+//! The channel-bypassing sidecar is what makes the worst case no longer
+//! matter: the exact-T fact is durable in ~2 syncs, and the WAL marker is a
+//! best-effort richer copy on top.
+//!
+//! The reader consumes whichever survived (see
+//! [`crate::powerfail::decode_power_fail_edge`] and `reconstruct`'s
+//! epoch-admitted `power_fail_edge_mono_ns` input), so a torn or missing
+//! WAL marker is covered by the sidecar and vice versa.
+//!
+//! # Why the WAL send blocks, never drops
 //!
 //! The socket reader must never block (Klipper disconnects slow clients),
 //! so its WAL sends drop under backpressure. The power-fail marker is the
@@ -32,8 +66,8 @@
 //! there is exactly one, so [`WalChannelResponse::mandatory`] uses a
 //! **blocking** channel send — it waits for space rather than dropping.
 //! The watcher runs on its own thread, so blocking it has no external
-//! consequence, and the WAL thread drains continuously, so the wait is the
-//! time to free one slot (measured in the mandatory-tier latency test).
+//! consequence. Durability of *this copy* still depends on the drain (see
+//! above), which is exactly why the sidecar is written first.
 //!
 //! # The abstracted edge source
 //!
@@ -76,6 +110,47 @@ impl fmt::Display for EdgeError {
 }
 
 impl std::error::Error for EdgeError {}
+
+/// On-disk length of the power-fail sidecar file: magic(4) + edge
+/// `mono_ns`(8, LE) + `crc32c`(4) over the first 12 bytes.
+pub const POWER_FAIL_SIDECAR_LEN: usize = 16;
+
+/// Magic prefix identifying the sidecar (and its format revision).
+const POWER_FAIL_SIDECAR_MAGIC: [u8; 4] = *b"PFE1";
+
+/// Encodes a power-fail edge timestamp into the fixed sidecar layout. The
+/// `crc32c` (the same integrity primitive the WAL frames and heartbeat
+/// slots use, `plr_wal::crc32c`) lets the reader reject a torn or foreign
+/// file rather than trust a bogus edge.
+#[must_use]
+pub fn encode_power_fail_edge(edge_mono_ns: u64) -> [u8; POWER_FAIL_SIDECAR_LEN] {
+    let mut buf = [0_u8; POWER_FAIL_SIDECAR_LEN];
+    buf[0..4].copy_from_slice(&POWER_FAIL_SIDECAR_MAGIC);
+    buf[4..12].copy_from_slice(&edge_mono_ns.to_le_bytes());
+    let crc = plr_wal::crc32c(&buf[0..12]);
+    buf[12..16].copy_from_slice(&crc.to_le_bytes());
+    buf
+}
+
+/// Decodes a power-fail sidecar, returning the edge `mono_ns` only when the
+/// magic and CRC both validate. `None` for any short, foreign, or corrupt
+/// buffer — a torn or stale-garbage file never yields a bogus edge, which
+/// is the safe direction (a *missing* edge only widens reconstruction,
+/// never narrows it). Staleness across boots is handled separately, by the
+/// reader's epoch admission (`reconstruct`'s `epoch_admits`, same as the
+/// heartbeat file).
+#[must_use]
+pub fn decode_power_fail_edge(bytes: &[u8]) -> Option<u64> {
+    let buf = bytes.get(..POWER_FAIL_SIDECAR_LEN)?;
+    if buf[0..4] != POWER_FAIL_SIDECAR_MAGIC {
+        return None;
+    }
+    let stored_crc = u32::from_le_bytes(buf[12..16].try_into().ok()?);
+    if stored_crc != plr_wal::crc32c(&buf[0..12]) {
+        return None;
+    }
+    Some(u64::from_le_bytes(buf[4..12].try_into().ok()?))
+}
 
 /// The thin OS-facing seam the watcher reads edges through. Real hardware
 /// implements it with `gpiocdev` ([`GpioEdgeSource`](#impl)); tests
@@ -255,35 +330,89 @@ mod linux {
         }
     }
 
-    /// The production response: the mandatory tier hands the WAL thread a
-    /// `PowerFailing` marker over the same channel the recorder uses; the
-    /// best-effort tier fires the injected clean-exit hook.
+    /// The production response. The mandatory tier makes the edge durable
+    /// **twice, in order**: first a channel-bypassing sidecar on its own fd
+    /// (bounded by ~2 syncs regardless of WAL backlog — the copy that holds
+    /// on a stalling disk), then the richer `PowerFailing` marker through
+    /// the WAL channel. The best-effort tier fires the injected clean-exit
+    /// hook. See the module docs for why the sidecar comes first.
     pub struct WalChannelResponse {
+        sidecar_path: std::path::PathBuf,
         tx: std::sync::mpsc::SyncSender<WalCmd>,
         cleanup: Box<dyn FnMut() + Send>,
     }
 
     impl WalChannelResponse {
-        /// `tx` is a clone of the WAL channel's sender (from `daemon`);
-        /// `cleanup` triggers the daemon's power-fail clean exit (it must
-        /// NOT write a `RecorderStopped` marker — the print really did die).
+        /// `sidecar_path` is where the first durable copy is written
+        /// (`config.power_fail_sidecar_file()`); `tx` is a clone of the WAL
+        /// channel's sender (from `daemon`); `cleanup` triggers the daemon's
+        /// power-fail clean exit (which must NOT write a `RecorderStopped`
+        /// marker — the print really did die).
         pub fn new(
+            sidecar_path: std::path::PathBuf,
             tx: std::sync::mpsc::SyncSender<WalCmd>,
             cleanup: Box<dyn FnMut() + Send>,
         ) -> Self {
-            Self { tx, cleanup }
+            Self {
+                sidecar_path,
+                tx,
+                cleanup,
+            }
+        }
+
+        /// Writes the edge time to the sidecar durably: temp in the same
+        /// directory, `sync_all` (a fresh file — its size is as load-bearing
+        /// as its bytes), atomic `rename`, then a directory `fsync` so the
+        /// rename survives. Mirrors `detect::write_frame_invalid`. Cost is
+        /// ~2 syncs, independent of the WAL channel's backlog.
+        fn write_sidecar(&self, edge_mono_ns: u64) -> std::io::Result<()> {
+            use std::io::Write as _;
+            let dir = self.sidecar_path.parent().ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "sidecar path has no parent",
+                )
+            })?;
+            let mut temp = self.sidecar_path.clone();
+            temp.set_extension("bin.tmp");
+            let bytes = super::encode_power_fail_edge(edge_mono_ns);
+            let write = (|| -> std::io::Result<()> {
+                let mut file = std::fs::File::create(&temp)?;
+                file.write_all(&bytes)?;
+                file.flush()?;
+                file.sync_all()
+            })();
+            if let Err(e) = write {
+                let _ = std::fs::remove_file(&temp);
+                return Err(e);
+            }
+            if let Err(e) = std::fs::rename(&temp, &self.sidecar_path) {
+                let _ = std::fs::remove_file(&temp);
+                return Err(e);
+            }
+            std::fs::File::open(dir)?.sync_all()
         }
     }
 
     impl PowerFailResponse for WalChannelResponse {
         fn mandatory(&mut self, edge_mono_ns: u64) {
-            // BLOCKING send = never-dropped: waits for one channel slot
-            // rather than dropping (the socket reader drops; this must not).
-            // The WAL thread then appends+fsyncs the marker on its Immediate
-            // path AND force-syncs the heartbeat file (see `walsvc`'s Append
-            // handler). The send returns once the command is enqueued, ahead
-            // of any best-effort `Shutdown`, so FIFO delivery guarantees the
-            // marker is journaled before the clean exit's final sync.
+            // COPY 1 (first, channel-bypassing): the sidecar. Bounded by ~2
+            // syncs on our own fd, so it is durable even when the WAL FIFO
+            // is backlogged behind a stalling disk — the case the feature
+            // exists for. A write failure is logged, never fatal; copy 2
+            // still runs.
+            if let Err(e) = self.write_sidecar(edge_mono_ns) {
+                eprintln!(
+                    "plrd: power-fail sidecar write failed (WAL marker still attempted): {e}"
+                );
+            }
+
+            // COPY 2 (second, richer): the WAL marker. BLOCKING send =
+            // never-dropped (the socket reader drops; this must not). The
+            // WAL thread appends+fsyncs the marker on its Immediate path AND
+            // force-syncs the heartbeat file (see `walsvc`'s Append
+            // handler). Durability of THIS copy waits on the drain; the
+            // sidecar above is why that no longer bounds the mandatory tier.
             let marker = WalRecord::Marker(Marker {
                 mono_ns: edge_mono_ns,
                 kind: MarkerKind::PowerFailing,
@@ -296,11 +425,11 @@ mod linux {
                 })
                 .is_err()
             {
-                // The WAL thread is already gone; nothing can be journaled.
+                // The WAL thread is already gone; the sidecar copy stands.
                 // Logged, never fatal — the rail is dying regardless.
                 eprintln!(
                     "plrd: power-fail edge observed, but the WAL thread is gone; \
-                     the PowerFailing marker could not be journaled"
+                     the PowerFailing marker was not journaled (the sidecar copy stands)"
                 );
             }
         }
@@ -341,9 +470,40 @@ mod linux {
 
 #[cfg(test)]
 mod tests {
-    use super::{run_watcher, EdgeError, EdgeSource, PowerFailResponse, WatcherOutcome};
+    use super::{
+        decode_power_fail_edge, encode_power_fail_edge, run_watcher, EdgeError, EdgeSource,
+        PowerFailResponse, WatcherOutcome, POWER_FAIL_SIDECAR_LEN,
+    };
     use std::collections::VecDeque;
     use std::time::Duration;
+
+    #[test]
+    fn power_fail_sidecar_roundtrips_and_rejects_corruption() {
+        for mono in [0_u64, 1, 42, 1_000_000_000, u64::MAX] {
+            let bytes = encode_power_fail_edge(mono);
+            assert_eq!(bytes.len(), POWER_FAIL_SIDECAR_LEN);
+            assert_eq!(decode_power_fail_edge(&bytes), Some(mono));
+        }
+        // A short buffer, a foreign magic, a flipped CRC, and a flipped
+        // payload bit all decode to None — never a bogus edge (safe
+        // direction: a missing edge only widens reconstruction).
+        assert_eq!(decode_power_fail_edge(&[]), None);
+        assert_eq!(decode_power_fail_edge(&[0_u8; 8]), None);
+        let mut foreign = encode_power_fail_edge(42);
+        foreign[0] = b'X';
+        assert_eq!(decode_power_fail_edge(&foreign), None);
+        let mut bad_crc = encode_power_fail_edge(42);
+        bad_crc[15] ^= 0x01;
+        assert_eq!(decode_power_fail_edge(&bad_crc), None);
+        let mut torn_payload = encode_power_fail_edge(42);
+        torn_payload[5] ^= 0x80; // payload changed, CRC now mismatches
+        assert_eq!(decode_power_fail_edge(&torn_payload), None);
+        // Trailing bytes past the fixed length are ignored (a valid prefix
+        // still decodes).
+        let mut padded = encode_power_fail_edge(7).to_vec();
+        padded.extend_from_slice(&[0xAB, 0xCD]);
+        assert_eq!(decode_power_fail_edge(&padded), Some(7));
+    }
 
     /// A scripted edge source: `asserts[i]` is the value `is_asserted`
     /// returns for the i-th edge. `wait_for_edge` succeeds while edges
@@ -490,7 +650,7 @@ mod linux_tests {
 
     use super::linux::WalChannelResponse;
     use super::tests::SyntheticEdge;
-    use super::{run_watcher, WatcherOutcome};
+    use super::{run_watcher, PowerFailResponse, WatcherOutcome};
     use crate::sender::{HeartbeatData, WalCmd};
     use crate::walsvc::{self, WalSvcCfg};
 
@@ -558,7 +718,9 @@ mod linux_tests {
         // tier. Zero debounce: we are timing the tier itself.
         let best_effort_ran = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let flag = std::sync::Arc::clone(&best_effort_ran);
+        let sidecar = dir.join("power_fail.bin");
         let response = WalChannelResponse::new(
+            sidecar.clone(),
             tx.clone(),
             Box::new(move || flag.store(true, std::sync::atomic::Ordering::SeqCst)),
         );
@@ -568,6 +730,11 @@ mod linux_tests {
             crate::hostclock::now_mono_ns()
         });
         assert_eq!(outcome, WatcherOutcome::Fired);
+        // The sidecar (durability copy 1) is written before the channel
+        // send, so it is already durable and decodes to the edge.
+        let sidecar_edge = super::decode_power_fail_edge(&std::fs::read(&sidecar).unwrap())
+            .expect("the sidecar copy is durable and valid");
+        assert!(sidecar_edge > 0, "the sidecar carries the edge timestamp");
 
         // Poll the segment until the durable PowerFailing marker appears.
         let seg = dir.join("wal-000001.plr");
@@ -621,6 +788,7 @@ mod linux_tests {
         let flag = std::sync::Arc::clone(&done);
         // A best-effort hook that blocks for a long time.
         let response = WalChannelResponse::new(
+            dir.join("power_fail.bin"),
             tx.clone(),
             Box::new(move || {
                 std::thread::sleep(Duration::from_secs(2));
@@ -650,6 +818,54 @@ mod linux_tests {
         assert_eq!(handle.join().unwrap(), WatcherOutcome::Fired);
         tx.send(WalCmd::Shutdown).unwrap();
         wal.join().unwrap().unwrap();
+    }
+
+    /// **The MAJOR-1 property: the sidecar copy is durable without the WAL
+    /// channel draining at all.** With a full channel and no consumer, the
+    /// blocking WAL send hangs — yet the sidecar (written first, on the
+    /// watcher's own fd) becomes durable quickly, proving the exact-T fact
+    /// no longer waits on the FIFO drain a stalling disk backs up. Reports
+    /// the sidecar's worst-ish latency.
+    #[test]
+    fn the_sidecar_copy_is_durable_without_the_wal_channel_draining() {
+        let dir = temp_dir("sidecar-independent");
+        let sidecar = dir.join("power_fail.bin");
+        // Capacity-1 channel with NO draining consumer; fill the slot so the
+        // marker's blocking send hangs indefinitely.
+        let (tx, rx) = std::sync::mpsc::sync_channel::<WalCmd>(1);
+        tx.send(WalCmd::Heartbeat(None)).unwrap(); // fills the one slot
+
+        let mut response = WalChannelResponse::new(sidecar.clone(), tx.clone(), Box::new(|| {}));
+        let start = Instant::now();
+        // mandatory() writes the sidecar, THEN blocks on the full channel.
+        let handle = std::thread::spawn(move || response.mandatory(777_000_000));
+
+        wait_until(Duration::from_secs(2), || {
+            std::fs::read(&sidecar)
+                .ok()
+                .and_then(|b| super::decode_power_fail_edge(&b))
+                .is_some()
+        });
+        let sidecar_latency = start.elapsed();
+        eprintln!("power-fail sidecar durable (WAL channel backlogged, never draining): {sidecar_latency:?}");
+        assert_eq!(
+            super::decode_power_fail_edge(&std::fs::read(&sidecar).unwrap()),
+            Some(777_000_000),
+            "the sidecar holds the edge even though the WAL send is still blocked"
+        );
+        assert!(
+            sidecar_latency < Duration::from_millis(500),
+            "sidecar durability must not wait on the drain: {sidecar_latency:?}"
+        );
+        assert!(
+            !handle.is_finished(),
+            "mandatory() must still be blocked on the full channel — proving the \
+             sidecar did NOT depend on the drain"
+        );
+        // Release the blocked send so the thread can finish.
+        let _ = rx.recv(); // frees a slot -> the marker send completes
+        let _ = rx.recv(); // consume the marker
+        handle.join().unwrap();
     }
 
     fn power_failing_marker_present(segment: &std::path::Path) -> bool {

@@ -292,6 +292,17 @@ impl Config {
         self.wal_dir.join("receive_seq.bin")
     }
 
+    /// The power-fail sidecar path (not configurable; lives next to the
+    /// segments like the other sidecars). The power-fail watcher
+    /// (`crate::powerfail`) writes the edge timestamp here as its first,
+    /// channel-bypassing durability copy; recovery reads it back
+    /// (epoch-admitted like the heartbeat file). Basename must match
+    /// `crate::scan::POWER_FAIL_FILE_NAME`.
+    #[must_use]
+    pub fn power_fail_sidecar_file(&self) -> PathBuf {
+        self.wal_dir.join("power_fail.bin")
+    }
+
     /// Reads and parses a config file.
     pub fn load(path: &Path) -> Result<Self, String> {
         let text = std::fs::read_to_string(path)

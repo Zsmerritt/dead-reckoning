@@ -438,6 +438,11 @@ pub fn detect(wal_dir: &Path, heartbeat_path: &Path, detected_wall_ns: u64) -> D
     };
     let heartbeat = scan::load_heartbeat(heartbeat_path).ok();
     let receive_seq = scan::load_receive_seq(&wal_dir.join(scan::RECEIVE_SEQ_FILE_NAME));
+    // The power-fail sidecar (the watcher's channel-bypassing edge copy):
+    // the exact-T fact for boot-time classification, epoch-admitted inside
+    // reconstruct exactly like the heartbeat file.
+    let power_fail_edge_mono_ns =
+        scan::load_power_fail_edge(&wal_dir.join(scan::POWER_FAIL_FILE_NAME));
     // No file tail for the *classification*: it must stay cheap and
     // independent of the print file's availability. The completion gate
     // below does read a byte-capped tail, but only after classification
@@ -447,6 +452,7 @@ pub fn detect(wal_dir: &Path, heartbeat_path: &Path, detected_wall_ns: u64) -> D
         heartbeat: heartbeat.as_ref(),
         file_tail: None,
         receive_seq,
+        power_fail_edge_mono_ns,
     };
     let recovery =
         match plr_reconstruct::reconstruct(&inputs, &crate::convert::reconstruct_config(None)) {
@@ -2130,6 +2136,7 @@ mod tests {
             heartbeat: None,
             file_tail: None,
             receive_seq: None,
+            power_fail_edge_mono_ns: None,
         };
         let outcome =
             plr_reconstruct::reconstruct(&inputs, &crate::convert::reconstruct_config(None))

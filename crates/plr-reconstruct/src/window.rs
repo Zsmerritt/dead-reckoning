@@ -422,33 +422,33 @@ fn classify(
     if timeline.clean_shutdown {
         return CrashClass::CleanShutdown;
     }
-    if let Some(mono_ns) = timeline.socket_lost_tail {
-        return CrashClass::ShutdownPowerRetained {
-            evidence: ShutdownEvidence::SocketLostMarker { mono_ns },
-        };
-    }
-    // A tail power-fail GPIO edge is the cause of death itself, so it is
-    // decisive power-loss evidence and overrides the quiet-tail
-    // *inference* below. Without this, a power cut during a long dwell
-    // (motion stopped seconds ago, heartbeats kept beating until the edge)
-    // would satisfy `quiet_ns > quiet_tail_ns` and be misread as a
-    // power-*retained* klippy/MCU shutdown — the wrong cause, and the wrong
-    // downstream policy for a bed that was in fact losing power. It is
-    // placed AFTER the socket-loss marker on purpose: a dropped API socket
-    // is an earlier, more specific story (the recorder outlived klippy),
-    // and the power-fail edge does not contradict it. The resulting class
-    // is the ordinary `HostDeathOrPowerLoss`, which runs the full forward
+    // A tail power-fail GPIO edge is the cause of death itself: decisive
+    // power-loss evidence. It is checked FIRST among the unclean classes —
+    // ahead of the socket-loss marker — because asserting
+    // `ShutdownPowerRetained` (power was RETAINED) against a hold-up edge
+    // that says power was FAILING is a direct contradiction. That race is
+    // reachable: klippy's API socket can drop in the same millisecond band
+    // as the watcher's own edge (both happen as the rail browns out). When
+    // both are present, the power-fail edge wins. The resulting class is the
+    // ordinary `HostDeathOrPowerLoss`, which runs the full forward
     // extension, so this only ever corrects a classification — it never
-    // narrows the stop set. `CrashClass` is deliberately left unchanged
-    // (it is matched exhaustively outside this crate); the exact-T fact is
-    // carried into the *window arithmetic* by the frontier cap
-    // (`crate::stopset`), not by a new class.
+    // narrows the stop set (and it overrides the quiet-tail *inference*
+    // below, which would otherwise misread a power cut during a long dwell
+    // as a power-retained shutdown). `CrashClass` is deliberately left
+    // unchanged (it is matched exhaustively outside this crate); the exact-T
+    // fact reaches the *window arithmetic* via the frontier cap
+    // (`crate::stopset`), not a new class.
     if timeline.power_failing_tail().is_some() {
         return CrashClass::HostDeathOrPowerLoss {
             torn_tail: matches!(
                 timeline.scan_end,
                 ScanEnd::TruncatedFrameHeader | ScanEnd::TruncatedPayload
             ),
+        };
+    }
+    if let Some(mono_ns) = timeline.socket_lost_tail {
+        return CrashClass::ShutdownPowerRetained {
+            evidence: ShutdownEvidence::SocketLostMarker { mono_ns },
         };
     }
     if let Some(last_motion) = timeline.last_motion_mono_ns {
@@ -727,22 +727,68 @@ mod tests {
     }
 
     #[test]
-    fn a_spurious_power_fail_marker_does_not_change_classification() {
-        // A false edge mid-print (motion postdates it) is not a tail fact,
-        // so classification is exactly what it would be without the marker:
-        // here, an ordinary HostDeathOrPowerLoss (motion is recent).
-        let timeline = ingest_records(vec![
+    fn a_neutralized_power_fail_marker_does_not_change_classification() {
+        // A false edge that liveness outlived past the margin (motion AND a
+        // heartbeat 4 s after a 1 s edge) is neutralized, so classification
+        // is exactly what it would be without the marker at all.
+        let records = vec![
+            WalRecord::TrapqSegment(trapq_segment("toolhead", 9.0, 0.5, 5_000_000_000)),
+            WalRecord::Heartbeat(heartbeat_at(5_000_000_000, 10.0)),
+        ];
+        let mut with_edge = records.clone();
+        with_edge.insert(
+            0,
             WalRecord::Marker(Marker {
-                mono_ns: 1_050_000_000,
+                mono_ns: 1_000_000_000,
                 kind: MarkerKind::PowerFailing,
             }),
-            WalRecord::TrapqSegment(trapq_segment("toolhead", 9.0, 0.5, 1_100_000_000)),
-            WalRecord::Heartbeat(heartbeat_at(1_200_000_000, 10.0)),
+        );
+        let without = compute_stop_window(&ingest_records(records), None, &cfg())
+            .unwrap()
+            .class;
+        let timeline = ingest_records(with_edge);
+        assert_eq!(
+            timeline.power_failing_tail(),
+            None,
+            "liveness 4 s past a 1 s edge must neutralize it"
+        );
+        let with_ = compute_stop_window(&timeline, None, &cfg()).unwrap().class;
+        assert_eq!(
+            with_, without,
+            "a neutralized edge must not change the class"
+        );
+        assert_eq!(with_, CrashClass::HostDeathOrPowerLoss { torn_tail: false });
+    }
+
+    /// **MINOR precedence fix + race.** A tail `SocketLost` and a tail
+    /// `PowerFailing` in the same millisecond band (klippy's socket dropping
+    /// as the rail browns out): the power-fail edge WINS. Asserting
+    /// `ShutdownPowerRetained` — power RETAINED — against a hold-up edge
+    /// saying power was FAILING would be a contradiction.
+    #[test]
+    fn a_tail_power_fail_edge_beats_a_tail_socket_lost() {
+        let timeline = ingest_records(vec![
+            WalRecord::TrapqSegment(trapq_segment("toolhead", 9.0, 0.5, 1_000_000_000)),
+            WalRecord::Heartbeat(heartbeat_at(1_100_000_000, 10.0)),
+            // Socket drops, then the power-fail edge, both after motion.
+            WalRecord::Marker(Marker {
+                mono_ns: 1_200_000_000,
+                kind: MarkerKind::SocketLost,
+            }),
+            WalRecord::Marker(Marker {
+                mono_ns: 1_200_500_000,
+                kind: MarkerKind::PowerFailing,
+            }),
         ]);
+        // Both tail facts are present...
+        assert_eq!(timeline.socket_lost_tail, Some(1_200_000_000));
+        assert_eq!(timeline.power_failing_tail(), Some(1_200_500_000));
+        // ...and the power-fail edge decides the class.
         let window = compute_stop_window(&timeline, None, &cfg()).unwrap();
         assert_eq!(
             window.class,
-            CrashClass::HostDeathOrPowerLoss { torn_tail: false }
+            CrashClass::HostDeathOrPowerLoss { torn_tail: false },
+            "a power-fail tail must never yield a power-retained class"
         );
     }
 
