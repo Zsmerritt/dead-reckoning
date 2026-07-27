@@ -146,6 +146,14 @@ struct Service {
     dirty: bool,
     batch_deadline: Option<Instant>,
     next_heartbeat: Instant,
+    /// Set once a [`plr_wal::MarkerKind::PowerFailing`] marker has been
+    /// processed. From then on, heartbeat *beats* (file and WAL record
+    /// both) are suppressed: a daemon that has journaled "power failing"
+    /// must not keep asserting liveness against its own declaration while
+    /// it drains on hold-up power — those late durable beats would postdate
+    /// `edge + margin` and neutralize the very edge just recorded. The
+    /// drain of queued records continues; only new beats stop.
+    power_failing_seen: bool,
 }
 
 impl Service {
@@ -204,6 +212,7 @@ impl Service {
             dirty: false,
             batch_deadline: None,
             next_heartbeat,
+            power_failing_seen: false,
         })
     }
 
@@ -257,7 +266,12 @@ impl Service {
                 );
                 self.append(&record, sync)?;
                 if power_failing {
+                    // The one final beat at edge time (mono ~= edge, within
+                    // the hold-up margin, so it does NOT neutralize).
                     self.force_heartbeat_sync()?;
+                    // From here on, suppress all further beats: the drain
+                    // continues, the death-throes beats stop (MINOR-A).
+                    self.power_failing_seen = true;
                 }
                 Ok(())
             }
@@ -373,6 +387,14 @@ impl Service {
     }
 
     fn heartbeat_tick(&mut self) -> Result<(), WalSvcError> {
+        // Once power-failing is journaled, stop beating (file and WAL
+        // record): the drain continues on hold-up power but the daemon
+        // must not keep asserting liveness against its own PowerFailing
+        // declaration — a late durable beat past `edge + margin` would
+        // neutralize the genuine edge (MINOR-A).
+        if self.power_failing_seen {
+            return Ok(());
+        }
         // No correlation sample yet (or paused after a socket loss): no
         // liveness claim.
         let Some(heartbeat) = self.write_heartbeat_slot()? else {
@@ -1117,6 +1139,80 @@ mod tests {
             )
         });
         assert!(has_marker, "the PowerFailing marker must be journaled");
+    }
+
+    /// **MINOR-A.** After a `PowerFailing` marker, heartbeats stop (file
+    /// and WAL record both) even though the service keeps draining: a
+    /// daemon that declared the rail failing must not keep asserting
+    /// liveness against its own declaration, or a late beat past
+    /// `edge + margin` would neutralize the genuine edge. The forced beat
+    /// at edge time is the last one.
+    #[test]
+    fn power_failing_suppresses_further_heartbeats_during_the_drain() {
+        let dir = temp_dir("powerfail-suppress");
+        let (tx, rx) = sync_channel(64);
+        let mut c = cfg(&dir, false, 1 << 20);
+        c.heartbeat_period = Duration::from_millis(5);
+        let handle = spawn(c, rx);
+        let hb_path = dir.join("heartbeat.bin");
+        send(&tx, WalCmd::Heartbeat(Some(heartbeat_data())));
+        await_heartbeat(&hb_path, 0);
+        let seq_before = recover_heartbeat(&std::fs::read(&hb_path).unwrap())
+            .unwrap()
+            .heartbeat
+            .sequence;
+
+        // Journal power-failing. Its handler forces exactly ONE final beat
+        // (seq_before + 1) and then sets the suppression flag.
+        send(
+            &tx,
+            WalCmd::Append {
+                record: WalRecord::Marker(Marker {
+                    mono_ns: 42,
+                    kind: MarkerKind::PowerFailing,
+                }),
+                sync: SyncPolicy::Immediate,
+            },
+        );
+        // Observing the forced beat proves the marker was processed and the
+        // flag is now set (channel is FIFO).
+        await_heartbeat(&hb_path, seq_before + 1);
+        let seq_frozen = recover_heartbeat(&std::fs::read(&hb_path).unwrap())
+            .unwrap()
+            .heartbeat
+            .sequence;
+
+        // Give the timer many periods to (wrongly) beat again. A sleep in
+        // the SAFE direction: more time only makes a regression more likely
+        // to be caught (same pattern as the pause test).
+        std::thread::sleep(Duration::from_millis(80));
+        let seq_later = recover_heartbeat(&std::fs::read(&hb_path).unwrap())
+            .unwrap()
+            .heartbeat
+            .sequence;
+        assert_eq!(
+            seq_frozen, seq_later,
+            "heartbeats must stop after the PowerFailing marker (drain continues, beats do not)"
+        );
+
+        send(&tx, WalCmd::Shutdown);
+        handle.join().unwrap().unwrap();
+
+        // And no WAL heartbeat *record* follows the marker in the log.
+        let result = scan_segment(&dir, 1);
+        let marker_idx = result
+            .records
+            .iter()
+            .position(
+                |r| matches!(&r.record, WalRecord::Marker(m) if m.kind == MarkerKind::PowerFailing),
+            )
+            .expect("the PowerFailing marker must be journaled");
+        assert!(
+            !result.records[marker_idx + 1..]
+                .iter()
+                .any(|r| matches!(r.record, WalRecord::Heartbeat(_))),
+            "no heartbeat record may follow the PowerFailing marker"
+        );
     }
 
     #[test]

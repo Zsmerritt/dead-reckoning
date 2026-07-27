@@ -230,11 +230,27 @@ pub(crate) fn load_receive_seq(path: &Path) -> Option<ReceiveSeqObservation> {
     })
 }
 
-/// Loads the power-fail sidecar (edge `mono_ns`) without printing; `None`
-/// when absent, torn, or foreign — the conservative direction (a missing
-/// edge only widens reconstruction). `crate::powerfail` owns the codec.
+/// Loads the power-fail sidecar (edge `mono_ns`); `None` when absent,
+/// torn, or foreign — the conservative direction (a missing edge only
+/// widens reconstruction). `crate::powerfail` owns the codec.
+///
+/// A file that is PRESENT but does not decode (torn/foreign/zeroed) is a
+/// data-quality event, so it is logged naming the file — per project
+/// convention — while still returning the safe `None`. A genuinely absent
+/// file logs nothing (the common, expected case).
 pub(crate) fn load_power_fail_edge(path: &Path) -> Option<u64> {
-    crate::powerfail::decode_power_fail_edge(&std::fs::read(path).ok()?)
+    let bytes = std::fs::read(path).ok()?;
+    let edge = crate::powerfail::decode_power_fail_edge(&bytes);
+    if edge.is_none() {
+        // Present but undecodable: a data-quality event, logged naming the
+        // file (per project convention) while still returning the safe None.
+        eprintln!(
+            "plrd: power-fail sidecar {} is present but unreadable \
+             (torn/foreign/zeroed); ignoring it",
+            path.display()
+        );
+    }
+    edge
 }
 
 /// The half-open `[start, end)` index range of the crash epoch within a

@@ -81,6 +81,26 @@ pub fn run(config_path: &Path) -> u8 {
     // executes anything — it only writes a state file and announces.
     let announcement = boot_detection(&config);
 
+    // Power-fail sidecar lifecycle: it is a WRITE-ONCE event file, so once
+    // this boot's detection has CONSUMED it (the read happens inside
+    // `boot_detection` above, via `detect` -> `scan::load_power_fail_edge`),
+    // it must be deleted — a consumed genuine edge already lives on in
+    // detection's output (`pending_recovery.json`), and a stale/inert file
+    // left behind would poison a LATER crash's early-uptime reconstruction
+    // (the admission band's tail-anchor plus this deletion together close
+    // that hazard). Ordering is load-bearing: this runs strictly AFTER the
+    // read above and never before it, so a genuine edge is never dropped
+    // before it is used. Failure to delete is logged, never fatal — the
+    // same posture as the `pending_recovery.json` clear sites.
+    if let Err(e) = std::fs::remove_file(config.power_fail_sidecar_file()) {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            eprintln!(
+                "plrd: could not delete consumed power-fail sidecar {} (continuing): {e}",
+                config.power_fail_sidecar_file().display()
+            );
+        }
+    }
+
     // WAL retention: prune superseded old sessions down to the configured
     // cap. This MUST run here — after boot detection (which also reads the
     // previous session's tail) and BEFORE the WAL service spawns — so the
