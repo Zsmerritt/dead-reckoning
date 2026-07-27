@@ -3110,6 +3110,9 @@ fn build_preview_spec(
         z_max: ctx.machine.axis_limits.z_max,
         cool_nozzle_temp: entry.cool_nozzle_temp,
         travel_feed: ctx.cfg.travel_feed,
+        // Copied verbatim from the analyzer set, which the pipeline
+        // annotated with the absolute-frame-valid slicer mark (or `None`).
+        corroborating_layer_mark: set.corroborating_layer_mark,
     })
 }
 

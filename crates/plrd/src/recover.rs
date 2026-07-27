@@ -379,6 +379,9 @@ impl FrameGuard for MarkerFrameGuard {
             // unverifiable. An abort later overwrites this with the real
             // reason; if nothing ever runs again, THIS is the record.
             reason: "shifted-frame-declared".to_owned(),
+            // Monotonic arming time, comparable to the WAL's PowerFailing
+            // edge on the next boot (see `FrameInvalid::arm_mono_ns`).
+            arm_mono_ns: arm_mono_ns(),
         };
         crate::detect::write_frame_invalid(&self.wal_dir, &marker).map_err(|e| e.to_string())
     }
@@ -390,6 +393,30 @@ fn wall_ns() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX))
+}
+
+/// The host monotonic clock (`CLOCK_MONOTONIC`) at interlock-arm time, on
+/// the SAME axis the WAL's `PowerFailing` markers use, so a later boot can
+/// tell whether a reconstructed power-fail edge postdates the arming.
+///
+/// Only the Linux production build has `hostclock` (the daemon is a Linux
+/// daemon; the cross-platform build exists to keep this logic testable, not
+/// to be deployed). On any other target this is `None` and the postdates
+/// check degrades to the reason + power-fail evidence — see
+/// [`crate::detect::interrupted_by_power_fail`].
+// The Linux arm is always `Some`; the `None` arm is a different target's
+// body, invisible to clippy on this compile — the Option is load-bearing
+// cross-platform, not an unnecessary wrap.
+#[allow(clippy::unnecessary_wraps)]
+fn arm_mono_ns() -> Option<u64> {
+    #[cfg(target_os = "linux")]
+    {
+        Some(crate::hostclock::now_mono_ns())
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
 }
 
 /// The non-interactive gate used by the control socket (Linux-only
@@ -656,6 +683,7 @@ fn record_frame_invalid(
         step_id,
         phase: phase.to_owned(),
         reason: reason.to_owned(),
+        arm_mono_ns: None,
     };
     // A RE-ASSERT, not the only writer. `MarkerFrameGuard` wrote this
     // marker BEFORE the declare was issued, and refused to issue it at
@@ -2066,6 +2094,7 @@ mod tests {
             step_id: 7,
             phase: "shifted-frame".to_owned(),
             reason: "shifted-frame-not-declared".to_owned(),
+            arm_mono_ns: None,
         };
         crate::detect::write_frame_invalid(&config.wal_dir, &marker).unwrap();
 

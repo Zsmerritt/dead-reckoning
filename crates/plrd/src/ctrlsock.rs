@@ -1621,6 +1621,8 @@ mod tests {
             percent: Some(50.0),
             crash_class: "HostDeathOrPowerLoss".to_owned(),
             frame_invalid: false,
+            power_fail_edge_mono_ns: None,
+            interrupted_by: None,
         };
         crate::detect::write_pending(&config.wal_dir, &pending).unwrap();
         let (path, _state) = spawn_server("status", config);
@@ -2787,6 +2789,13 @@ mod tests {
         assert!(detail["z"].as_f64().is_some(), "z: {pause}");
         // `layer` is u32 or null; `feature` is the FeatureClass Debug string.
         assert!(detail.get("layer").is_some(), "layer key: {pause}");
+        // `layer_provenance` is "journal" | "inferred" | null (the
+        // layer-provenance follow-up): present whenever `layer` is, null
+        // when the stop has no layer or no valid corroborating mark.
+        assert!(
+            detail.get("layer_provenance").is_some(),
+            "layer_provenance key: {pause}"
+        );
         assert!(detail["feature"].as_str().is_some(), "feature: {pause}");
         assert!(
             detail["on_infill"].as_bool().is_some(),
@@ -2806,6 +2815,13 @@ mod tests {
             detail["acceptable"].as_bool().is_some(),
             "acceptable: {pause}"
         );
+        // `at_boundary` is "first" | "last" | "only" | null (the
+        // boundary-nudge follow-up): present every pause, null in the
+        // interior, "only" for a single-stop set.
+        assert!(
+            detail.get("at_boundary").is_some(),
+            "at_boundary key: {pause}"
+        );
     }
 
     /// The full resume-preview conversation over the real socket (design
@@ -2824,8 +2840,10 @@ mod tests {
         )
         .await;
 
-        // Open on the preview: kind "preview", the 12-field detail map, and
-        // the mirror agrees.
+        // Open on the preview: kind "preview", the 14-field detail map
+        // (12 original + `layer_provenance` + `at_boundary`, the
+        // layer-provenance and boundary-nudge follow-ups), and the mirror
+        // agrees.
         let p1 = roundtrip(&path, EXECUTE_ASK).await;
         assert_eq!(
             p1["data"]["outcome"],

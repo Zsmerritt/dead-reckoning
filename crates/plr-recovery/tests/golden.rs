@@ -465,6 +465,7 @@ fn fixture_preview_set() -> PreviewSet {
         first_index: 0,
         mid_index: 0,
         last_index: 1,
+        corroborating_layer_mark: None,
     }
 }
 

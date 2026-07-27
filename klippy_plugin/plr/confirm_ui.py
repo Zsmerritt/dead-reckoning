@@ -39,7 +39,7 @@ THE RESUME-PREVIEW ``detail`` CONTRACT — crates/plrd/src/executor.rs
 ``preview_detail`` is the producer, and every field it emits is read here
 BYTE-FOR-BYTE (agent-contract discipline: never read a field the producer
 does not send; this project's worst plugin bug was reading fields that did
-not exist).  The 12 fields, with their Rust source types::
+not exist).  The 14 fields, with their Rust source types::
 
     offset             u64   this deposition line's byte offset (M26-safe);
                              updates every reposition — the alignment
@@ -52,13 +52,16 @@ not exist).  The 12 fields, with their Rust source types::
                              nudge moves xy while offset holds (design §12)
     z                  f64   this stop's deposition Z (NOT the hover plane)
     layer              u32 | null   layer active at the move; null before
-                             the first deposition.  There is NO field
-                             distinguishing a journal-confirmed layer from
-                             an inferred one — the producer carries only
-                             presence/absence, so this renderer states the
-                             layer when marked and says so when it is not,
-                             and never labels a provenance the wire does not
-                             carry
+                             the first deposition
+    layer_provenance   str | null   "journal" when ``layer`` is corroborated
+                             by a journaled slicer mark
+                             (plr_wal::Context::current_layer, an upper bound
+                             on the physical layer, validated under the
+                             absolute-frame rule), "inferred" when derived
+                             from the model alone, null when there is no
+                             layer.  ABSENT on an old daemon that predates the
+                             field — the renderer then states the layer with
+                             no provenance claim, never inventing "journal"
     feature            str   FeatureClass Debug name (see _FEATURE_LABELS)
     on_infill          bool  the stop's line is internal/solid infill
     is_candidate       bool  the stop matched the crash evidence (vs a
@@ -72,6 +75,15 @@ not exist).  The 12 fields, with their Rust source types::
     acceptable         bool  false for a stop with no resumable line (empty
                              entry moves); the executor also refuses accept
                              on it, so the dialog renders it non-acceptable
+    at_boundary        str | null   "first" when the cursor is on the
+                             earliest stop, "last" on the final one, "only"
+                             when the set has a single stop (both boundaries
+                             at once), null in between.  A ±nudge past a
+                             boundary CLAMPS and re-emits the same stop; the
+                             renderer states this so the operator learns why
+                             nothing changed rather than seeing a
+                             byte-identical prompt.  ABSENT on an old daemon
+                             predating the field
 
 THE THREE-PART REQUIREMENT.  Every rendered confirmation says WHY it
 stopped, SUGGESTS a fix, and OFFERS to continue anyway — in the dialog
@@ -413,6 +425,24 @@ def _feature_text(value):
     return _FEATURE_LABELS.get(name, name)
 
 
+def _provenance_suffix(value):
+    """ " (confirmed by the slicer's layer mark)" / " (inferred from the
+    model)" / "" for the ``layer_provenance`` wire field.
+
+    Only the two values the producer documents are rendered; an absent field
+    (an old daemon) or any unrecognized value yields the empty suffix — the
+    layer is then stated with no provenance claim rather than a guessed one
+    (agent-contract discipline: never label a provenance the wire does not
+    carry).
+    """
+    provenance = _text(value)
+    if provenance == "journal":
+        return " (confirmed by the slicer's layer mark)"
+    if provenance == "inferred":
+        return " (inferred from the model)"
+    return ""
+
+
 def preview_position_line(detail):
     """ "stop N of M" — the rep-position headline, best effort.
 
@@ -470,14 +500,18 @@ def preview_detail_lines(detail):
         where.append("plrd did not report a hover XY")
     lines.append("Position: %s." % ("; ".join(where),))
 
-    # Layer + feature.  The layer is stated when marked and admitted when
-    # not; there is no journal-confirmed/inferred provenance in the wire,
-    # so none is claimed.
+    # Layer + feature.  When a layer is marked its PROVENANCE is stated
+    # honestly from the wire's ``layer_provenance``: "journal" (corroborated
+    # by the slicer's layer mark) vs "inferred" (from the model alone).  An
+    # old daemon predating the field sends nothing here — ``_provenance``
+    # is then None and the layer is stated with no provenance claim, never a
+    # fabricated "journal" (agent-contract discipline).
     layer = _preview_int(detail.get("layer"))
     feature = _feature_text(detail.get("feature"))
     facts = []
     if layer is not None:
-        facts.append("layer %d" % (layer,))
+        suffix = _provenance_suffix(detail.get("layer_provenance"))
+        facts.append("layer %d%s" % (layer, suffix))
     else:
         facts.append("layer not yet marked (before the first layer change)")
     if feature is not None:
@@ -521,6 +555,27 @@ def preview_detail_lines(detail):
             "This stop cannot be accepted — nothing remains to print past "
             "it. Nudge or step to a stop with printing still ahead, then "
             "accept that one."
+        )
+
+    # Boundary notice: a nudge past the first/last stop CLAMPS and re-emits
+    # this same stop, so without this the prompt would look byte-identical
+    # and the operator could not tell the nudge did nothing.  Stated from the
+    # wire's ``at_boundary`` ("first"/"last"); absent/null -> nothing.
+    at_boundary = _text(detail.get("at_boundary"))
+    if at_boundary == "first":
+        lines.append(
+            "You are at the FIRST stop — a backward nudge or Prev cannot go "
+            "earlier (it stays here)."
+        )
+    elif at_boundary == "last":
+        lines.append(
+            "You are at the LAST stop — a forward nudge or Next cannot go "
+            "further (it stays here)."
+        )
+    elif at_boundary == "only":
+        lines.append(
+            "This is the ONLY stop — there is nowhere to nudge or step to "
+            "(any nudge, Next, or Prev stays here)."
         )
     return lines
 

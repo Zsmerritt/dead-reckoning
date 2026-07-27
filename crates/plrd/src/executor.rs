@@ -1406,6 +1406,28 @@ fn preview_detail(spec: &plr_recovery::PreviewSpec, cursor: usize) -> Value {
         "xy": [cur.xy[0], cur.xy[1]],
         "z": cur.z,
         "layer": cur.layer,
+        // Provenance of `layer`: "journal" when corroborated by a journaled
+        // slicer mark (`plr_wal::Context::current_layer`), "inferred" when
+        // derived from the model alone, null when the stop has no layer. The
+        // mark is an UPPER BOUND on the physical layer (parse leads
+        // execution), so a stop's layer `L` is journal-corroborated only
+        // when a valid mark exists (`spec.corroborating_layer_mark` — the
+        // pipeline set it Some ONLY when the slicer emitted a mark AND the
+        // model spans from file start so the absolute-vs-window comparison
+        // is semantically valid, `WindowLayers::mark_is_consistent`'s
+        // absolute-frame rule) AND `L <= mark`. A layer ABOVE the mark, or a
+        // withheld mark (mid-file model / no mark), yields "inferred" — the
+        // wire never fabricates a provenance the mark does not support.
+        "layer_provenance": match cur.layer {
+            None => Value::Null,
+            Some(layer) => {
+                if spec.corroborating_layer_mark.is_some_and(|mark| layer <= mark) {
+                    json!("journal")
+                } else {
+                    json!("inferred")
+                }
+            }
+        },
         // Feature class name (infill/wall/...) for the prompt.
         "feature": format!("{:?}", cur.feature),
         "on_infill": cur.on_infill,
@@ -1424,6 +1446,24 @@ fn preview_detail(spec: &plr_recovery::PreviewSpec, cursor: usize) -> Value {
         "acceptable": spec
             .binding(cursor_u32(cursor))
             .is_some_and(|b| !b.entry_commands.is_empty()),
+        // "first" when the cursor sits on the earliest stop, "last" on the
+        // final one, "only" when the set has a SINGLE stop (both boundaries
+        // at once — a nudge in EITHER direction clamps, so first-vs-last
+        // advice would be direction-wrong), else null. A ±1/±10 nudge past a
+        // boundary CLAMPS (the loop's `clamp` keeps the cursor in range),
+        // re-emitting this same stop; the plugin reads this so the operator
+        // learns WHY nothing changed instead of seeing a byte-identical
+        // prompt. Emitted EVERY pause (an always-present readout, not a
+        // nudge-triggered one) — honest even on the first open.
+        "at_boundary": if spec.stops.len() <= 1 {
+            json!("only")
+        } else if cursor == 0 {
+            json!("first")
+        } else if cursor + 1 == spec.stops.len() {
+            json!("last")
+        } else {
+            Value::Null
+        },
     })
 }
 
@@ -3904,7 +3944,82 @@ pub(crate) mod tests {
             z_max: Some(300.0),
             cool_nozzle_temp: 150.0,
             travel_feed: 6000.0,
+            // No corroborating mark by default: every stop's layer reads as
+            // model-inferred. `layer_provenance_reflects_the_corroborating_mark`
+            // overrides this to exercise the journal path.
+            corroborating_layer_mark: None,
         }
+    }
+
+    #[test]
+    fn layer_provenance_reflects_the_corroborating_mark() {
+        // Every fixture stop is layer 1. The `layer_provenance` wire field
+        // is "journal" ONLY when a valid slicer mark corroborates the
+        // layer (`layer <= mark`, the upper-bound rule), "inferred"
+        // otherwise, and null when the stop has no layer.
+        let mut spec = preview_spec();
+
+        // No corroborating mark (mid-file model / no slicer mark): inferred.
+        spec.corroborating_layer_mark = None;
+        assert_eq!(
+            super::preview_detail(&spec, 0)["layer_provenance"],
+            json!("inferred")
+        );
+
+        // Mark at or above the layer: journal-corroborated.
+        spec.corroborating_layer_mark = Some(1);
+        assert_eq!(
+            super::preview_detail(&spec, 0)["layer_provenance"],
+            json!("journal")
+        );
+        spec.corroborating_layer_mark = Some(5);
+        assert_eq!(
+            super::preview_detail(&spec, 0)["layer_provenance"],
+            json!("journal")
+        );
+
+        // Mark BELOW the layer: geometry above the upper bound is the
+        // physically-impossible case — never labelled journal.
+        spec.corroborating_layer_mark = Some(0);
+        assert_eq!(
+            super::preview_detail(&spec, 0)["layer_provenance"],
+            json!("inferred")
+        );
+
+        // No layer -> null, whatever the mark says.
+        spec.stops[0].layer = None;
+        spec.corroborating_layer_mark = Some(1);
+        assert_eq!(
+            super::preview_detail(&spec, 0)["layer_provenance"],
+            Value::Null
+        );
+    }
+
+    #[test]
+    fn at_boundary_marks_only_the_endpoint_cursors() {
+        // The three-stop fixture: cursor 0 is "first", cursor 2 is "last",
+        // cursor 1 is interior (null). This is what a clamped nudge re-emits
+        // so the plugin can say "nothing changed".
+        let spec = preview_spec();
+        assert_eq!(
+            super::preview_detail(&spec, 0)["at_boundary"],
+            json!("first")
+        );
+        assert_eq!(super::preview_detail(&spec, 1)["at_boundary"], Value::Null);
+        assert_eq!(
+            super::preview_detail(&spec, 2)["at_boundary"],
+            json!("last")
+        );
+
+        // A SINGLE-stop set is BOTH boundaries at once -> "only", never
+        // "first" (a forward clamped nudge on a lone stop must not render
+        // backward-direction advice).
+        let mut lone = preview_spec();
+        lone.stops.truncate(1);
+        assert_eq!(
+            super::preview_detail(&lone, 0)["at_boundary"],
+            json!("only")
+        );
     }
 
     fn resume_preview_step(id: u32) -> RecoveryStep {

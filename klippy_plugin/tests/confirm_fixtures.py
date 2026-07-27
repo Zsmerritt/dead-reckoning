@@ -75,6 +75,11 @@ def expected(quantity="extruder.temperature", low=55.0, high=65.0, unit="C"):
 # can really send.
 _KEEP = object()
 
+# Distinct sentinel for "the producer omits this key entirely" (an old
+# daemon), kept apart from JSON null (a value plrd can really send) so a
+# fixture can model both cases.
+_OMIT = object()
+
 
 def pause_data(
     kind="diagnosis",
@@ -191,6 +196,7 @@ def preview_detail(
     xy=None,
     z=1.0,
     layer=42,
+    layer_provenance="journal",
     feature="InternalInfill",
     on_infill=True,
     is_candidate=True,
@@ -198,19 +204,23 @@ def preview_detail(
     count=5,
     before_skip_forward=False,
     acceptable=True,
+    at_boundary=None,
 ):
     """The resume-preview ``detail`` map (crates/plrd/src/executor.rs
     ``preview_detail``), field-for-field.
 
     Every field the producer emits is present: ``offset`` / ``resume_offset``
     (u64 byte offsets), ``xy`` ([f64; 2], Klipper-internal frame), ``z``
-    (f64, the stop's deposition Z), ``layer`` (u32 or JSON null — the
-    producer carries only presence, no journal/inferred provenance),
-    ``feature`` (the ``FeatureClass`` Debug name), ``on_infill`` /
-    ``is_candidate`` / ``before_skip_forward`` / ``acceptable`` (bools), and
-    ``position`` / ``count`` (1-based rep position).
+    (f64, the stop's deposition Z), ``layer`` (u32 or JSON null),
+    ``layer_provenance`` ("journal" | "inferred" | null — the layer-
+    provenance follow-up; pass ``_OMIT`` to model an old daemon that never
+    sends it), ``feature`` (the ``FeatureClass`` Debug name), ``on_infill`` /
+    ``is_candidate`` / ``before_skip_forward`` / ``acceptable`` (bools),
+    ``position`` / ``count`` (1-based rep position), and ``at_boundary``
+    ("first" | "last" | "only" | null — the boundary-nudge follow-up; pass
+    ``_OMIT`` to model an old daemon that never sends it).
     """
-    return {
+    detail = {
         "offset": offset,
         "resume_offset": resume_offset,
         "xy": [132.4, 88.1] if xy is None else xy,
@@ -223,7 +233,15 @@ def preview_detail(
         "count": count,
         "before_skip_forward": before_skip_forward,
         "acceptable": acceptable,
+        "at_boundary": at_boundary,
     }
+    # ``_OMIT`` models an old daemon that predates the field; anything else
+    # (including JSON null) is sent verbatim.
+    if layer_provenance is not _OMIT:
+        detail["layer_provenance"] = layer_provenance
+    if at_boundary is _OMIT:
+        del detail["at_boundary"]
+    return detail
 
 
 def preview_pause(token="plrc-17bd4c0f9a2-5", step=7, detail=_KEEP, **detail_kwargs):

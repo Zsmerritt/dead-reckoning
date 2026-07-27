@@ -534,6 +534,40 @@ def test_a_non_acceptable_stop_drops_accept_and_says_why():
     assert "not acceptable" in fallback
 
 
+def test_the_first_stop_says_a_backward_nudge_clamps():
+    body = "\n".join(preview_texts(fx.preview_pause(at_boundary="first")["data"]))
+    assert "FIRST stop" in body
+    assert "cannot go earlier" in body
+
+
+def test_the_last_stop_says_a_forward_nudge_clamps():
+    body = "\n".join(preview_texts(fx.preview_pause(at_boundary="last")["data"]))
+    assert "LAST stop" in body
+    assert "cannot go further" in body
+
+
+def test_the_only_stop_says_there_is_nowhere_to_go():
+    # A single-stop set is BOTH boundaries at once: the notice must not give
+    # first-vs-last (direction-specific) advice.
+    body = "\n".join(preview_texts(fx.preview_pause(at_boundary="only")["data"]))
+    assert "ONLY stop" in body
+    assert "nowhere to nudge" in body
+    assert "FIRST stop" not in body
+    assert "LAST stop" not in body
+
+
+def test_an_interior_stop_carries_no_boundary_notice():
+    body = "\n".join(preview_texts(fx.preview_pause(at_boundary=None)["data"]))
+    assert "FIRST stop" not in body
+    assert "LAST stop" not in body
+
+
+def test_an_old_daemon_without_at_boundary_shows_no_notice():
+    body = "\n".join(preview_texts(fx.preview_pause(at_boundary=fx._OMIT)["data"]))
+    assert "FIRST stop" not in body
+    assert "LAST stop" not in body
+
+
 def test_a_nudge_only_stop_is_labelled_reachable_by_nudging():
     body = "\n".join(preview_texts(fx.preview_pause(is_candidate=False)["data"]))
     assert "reachable only by nudging" in body
@@ -547,6 +581,45 @@ def test_an_unmarked_layer_is_admitted_not_invented():
     # And no provenance the wire does not carry.
     assert "journal-confirmed" not in body
     assert "inferred" not in body
+    assert "slicer's layer mark" not in body
+
+
+def test_a_journal_confirmed_layer_states_its_provenance():
+    body = "\n".join(
+        preview_texts(fx.preview_pause(layer=42, layer_provenance="journal")["data"])
+    )
+    assert "layer 42" in body
+    assert "confirmed by the slicer's layer mark" in body
+
+
+def test_an_inferred_layer_says_so():
+    body = "\n".join(
+        preview_texts(fx.preview_pause(layer=42, layer_provenance="inferred")["data"])
+    )
+    assert "layer 42" in body
+    assert "inferred from the model" in body
+
+
+def test_an_old_daemon_without_provenance_states_the_layer_plainly():
+    # The field is ABSENT (a daemon predating it): the layer is stated with
+    # no provenance claim — never a fabricated "journal".
+    body = "\n".join(
+        preview_texts(fx.preview_pause(layer=42, layer_provenance=fx._OMIT)["data"])
+    )
+    assert "layer 42" in body
+    assert "confirmed by the slicer" not in body
+    assert "inferred from the model" not in body
+
+
+def test_an_unrecognized_provenance_value_is_not_rendered():
+    # A value the contract does not define (a daemon that grows a third
+    # provenance) yields no claim rather than a guessed translation.
+    body = "\n".join(
+        preview_texts(fx.preview_pause(layer=42, layer_provenance="fabricated")["data"])
+    )
+    assert "layer 42" in body
+    assert "confirmed by the slicer" not in body
+    assert "inferred from the model" not in body
 
 
 def test_an_unknown_feature_name_is_shown_verbatim():
