@@ -1063,6 +1063,8 @@ mod tests {
             percent: None,
             crash_class: "x".to_owned(),
             frame_invalid: false,
+            power_fail_edge_mono_ns: None,
+            interrupted_by: None,
         };
         crate::detect::write_pending(&dir, &pending).unwrap();
         let pins = resolve_pins(&dir, &sessions);
@@ -1084,6 +1086,8 @@ mod tests {
             percent: None,
             crash_class: "x".to_owned(),
             frame_invalid: false,
+            power_fail_edge_mono_ns: None,
+            interrupted_by: None,
         };
         crate::detect::write_pending(&dir, &pending).unwrap();
         let pins = resolve_pins(&dir, &sessions);
@@ -1104,6 +1108,7 @@ mod tests {
                 step_id: 7,
                 phase: "declare_frame".to_owned(),
                 reason: "abort".to_owned(),
+                arm_mono_ns: None,
             },
         )
         .unwrap();
@@ -1128,6 +1133,8 @@ mod tests {
                 percent: None,
                 crash_class: "x".to_owned(),
                 frame_invalid: true,
+                power_fail_edge_mono_ns: None,
+                interrupted_by: None,
             },
         )
         .unwrap();
@@ -1138,6 +1145,7 @@ mod tests {
                 step_id: 7,
                 phase: "declare_frame".to_owned(),
                 reason: "abort".to_owned(),
+                arm_mono_ns: None,
             },
         )
         .unwrap();
@@ -1155,6 +1163,8 @@ mod tests {
             percent: None,
             crash_class: "x".to_owned(),
             frame_invalid: false,
+            power_fail_edge_mono_ns: None,
+            interrupted_by: None,
         }
     }
 
@@ -1499,6 +1509,8 @@ mod tests {
                     percent: None,
                     crash_class: "demo".to_owned(),
                     frame_invalid: false,
+                    power_fail_edge_mono_ns: None,
+                    interrupted_by: None,
                 },
             )
             .unwrap();

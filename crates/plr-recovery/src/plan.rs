@@ -1123,6 +1123,20 @@ pub struct PreviewSpec {
     /// hover plane, clear of all geometry, so the ordinary travel feed is
     /// safe.
     pub travel_feed: f64,
+    /// The slicer `current_layer` mark this set's layers may be
+    /// cross-checked against, copied verbatim from
+    /// [`plr_analyzer::PreviewSet::corroborating_layer_mark`] (the daemon
+    /// pipeline populates it — see that field for the absolute-frame
+    /// validity rule). `Some(mark)` means a stop whose
+    /// [`plr_analyzer::PreviewStop::layer`] `L` satisfies `L <= mark` is
+    /// journal-corroborated (the mark is an upper bound on the physical
+    /// layer); `None` means no valid corroborating mark, so every stop's
+    /// layer is model-inferred. Consumed by the daemon's `preview_detail` to
+    /// emit the per-stop `layer_provenance` wire field.
+    /// `skip_serializing_if` keeps a preview spec built before the field
+    /// existed byte-identical.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub corroborating_layer_mark: Option<u32>,
 }
 
 impl PreviewSpec {

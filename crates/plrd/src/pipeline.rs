@@ -235,8 +235,30 @@ pub fn run_pipeline(config: &Config, out: &mut dyn Write) -> Result<PipelineOutc
     };
     let receive_seq = scan::load_receive_seq(&config.receive_seq_file());
     // The power-fail sidecar (the watcher's channel-bypassing edge copy):
-    // recovery's exact-T fact, epoch-admitted inside reconstruct.
-    let power_fail_edge_mono_ns = scan::load_power_fail_edge(&config.power_fail_sidecar_file());
+    // recovery's exact-T fact, epoch-admitted inside reconstruct. The
+    // write-once sidecar is DELETED by the daemon at boot once detection
+    // consumed it, so a `plrd recover` run later finds it gone — fall back
+    // to the copy boot detection PERSISTED into `pending_recovery.json`.
+    // Feeding it through the same input means it obeys the identical
+    // epoch-admission band (`sidecar_admits`): a persisted edge not adjacent
+    // to this crash's tail is rejected exactly as a stale sidecar would be,
+    // so an old pending edge cannot resurrect against an unrelated crash.
+    let power_fail_edge_mono_ns = scan::load_power_fail_edge(&config.power_fail_sidecar_file())
+        .or_else(
+            || match crate::detect::read_pending_presence(&config.wal_dir) {
+                crate::detect::StatePresence::Present(pending) => {
+                    let edge = pending.power_fail_edge_mono_ns;
+                    if edge.is_some() {
+                        say(
+                            "pipeline: power-fail sidecar absent; using the edge persisted in \
+                         pending_recovery.json (same epoch-admission band applies)",
+                        );
+                    }
+                    edge
+                }
+                _ => None,
+            },
+        );
 
     // The print file is optional until we know recovery is needed: a
     // clean shutdown must classify as clean even with no file around.
@@ -681,7 +703,7 @@ fn plan_from_recovery(
     // empty set never leaves the operator without a resume.
     let policy = plan_config.resume_candidate_policy;
     let build_set = !matches!(match_result.confidence, MatchConfidence::UniqueLine { .. });
-    let preview_owned: Option<PreviewSet> = if build_set {
+    let mut preview_owned: Option<PreviewSet> = if build_set {
         match build_preview(
             &model,
             &evidence,
@@ -703,6 +725,23 @@ fn plan_from_recovery(
     } else {
         None
     };
+    // Annotate the set with the slicer layer mark its stops' layers may be
+    // cross-checked against (the layer-provenance follow-up). The mark is
+    // ABSOLUTE (from file start) and window ordinals equal absolute layers
+    // only when the model itself spans from file start (`base_offset == 0`)
+    // — the identical absolute-frame gate `narrate_layer_attribution`
+    // applies. On a mid-file model the comparison is incommensurable, so the
+    // mark is withheld (`None`) and every stop reads as model-inferred; the
+    // per-stop `L <= mark` upper-bound check that yields "journal" lives in
+    // the daemon's `preview_detail`. A stale/withheld mark never fabricates
+    // provenance — it degrades to inferred.
+    if let Some(set) = preview_owned.as_mut() {
+        set.corroborating_layer_mark = if base_offset == 0 {
+            anchor.current_layer
+        } else {
+            None
+        };
+    }
     let preview = preview_owned.as_ref();
 
     let (resume, contact) = match resume_and_contact(

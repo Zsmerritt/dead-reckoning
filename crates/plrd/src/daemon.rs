@@ -79,20 +79,34 @@ pub fn run(config_path: &Path) -> u8 {
     // session's evidence. Bounded (newest segments only) and never
     // fatal: recording starts regardless of what it finds, and it never
     // executes anything — it only writes a state file and announces.
-    let announcement = boot_detection(&config);
+    let boot = boot_detection(&config);
+    let announcement = boot.announcement;
 
     // Power-fail sidecar lifecycle: it is a WRITE-ONCE event file, so once
     // this boot's detection has CONSUMED it (the read happens inside
     // `boot_detection` above, via `detect` -> `scan::load_power_fail_edge`),
     // it must be deleted — a consumed genuine edge already lives on in
-    // detection's output (`pending_recovery.json`), and a stale/inert file
-    // left behind would poison a LATER crash's early-uptime reconstruction
-    // (the admission band's tail-anchor plus this deletion together close
-    // that hazard). Ordering is load-bearing: this runs strictly AFTER the
-    // read above and never before it, so a genuine edge is never dropped
-    // before it is used. Failure to delete is logged, never fatal — the
-    // same posture as the `pending_recovery.json` clear sites.
-    if let Err(e) = std::fs::remove_file(config.power_fail_sidecar_file()) {
+    // detection's output: the edge is PERSISTED into `pending_recovery.json`
+    // (`PendingRecovery::power_fail_edge_mono_ns`), so a later `plrd recover`
+    // still has the exact-T fact, and a stale/inert file left behind would
+    // poison a LATER crash's early-uptime reconstruction (the admission
+    // band's tail-anchor plus this deletion together close that hazard).
+    //
+    // But the delete is now GUARDED: when detection was inconclusive (an
+    // unreadable/unanalyzable WAL, or a pending-write that failed) the edge
+    // was NOT durably consumed, and deleting it would destroy an unconsumed
+    // exact-T edge a later readable boot or `plrd recover` still needs. The
+    // sidecar shares the pending file's fate — both are preserved together.
+    // Ordering is load-bearing: this runs strictly AFTER the read above and
+    // never before it, so a genuine edge is never dropped before it is used.
+    // Failure to delete is logged, never fatal — the same posture as the
+    // `pending_recovery.json` clear sites.
+    if boot.preserve_power_fail_sidecar {
+        eprintln!(
+            "plrd: keeping the power-fail sidecar {} (its edge was not durably consumed)",
+            config.power_fail_sidecar_file().display()
+        );
+    } else if let Err(e) = std::fs::remove_file(config.power_fail_sidecar_file()) {
         if e.kind() != std::io::ErrorKind::NotFound {
             eprintln!(
                 "plrd: could not delete consumed power-fail sidecar {} (continuing): {e}",
@@ -327,9 +341,24 @@ struct BootAnnouncement {
     offer_for: Option<String>,
 }
 
+/// The result of boot-time classification: what to announce, and whether
+/// the power-fail sidecar's edge is now safe to delete.
+struct BootOutcome {
+    /// What to announce, if anything.
+    announcement: Option<BootAnnouncement>,
+    /// `true` when the write-once power-fail sidecar must be KEPT rather
+    /// than deleted this boot, because its edge was NOT durably consumed —
+    /// detection was inconclusive (an unreadable/unanalyzable WAL, or a
+    /// pending-file write that failed), so deleting it would destroy an
+    /// unconsumed exact-T edge a later `plrd recover` (or a later, readable
+    /// boot) still needs. Mirrors the same fate as the pending file: an edge
+    /// and the offer it belongs to are preserved together.
+    preserve_power_fail_sidecar: bool,
+}
+
 /// Classifies the previous session and prepares the announcement
 /// commands, if any (see `detect` for the semantics).
-fn boot_detection(config: &Config) -> Option<BootAnnouncement> {
+fn boot_detection(config: &Config) -> BootOutcome {
     use crate::detect::{self, Detection};
     let detection = detect::detect(
         &config.wal_dir,
@@ -347,13 +376,24 @@ fn boot_detection(config: &Config) -> Option<BootAnnouncement> {
                     .map_or(String::new(), |p| format!(" (~{p:.0}%)")),
                 pending.crash_class,
             );
-            if let Err(e) = detect::write_pending(&config.wal_dir, &pending) {
+            // The pending file now carries the persisted power-fail edge
+            // (`PendingRecovery::power_fail_edge_mono_ns`). Only once that
+            // write SUCCEEDS is the sidecar's edge durably consumed and safe
+            // to delete; a failed write means the sidecar is the sole
+            // surviving copy, so keep it.
+            let write_failed = if let Err(e) = detect::write_pending(&config.wal_dir, &pending) {
                 eprintln!("plrd: cannot write pending-recovery state: {e}");
+                true
+            } else {
+                false
+            };
+            BootOutcome {
+                announcement: Some(BootAnnouncement {
+                    commands: detect::announcement_commands(&pending),
+                    offer_for: Some(pending.file.clone()),
+                }),
+                preserve_power_fail_sidecar: write_failed,
             }
-            Some(BootAnnouncement {
-                commands: detect::announcement_commands(&pending),
-                offer_for: Some(pending.file.clone()),
-            })
         }
         Detection::Complete(completion) => {
             eprintln!(
@@ -365,18 +405,27 @@ fn boot_detection(config: &Config) -> Option<BootAnnouncement> {
                 completion.trailing_bytes,
             );
             // A finished print retracts any stale offer, exactly as a
-            // clean shutdown does.
+            // clean shutdown does; a stale sidecar edge is likewise inert.
             detect::clear_pending(&config.wal_dir);
-            detect::completion_commands(&completion).map(|commands| BootAnnouncement {
-                commands,
-                offer_for: None,
-            })
+            BootOutcome {
+                announcement: detect::completion_commands(&completion).map(|commands| {
+                    BootAnnouncement {
+                        commands,
+                        offer_for: None,
+                    }
+                }),
+                preserve_power_fail_sidecar: false,
+            }
         }
         Detection::Clean => {
             detect::clear_pending(&config.wal_dir);
             // `frame_invalid.json` is deliberately left alone: see
-            // `Detection::Clean`. Only a fresh dry run clears it.
-            None
+            // `Detection::Clean`. Only a fresh dry run clears it. A clean end
+            // makes any leftover sidecar edge stale — delete it.
+            BootOutcome {
+                announcement: None,
+                preserve_power_fail_sidecar: false,
+            }
         }
         Detection::Nothing(no_offer) => {
             eprintln!("plrd: no pending recovery: {}", no_offer.reason);
@@ -385,15 +434,21 @@ fn boot_detection(config: &Config) -> Option<BootAnnouncement> {
                 // there is none: a stale-looking pending file may be the
                 // only surviving record of a genuine offer, because the
                 // evidence behind it scrolls out of the segments detection
-                // reads. Leave it alone.
+                // reads. Leave it alone — and, for the identical reason,
+                // leave the power-fail sidecar's edge (it was NOT consumed
+                // into any durable pending; an unreadable-WAL boot must not
+                // destroy an unconsumed edge).
                 eprintln!(
-                    "plrd: leaving any existing pending-recovery state in place \
-                     (the verdict above is inconclusive)"
+                    "plrd: leaving any existing pending-recovery state and power-fail edge in \
+                     place (the verdict above is inconclusive)"
                 );
             } else {
                 detect::clear_pending(&config.wal_dir);
             }
-            None
+            BootOutcome {
+                announcement: None,
+                preserve_power_fail_sidecar: no_offer.preserve_pending,
+            }
         }
     }
 }
@@ -760,6 +815,8 @@ mod tests {
             percent: Some(25.0),
             crash_class: "HostDeathOrPowerLoss".to_owned(),
             frame_invalid: false,
+            power_fail_edge_mono_ns: None,
+            interrupted_by: None,
         };
         crate::detect::write_pending(&config.wal_dir, &pending).unwrap();
         let fake = FakeMoonraker::spawn(|method, _| {
@@ -809,6 +866,8 @@ mod tests {
             percent: Some(25.0),
             crash_class: "HostDeathOrPowerLoss".to_owned(),
             frame_invalid: false,
+            power_fail_edge_mono_ns: None,
+            interrupted_by: None,
         };
         crate::detect::write_pending(&config.wal_dir, &pending).unwrap();
         for status in [
@@ -1032,6 +1091,7 @@ mod tests {
                 step_id: 3,
                 phase: "shifted-frame".to_owned(),
                 reason: "shifted-frame-declared".to_owned(),
+                arm_mono_ns: None,
             },
         )
         .unwrap();

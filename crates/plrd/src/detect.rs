@@ -295,6 +295,32 @@ pub struct PendingRecovery {
     /// pending file written before the field existed still loads.
     #[serde(default)]
     pub frame_invalid: bool,
+    /// The power-fail sidecar's host-monotonic edge (`CLOCK_MONOTONIC` ns),
+    /// **persisted** here at boot detection so a later `plrd recover` — run
+    /// after the daemon deleted the write-once sidecar — still has the
+    /// crash's exact-T fact. `None` when no genuine edge was present.
+    ///
+    /// The recover-time reconstruction feeds this back through the SAME
+    /// `power_fail_edge_mono_ns` input the sidecar used, so it obeys the
+    /// identical epoch-admission band (`sidecar_admits`,
+    /// `[tail\u{2212}1s, tail+10s]`): a persisted edge NOT adjacent to the
+    /// crash tail is rejected exactly as a stale sidecar would be, so an old
+    /// pending edge can never resurrect against an unrelated later crash.
+    /// `#[serde(default)]` so a pending file written before the field
+    /// existed still loads.
+    #[serde(default)]
+    pub power_fail_edge_mono_ns: Option<u64>,
+    /// Set to `Some("power-fail")` when the previous recovery armed the
+    /// Z-frame interlock and was then interrupted by a power loss (the
+    /// eager `shifted-frame-declared` marker survived un-overwritten AND the
+    /// reconstructed crash epoch carries a `PowerFailing` edge that
+    /// postdates the arming — see [`interrupted_by_power_fail`]). Display
+    /// only; the mandated remedy (a fresh dry run) is already forced by
+    /// [`frame_invalid`](Self::frame_invalid). `#[serde(default)]` /
+    /// `skip_serializing_if` keep a pending file that does not use it
+    /// byte-identical to one produced before the field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interrupted_by: Option<String>,
 }
 
 /// The frame-invalidation marker: a recovery aborted at or after the
@@ -312,6 +338,16 @@ pub struct FrameInvalid {
     pub phase: String,
     /// The abort reason code.
     pub reason: String,
+    /// Host-monotonic time (`CLOCK_MONOTONIC` ns) the interlock was armed,
+    /// on the SAME clock the WAL's `PowerFailing` markers use — so a later
+    /// boot can test whether a reconstructed crash-epoch power-fail edge
+    /// *postdates* the arming (see [`interrupted_by_power_fail`]). `None`
+    /// when unavailable (a marker written before this field existed, or the
+    /// non-Linux test build where the monotonic host clock is not compiled
+    /// in); the postdates check then degrades to the reason + power-fail
+    /// evidence alone. `#[serde(default)]` so an older marker still loads.
+    #[serde(default)]
+    pub arm_mono_ns: Option<u64>,
 }
 
 /// Path of the frame-invalidation marker in `wal_dir`.
@@ -515,12 +551,21 @@ pub fn detect(wal_dir: &Path, heartbeat_path: &Path, detected_wall_ns: u64) -> D
     // announcement branches on. The sentinel is *also* folded into the
     // crash-class string, for the out-of-crate wizard alone — see the
     // field docs.
-    let frame_invalid = read_frame_invalid(wal_dir).is_some();
+    let frame_marker = read_frame_invalid(wal_dir);
+    let frame_invalid = frame_marker.is_some();
     let mut crash_class = format!("{:?}", recovery.window.class);
     if frame_invalid {
         crash_class.push_str("; ");
         crash_class.push_str(FRAME_INVALID_NOTE);
     }
+    // A recovery that armed the interlock and was then cut off by power
+    // loss: the eager marker still reads `shifted-frame-declared` (no
+    // deliberate abort overwrote it) AND this crash epoch's reconstruction
+    // carries a tail `PowerFailing` edge that postdates the arming.
+    let interrupted_by = frame_marker
+        .as_ref()
+        .filter(|m| interrupted_by_power_fail(m, recovery.timeline.power_failing_tail()))
+        .map(|_| "power-fail".to_owned());
     Detection::Pending(PendingRecovery {
         detected_wall_ns,
         file,
@@ -529,7 +574,51 @@ pub fn detect(wal_dir: &Path, heartbeat_path: &Path, detected_wall_ns: u64) -> D
         percent,
         crash_class,
         frame_invalid,
+        // Persist the exact-T sidecar edge (see the field docs): the daemon
+        // deletes the write-once sidecar after this boot, so a later `plrd
+        // recover` reads it from here instead.
+        power_fail_edge_mono_ns,
+        interrupted_by,
     })
+}
+
+/// Whether an armed Z-frame interlock was interrupted by a power loss
+/// (rather than a deliberate abort or an unrelated stop).
+///
+/// True iff BOTH:
+/// * the eager arming record still reads `"shifted-frame-declared"` — any
+///   real abort (timeout, failed verification, `M112`) OVERWRITES the
+///   marker's reason with the abort code, so this value means nothing ran
+///   to a deliberate abort after the frame was declared (this is the guard
+///   against the reviewer's "interrupted-by fires on a non-power abort"), AND
+/// * the reconstructed crash epoch carries a tail `PowerFailing` edge
+///   (`power_failing_tail`) that POSTDATES the arming.
+///
+/// The postdates test compares the edge to [`FrameInvalid::arm_mono_ns`],
+/// both on `CLOCK_MONOTONIC`. When the arm mono is absent (an older marker,
+/// or the non-Linux test build) the numeric check is skipped and the
+/// reason + power-fail evidence carries the verdict.
+///
+/// # Error direction
+///
+/// Deliberately biased toward the WARNING. A false positive (attributing a
+/// power-fail that did not literally interrupt *this* recovery) only widens
+/// the wording; the mandated remedy — a fresh dry run — is already forced
+/// by the armed interlock, so over-warning costs nothing. A false negative
+/// would drop the "power loss" context but still force the dry run. The one
+/// case actively guarded (reason overwritten by a real abort) is the only
+/// one where the label would be genuinely misleading.
+///
+/// Residual (acknowledged, not guarded): a stale interlock armed in a PRIOR
+/// boot that ended without an abort AND without clearing (e.g. a graceful
+/// daemon stop mid-recovery), followed by an unrelated later power loss, can
+/// cross the mono comparison — the arm mono is then from a different boot's
+/// monotonic epoch. The wording may over-attribute, but the remedy is
+/// identical, so it is left in the safe (warn) direction.
+#[must_use]
+pub fn interrupted_by_power_fail(marker: &FrameInvalid, power_failing_tail: Option<u64>) -> bool {
+    marker.reason == "shifted-frame-declared"
+        && power_failing_tail.is_some_and(|edge| marker.arm_mono_ns.is_none_or(|arm| edge >= arm))
 }
 
 /// The newest journaled `print_stats.state` **that describes `file`**.
@@ -1123,8 +1212,12 @@ pub fn announcement_commands(pending: &PendingRecovery) -> (String, String) {
     // A prior recovery aborted after declaring the shifted frame: the
     // announcement warns the operator the Z frame is unknown and a fresh
     // dry run is required before resuming. Keyed on the typed flag, never
-    // on the crash-class string.
-    let frame_note = if pending.frame_invalid {
+    // on the crash-class string. When the interruption was a power loss
+    // (`interrupted_by`), name that specifically — same mandated remedy, but
+    // the operator learns the previous recovery was cut off by power.
+    let frame_note = if pending.interrupted_by.as_deref() == Some("power-fail") {
+        "; the previous recovery was interrupted by power loss and Z frame is UNKNOWN — a fresh dry run (plrd scan / plrd recover) is required before resuming"
+    } else if pending.frame_invalid {
         "; Z frame is UNKNOWN after an aborted recovery — re-run a dry run (plrd scan / plrd recover) for a fresh plan before resuming"
     } else {
         ""
@@ -1372,6 +1465,7 @@ mod tests {
                 step_id: 7,
                 phase: "shifted-frame".to_owned(),
                 reason: "shifted-frame-declared".to_owned(),
+                arm_mono_ns: None,
             },
         )
         .unwrap();
@@ -1458,6 +1552,7 @@ mod tests {
             step_id: 7,
             phase: "shifted-frame".to_owned(),
             reason: "shifted-frame-not-declared".to_owned(),
+            arm_mono_ns: None,
         };
         write_frame_invalid(&dir, &marker).unwrap();
         assert_eq!(read_frame_invalid(&dir).unwrap(), marker);
@@ -1504,6 +1599,105 @@ mod tests {
     }
 
     #[test]
+    fn interrupted_by_power_fail_only_fires_for_a_declared_reason_a_later_edge_postdates() {
+        let armed = |reason: &str, arm: Option<u64>| super::FrameInvalid {
+            detected_wall_ns: 1,
+            step_id: 7,
+            phase: "shifted-frame".to_owned(),
+            reason: reason.to_owned(),
+            arm_mono_ns: arm,
+        };
+        // Eager arming + a power-fail edge that postdates it: interrupted.
+        assert!(super::interrupted_by_power_fail(
+            &armed("shifted-frame-declared", Some(1_000)),
+            Some(2_000)
+        ));
+        // No power-fail edge: not a power interruption.
+        assert!(!super::interrupted_by_power_fail(
+            &armed("shifted-frame-declared", Some(1_000)),
+            None
+        ));
+        // A REAL abort overwrote the reason (the reviewer's non-power-abort
+        // case): never labelled power-fail, even with an edge present.
+        assert!(!super::interrupted_by_power_fail(
+            &armed("confirmation-timeout", Some(1_000)),
+            Some(2_000)
+        ));
+        // The edge PREDATES the arming: it belongs to an earlier event, not
+        // this recovery — not interrupted.
+        assert!(!super::interrupted_by_power_fail(
+            &armed("shifted-frame-declared", Some(5_000)),
+            Some(2_000)
+        ));
+        // No arm mono (old marker / non-Linux build): reason + edge carry
+        // the verdict (the documented safe-direction fallback).
+        assert!(super::interrupted_by_power_fail(
+            &armed("shifted-frame-declared", None),
+            Some(2_000)
+        ));
+    }
+
+    #[test]
+    fn pending_persists_the_power_fail_edge_and_still_loads_a_legacy_file() {
+        let pending = PendingRecovery {
+            detected_wall_ns: 1,
+            file: "/g/x.gcode".to_owned(),
+            file_position: 5,
+            file_size: None,
+            percent: None,
+            crash_class: "HostDeathOrPowerLoss".to_owned(),
+            frame_invalid: false,
+            power_fail_edge_mono_ns: Some(42_000),
+            interrupted_by: None,
+        };
+        let dir = temp_dir("pending-edge");
+        write_pending(&dir, &pending).unwrap();
+        let super::StatePresence::Present(back) = super::read_pending_presence(&dir) else {
+            panic!("expected a present pending file");
+        };
+        assert_eq!(back.power_fail_edge_mono_ns, Some(42_000));
+        // A pending file written before the fields existed still loads,
+        // defaulting the new fields to None (old-reader compatibility).
+        let legacy: PendingRecovery = serde_json::from_value(serde_json::json!({
+            "detected_wall_ns": 1, "file": "/g/x.gcode", "file_position": 5,
+            "file_size": null, "percent": null, "crash_class": "X",
+        }))
+        .unwrap();
+        assert_eq!(legacy.power_fail_edge_mono_ns, None);
+        assert_eq!(legacy.interrupted_by, None);
+    }
+
+    #[test]
+    fn the_power_fail_interruption_note_replaces_the_generic_frame_warning() {
+        let base = PendingRecovery {
+            detected_wall_ns: 1,
+            file: "/g/x.gcode".to_owned(),
+            file_position: 5,
+            file_size: Some(1_000),
+            percent: Some(50.0),
+            crash_class: "HostDeathOrPowerLoss".to_owned(),
+            frame_invalid: true,
+            power_fail_edge_mono_ns: None,
+            interrupted_by: Some("power-fail".to_owned()),
+        };
+        let (primary, fallback) = announcement_commands(&base);
+        assert!(primary.contains("interrupted by power loss"), "{primary}");
+        assert!(primary.contains("fresh dry run"), "{primary}");
+        assert!(fallback.contains("interrupted by power loss"), "{fallback}");
+        // Without the flag, the generic aborted-recovery warning.
+        let generic = PendingRecovery {
+            interrupted_by: None,
+            ..base
+        };
+        let (primary, _) = announcement_commands(&generic);
+        assert!(!primary.contains("interrupted by power loss"), "{primary}");
+        assert!(
+            primary.contains("Z frame is UNKNOWN after an aborted recovery"),
+            "{primary}"
+        );
+    }
+
+    #[test]
     fn announcement_commands_are_console_safe() {
         let pending = PendingRecovery {
             detected_wall_ns: 1,
@@ -1513,6 +1707,8 @@ mod tests {
             percent: Some(50.0),
             crash_class: "HostDeathOrPowerLoss".to_owned(),
             frame_invalid: false,
+            power_fail_edge_mono_ns: None,
+            interrupted_by: None,
         };
         let (primary, fallback) = announcement_commands(&pending);
         assert!(
@@ -2431,6 +2627,7 @@ mod tests {
             step_id: 9,
             phase: "shifted-frame".to_owned(),
             reason: "confirmation-timeout".to_owned(),
+            arm_mono_ns: None,
         };
         write_frame_invalid(&dir, &marker).expect("durable write");
 
@@ -2457,6 +2654,7 @@ mod tests {
             step_id: 10,
             phase: "probe".to_owned(),
             reason: "probe-no-trigger".to_owned(),
+            arm_mono_ns: None,
         };
         write_frame_invalid(&dir, &second).expect("durable overwrite");
         assert_eq!(read_frame_invalid(&dir), Some(second));
@@ -2474,6 +2672,7 @@ mod tests {
             step_id: 2,
             phase: "shifted-frame".to_owned(),
             reason: "shifted-frame-not-declared".to_owned(),
+            arm_mono_ns: None,
         };
         let missing = std::path::Path::new("/nonexistent-plrd-dir-frame-invalid-xyzzy");
         let error = write_frame_invalid(missing, &marker)
@@ -2499,6 +2698,7 @@ mod tests {
             step_id: 2,
             phase: "shifted-frame".to_owned(),
             reason: "shifted-frame-declared".to_owned(),
+            arm_mono_ns: None,
         };
         write_frame_invalid(&dir, &marker).expect("write over the stranded staging file");
         assert_eq!(read_frame_invalid(&dir), Some(marker));
@@ -2530,6 +2730,8 @@ mod tests {
             percent: Some(50.0),
             crash_class: "HostDeathOrPowerLoss".to_owned(),
             frame_invalid: false,
+            power_fail_edge_mono_ns: None,
+            interrupted_by: None,
         };
         write_pending(&dir, &pending).expect("write");
         let names: Vec<String> = std::fs::read_dir(&dir)

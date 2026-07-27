@@ -162,6 +162,30 @@ pub struct PreviewSet {
     /// [`anchor_index`], MAJOR-2). This is the cursor the preview loop opens
     /// on.
     pub last_index: u32,
+    /// The slicer `current_layer` mark (`plr_wal::Context::current_layer`)
+    /// this set's layers may be cross-checked against, when — and ONLY
+    /// when — that comparison is semantically valid.
+    ///
+    /// The mark is an **upper bound** on the physically-printing layer (the
+    /// slicer sets it at the layer-change line's parse time, which leads
+    /// execution), so a stop whose [`PreviewStop::layer`] `L` satisfies
+    /// `L <= mark` is *journal-corroborated*; one with `L > mark` is not
+    /// (geometry above the mark is the physically-impossible case
+    /// [`crate::model::WindowLayers::mark_is_consistent`] flags). `None`
+    /// here means there is no valid corroborating mark — the slicer emitted
+    /// none, OR the model does not span from file start so window-relative
+    /// layer ordinals are incommensurable with the absolute mark (the
+    /// absolute-frame rule on `mark_is_consistent`) — and every stop's layer
+    /// is then model-inferred, not journal-confirmed.
+    ///
+    /// [`build_preview`] leaves this `None`: the analyzer has neither the
+    /// WAL mark nor the model's file base offset. The daemon pipeline, which
+    /// holds both, sets it after building (design follow-up: layer
+    /// provenance). Consumed by `plrd`'s `preview_detail` to emit the
+    /// per-stop `layer_provenance` wire field. `skip_serializing_if` keeps a
+    /// set built before the field existed byte-identical.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub corroborating_layer_mark: Option<u32>,
 }
 
 /// Why [`build_preview`] declined to produce a set.
@@ -447,6 +471,10 @@ pub fn build_preview(
         first_index,
         mid_index,
         last_index,
+        // The analyzer has neither the WAL slicer mark nor the model's file
+        // base offset; the daemon pipeline annotates this after building
+        // (see the field docs / the layer-provenance follow-up).
+        corroborating_layer_mark: None,
     })
 }
 

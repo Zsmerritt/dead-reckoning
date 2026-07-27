@@ -122,12 +122,17 @@ pub fn run_scan(
         receive_seq,
         power_fail_edge_mono_ns,
     };
+    // The crash epoch's tail power-fail edge, when reconstruction found one
+    // — used below to decide whether an armed frame interlock was cut off by
+    // power loss.
+    let mut power_failing_tail = None;
     match reconstruct(&inputs, &crate::convert::reconstruct_config(None)) {
         Ok(Reconstruction::CleanShutdown(_)) => {
             w.line("reconstruction: CLEAN SHUTDOWN — the print ended on purpose;");
             w.line("  no recovery is needed and none should be attempted.");
         }
         Ok(Reconstruction::Recovery(recovery)) => {
+            power_failing_tail = recovery.timeline.power_failing_tail();
             report_window(&mut w, &recovery.window);
             report_stop_set(&mut w, &recovery.stop_set);
             report_layer_attribution(&mut w, &recovery, file_tail_bytes.as_deref());
@@ -137,7 +142,31 @@ pub fn run_scan(
             w.line("  (the WAL prefix above is still valid evidence)");
         }
     }
+    report_frame_interlock(&mut w, wal_dir, power_failing_tail);
     Ok(())
+}
+
+/// Reports the Z-frame interlock (`frame_invalid.json`) when armed, naming
+/// a power-loss interruption specifically when the reconstructed crash
+/// epoch's `PowerFailing` edge postdates the arming (the same verdict boot
+/// detection folds into the pending file). Silent when the interlock is
+/// absent — nothing to warn about.
+fn report_frame_interlock(w: &mut Report<'_>, wal_dir: &Path, power_failing_tail: Option<u64>) {
+    let Some(marker) = crate::detect::read_frame_invalid(wal_dir) else {
+        return;
+    };
+    if crate::detect::interrupted_by_power_fail(&marker, power_failing_tail) {
+        w.line("frame interlock: ARMED — the previous recovery was interrupted by power loss;");
+        w.line("  Z frame is UNKNOWN. A fresh dry run is required before resuming.");
+    } else {
+        w.line(&format!(
+            "frame interlock: ARMED (reason: {}, phase {}) — a previous recovery declared the",
+            marker.reason, marker.phase
+        ));
+        w.line(
+            "  shifted Z frame; Z frame is UNKNOWN. A fresh dry run is required before resuming.",
+        );
+    }
 }
 
 /// Lists `(index, path)` for every segment, sorted by index. Shared
