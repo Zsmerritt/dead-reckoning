@@ -185,6 +185,82 @@ def step_debug_pause(token="plrc-17bd4c0f9a2-1", step=3, commands=None):
     )
 
 
+def preview_detail(
+    offset=244118,
+    resume_offset=244140,
+    xy=None,
+    z=1.0,
+    layer=42,
+    feature="InternalInfill",
+    on_infill=True,
+    is_candidate=True,
+    position=3,
+    count=5,
+    before_skip_forward=False,
+    acceptable=True,
+):
+    """The resume-preview ``detail`` map (crates/plrd/src/executor.rs
+    ``preview_detail``), field-for-field.
+
+    Every field the producer emits is present: ``offset`` / ``resume_offset``
+    (u64 byte offsets), ``xy`` ([f64; 2], Klipper-internal frame), ``z``
+    (f64, the stop's deposition Z), ``layer`` (u32 or JSON null — the
+    producer carries only presence, no journal/inferred provenance),
+    ``feature`` (the ``FeatureClass`` Debug name), ``on_infill`` /
+    ``is_candidate`` / ``before_skip_forward`` / ``acceptable`` (bools), and
+    ``position`` / ``count`` (1-based rep position).
+    """
+    return {
+        "offset": offset,
+        "resume_offset": resume_offset,
+        "xy": [132.4, 88.1] if xy is None else xy,
+        "z": z,
+        "layer": layer,
+        "feature": feature,
+        "on_infill": on_infill,
+        "is_candidate": is_candidate,
+        "position": position,
+        "count": count,
+        "before_skip_forward": before_skip_forward,
+        "acceptable": acceptable,
+    }
+
+
+def preview_pause(token="plrc-17bd4c0f9a2-5", step=7, detail=_KEEP, **detail_kwargs):
+    """A resume-preview pause (executor.rs ``preview_point``).
+
+    ``confirm_kind`` is ``"preview"`` and the diagnosis is ADVISORY tier
+    with code ``resume_preview`` (the producer builds ``Tier::Advisory``, not
+    Confirmable).  ``detail`` overrides the whole map; ``**detail_kwargs``
+    tweak individual fields of the default one.
+    """
+    detail_map = preview_detail(**detail_kwargs) if detail is _KEEP else detail
+    return pause(
+        kind="preview",
+        token=token,
+        step=step,
+        phase="resume-preview",
+        diag=diagnosis(
+            code="resume_preview",
+            tier="advisory",
+            what=(
+                "hovering over stop 3 of 5 at X132.4 Y88.1 (byte 244118); move "
+                "to the ragged edge on the part, then accept"
+            ),
+            why=(
+                "accepting resumes at the next deposition line after this point "
+                "(skip-forward)"
+            ),
+            suggested_fix=(
+                "Answer accept to resume here, next/prev to step between "
+                "representative points, nudge +/-1 (fine) or +/-10 (coarse) to "
+                "move along the toolpath, or abort to stop."
+            ),
+        ),
+        detail=detail_map,
+    )
+
+
 def completed(text="recover: plan complete; print resumed", exit_code=0):
     """The final success response (ctrlsock.rs:826-833)."""
     return {

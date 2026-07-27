@@ -424,3 +424,179 @@ def test_a_pipe_in_a_button_field_cannot_shift_the_other_fields():
     line = prompts.action_prompt_button("Continue|now", "PLR_X|Y", "warning")
     assert line == "action:prompt_button Continue/now|PLR_X/Y|warning"
     assert line.count("|") == 2
+
+
+# --- the resume-preview renderer (design §F.1) ------------------------
+#
+# Every field asserted here is one the producer really sends
+# (crates/plrd/src/executor.rs ``preview_detail`` — see
+# tests/confirm_fixtures.py ``preview_detail`` for the field-by-field
+# citation). The point of the branch is the console floor: the whole
+# preview is completable from bare g-code, and the per-reposition readout
+# is the alignment feedback because adjacent stops can be <1 mm apart.
+
+
+def preview_texts(data, deadline=DEADLINE):
+    return list(confirm_ui.confirm_prompt(data, deadline).texts)
+
+
+def test_preview_routes_to_the_preview_prompt_and_names_the_stop():
+    prompt = confirm_ui.confirm_prompt(fx.preview_pause()["data"], DEADLINE)
+    body = "\n".join(prompt.texts)
+    assert "Resume-point preview — stop 3 of 5" in body
+    # The alignment quantities the ruling names: the byte offset AND the
+    # hover XY, both from the detail map.
+    assert "byte 244,118" in body
+    assert "X132.4 Y88.1" in body
+    assert "layer 42" in body
+    assert "internal infill" in body
+    assert "byte 244,140" in body  # where a resume would begin
+
+
+def test_preview_buttons_fire_plain_commands_and_the_console_names_them_all():
+    # THE PORTABILITY FLOOR: every button is a plain PLR_* command, and the
+    # console fallback names every one, so a client that renders no dialog
+    # can still drive the whole preview.
+    prompt = confirm_ui.confirm_prompt(fx.preview_pause()["data"], DEADLINE)
+    gcodes = [gcode for _label, gcode, _color in prompt.buttons]
+    assert "PLR_RECOVER_ACCEPT" in gcodes
+    assert "PLR_RECOVER_PREV" in gcodes
+    assert "PLR_RECOVER_NEXT" in gcodes
+    assert "PLR_RECOVER_NUDGE BACK=10" in gcodes
+    assert "PLR_RECOVER_NUDGE BACK=1" in gcodes
+    assert "PLR_RECOVER_NUDGE FWD=1" in gcodes
+    assert "PLR_RECOVER_NUDGE FWD=10" in gcodes
+    assert prompt.footers == [("Abort recovery", "PLR_RECOVER_ABORT", "error")]
+    fallback = "\n".join(prompt.fallbacks)
+    for cmd in (
+        "PLR_RECOVER_ACCEPT",
+        "PLR_RECOVER_NEXT",
+        "PLR_RECOVER_PREV",
+        "PLR_RECOVER_NUDGE",
+        "PLR_RECOVER_ABORT",
+    ):
+        assert cmd in fallback
+
+
+def test_the_readout_refreshes_on_every_reposition():
+    # Adjacent stops can be sub-millimetre apart, so the operator must not
+    # rely on visible motion: the byte offset and XY are re-emitted for each
+    # stop.  Two different stops must produce different readouts.
+    a = "\n".join(
+        preview_texts(
+            fx.preview_pause(offset=1000, xy=[10.0, 20.0], position=2)["data"]
+        )
+    )
+    b = "\n".join(
+        preview_texts(
+            fx.preview_pause(offset=1004, xy=[10.4, 20.0], position=3)["data"]
+        )
+    )
+    assert "byte 1,000" in a and "X10 Y20" in a and "stop 2 of" in a
+    assert "byte 1,004" in b and "X10.4 Y20" in b and "stop 3 of" in b
+    assert a != b
+
+
+def test_within_arc_nudge_shows_the_xy_even_when_the_offset_holds():
+    # A ±1 nudge between two chords of one arc keeps the byte offset (they
+    # share the arc's source line) but moves the hover XY (design §12).  The
+    # renderer must show the XY so the nudge is not read as "no effect".
+    chord_a = "\n".join(
+        preview_texts(fx.preview_pause(offset=500, xy=[100.0, 50.0])["data"])
+    )
+    chord_b = "\n".join(
+        preview_texts(fx.preview_pause(offset=500, xy=[100.6, 50.3])["data"])
+    )
+    assert "byte 500" in chord_a and "byte 500" in chord_b  # offset holds
+    assert "X100 Y50" in chord_a
+    assert "X100.6 Y50.3" in chord_b  # XY moved — visible feedback
+    assert chord_a != chord_b
+
+
+def test_a_point_before_the_skip_forward_default_warns_about_reprinting():
+    body = "\n".join(preview_texts(fx.preview_pause(before_skip_forward=True)["data"]))
+    assert "BEFORE the safe skip-forward line" in body
+    assert "re-prints existing geometry" in body
+
+
+def test_a_non_acceptable_stop_drops_accept_and_says_why():
+    prompt = confirm_ui.confirm_prompt(
+        fx.preview_pause(acceptable=False)["data"], DEADLINE
+    )
+    gcodes = [gcode for _label, gcode, _color in prompt.buttons]
+    assert "PLR_RECOVER_ACCEPT" not in gcodes  # accept is unavailable
+    # Navigation stays available so the operator can move OFF the bad stop.
+    assert "PLR_RECOVER_NEXT" in gcodes
+    assert "PLR_RECOVER_NUDGE FWD=1" in gcodes
+    body = "\n".join(prompt.texts)
+    assert "cannot be accepted" in body
+    fallback = "\n".join(prompt.fallbacks)
+    assert "not acceptable" in fallback
+
+
+def test_a_nudge_only_stop_is_labelled_reachable_by_nudging():
+    body = "\n".join(preview_texts(fx.preview_pause(is_candidate=False)["data"]))
+    assert "reachable only by nudging" in body
+    matched = "\n".join(preview_texts(fx.preview_pause(is_candidate=True)["data"]))
+    assert "matched the crash evidence" in matched
+
+
+def test_an_unmarked_layer_is_admitted_not_invented():
+    body = "\n".join(preview_texts(fx.preview_pause(layer=None)["data"]))
+    assert "layer not yet marked" in body
+    # And no provenance the wire does not carry.
+    assert "journal-confirmed" not in body
+    assert "inferred" not in body
+
+
+def test_an_unknown_feature_name_is_shown_verbatim():
+    # A daemon that grows a FeatureClass must not render as a guess.
+    body = "\n".join(preview_texts(fx.preview_pause(feature="LightningInfill")["data"]))
+    assert "LightningInfill" in body
+
+
+@pytest.mark.parametrize(
+    "name,label",
+    [
+        ("InternalInfill", "internal infill"),
+        ("OuterWall", "outer wall"),
+        ("Surface", "surface"),
+        ("SkirtBrim", "skirt/brim"),
+    ],
+)
+def test_feature_labels_humanize_the_debug_names(name, label):
+    body = "\n".join(preview_texts(fx.preview_pause(feature=name)["data"]))
+    assert label in body
+
+
+def test_the_advisory_preview_does_not_trip_the_tier_mismatch_note():
+    # The preview diagnosis is Advisory by construction; the binary pauses'
+    # "not confirmable" warning must NOT fire for it.
+    body = "\n".join(preview_texts(fx.preview_pause()["data"]))
+    assert "not 'confirmable'" not in body
+    assert "unexpected for this pause" not in body
+
+
+def test_a_preview_with_the_wrong_tier_is_still_flagged():
+    data = fx.preview_pause()["data"]
+    data["diagnosis"]["tier"] = "hard"
+    body = "\n".join(preview_texts(data))
+    assert "unexpected for this pause" in body
+
+
+def test_a_missing_preview_detail_is_admitted_not_faked():
+    data = fx.preview_pause()["data"]
+    data["detail"] = None
+    body = "\n".join(preview_texts(data))
+    assert "no readable stop details" in body
+    # The prompt still offers navigation and abort, so the operator can act.
+    prompt = confirm_ui.confirm_prompt(data, DEADLINE)
+    assert prompt.footers == [("Abort recovery", "PLR_RECOVER_ABORT", "error")]
+
+
+def test_the_preview_question_is_distinct_and_names_the_workflow():
+    text = confirm_ui.question("preview")
+    assert "ragged edge" in text
+    # Distinct from every other kind's question.
+    others = {confirm_ui.question(k) for k in ("z-height", "step-debug", "diagnosis")}
+    assert text not in others
