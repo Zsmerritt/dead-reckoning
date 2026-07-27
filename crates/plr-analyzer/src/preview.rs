@@ -85,6 +85,21 @@ pub struct PreviewStop {
     pub index: u32,
     /// This deposition line's byte offset — a line boundary
     /// (`SimMove::span.start`), shown to the operator and safe for `M26`.
+    ///
+    /// # Arc-chord nudge consequence (design §12)
+    ///
+    /// A `G2`/`G3` arc decomposes into many `SimMove` chords that all share
+    /// the arc's ONE source line, so several adjacent stops carry the SAME
+    /// `offset` but different [`Self::xy`]. A ±1 nudge that steps between two
+    /// chords of one arc therefore moves the hover point along the curve
+    /// while this `offset` (and the `Line:` readout derived from it) does
+    /// NOT change. The reposition loop's prompt must show the per-chord
+    /// [`Self::xy`], not only the offset, so a within-arc nudge gives
+    /// visible feedback — and a UI must not read "offset unchanged" as
+    /// "nudge had no effect". The first/mid/last anchors and the
+    /// `last_index` skip-forward pin are unaffected: they resolve on the
+    /// committed *resume* offset, and same-offset ties break toward the last
+    /// chord ([`stop_resuming_at`]).
     pub offset: u64,
     /// Where a resume STARTS if this stop is accepted:
     /// `first_deposition_at_or_after(this.span.end)` — "resume at the NEXT
@@ -127,13 +142,25 @@ pub struct PreviewSet {
     /// [`PREVIEW_MAX_REPS`]. Always drawn from candidate stops and always
     /// contains the earliest and latest candidate stop.
     pub representatives: Vec<u32>,
-    /// Policy `first` = the minimum-offset candidate stop.
+    /// Policy `first` — the stop AT the minimum-offset candidate LINE (the
+    /// last chord if that line is an arc). A "may-reprint" reference cursor;
+    /// selected over the per-line population so arc chords do not skew it
+    /// (see [`anchor_index`], MINOR-1).
     pub first_index: u32,
-    /// Policy `mid` = the median-offset candidate stop (lower median by
-    /// offset; see [`median_index`]).
+    /// Policy `mid` — the stop AT the lower-median candidate LINE (by
+    /// execution-order offset; see [`median_index`]), same per-line rule as
+    /// [`Self::first_index`].
     pub mid_index: u32,
-    /// Policy `last` = the maximum-offset candidate stop — the
-    /// skip-forward-most option (design §3).
+    /// Policy `last` — the RESUME-COMMITTING stop for the skip-forward
+    /// default: the stop whose *acceptance* commits the resume that
+    /// `plr-recovery`'s `select_resume_target_with_policy(Last)` commits
+    /// (the predecessor of the resolver's resume line — [`stop_resuming_at`]),
+    /// NOT simply the maximum-offset candidate stop. Anchoring on the
+    /// committed *resume* rather than the stop offset is what makes `last`
+    /// equal today's skip-forward byte-for-byte even when the max candidate
+    /// is a travel line the extrusion-only stop set cannot hold (see
+    /// [`anchor_index`], MAJOR-2). This is the cursor the preview loop opens
+    /// on.
     pub last_index: u32,
 }
 

@@ -1266,6 +1266,23 @@ pub struct PlanInputs<'a> {
     /// `clean_nozzle_macro` (which degrades to asking the operator) is
     /// deliberate.
     pub purge_macro_present: bool,
+    /// The resume-point preview set from [`plr_analyzer::build_preview`],
+    /// present only when the pipeline routed a coarse match through
+    /// `resume_candidate_policy = ask` and got a usable set (design §D). It
+    /// is threaded in here — rather than built inside `plan_recovery` —
+    /// because building it needs the analyzer's [`plr_analyzer::MatchConfig`]
+    /// and exclusion oracle, which the pipeline holds.
+    ///
+    /// When `Some` AND the policy is `Ask`, the plan gains a
+    /// [`crate::plan::Phase::ResumePreview`] step and a
+    /// [`crate::plan::RecoveryPlan::preview`] spec (with per-stop recovery
+    /// bindings baked from THIS builder's g-code frame); its resume/entry
+    /// commands are rendered against the default (skip-forward) stop, which
+    /// the daemon late-binds to the accepted stop. `None` (any non-`ask`
+    /// policy, or `ask` with no usable set) produces the ordinary automatic
+    /// plan at the policy's offset.
+    #[allow(clippy::doc_markdown)]
+    pub preview: Option<&'a plr_analyzer::PreviewSet>,
 }
 
 /// Validated numeric view of the WAL g-code state.
@@ -1391,6 +1408,18 @@ fn fan_commands(fans: &[(String, f64)]) -> (Vec<String>, Vec<PlanWarning>) {
     (commands, warnings)
 }
 
+/// The resolved geometry for the resume-preview entry step, computed once
+/// in `plan_recovery` (it needs the g-code origin to map stop Z into the
+/// file frame) and consumed by [`step_resume_preview`].
+#[derive(Debug, Clone, Copy)]
+struct PreviewEntry {
+    /// Absolute g-code-frame floor for the hover plane, mm: the highest
+    /// stop's g-code Z plus `preview_standoff`.
+    target_z: f64,
+    /// The `M104` cool-down target commanded on entry, °C.
+    cool_nozzle_temp: f64,
+}
+
 /// Everything the step constructors need, computed once.
 struct Ctx<'a> {
     cfg: &'a PlanConfig,
@@ -1414,6 +1443,12 @@ struct Ctx<'a> {
     clean_nozzle_present: bool,
     /// The generated recovery file's top-level name (the `M23` target).
     recovery_file_name: &'a str,
+    /// The resolved resume-preview entry, present when this plan carries a
+    /// preview (`resume_candidate_policy = ask` + a usable set). `Some`
+    /// makes [`build_steps`] emit [`step_resume_preview`] (the hover lift +
+    /// cool-down) in place of [`step_z_confirm_standoff`] — the ruling that
+    /// the preview's Accept subsumes the standalone Z confirmation.
+    preview_entry: Option<PreviewEntry>,
 }
 
 fn step(
@@ -2126,6 +2161,53 @@ fn step_z_confirm_standoff(ctx: &Ctx<'_>) -> RecoveryStep {
     )
 }
 
+/// The resume-preview ENTRY step (`resume_candidate_policy = ask`, design
+/// §D.2 / §E). This is the ONE lift to the single hover plane plus the
+/// cool-down `M104` — the daemon then drives the XY-only reposition loop
+/// against [`crate::plan::RecoveryPlan::preview`].
+///
+/// Two safety properties are structural here:
+///
+/// * **Never descends.** The lift uses [`RuntimeComputation::HoverPlane`]
+///   (`min(z_max, max(current_z, target_z))`), which is `>= current_z`
+///   always — a lift or a no-op, never a move toward the part. `target_z`
+///   is an absolute floor ABOVE every stop, so the one plane clears all
+///   modelled geometry and every subsequent XY reposition is safe by
+///   construction (there is no per-stop Z step to make descend).
+/// * **Cannot ooze during the pause.** The `M104 S{cool}` cools the nozzle
+///   to a non-oozing temperature (the probe hold temp by default) BEFORE
+///   the minutes-long deliberation; the standoff means even a drip cannot
+///   bridge to the part. It is a non-blocking target set, ordered after the
+///   lift, and precedes the recovery file's own `M109` print-temp reheat.
+fn step_resume_preview(ctx: &Ctx<'_>, target_z: f64, cool_nozzle_temp: f64) -> RecoveryStep {
+    let mut commands = accel_prefix(ctx.cfg.accel_entry);
+    commands.push("G90".to_owned());
+    commands.push(format!(
+        "G1 Z{PARK_Z_PLACEHOLDER} F{}",
+        fmt_num(ctx.cfg.entry_feed)
+    ));
+    // Cool the nozzle so it cannot ooze during deliberation (non-blocking).
+    commands.push(format!("M104 S{}", fmt_num(cool_nozzle_temp)));
+    step(
+        Phase::ResumePreview,
+        "lift to the single hover plane and cool the nozzle for the resume-point preview (never descends)",
+        commands,
+        vec![],
+        vec![Verification::new(
+            "toolhead",
+            "position.2",
+            Predicate::NumWithinComputed {
+                epsilon: ctx.cfg.z_epsilon,
+            },
+        )],
+        Some(RuntimeComputation::HoverPlane {
+            target_z,
+            z_max: ctx.machine.axis_limits.z_max,
+        }),
+        AbortReason::ResumePreviewFailed,
+    )
+}
+
 fn step_mesh_load(profile: &str) -> RecoveryStep {
     step(
         Phase::MeshLoad,
@@ -2294,8 +2376,23 @@ fn step_restore_frame(ctx: &Ctx<'_>) -> RecoveryStep {
 ///
 /// [`RecoveryError::NonFinite`] on any non-finite derived coordinate.
 fn build_entry_commands(ctx: &Ctx<'_>) -> Result<Vec<String>, RecoveryError> {
+    build_entry_commands_for(ctx, ctx.resume.position)
+}
+
+/// The entry-move commands for an ARBITRARY resume position (internal
+/// frame `[x, y, z, e]`), sharing every derivation with
+/// [`build_entry_commands`] (which is this with `ctx.resume.position`).
+///
+/// The preview's per-stop late-binding calls this once per stop with that
+/// stop's resolved resume position, so every stop's entry moves come from
+/// the ONE formatter — no accept-time formatter that could drift (design
+/// §4, the recovery-file/preview-offset-match attack).
+fn build_entry_commands_for(
+    ctx: &Ctx<'_>,
+    position: [f64; 4],
+) -> Result<Vec<String>, RecoveryError> {
     let g = &ctx.gcode;
-    let [internal_x, internal_y, internal_z, internal_e] = ctx.resume.position;
+    let [internal_x, internal_y, internal_z, internal_e] = position;
     let gcode_x = internal_x - g.origin[0];
     let gcode_y = internal_y - g.origin[1];
     let gcode_z = internal_z - g.origin[2];
@@ -2575,7 +2672,18 @@ fn build_steps(ctx: &Ctx<'_>) -> Result<Vec<RecoveryStep>, RecoveryError> {
     // 7: true-Z declare, the optional operator Z confirmation, mesh,
     // final declare.
     steps.push(step_true_z_declare(ctx));
-    if ctx.cfg.confirm_z_before_resume {
+    // The interactive preview (policy = ask) SUBSUMES the standalone
+    // Z-confirm pause — its Accept IS the Z confirmation (ruling §E.4), so
+    // the two are mutually exclusive. Under any non-`ask` policy there is
+    // no preview entry and `confirm_z_before_resume` behaves exactly as
+    // before.
+    if let Some(preview) = ctx.preview_entry {
+        steps.push(step_resume_preview(
+            ctx,
+            preview.target_z,
+            preview.cool_nozzle_temp,
+        ));
+    } else if ctx.cfg.confirm_z_before_resume {
         steps.push(step_z_confirm_standoff(ctx));
     }
     if transforms.bed_mesh_active {
@@ -2661,9 +2769,28 @@ pub fn plan_recovery(
         });
     }
 
-    let resume = match select_resume_target(inputs.model, inputs.match_result) {
+    // Policy-aware resume selection (design §3). `first`/`mid`/`last` pick
+    // the corresponding offset from an ambiguous set — this alone turns a
+    // coarse match that used to be a ManualFallback into an automatic
+    // resume (the headless win). `ask` resolves as `last` (the safe
+    // skip-forward), which is exactly the point the preview renders and the
+    // loop opens on, so the recovery-file spec / entry moves below are
+    // built against it and the daemon late-binds to the accepted stop.
+    let resume = match select_resume_target_with_policy(
+        inputs.model,
+        inputs.match_result,
+        config.resume_candidate_policy,
+    ) {
         Ok(resume) => resume,
         Err(reason) => return Ok(PlanOutcome::ManualFallback { reason }),
+    };
+    // A preview is attached only under `ask` AND when the pipeline supplied
+    // a usable set. Any other policy is a plain automatic plan (no preview
+    // step, no loop), so a non-`ask` caller that also passed a set does not
+    // accidentally get an interactive plan.
+    let preview_set = match config.resume_candidate_policy {
+        ResumePolicy::Ask => inputs.preview,
+        ResumePolicy::First | ResumePolicy::Mid | ResumePolicy::Last => None,
     };
 
     let preheat = derive_preheat(context, &inputs.file_temps);
@@ -2710,6 +2837,30 @@ pub fn plan_recovery(
     // daemon's job; the builder emits the plain desired name).
     let recovery_name = crate::resume_file::recovery_file_name(&file_name, &|_| false);
 
+    // Resolve the preview entry geometry (design §E.1) before Ctx, since
+    // build_steps decides whether to emit the preview lift or the Z-confirm
+    // lift from it. The single hover plane's absolute floor is the highest
+    // stop's g-code Z plus the resolved standoff; every stop's Z is finite
+    // (the builder only emits trusted-position stops), so `fold` over the
+    // finite set with a finite standoff is finite. The cool-down target is
+    // the ruled probe-hold default unless the operator set one.
+    let origin_z = gcode.origin[2];
+    let preview_entry = preview_set.and_then(|set| {
+        let max_stop_z = set
+            .stops
+            .iter()
+            .map(|s| s.z)
+            .fold(f64::NEG_INFINITY, f64::max);
+        if !max_stop_z.is_finite() {
+            return None;
+        }
+        let target_z = (max_stop_z - origin_z) + config.preview_standoff_mm();
+        Some(PreviewEntry {
+            target_z,
+            cool_nozzle_temp: config.preview_nozzle_temp_c(&machine.probe.kind),
+        })
+    });
+
     let ctx = Ctx {
         cfg: config,
         machine: &machine,
@@ -2727,6 +2878,7 @@ pub fn plan_recovery(
         park,
         clean_nozzle_present: inputs.clean_nozzle_macro_present,
         recovery_file_name: &recovery_name,
+        preview_entry,
     };
     let steps = build_steps(&ctx)?;
 
@@ -2783,6 +2935,18 @@ pub fn plan_recovery(
         header_cap: RECOVERY_HEADER_CAP,
     };
 
+    // The preview spec: mirror the analyzer's stops/anchors and bake a
+    // per-stop recovery binding (design §4). Built here — the one place
+    // with both the model and the g-code frame — so accept-time
+    // materialisation is a pure field swap on the daemon side.
+    let preview = match (preview_set, preview_entry) {
+        (Some(set), Some(entry)) => Some(build_preview_spec(&ctx, inputs.model, set, entry)?),
+        // `preview_entry` is derived from `preview_set`, so they are Some
+        // together; the other arms cannot occur, but are handled as "no
+        // preview" rather than panicking.
+        _ => None,
+    };
+
     let plan = RecoveryPlan {
         steps,
         envelope,
@@ -2793,10 +2957,75 @@ pub fn plan_recovery(
         debug_confirm_each_step: config.debug_confirm_each_step,
         confirm_timeout_s: config.confirm_timeout_s,
         gcode_barrier_timeout_s: config.gcode_barrier_timeout_s,
+        preview,
         warnings,
     };
     run_preflight(&plan, &machine, candidate.point)?;
     Ok(PlanOutcome::Plan(Box::new(plan)))
+}
+
+/// Builds the plan's [`crate::plan::PreviewSpec`] from the analyzer's
+/// [`plr_analyzer::PreviewSet`] and the resolved entry geometry (design §D
+/// / §4).
+///
+/// The stops and navigation anchors are copied verbatim; the work here is
+/// the per-stop recovery [`crate::plan::PreviewBinding`], which needs the
+/// g-code frame the analyzer lacks. For each stop it resolves the resume
+/// deposition from the stop's *baked* `resume_offset` and requires the
+/// resolved deposition to sit EXACTLY at that offset before trusting it:
+///
+/// * a match means the analyzer's kept-and-trusted resume line resolved
+///   cleanly, so the entry moves target it (built by the shared
+///   [`build_entry_commands_for`], so a stop's file matches its preview
+///   byte-for-byte);
+/// * a miss or an error means the analyzer baked `resume_offset =
+///   span.end` (no kept deposition remained after this stop — the print is
+///   complete past it, or every later deposition is an EXCLUDED /
+///   cancelled object). Resolving unconditionally there would let
+///   `first_deposition_at_or_after` walk into that excluded deposition and
+///   bind a resume INTO cancelled debris (the D9 hazard); requiring the
+///   offset to match refuses that. The binding then carries empty entry
+///   moves — accepting such a stop resumes "past the end" with nothing to
+///   deposit, which is safe.
+///
+/// # Errors
+///
+/// [`RecoveryError::NonFinite`] if a resolved entry command is non-finite.
+fn build_preview_spec(
+    ctx: &Ctx<'_>,
+    model: &LayerModel,
+    set: &plr_analyzer::PreviewSet,
+    entry: PreviewEntry,
+) -> Result<crate::plan::PreviewSpec, RecoveryError> {
+    let mut bindings = Vec::with_capacity(set.stops.len());
+    for stop in &set.stops {
+        // Trust a resolved resume only when it lands EXACTLY on the stop's
+        // baked resume_offset (see the fn docs — the D9 guard).
+        let entry_commands = match resolve_resume_from_offset(model, stop.resume_offset) {
+            Ok(target) if target.offset == stop.resume_offset => {
+                build_entry_commands_for(ctx, target.position)?
+            }
+            _ => Vec::new(),
+        };
+        bindings.push(crate::plan::PreviewBinding {
+            tail_offset: stop.resume_offset,
+            entry_commands,
+        });
+    }
+    Ok(crate::plan::PreviewSpec {
+        stops: set.stops.clone(),
+        representatives: set.representatives.clone(),
+        first_index: set.first_index,
+        mid_index: set.mid_index,
+        last_index: set.last_index,
+        // The loop opens on the skip-forward stop — the safe default an
+        // operator who just accepts gets (design §D.2).
+        default_index: set.last_index,
+        bindings,
+        hover_target_z: entry.target_z,
+        z_max: ctx.machine.axis_limits.z_max,
+        cool_nozzle_temp: entry.cool_nozzle_temp,
+    })
 }
 
 /// Pre-flights the GENERATED RECOVERY FILE's own absolute coordinates —

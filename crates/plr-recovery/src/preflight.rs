@@ -530,6 +530,7 @@ mod tests {
             debug_confirm_each_step: false,
             confirm_timeout_s: None,
             gcode_barrier_timeout_s: None,
+            preview: None,
             warnings: vec![],
         }
     }
