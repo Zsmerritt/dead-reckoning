@@ -539,19 +539,42 @@ fn report_layer_attribution(
     );
     // OffsetWindow.end is inclusive; layers_in_window takes an exclusive end.
     let wl = model.layers_in_window(window.start, Some(window.end.saturating_add(1)));
-    w.line(&format!(
-        "  layer attribution: {} (layer model from byte {}: {} layers)",
-        wl.describe(),
-        base_offset,
-        model.layers.len()
-    ));
+    // `Layer::index` is window-relative; it equals an absolute file layer
+    // only when the model spans from file start. The slicer mark is
+    // absolute, so the cross-check is valid only then (see
+    // `pipeline::narrate_layer_attribution` for the full rationale).
+    let absolute = base_offset == 0;
+    if absolute {
+        w.line(&format!(
+            "  layer attribution: {} (layer model from byte {base_offset}: {} layers)",
+            wl.describe(),
+            model.layers.len()
+        ));
+    } else {
+        w.line(&format!(
+            "  layer attribution: stop spans {} geometric layer(s){} (layer model from byte \
+             {base_offset}: {} layers; layer numbers window-relative to the anchor, not absolute)",
+            wl.layers.len(),
+            if wl.before_first {
+                " plus the pre-first-layer preamble"
+            } else {
+                ""
+            },
+            model.layers.len()
+        ));
+    }
     match anchor.current_layer {
         None => w.line(
             "  slicer layer marks: unavailable (no SET_PRINT_STATS_INFO); geometry carries the answer",
         ),
         Some(mark) => {
             let of = anchor.total_layer.map_or_else(String::new, |t| format!(" of {t}"));
-            if wl.mark_is_consistent(mark) {
+            if !absolute {
+                w.line(&format!(
+                    "  slicer reported current_layer={mark}{of} (absolute); no consistency check — \
+                     the attribution above is window-relative to a mid-file anchor"
+                ));
+            } else if wl.mark_is_consistent(mark) {
                 w.line(&format!(
                     "  slicer layer mark: current_layer={mark}{of} (upper bound; consistent cross-check)"
                 ));
@@ -752,24 +775,19 @@ mod tests {
         );
     }
 
-    /// Part 2 + Part 3 in the scan report: with the print file readable, a
-    /// layer model is built and the offset window is attributed to layer(s),
-    /// and the slicer `current_layer` mark is folded in as an upper-bound
-    /// cross-check (here a large mark, so trivially consistent).
-    #[test]
-    fn recovery_reports_layer_attribution_and_a_consistent_slicer_mark() {
-        let dir = temp_dir("layerattr");
-        // A small two-layer print written to a real, readable path.
+    /// Builds a readable two-layer print + a WAL that reconstructs to a
+    /// RECOVERY whose anchor context sits at `ctx_pos`, carrying the given
+    /// slicer mark. Returns the scan report.
+    fn layer_attr_report(tag: &str, ctx_pos: u64, mark: Option<u32>) -> String {
+        let dir = temp_dir(tag);
         let gcode = "G90\nM83\nG1 Z0.2 F7200\nG1 X10 Y10 F9000\nG1 X20 Y10 E1 F1800\n\
                      G1 Z0.4 F7200\nG1 X10 Y10 F9000\nG1 X20 Y10 E1\n";
         let gpath = dir.join("part.gcode");
         std::fs::write(&gpath, gcode).unwrap();
         let path_str = gpath.to_str().unwrap().to_owned();
-        let pos = gcode.find("G1 X20 Y10 E1 F1800").unwrap() as u64;
-        // A slicer mark that is a safe upper bound (parse leads execution).
-        let mut ctx = context(5_000_000_000, pos, &path_str);
-        ctx.current_layer = Some(99);
-        ctx.total_layer = Some(120);
+        let mut ctx = context(5_000_000_000, ctx_pos, &path_str);
+        ctx.current_layer = mark;
+        ctx.total_layer = mark.map(|_| 120);
         let full = write_segment(
             &dir,
             1,
@@ -784,18 +802,49 @@ mod tests {
         );
         // Tear the tail: a realistic power-loss shape → RECOVERY.
         std::fs::write(dir.join(segment_file_name(1)), &full[..full.len() - 5]).unwrap();
+        scan_to_string(&dir)
+    }
 
-        let report = scan_to_string(&dir);
+    /// Part 2 in the scan report: with the print file readable, a layer
+    /// model is built and the offset window is attributed to layer(s).
+    /// MAJOR-fix case: at a **mid-file** anchor the geometric layer numbers
+    /// are window-relative, so the absolute slicer mark gets NO consistency
+    /// verdict — it is reported verbatim. (This is the case whose absence of
+    /// a mid-file test let the relative-vs-absolute bug through.)
+    #[test]
+    fn mid_file_recovery_reports_the_mark_verbatim_without_a_verdict() {
+        let pos = "G90\nM83\nG1 Z0.2 F7200\nG1 X10 Y10 F9000\n".len() as u64; // start of the layer-0 deposit line, mid-file
+        assert!(pos > 0);
+        let report = layer_attr_report("layerattr-mid", pos, Some(99));
         assert!(report.contains("RECOVERY"), "{report}");
-        assert!(report.contains("layer attribution:"), "{report}");
         assert!(
             !report.contains("layer attribution: unavailable"),
             "a readable file must build a model: {report}"
         );
-        assert!(report.contains("layer model from byte"), "{report}");
+        // Mid-file: window-relative attribution, mark reported verbatim.
+        assert!(report.contains("window-relative"), "{report}");
         assert!(
-            report.contains("current_layer=99") && report.contains("consistent"),
-            "the upper-bound mark must read as a consistent cross-check: {report}"
+            report.contains("current_layer=99") && report.contains("no consistency check"),
+            "a mid-file anchor must NOT emit a consistency verdict: {report}"
+        );
+        assert!(
+            !report.contains("consistent cross-check"),
+            "no absolute cross-check is possible mid-file: {report}"
+        );
+    }
+
+    /// The companion: when the anchor sits at **file start** (`base_offset
+    /// == 0`) the window ordinals ARE absolute, so the upper-bound
+    /// cross-check is valid and fires — here a large mark is trivially
+    /// consistent.
+    #[test]
+    fn file_start_recovery_runs_the_absolute_mark_cross_check() {
+        let report = layer_attr_report("layerattr-start", 0, Some(99));
+        assert!(report.contains("RECOVERY"), "{report}");
+        assert!(report.contains("layer model from byte 0"), "{report}");
+        assert!(
+            report.contains("current_layer=99") && report.contains("consistent cross-check"),
+            "a file-start anchor must run the absolute cross-check: {report}"
         );
     }
 

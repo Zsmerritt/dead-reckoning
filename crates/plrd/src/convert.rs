@@ -360,6 +360,13 @@ pub fn reconstruct_config(config: Option<&Config>) -> ReconstructConfig {
     ReconstructConfig {
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         heartbeat_period_ns: period_ns as u64,
+        // The frontier cap's Δt_tail must price the WAL heartbeat's batch
+        // durability lag. Derive it from the SAME `batch_sync_ms` that
+        // configures `walsvc`'s `fdatasync` cadence (`daemon::wal_cfg`), so
+        // the reconstruct side and the writer side cannot drift.
+        // `Config::validate` bounds `batch_sync_ms` to [1, 60000] ms, so
+        // this multiply cannot overflow.
+        durability_lag_ns: config.batch_sync_ms.saturating_mul(1_000_000),
         ..defaults
     }
 }
@@ -1550,6 +1557,46 @@ mod tests {
         );
     }
 
+    /// Cross-crate pin (both platforms): the frontier cap's batch durability
+    /// lag must equal the `fdatasync` batch cadence `walsvc` actually uses.
+    /// `plr-reconstruct` cannot import `plrd`, so `ReconstructConfig` takes
+    /// the lag as an input; this test is what keeps the two sides from
+    /// drifting — the config-less default must equal `Config`'s
+    /// `batch_sync_ms` default (the offline scan's assumption), and a passed
+    /// config must derive the lag from the very `batch_sync_ms` that feeds
+    /// `walsvc` (`daemon::wal_cfg`). If someone retunes the batch cadence
+    /// default and not this, the first assertion fails rather than the cap
+    /// silently understating `Δt` on every offline scan.
+    #[test]
+    fn durability_lag_stays_in_lockstep_with_the_walsvc_batch_cadence() {
+        use crate::config::Config;
+
+        // Offline default == production batch_sync_ms default, in ns.
+        assert_eq!(
+            plr_reconstruct::ReconstructConfig::default().durability_lag_ns,
+            Config::default().batch_sync_ms * 1_000_000,
+            "the offline durability-lag default drifted from Config::batch_sync_ms"
+        );
+        // reconstruct_config(None) inherits that default.
+        assert_eq!(
+            super::reconstruct_config(None).durability_lag_ns,
+            Config::default().batch_sync_ms * 1_000_000
+        );
+        // A passed config derives the lag from ITS batch_sync_ms — the same
+        // value that configures walsvc — so the two cannot diverge.
+        for ms in [1_u64, 40, 250, 500, 1000, 60_000] {
+            let cfg = Config {
+                batch_sync_ms: ms,
+                ..Config::default()
+            };
+            assert_eq!(
+                super::reconstruct_config(Some(&cfg)).durability_lag_ns,
+                ms * 1_000_000,
+                "durability lag must track batch_sync_ms={ms}"
+            );
+        }
+    }
+
     #[test]
     fn reconstruct_config_is_total_on_a_degenerate_rate() {
         use crate::config::Config;
@@ -1825,6 +1872,41 @@ mod tests {
             panic!("expected context");
         };
         assert_eq!(ctx.current_layer, Some(5));
+        assert_eq!(ctx.total_layer, Some(90));
+    }
+
+    /// The common mid-print shape: a diff carries `print_stats` with a
+    /// `state` change but **no `info` key**. `info` absent means "unchanged",
+    /// so the stored marks must be KEPT, not cleared — the mutation that
+    /// clears marks on absent `info` must fail here.
+    #[test]
+    fn a_state_change_without_info_keeps_the_layer_marks() {
+        let mut r = recorder_with_snapshot();
+        r.on_status(
+            &status(json!({"eventtime": 101.0, "status": {
+                "print_stats": {"info": {"current_layer": 5, "total_layer": 90}},
+            }})),
+            2_000,
+            false,
+        );
+        // A state change carrying `print_stats` but no `info`: the state
+        // moves (snapshot had none), so a context is journaled — and it must
+        // still carry the previously observed marks.
+        let out = r.on_status(
+            &status(json!({"eventtime": 102.0, "status": {
+                "print_stats": {"state": "printing"},
+            }})),
+            3_000,
+            false,
+        );
+        let (WalRecord::Context(ctx), _) = &out.records[0] else {
+            panic!("a state change must journal a context");
+        };
+        assert_eq!(
+            ctx.current_layer,
+            Some(5),
+            "an absent `info` key must keep the stored current_layer"
+        );
         assert_eq!(ctx.total_layer, Some(90));
     }
 

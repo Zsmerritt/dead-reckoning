@@ -380,6 +380,17 @@ impl WindowLayers {
     /// A geometric attribution lying entirely *above* the mark is the one
     /// physically impossible case and returns `false` (evidence to flag,
     /// never a reason to override geometry).
+    ///
+    /// # Caller contract: absolute layers only
+    ///
+    /// [`Self::layers`] are **window-relative** ordinals of a [`LayerModel`]
+    /// — they equal absolute file layers only when the model was built from
+    /// file start (`base_offset == 0`). The slicer mark is absolute. Calling
+    /// this on a mid-file model compares incommensurable numbers (it reads
+    /// vacuously true mid-print and spuriously false when the slicer resets
+    /// `current_layer` to 0 on a `total_layer` change), so callers must
+    /// invoke it **only** when the model spans from file start; both plrd
+    /// narrations gate on exactly that.
     #[must_use]
     pub fn mark_is_consistent(&self, current_layer: u32) -> bool {
         self.before_first || self.layers.iter().any(|&l| l <= current_layer)
@@ -420,8 +431,12 @@ impl LayerModel {
     /// first layer's deposition is the preamble.
     ///
     /// Reporting only — never consulted by [`crate::match_stop_point`], so
-    /// the matcher's ladder is unaffected. Total: never panics, and an
-    /// inverted or empty window simply yields no layers.
+    /// the matcher's ladder is unaffected. Total: never panics. A degenerate
+    /// window (`end` is `None`, equal to `start`, or below it — an inverted
+    /// range) is treated as the single offset `start`, so it attributes the
+    /// one cell that offset falls in rather than nothing. The `start + 1`
+    /// used for that single offset saturates at `u64::MAX` (a file that
+    /// large is not addressable anyway).
     #[must_use]
     pub fn layers_in_window(&self, start: u64, end: Option<u64>) -> WindowLayers {
         // A window is [start, end_excl). Treat `end = None` and any end

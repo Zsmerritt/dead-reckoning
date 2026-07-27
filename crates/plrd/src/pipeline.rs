@@ -565,6 +565,7 @@ fn plan_from_recovery(
         stop_set,
         anchor.current_layer,
         anchor.total_layer,
+        base_offset,
         say,
     );
 
@@ -953,22 +954,26 @@ fn anchored_model<'a>(
 }
 
 /// Narrates the geometric layer attribution of the (cap-narrowed) offset
-/// window, folding in the slicer layer mark as an upper-bound cross-check.
+/// window, folding in the slicer layer mark.
 ///
-/// Reporting only. `current_layer`/`total_layer` are the slicer marks from
-/// the anchor context (Part 3): the slicer sets `current_layer` at the
-/// layer-change line's *parse* time, which leads physical execution, so
-/// the physically-printing layer is `<= current_layer` — an upper bound.
-/// We therefore treat a geometric attribution whose layers all sit at or
-/// below `current_layer` as consistent, and flag the (physically
-/// impossible, so evidence-quality) case where geometry lands entirely
-/// above the mark. The mark never overrides geometry; when absent (the
-/// operator's own `OrcaSlicer` emits none) we say so plainly.
+/// Reporting only. **`Layer::index` is window-relative** — the model is
+/// built from the mid-file anchor (`base_offset`), so its layer 0 is the
+/// anchor's layer, not file layer 0. The slicer `current_layer` mark is
+/// **absolute** (from file start), and Klipper resets it to 0 on a
+/// `total_layer` change (`print_stats.py`). Comparing the two only makes
+/// sense when the model itself spans from file start (`base_offset == 0`);
+/// there, and only there, window ordinals are absolute and the upper-bound
+/// cross-check (physical layer `<= current_layer`, parse leads execution)
+/// is valid. On a mid-file model the geometric layers are reported as
+/// window-relative and the mark is reported verbatim with no verdict —
+/// avoiding both the vacuous-true and the spurious "impossible" alarm a
+/// relative-vs-absolute comparison would produce.
 fn narrate_layer_attribution(
     model: &LayerModel,
     stop_set: &PossibleStopSet,
     current_layer: Option<u32>,
     total_layer: Option<u32>,
+    base_offset: u64,
     say: &mut dyn FnMut(&str),
 ) {
     let Some(window) = stop_set.file_window.as_ref() else {
@@ -977,12 +982,31 @@ fn narrate_layer_attribution(
     };
     // OffsetWindow.end is inclusive; layers_in_window takes an exclusive end.
     let wl = model.layers_in_window(window.start, Some(window.end.saturating_add(1)));
-    say(&format!(
-        "pipeline: layer attribution: {} (offset window bytes {}..={})",
-        wl.describe(),
-        window.start,
-        window.end
-    ));
+    // Window ordinals equal absolute file layers only when the model spans
+    // from file start.
+    let absolute = base_offset == 0;
+    if absolute {
+        say(&format!(
+            "pipeline: layer attribution: {} (offset window bytes {}..={})",
+            wl.describe(),
+            window.start,
+            window.end
+        ));
+    } else {
+        say(&format!(
+            "pipeline: layer attribution: stop spans {} geometric layer(s){} within the offset \
+             window bytes {}..={}, window-relative to the resume anchor at byte {base_offset} \
+             (absolute layer numbers would require modeling from file start)",
+            wl.layers.len(),
+            if wl.before_first {
+                " plus the pre-first-layer preamble"
+            } else {
+                ""
+            },
+            window.start,
+            window.end
+        ));
+    }
     match current_layer {
         None => say(
             "pipeline: layer marks unavailable (slicer emitted no SET_PRINT_STATS_INFO); \
@@ -990,9 +1014,15 @@ fn narrate_layer_attribution(
         ),
         Some(mark) => {
             let of = total_layer.map_or_else(String::new, |t| format!(" of {t}"));
-            // Direction: physical layer <= current_layer (parse leads
-            // execution); see WindowLayers::mark_is_consistent.
-            if wl.mark_is_consistent(mark) {
+            if !absolute {
+                // Mid-file model: window ordinals are NOT absolute, so no
+                // consistency verdict — report the mark verbatim.
+                say(&format!(
+                    "pipeline: slicer reported current_layer={mark}{of} (absolute) — no \
+                     consistency check: the geometric attribution above is window-relative to a \
+                     mid-file anchor, not an absolute layer number"
+                ));
+            } else if wl.mark_is_consistent(mark) {
                 say(&format!(
                     "pipeline: slicer layer mark current_layer={mark}{of} (upper bound on the \
                      physical layer; parse leads execution) — consistent with the geometric \
@@ -1646,67 +1676,75 @@ G1 X60 Y60 E0.02
     /// recorded frontier by seconds, which is what keeps the set containing
     /// the truth, and it widens the offset candidate window.
     ///
-    /// The outcome is `ManualFallback` either way, but the frontier cap
-    /// (Part 1, `feat/layer-attribution`) changed *which* step declines,
-    /// and this test is re-pinned to it deliberately. **Before the cap:**
-    /// the reader-lead horizon left 16 candidate lines, past what the
-    /// matcher can resolve per line, so the *matcher* declined
-    /// ("stop-point match failed … below layer granularity"). **After the
-    /// cap:** its parser-leads-execution bound narrows the high end (here
-    /// Δt ≈ 1.25 s of executable path from the frontier), leaving 7
-    /// candidates — a matcher-resolvable `AmbiguousWindow` — so the matcher
-    /// now succeeds and recovery is refused one step later at *contact
-    /// selection*: a stop this early sits on the resume layer itself with
-    /// no layer below to probe ("resume layer 0 out of range"). The
-    /// original test comment already anticipated exactly this structural
-    /// refusal for a narrow horizon.
+    /// The outcome is `ManualFallback`. The frontier cap (Part 1) narrows
+    /// only the offset window's *high* end, from the parser-leads-execution
+    /// bound; on this unanchored early crash the cap's honestly-priced Δt
+    /// (record spacing + batch durability lag + two subscription draws —
+    /// large here, since the fixture carries a single heartbeat, so the
+    /// conservative tolerance spacing applies) barely trims the reader-lead
+    /// horizon. The window therefore stays wider than per-line granularity —
+    /// 15 candidate lines within layer 0 — and the *matcher* declines
+    /// ("stop-point match failed … below layer granularity"), the deliberate
+    /// degradation this fixture ratifies.
     ///
-    /// The containment hole the reader-lead bound closes stays closed: the
-    /// cap narrows only the *high* end, and the window LOW end is still the
-    /// frontier (byte 8), so the truth — a stop that had not advanced past
-    /// the frontier — remains contained. This is asserted below (the window
-    /// low end is pinned to 8), which is what now catches an unsound
-    /// narrowing, in place of the obsolete `count >= 12` guard the cap
-    /// legitimately falsifies.
+    /// **History of this golden.** It moved twice, both deliberate. The
+    /// first cap shipped with a too-tight Δt (nominal 1× period + one draw =
+    /// 1.25 s) that over-narrowed this window to 7 candidates and flipped
+    /// the decline to contact selection — the exact over-narrowing the
+    /// adversarial review flagged as unsound. Pricing Δt honestly (batch
+    /// durability lag + the second subscription draw + observed-spacing
+    /// terminal gap) restores the matcher-ambiguity decline and re-arms the
+    /// `count >= 12` guard, which now again catches an unsound re-narrowing.
     ///
-    /// Asserted rather than left implicit so the unanchored path keeps a
-    /// consumer-level test that can fail. `docs/operations.md` carries the
-    /// operator-facing half — an early-print power loss lands in manual
-    /// recovery, which costs the operator little because almost nothing has
-    /// printed.
+    /// Containment: the cap narrows only the high end, so the window LOW end
+    /// is still the frontier (byte 8) and the truth — a stop that had not
+    /// advanced past the frontier — remains contained (asserted below). The
+    /// attribution line is window-relative (base 8 ≠ file start), the
+    /// MAJOR-fix behavior: no absolute layer claim on a mid-file model.
+    ///
+    /// `docs/operations.md` carries the operator-facing half — an early-print
+    /// power loss lands in manual recovery, which costs the operator little
+    /// because almost nothing has printed.
     #[test]
     fn an_early_print_cut_without_motion_evidence_falls_back_to_manual() {
         let (_dir, config) = early_print_fixture("early-print-unanchored");
         let (outcome, output) = run(&config);
-        // Outcome preserved: still ManualFallback, no regression — the
-        // decline moved from the matcher to contact selection, not from
-        // automatic to manual (see this test's doc comment for the cap).
         let PipelineOutcome::ManualFallback(reason) = outcome else {
             panic!("expected ManualFallback, got {outcome:?}\n{output}");
         };
-        // The frontier cap resolves the window, so recovery is now refused
-        // structurally: a layer-0 stop has no layer below to probe.
+        // The honestly-priced Δt leaves the window past per-line granularity,
+        // so the matcher declines — not contact selection.
         assert!(
-            reason.contains("contact selection failed")
-                && reason.contains("resume layer 0 out of range"),
+            reason.contains("stop-point match failed")
+                && reason.contains("below layer granularity"),
             "reason changed: {reason}\n{output}"
         );
-        // The cap did its job: the window is now a bounded, matcher-
-        // resolvable AmbiguousWindow (was 16 candidate lines past layer
-        // granularity; now 7), and its LOW end is still the frontier
-        // (byte 8) — the cap narrowed only the high end, never below the
-        // truth, so the reader-lead containment hole stays closed.
+        // Re-armed numeric guard: the reader-lead widening leaves > 12
+        // candidate lines. A cap that over-narrows (the review's blocker)
+        // would drop this below 12 and fail here.
+        let count: usize = reason
+            .split_whitespace()
+            .find_map(|w| w.parse().ok())
+            .unwrap_or(0);
         assert!(
-            output.contains("AmbiguousWindow"),
-            "the frontier cap must resolve this to a bounded window: {output}"
+            count >= 12,
+            "only {count} candidate lines — an over-narrowing cap is back: {reason}"
         );
+        // Containment: the window LOW end is still the frontier (byte 8).
+        // The matcher declined, so there is no AmbiguousWindow offsets line;
+        // the offset window is visible in the attribution narration instead.
         assert!(
-            output.contains("offsets: [8,"),
+            output.contains("offset window bytes 8..="),
             "the frontier (byte 8) must remain the window low end: {output}"
         );
-        // Nothing is lost by declining here: a stop this early has no
-        // layer below the resume layer to probe, so recovery is refused
-        // on structural grounds. See docs/operations.md.
+        // MAJOR fix: a mid-file model reports window-relative layers, never
+        // an absolute layer number.
+        assert!(
+            output.contains("layer attribution:") && output.contains("window-relative"),
+            "mid-file attribution must be window-relative: {output}"
+        );
+        // Nothing is lost by declining here: a stop this early has no layer
+        // below the resume layer to probe. See docs/operations.md.
         assert!(
             output.contains("layer model from byte 8: 2 layers"),
             "{output}"

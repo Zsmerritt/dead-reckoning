@@ -141,6 +141,29 @@ pub struct ReconstructConfig {
     /// between independently-computed copies of the same layer height;
     /// keep well below any physical layer height.
     pub z_merge_tolerance: f64,
+    /// Durability lag of a WAL `Heartbeat` **record**, in nanoseconds:
+    /// how long the newest *durable* heartbeat can trail the newest
+    /// *written* one.
+    ///
+    /// # Why this is an input, not a constant here
+    ///
+    /// `plrd` appends heartbeat records with `SyncPolicy::Batched` and
+    /// `fdatasync`s them on a batch cadence (`plrd::walsvc`, from
+    /// `Config::batch_sync_ms`, default 0.5 s). A record can therefore be
+    /// written but not yet durable when power is lost, so the newest
+    /// durable heartbeat's print time `t_a` trails the cut by up to one
+    /// batch interval *on top of* the record spacing. The frontier cap
+    /// (`crate::stopset`) prices this into `Δt_tail`.
+    ///
+    /// It is a config **input** rather than a literal because
+    /// `plr-reconstruct` cannot depend on `plrd` (dependency direction),
+    /// and a reconstruct-side copy of `walsvc`'s batch interval would be a
+    /// divergence bug waiting to happen. `plrd::convert::reconstruct_config`
+    /// populates it from the very `batch_sync_ms` that feeds `walsvc`; the
+    /// default here mirrors `Config`'s default (500 ms) for the
+    /// config-less offline scan, and a cross-crate pin test keeps the two
+    /// from drifting.
+    pub durability_lag_ns: u64,
 }
 
 impl Default for ReconstructConfig {
@@ -159,6 +182,11 @@ impl Default for ReconstructConfig {
             heartbeat_gap_tolerance: 3.0,
             sim: SimConfig::default(),
             z_merge_tolerance: 1e-6,
+            // Mirrors `plrd::config::Config`'s default `batch_sync_ms`
+            // (500 ms) for the config-less offline scan. The running
+            // daemon passes its own via `reconstruct_config`; a cross-crate
+            // pin test keeps this in lockstep with `Config`'s default.
+            durability_lag_ns: 500_000_000,
         }
     }
 }

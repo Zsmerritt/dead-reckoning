@@ -225,40 +225,76 @@
 //! `P_stop`. The window's high end becomes `min(extension_resume, cap)`;
 //! the cap can only ever narrow, never widen.
 //!
-//! **Δt, conservatively (the one direction that can hurt is understating
-//! it).** `Δt = t_cut − t_ctx` is split into two bounded pieces:
+//! **Δt: the honest containment claim.** Containment does NOT rest on
+//! "no term errs short." It rests on this: **every *observable* contributor
+//! to `t_cut − t_ctx` is priced at its admitted maximum, and the sole
+//! *unobservable* residual is hazard-pinned.** `Δt = t_cut − t_ctx =
+//! staleness + Δt_tail`:
 //!
-//! * `max(0, t_a − t_ctx)` — the measured staleness of the anchor context
+//! * `staleness = max(0, t_a − t_ctx)` — the anchor context's measured age
 //!   relative to the newest durable heartbeat `t_a` (`window.t_a`). A
-//!   frontier that stopped being durable long before `t_a` (dropped
-//!   contexts, a torn tail at the context stream) makes this large, which
-//!   *loosens* the cap — the safe direction. Clamped at 0: an anchor
-//!   *newer* than `t_a` is even closer to the cut, so the tail term alone
-//!   already covers it.
-//! * `Δt_tail` bounds `t_cut − t_a`. `t_a` is the newest durable heartbeat
-//!   (file or WAL record); active printing appends a WAL `Heartbeat`
-//!   record every heartbeat-file beat (`WAL_HEARTBEAT_ACTIVE_EVERY`, 10 Hz)
-//!   and rewrites the fsync'd heartbeat *file* in place, pinning `t_a` to
-//!   within ~100 ms of the cut. Conservatively `Δt_tail` = one WAL
-//!   heartbeat spacing (`config.heartbeat_period_ns`, the reader's 1 Hz
-//!   basis — `plrd::convert::WAL_HEARTBEAT_EVERY`) plus the 0.25 s
-//!   subscription-refresh staleness (`SUBSCRIPTION_REFRESH_TIME`,
-//!   `klippy/webhooks.py:469` — the status sample that fed the heartbeat
-//!   can itself be that stale).
+//!   frontier that stopped being durable well before `t_a` (dropped
+//!   contexts, a torn context tail) makes this large, which *loosens* the
+//!   cap. Clamped at 0: an anchor newer than `t_a` is closer to the cut, so
+//!   the tail term already covers it.
+//! * `Δt_tail` bounds `t_cut − t_a` as a sum of four priced terms plus one
+//!   pinned residual:
+//!   1. **Record spacing** — the widest gap the heartbeat tail actually
+//!      shows ([`heartbeat_tail_spacing_ns`]), *not* a nominal period. The
+//!      newest durable heartbeat can trail the cut by about the recent
+//!      cadence; guard 3 has already refused a tail whose newest gap
+//!      exceeds `heartbeat_period_ns * heartbeat_gap_tolerance`, so this is
+//!      bounded by `period * gap_tolerance`. Pricing the nominal 1× period
+//!      was the review's blocker: it is neither what modern 10 Hz WALs show
+//!      (~0.1 s) nor what guard 3 admits (3.0×).
+//!   2. **Batch durability lag** — the newest *durable* heartbeat trails
+//!      the newest *written* one, because `plrd::walsvc` appends heartbeat
+//!      records with `SyncPolicy::Batched` and `fdatasync`s on a batch
+//!      cadence (`Config::batch_sync_ms`, 0.5 s default). Priced from
+//!      [`ReconstructConfig::durability_lag_ns`], which `plrd` derives from
+//!      that same `batch_sync_ms` — never restated crate-locally.
+//!   3. **Two independent subscription draws**, `2 * SUBSCRIPTION_REFRESH`
+//!      (`webhooks.py:469`, 0.25 s each). The heartbeat's `print_time` and
+//!      the anchor context's `file_position` come from *separate*
+//!      `QueryStatusHelper` samples, each up to one refresh stale, and the
+//!      clock correlation absorbs only the heartbeat's draw.
 //!
-//! **When the cap does not apply (hazard pins; falls back to
-//! extension-only).** Each premise above has a guard; if any fails the cap
-//! is `None` and the high end is the extension resume offset alone:
+//! **The terminal-stall residual (hazard pin, not priced).** One
+//! contributor is unobservable: if `plrd` itself stalls (stops appending
+//! heartbeats) while klippy keeps executing, the terminal gap `t_cut − t_a`
+//! can exceed the widest *observed* tail gap without leaving any evidence,
+//! *provided it stays below the observation-gap threshold* (a larger stall
+//! surfaces as a `SubscriptionGap`/`SocketLost` and trips guard 2). Below
+//! that threshold there is nothing in the WAL to price against, so — as the
+//! epoch work documented its marker-less-restart pin — this residual is
+//! **acknowledged, not guarded**: under a sub-threshold terminal writer
+//! stall the cap can understate `Δt`. `terminal_writer_stall_residual_is_pinned`
+//! constructs the shape and asserts the residual exists. Every other path
+//! is priced.
 //!
-//! * `anchor_pt` unplaceable on the print-time axis — the staleness term
-//!   is unmeasurable ([`Degradation::anchor_time_unknown`]).
+//! **Modern-WAL margin (worked).** On the real 10 Hz capture the observed
+//! tail spacing is small, so `Δt_tail ≈ (tail gap) + 0.5 (durability) +
+//! 0.5 (two draws) ≈ 1.3 s`, and the cap stays decisively useful (it trims
+//! 3.3–4.7 s of over-covered horizon on the two real crashes). A legacy
+//! 1 Hz stream shows wider gaps, so `Δt_tail` can approach `3.0 (tail) +
+//! 1.0 = 4.0 s`; there the cap may narrow to a near-no-op — **acceptable,
+//! because a useless-but-sound cap on a sparse legacy stream beats an
+//! unsound one.**
+//!
+//! **When the cap does not apply (guards; falls back to extension-only).**
+//! If any premise fails the cap is `None` and the high end is the extension
+//! resume offset alone:
+//!
+//! * `anchor_pt` unplaceable on the print-time axis — staleness is
+//!   unmeasurable ([`Degradation::anchor_time_unknown`]).
 //! * an observation gap overlaps the window
 //!   ([`Degradation::observation_gap`]: a `SubscriptionGap`/`SocketLost`
-//!   means motion could have advanced past `t_a` unobserved for longer
-//!   than a heartbeat spacing, voiding `Δt_tail`).
-//! * the heartbeat stream is not continuous at the tail (the newest
-//!   inter-heartbeat gap exceeds `heartbeat_period_ns * heartbeat_gap_tolerance`
-//!   — a stalled writer, so `t_a` may not be one spacing from the cut).
+//!   means motion could have advanced past `t_a` unobserved for longer than
+//!   the tail spacing prices — this is the observable half of the stall
+//!   above, and it trips here).
+//! * the heartbeat tail is broken — the newest inter-heartbeat gap exceeds
+//!   `heartbeat_period_ns * heartbeat_gap_tolerance`, so `t_a` is a stale
+//!   island ([`heartbeat_tail_spacing_ns`] returns `None`).
 //!
 //! **The one-line skew (edge case a).** `virtual_sdcard.file_position`
 //! can lag `gcode_move`'s `last_position` by exactly one line
@@ -1227,18 +1263,35 @@ fn frontier_cap_offset(
     if observation_gap {
         return None;
     }
-    // Guard 3: the newest heartbeat must sit on a continuous stream, or
-    // `t_a` may be a stale island far from the cut (a stalled writer).
-    if !heartbeat_tail_continuous(timeline, config) {
-        return None;
-    }
     let t_a = window.t_a;
     if !t_a.is_finite() {
         return None;
     }
+    // Guard 3 AND the spacing term in one tail walk: a broken tail (the
+    // newest heartbeat is a stale island) refuses the cap; otherwise the
+    // terminal gap `t_cut - t_a` is priced at the widest gap the tail
+    // actually shows — evidence, not a nominal period.
+    let spacing_ns = heartbeat_tail_spacing_ns(timeline, config)?;
 
     let staleness = (t_a - anchor_pt).max(0.0);
-    let dt_tail = ns_to_s(config.heartbeat_period_ns) + SUBSCRIPTION_REFRESH_S;
+    // Δt_tail bounds `t_cut - t_a`. Every OBSERVABLE contributor is priced
+    // at its admitted maximum (see the module-level "Frontier cap"):
+    //   * record spacing — the widest gap the heartbeat tail shows (guard 3
+    //     above has already refused a tail whose newest gap exceeds
+    //     tolerance, so this is bounded by `period * gap_tolerance`);
+    //   * batch durability lag — one `fdatasync` batch, because the newest
+    //     DURABLE heartbeat trails the newest WRITTEN one (`plrd::walsvc`
+    //     appends heartbeat records `SyncPolicy::Batched`); config-derived,
+    //     never a literal here;
+    //   * two independent 0.25 s subscription draws — the heartbeat's status
+    //     sample AND the anchor context's `file_position` sample are each up
+    //     to `SUBSCRIPTION_REFRESH` stale, and the clock correlation absorbs
+    //     only the heartbeat's draw, not the anchor's.
+    // The sole UNOBSERVABLE contributor — a terminal writer stall below the
+    // observation-gap threshold — is hazard-pinned, not priced (see the
+    // module doc's "terminal-stall residual").
+    let dt_tail =
+        ns_to_s(spacing_ns) + ns_to_s(config.durability_lag_ns) + 2.0 * SUBSCRIPTION_REFRESH_S;
     let dt = staleness + dt_tail;
     if !dt.is_finite() {
         return None;
@@ -1269,27 +1322,49 @@ fn frontier_cap_offset(
     Some(raw.max(slacked).min(tail_end))
 }
 
-/// Whether the newest heartbeat sits on a continuous stream: the gap
-/// between the two newest samples is within the reader's liveness
-/// tolerance (`heartbeat_period_ns * heartbeat_gap_tolerance`). A gap
-/// wider than that is the reader's own definition of broken coverage
-/// (`crate::exclude`'s `HeartbeatGap`), under which `t_a` cannot be
-/// assumed within one spacing of the cut. A single sample carries no gap
-/// evidence and is admitted (the other cap guards still apply); zero
-/// samples cannot reach here (the pipeline errors first) and are refused.
-fn heartbeat_tail_continuous(timeline: &WalTimeline, config: &ReconstructConfig) -> bool {
+/// The heartbeat tail's observed spacing, in nanoseconds — the widest gap
+/// between consecutive durable heartbeats over the contiguous run ending at
+/// the newest sample — or `None` when the tail is broken (the newest gap
+/// exceeds `heartbeat_period_ns * heartbeat_gap_tolerance`, so `t_a` is a
+/// stale island) or there are no samples.
+///
+/// This serves the frontier cap two ways at once: a `None` result is guard
+/// 3 (refuse the cap), and a `Some(gap)` result is the cap's spacing term —
+/// the terminal gap `t_cut - t_a` priced at the widest gap the tail
+/// actually shows rather than a nominal period. So a dense 10 Hz stream
+/// (small gaps) keeps a tight cap and a sparse stream honestly loosens it.
+///
+/// The walk stops at the first over-tolerance gap going backward: an early
+/// idle→active coverage break does not inflate the recent-cadence estimate,
+/// but if that break IS the newest gap, `t_a` is isolated and the cap is
+/// refused. A single sample carries no gap evidence, so the conservative
+/// tolerance spacing (the widest the guard would admit) is returned; zero
+/// samples cannot reach the cap (the pipeline errors first) and are refused.
+fn heartbeat_tail_spacing_ns(timeline: &WalTimeline, config: &ReconstructConfig) -> Option<u64> {
     let hbs = &timeline.heartbeats;
     let n = hbs.len();
+    #[allow(
+        clippy::cast_precision_loss,
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss
+    )]
+    let tol_ns = (config.heartbeat_period_ns as f64 * config.heartbeat_gap_tolerance) as u64;
     match n {
-        0 => false,
-        1 => true,
+        0 => None,
+        1 => Some(tol_ns),
         _ => {
-            let gap = hbs[n - 1].mono_ns.saturating_sub(hbs[n - 2].mono_ns);
-            #[allow(clippy::cast_precision_loss)]
-            let tol = config.heartbeat_period_ns as f64 * config.heartbeat_gap_tolerance;
-            #[allow(clippy::cast_precision_loss)]
-            let gap_s = gap as f64;
-            gap_s <= tol
+            let mut max_gap_ns = 0_u64;
+            for i in (1..n).rev() {
+                let gap_ns = hbs[i].mono_ns.saturating_sub(hbs[i - 1].mono_ns);
+                if gap_ns > tol_ns {
+                    if i == n - 1 {
+                        return None; // newest gap broken: t_a is a stale island
+                    }
+                    break; // an older coverage break ends the contiguous tail
+                }
+                max_gap_ns = max_gap_ns.max(gap_ns);
+            }
+            Some(max_gap_ns)
         }
     }
 }
@@ -2817,10 +2892,10 @@ mod tests {
     #[test]
     fn frontier_cap_slack_is_exactly_one_line() {
         use plr_gcode::{simulate, Line, LineIter};
-        // Same fresh-anchor march; recompute the Δt simulation the cap runs
-        // (staleness 0 + 1.0 + 0.25 = 1.25 s) and prove the window high end
-        // is exactly one line past where that simulation stopped — the
-        // one-line skew slack (edge case a), no more, no less.
+        // Same fresh-anchor march. Recompute the Δt the cap runs — from the
+        // config's own terms, not a hardcoded number — and prove the window
+        // high end is exactly one line past where that simulation stopped
+        // (the one-line skew slack, edge case a; no more, no less).
         let text = long_x_march();
         let records = base_records(
             10.0,
@@ -2840,10 +2915,21 @@ mod tests {
         let set = compute_stop_set(&timeline, &window, Some(&tail), &cfg()).unwrap();
         let fw = set.file_window.unwrap();
 
+        // Δt = staleness + spacing + durability + 2·refresh. For this
+        // fresh-anchor fixture the anchor's print time equals t_a, so
+        // staleness is 0; the single heartbeat yields the conservative
+        // tolerance spacing (no cadence evidence). Derived via the cap's own
+        // spacing helper so the two cannot drift.
+        #[allow(clippy::cast_precision_loss)]
+        let spacing_s = super::heartbeat_tail_spacing_ns(&timeline, &cfg()).unwrap() as f64 / 1e9;
+        #[allow(clippy::cast_precision_loss)]
+        let durability_s = cfg().durability_lag_ns as f64 / 1e9;
+        let dt = spacing_s + durability_s + 2.0 * super::SUBSCRIPTION_REFRESH_S;
+
         let anchor_state = anchor_state_from_context(&march_gcode()).unwrap();
         let lines: Vec<Line> = LineIter::new(text.as_bytes(), 0).collect();
         let mut sc = cfg().sim.clone();
-        sc.max_duration = Some(1.25);
+        sc.max_duration = Some(dt);
         let mut st = anchor_state.clone();
         let sim = simulate(&mut st, &lines, &sc);
         let raw = sim.resume_offset.unwrap();
@@ -2851,7 +2937,165 @@ mod tests {
         assert!(with_slack > raw, "test needs a further line to exist");
         assert_eq!(
             fw.end, with_slack,
-            "cap must add exactly one line of skew slack (raw {raw})"
+            "cap must add exactly one line of skew slack (raw {raw}, Δt {dt})"
+        );
+    }
+
+    /// Reviewer probe (platform: `plr-reconstruct`). The blocker was that
+    /// pricing `Δt_tail` at the nominal 1× period (+ one draw) excluded
+    /// reachable file on a legacy 1 Hz stream (~54 B / ~3 lines). With the
+    /// batch durability lag and the second subscription draw priced, the cap
+    /// now CONTAINS that file. Heartbeats 1 s apart, fresh anchor
+    /// (staleness 0): observed spacing 1.0 s, so `Δt_tail` = 1.0 + 0.5
+    /// (durability) + 0.5 (two draws) = 2.0 s, versus the old-too-tight
+    /// 1.0 + 0.25 = 1.25 s.
+    #[test]
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    fn legacy_1hz_cap_contains_what_the_nominal_bound_excluded() {
+        use plr_gcode::{simulate, Line, LineIter};
+        let text = long_x_march();
+        let mono = |pt: f64| (pt * 1e9) as u64;
+        let records = vec![
+            WalRecord::Heartbeat(heartbeat_at(mono(8.0), 8.0)),
+            WalRecord::Heartbeat(heartbeat_at(mono(9.0), 9.0)),
+            WalRecord::Heartbeat(heartbeat_at(mono(10.0), 10.0)),
+            WalRecord::StepperRange(stepper_range_with_clock(
+                "stepper_z",
+                10.0,
+                FREQ,
+                mono(10.0),
+            )),
+            WalRecord::Context(context_with_gcode(mono(10.0), 0, march_gcode())),
+        ];
+        let timeline = ingest_records(records);
+        let window = compute_stop_window(&timeline, None, &cfg()).unwrap();
+        let tail = FileTail {
+            base_offset: 0,
+            bytes: text.as_bytes(),
+        };
+        let set = compute_stop_set(&timeline, &window, Some(&tail), &cfg()).unwrap();
+        let fw = set.file_window.unwrap();
+
+        let anchor_state = anchor_state_from_context(&march_gcode()).unwrap();
+        let lines: Vec<Line> = LineIter::new(text.as_bytes(), 0).collect();
+        let offset_for = |dt: f64| -> u64 {
+            let mut sc = cfg().sim.clone();
+            sc.max_duration = Some(dt);
+            let mut st = anchor_state.clone();
+            simulate(&mut st, &lines, &sc).resume_offset.unwrap()
+        };
+        let old_too_tight = offset_for(1.0 + 0.25);
+        let new_correct = offset_for(1.0 + 0.5 + 0.5);
+        assert!(
+            new_correct > old_too_tight,
+            "the priced-in terms must reach further file (old {old_too_tight}, new {new_correct})"
+        );
+        assert!(
+            fw.end >= new_correct,
+            "the cap must now CONTAIN the file the nominal bound excluded \
+             (old {old_too_tight}, new {new_correct}, cap {})",
+            fw.end
+        );
+    }
+
+    /// Reviewer probe (platform: `plr-reconstruct`). Guard 3 admits gaps up
+    /// to 3.0× the 1 s basis; a 2.9 s terminal gap is admitted and the
+    /// spacing term must be priced at the observed 2.9 s, not the nominal
+    /// 1 s. A 3.1 s gap exceeds tolerance and the cap falls back.
+    #[test]
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    fn frontier_cap_prices_a_wide_but_admitted_tail_gap_and_refuses_a_broken_one() {
+        let text = long_x_march();
+        let mono = |pt: f64| (pt * 1e9) as u64;
+        let build = |gap: f64| {
+            ingest_records(vec![
+                WalRecord::Heartbeat(heartbeat_at(mono(10.0 - gap), 10.0 - gap)),
+                WalRecord::Heartbeat(heartbeat_at(mono(10.0), 10.0)),
+                WalRecord::StepperRange(stepper_range_with_clock(
+                    "stepper_z",
+                    10.0,
+                    FREQ,
+                    mono(10.0),
+                )),
+                WalRecord::Context(context_with_gcode(mono(10.0), 0, march_gcode())),
+            ])
+        };
+        let tail = FileTail {
+            base_offset: 0,
+            bytes: text.as_bytes(),
+        };
+
+        // 2.9 s gap: admitted; spacing priced at the observed 2.9 s.
+        let tl = build(2.9);
+        let window = compute_stop_window(&tl, None, &cfg()).unwrap();
+        let set = compute_stop_set(&tl, &window, Some(&tail), &cfg()).unwrap();
+        assert!(
+            set.extension.as_ref().unwrap().frontier_cap.is_some(),
+            "a 2.9 s gap is within the 3.0 s tolerance — cap applies"
+        );
+        #[allow(clippy::cast_precision_loss)]
+        let spacing_s = super::heartbeat_tail_spacing_ns(&tl, &cfg()).unwrap() as f64 / 1e9;
+        assert!(
+            (spacing_s - 2.9).abs() < 1e-6,
+            "spacing must be the observed 2.9 s, got {spacing_s}"
+        );
+
+        // 3.1 s gap: exceeds tolerance — the tail is broken, cap falls back.
+        let tl2 = build(3.1);
+        let window2 = compute_stop_window(&tl2, None, &cfg()).unwrap();
+        let set2 = compute_stop_set(&tl2, &window2, Some(&tail), &cfg()).unwrap();
+        assert!(
+            set2.extension.as_ref().unwrap().frontier_cap.is_none(),
+            "a 3.1 s gap breaks the tail — cap must refuse"
+        );
+    }
+
+    /// The terminal-stall residual pin (platform: `plr-reconstruct`). The one
+    /// unpriced contributor: a terminal writer stall (`plrd` stops appending
+    /// heartbeats while klippy keeps executing) below the observation-gap
+    /// threshold leaves no evidence, so the cap — which prices `Δt_tail` from
+    /// the OBSERVED heartbeat cadence — is blind to how far motion actually
+    /// extended past `t_a`. This pins the residual: a dense tail yields a
+    /// small `Δt_tail` while durable motion extends much further past `t_a`.
+    /// Acknowledged, not guarded (see the module doc).
+    #[test]
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::cast_precision_loss
+    )]
+    fn terminal_writer_stall_residual_is_pinned() {
+        let mono = |pt: f64| (pt * 1e9) as u64;
+        let mut records = Vec::new();
+        // Dense 10 Hz tail ending at t_a = 10.0 (0.1 s gaps).
+        for i in 0..=20u64 {
+            let pt = 10.0 - 0.1 * (20 - i) as f64;
+            records.push(WalRecord::Heartbeat(heartbeat_at(mono(pt), pt)));
+        }
+        // Durable motion (a dumped-ahead plan) reaching 2.0 s past t_a, with
+        // NO further heartbeat and NO SubscriptionGap marker.
+        records.push(WalRecord::StepperRange(stepper_range_with_clock(
+            "stepper_z",
+            12.0,
+            FREQ,
+            mono(12.0),
+        )));
+        records.push(WalRecord::Context(context_with_gcode(
+            mono(10.0),
+            0,
+            march_gcode(),
+        )));
+        let timeline = ingest_records(records);
+
+        let dt_tail = super::heartbeat_tail_spacing_ns(&timeline, &cfg()).unwrap() as f64 / 1e9
+            + cfg().durability_lag_ns as f64 / 1e9
+            + 2.0 * super::SUBSCRIPTION_REFRESH_S;
+        let motion_past_ta = 12.0 - 10.0;
+        assert!(
+            motion_past_ta > dt_tail,
+            "residual pin: motion can reach {motion_past_ta}s past t_a while Δt_tail prices \
+             only {dt_tail}s from the observed cadence — a sub-threshold terminal stall is \
+             unpriced and unguarded"
         );
     }
 
