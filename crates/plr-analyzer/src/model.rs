@@ -332,11 +332,135 @@ pub struct LayerModel {
     pub lines_consumed: usize,
 }
 
+/// Which geometric layer(s) a byte window can contain — the capped
+/// offset window mapped through the layer spans, independently of any
+/// XY/E/Z evidence.
+///
+/// This is the answer to "which layer(s) is the stop in?" on geometry the
+/// matcher cannot separate: on a prismatic part (e.g. a benchy smokestack)
+/// consecutive layers are byte-distinct but XY-identical, so the offset
+/// window — not the XY evidence — is what pins the layer. Reporting only;
+/// it never feeds the matcher's ladder.
+///
+/// # Attribution rule
+///
+/// A layer is "active" from its first depositing line until the *next*
+/// layer's first depositing line — a total partition of the modeled bytes
+/// by [`Layer::span`] start (the non-depositing gap between two layers'
+/// deposition — the Z-lift, travel and `;LAYER_CHANGE` — is attributed to
+/// the layer still in progress, the one whose deposition most recently
+/// began). [`Self::layers`] lists every partition cell the window touches.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WindowLayers {
+    /// Geometric layer ordinals the window can contain, ascending; each
+    /// indexes [`LayerModel::layers`]. Empty when the model has no layers,
+    /// or when the window lies wholly before the first deposition (then
+    /// [`Self::before_first`] is set).
+    pub layers: Vec<u32>,
+    /// The window reaches into the pre-first-deposition preamble (leading
+    /// travel / heat-up / skirt setup before any layer opened). A stop
+    /// there is "before layer 0"; nothing has been deposited yet.
+    pub before_first: bool,
+}
+
+impl WindowLayers {
+    /// True when the window can be in exactly one layer and nowhere else
+    /// (no boundary straddle, no preamble) — the unambiguous case.
+    #[must_use]
+    pub fn is_single_layer(&self) -> bool {
+        self.layers.len() == 1 && !self.before_first
+    }
+
+    /// Cross-check the geometric attribution against a slicer
+    /// `current_layer` mark (Part 3). The mark is an **upper bound** on the
+    /// physically-printing layer — the slicer sets it at the layer-change
+    /// line's parse time, which leads execution — so the attribution is
+    /// consistent iff at least one attributed layer is `<= mark`, or the
+    /// window is in the preamble (before layer 0, trivially `<=` anything).
+    /// A geometric attribution lying entirely *above* the mark is the one
+    /// physically impossible case and returns `false` (evidence to flag,
+    /// never a reason to override geometry).
+    #[must_use]
+    pub fn mark_is_consistent(&self, current_layer: u32) -> bool {
+        self.before_first || self.layers.iter().any(|&l| l <= current_layer)
+    }
+
+    /// A one-line human summary for the scan/pipeline narration, e.g.
+    /// "layer 12", "layers 12–15", "before layer 0 (preamble)", or
+    /// "before layer 0, then layers 0–1". Never panics.
+    #[must_use]
+    pub fn describe(&self) -> String {
+        let span = match self.layers.as_slice() {
+            [] => None,
+            [only] => Some(format!("layer {only}")),
+            [first, .., last] => Some(format!("layers {first}\u{2013}{last}")),
+        };
+        match (self.before_first, span) {
+            (false, Some(s)) => s,
+            (true, None) => "before layer 0 (preamble)".to_owned(),
+            (true, Some(s)) => format!("before layer 0, then {s}"),
+            (false, None) => "no modeled layer".to_owned(),
+        }
+    }
+}
+
 impl LayerModel {
     /// Look up a layer by index.
     #[must_use]
     pub fn layer(&self, index: u32) -> Option<&Layer> {
         self.layers.get(index as usize)
+    }
+
+    /// Map a byte window `[start, end)` onto the geometric layer(s) it can
+    /// contain (see [`WindowLayers`]). `end = None` means "to the end of
+    /// the modeled window". The window is intersected against a total
+    /// partition of the bytes by [`Layer::span`] start: layer `i` owns
+    /// `[layers[i].span.start, layers[i+1].span.start)`, the last layer
+    /// owns everything from its start onward, and everything before the
+    /// first layer's deposition is the preamble.
+    ///
+    /// Reporting only — never consulted by [`crate::match_stop_point`], so
+    /// the matcher's ladder is unaffected. Total: never panics, and an
+    /// inverted or empty window simply yields no layers.
+    #[must_use]
+    pub fn layers_in_window(&self, start: u64, end: Option<u64>) -> WindowLayers {
+        // A window is [start, end_excl). Treat `end = None` and any end
+        // below start as "just the single offset `start`" so a degenerate
+        // window still attributes the offset it names rather than nothing.
+        let end_excl = end
+            .filter(|&e| e > start)
+            .unwrap_or(start.saturating_add(1));
+        let mut layers = Vec::new();
+        let mut before_first = false;
+        if self.layers.is_empty() {
+            return WindowLayers {
+                layers,
+                before_first: true,
+            };
+        }
+        // Preamble cell: [0, layers[0].span.start).
+        if start < self.layers[0].span.start {
+            before_first = true;
+        }
+        for (i, layer) in self.layers.iter().enumerate() {
+            let cell_start = layer.span.start;
+            // The cell ends where the next layer's deposition begins; the
+            // last layer's cell runs to the end of the modeled window.
+            let cell_end = self
+                .layers
+                .get(i + 1)
+                .map_or(u64::MAX, |next| next.span.start);
+            // Half-open overlap of [start, end_excl) with [cell_start, cell_end).
+            if start < cell_end && cell_start < end_excl {
+                // `index` is authoritative (it may differ from `i` only if
+                // a caller mutated `layers`; use the stored ordinal).
+                layers.push(layer.index);
+            }
+        }
+        WindowLayers {
+            layers,
+            before_first,
+        }
     }
 
     /// Fraction of extrusion moves that also changed Z (0 when the
@@ -617,6 +741,124 @@ mod tests {
             assert!(!class.probe_eligible());
         }
         assert!(FeatureClass::InternalInfill.probe_eligible());
+    }
+
+    /// A three-layer geometric model whose layer deposition spans are
+    /// known, so window→layer attribution can be checked at exact offsets.
+    fn three_layer_model() -> LayerModel {
+        // Each layer: a Z move, a travel, then one depositing move.
+        let m = model_of(
+            "G90\nM83\n\
+             G1 Z0.2 F7200\nG1 X10 Y10 F9000\nG1 X20 Y10 E1 F1800\n\
+             G1 Z0.4 F7200\nG1 X10 Y10 F9000\nG1 X20 Y10 E1\n\
+             G1 Z0.6 F7200\nG1 X10 Y10 F9000\nG1 X20 Y10 E1\n",
+        );
+        assert_eq!(m.layers.len(), 3, "fixture must have three layers");
+        m
+    }
+
+    #[test]
+    fn window_inside_one_layer_attributes_that_layer_only() {
+        let m = three_layer_model();
+        // A window strictly inside layer 1's deposition span.
+        let l1 = &m.layers[1];
+        let start = l1.span.start;
+        let end = l1.span.end; // exclusive-ish; still inside cell 1
+        let wl = m.layers_in_window(start, Some(end));
+        assert_eq!(wl.layers, vec![1]);
+        assert!(!wl.before_first);
+        assert!(wl.is_single_layer());
+        assert_eq!(wl.describe(), "layer 1");
+    }
+
+    #[test]
+    fn window_straddling_two_layers_reports_both() {
+        let m = three_layer_model();
+        // From inside layer 0 to inside layer 2 → 0,1,2.
+        let start = m.layers[0].span.start;
+        let end = m.layers[2].span.end;
+        let wl = m.layers_in_window(start, Some(end));
+        assert_eq!(wl.layers, vec![0, 1, 2]);
+        assert!(!wl.is_single_layer());
+        assert_eq!(wl.describe(), "layers 0\u{2013}2");
+    }
+
+    #[test]
+    fn a_stop_in_the_layer_change_gap_stays_on_the_layer_in_progress() {
+        let m = three_layer_model();
+        // The gap between layer 0's last deposition and layer 1's first
+        // deposition (the Z0.4 lift + travel) is owned by layer 0, the
+        // layer whose deposition most recently began.
+        let gap_offset = m.layers[0].span.end; // just past layer 0's deposit
+        assert!(gap_offset < m.layers[1].span.start, "there is a real gap");
+        let wl = m.layers_in_window(gap_offset, Some(gap_offset + 1));
+        assert_eq!(
+            wl.layers,
+            vec![0],
+            "gap byte belongs to the layer in progress"
+        );
+    }
+
+    #[test]
+    fn a_window_in_the_preamble_reports_before_first() {
+        let m = three_layer_model();
+        // Offset 0 is the G90/M83 preamble, before any deposition.
+        let wl = m.layers_in_window(0, Some(1));
+        assert!(wl.before_first);
+        assert!(wl.layers.is_empty());
+        assert_eq!(wl.describe(), "before layer 0 (preamble)");
+        // A window from the preamble into layer 0 flags both.
+        let into_l0 = m.layers_in_window(0, Some(m.layers[0].span.start + 1));
+        assert!(into_l0.before_first);
+        assert_eq!(into_l0.layers, vec![0]);
+        assert_eq!(into_l0.describe(), "before layer 0, then layer 0");
+    }
+
+    #[test]
+    fn slicer_mark_cross_check_respects_the_upper_bound_direction() {
+        // Geometry says the stop is in layers 3..5. The slicer mark is an
+        // UPPER bound on the physical layer (parse leads execution), so:
+        //  - mark 5 (== max): consistent (some layer <= 5).
+        //  - mark 4 (inside): consistent.
+        //  - mark 3 (== min): consistent.
+        //  - mark 2 (below all): INCONSISTENT — geometry above the upper
+        //    bound is the one physically impossible case.
+        let wl = WindowLayers {
+            layers: vec![3, 4, 5],
+            before_first: false,
+        };
+        assert!(wl.mark_is_consistent(5));
+        assert!(wl.mark_is_consistent(4));
+        assert!(wl.mark_is_consistent(3));
+        assert!(
+            !wl.mark_is_consistent(2),
+            "mark below every layer is impossible"
+        );
+        // Preamble is trivially consistent with any mark (before layer 0).
+        let pre = WindowLayers {
+            layers: vec![],
+            before_first: true,
+        };
+        assert!(pre.mark_is_consistent(0));
+    }
+
+    #[test]
+    fn degenerate_and_empty_windows_are_total() {
+        let m = three_layer_model();
+        // end == start (degenerate): attribute the single named offset.
+        let at = m.layers[2].span.start;
+        assert_eq!(m.layers_in_window(at, Some(at)).layers, vec![2]);
+        // end == None: from the offset to the end of the model → last layer.
+        assert_eq!(m.layers_in_window(at, None).layers, vec![2]);
+        // A window past every deposition still lands on the last layer.
+        assert_eq!(m.layers_in_window(u64::MAX - 1, None).layers, vec![2]);
+        // An empty model: everything is "before first", no layers, no panic.
+        let empty = model_of("G90\nM83\nG1 X10 Y10 F9000\n");
+        assert!(empty.layers.is_empty());
+        let wl = empty.layers_in_window(0, Some(100));
+        assert!(wl.before_first);
+        assert!(wl.layers.is_empty());
+        assert_eq!(wl.describe(), "before layer 0 (preamble)");
     }
 
     #[test]

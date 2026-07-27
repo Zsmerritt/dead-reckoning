@@ -65,7 +65,7 @@ use std::path::Path;
 
 use plr_analyzer::{
     build_layer_model, match_stop_point, select_contact_zone, ByteWindow, ContactConfig,
-    ContactOutcome, Interval, MatchConfig, ModelConfig, StopEvidence,
+    ContactOutcome, Interval, LayerModel, MatchConfig, ModelConfig, StopEvidence,
 };
 use plr_reconstruct::{
     anchor_state_from_context, reconstruct, select_crash_epoch, FileTail, PossibleStopSet,
@@ -556,6 +556,18 @@ fn plan_from_recovery(
     };
     let stop_set = &recovery.stop_set;
 
+    // Part 2: map the (cap-narrowed) offset window through the layer model
+    // and narrate which layer(s) the stop can be in. Reporting only — the
+    // matcher's ladder below is unchanged. The slicer layer mark (Part 3),
+    // when present, is folded in as an upper-bound cross-check.
+    narrate_layer_attribution(
+        &model,
+        stop_set,
+        anchor.current_layer,
+        anchor.total_layer,
+        say,
+    );
+
     match completion_check(recovery, &model, base_offset, anchor, file_path, file_bytes) {
         CompletionCheck::Complete(report) => {
             narrate_completion(&report, say);
@@ -938,6 +950,64 @@ fn anchored_model<'a>(
         base_offset,
         anchor,
     })
+}
+
+/// Narrates the geometric layer attribution of the (cap-narrowed) offset
+/// window, folding in the slicer layer mark as an upper-bound cross-check.
+///
+/// Reporting only. `current_layer`/`total_layer` are the slicer marks from
+/// the anchor context (Part 3): the slicer sets `current_layer` at the
+/// layer-change line's *parse* time, which leads physical execution, so
+/// the physically-printing layer is `<= current_layer` — an upper bound.
+/// We therefore treat a geometric attribution whose layers all sit at or
+/// below `current_layer` as consistent, and flag the (physically
+/// impossible, so evidence-quality) case where geometry lands entirely
+/// above the mark. The mark never overrides geometry; when absent (the
+/// operator's own `OrcaSlicer` emits none) we say so plainly.
+fn narrate_layer_attribution(
+    model: &LayerModel,
+    stop_set: &PossibleStopSet,
+    current_layer: Option<u32>,
+    total_layer: Option<u32>,
+    say: &mut dyn FnMut(&str),
+) {
+    let Some(window) = stop_set.file_window.as_ref() else {
+        say("pipeline: layer attribution: no offset window (nothing to map)");
+        return;
+    };
+    // OffsetWindow.end is inclusive; layers_in_window takes an exclusive end.
+    let wl = model.layers_in_window(window.start, Some(window.end.saturating_add(1)));
+    say(&format!(
+        "pipeline: layer attribution: {} (offset window bytes {}..={})",
+        wl.describe(),
+        window.start,
+        window.end
+    ));
+    match current_layer {
+        None => say(
+            "pipeline: layer marks unavailable (slicer emitted no SET_PRINT_STATS_INFO); \
+             geometric attribution above carries the answer",
+        ),
+        Some(mark) => {
+            let of = total_layer.map_or_else(String::new, |t| format!(" of {t}"));
+            // Direction: physical layer <= current_layer (parse leads
+            // execution); see WindowLayers::mark_is_consistent.
+            if wl.mark_is_consistent(mark) {
+                say(&format!(
+                    "pipeline: slicer layer mark current_layer={mark}{of} (upper bound on the \
+                     physical layer; parse leads execution) — consistent with the geometric \
+                     attribution above (cross-check, not a narrowing)"
+                ));
+            } else {
+                say(&format!(
+                    "pipeline: NOTE slicer layer mark current_layer={mark}{of} is BELOW every \
+                     geometrically attributed layer — the mark is an upper bound on the physical \
+                     layer, so geometry above it is unexpected; trusting geometry, flagging the \
+                     discrepancy for evidence review"
+                ));
+            }
+        }
+    }
 }
 
 /// Maps the possible-stop set onto the matcher's evidence contract.
@@ -1689,6 +1759,18 @@ G1 X60 Y60 E0.02
         assert!(
             output.contains("machine prerequisites validated"),
             "{output}"
+        );
+        // Part 2: the cap-narrowed offset window is mapped through the
+        // layer model and narrated. This fixture's anchor context carries
+        // no slicer marks, so the marks-unavailable branch fires and the
+        // geometric attribution carries the answer.
+        assert!(
+            output.contains("layer attribution:"),
+            "layer attribution must be narrated: {output}"
+        );
+        assert!(
+            output.contains("layer marks unavailable"),
+            "a mark-less fixture must say so honestly: {output}"
         );
     }
 

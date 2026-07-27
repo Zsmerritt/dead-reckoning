@@ -19,8 +19,9 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use plr_reconstruct::{
-    reconstruct, select_crash_epoch, CrashClass, EpochBoundaryKind, PossibleStopSet,
-    ReceiveSeqObservation, ReconstructInputs, Reconstruction, StopWindow,
+    anchor_state_from_context, reconstruct, select_crash_epoch, CrashClass, EpochBoundaryKind,
+    PossibleStopSet, ReceiveSeqObservation, ReconstructInputs, Reconstruction,
+    RecoveryReconstruction, StopWindow,
 };
 use plr_wal::{
     recover_heartbeat, scan_read, HeartbeatRecovery, RecordKind, RecoveryScan, ScanEnd, WalRecord,
@@ -122,6 +123,7 @@ pub fn run_scan(
         Ok(Reconstruction::Recovery(recovery)) => {
             report_window(&mut w, &recovery.window);
             report_stop_set(&mut w, &recovery.stop_set);
+            report_layer_attribution(&mut w, &recovery, file_tail_bytes.as_deref());
         }
         Err(e) => {
             w.line(&format!("reconstruction: not possible: {e}"));
@@ -478,6 +480,91 @@ fn report_stop_set(w: &mut Report<'_>, set: &PossibleStopSet) {
     ));
 }
 
+/// Part 2: map the (cap-narrowed) offset window through a layer model
+/// built from the anchor context + print file, and report which layer(s)
+/// the stop can be in, with the slicer mark (Part 3) as an upper-bound
+/// cross-check. Needs the print file; `file_bytes` is `None` when it was
+/// unreadable (an offline scan on a machine without the gcode), in which
+/// case attribution is honestly reported as unavailable.
+fn report_layer_attribution(
+    w: &mut Report<'_>,
+    recovery: &RecoveryReconstruction,
+    file_bytes: Option<&[u8]>,
+) {
+    let Some(window) = recovery.stop_set.file_window.as_ref() else {
+        w.line("  layer attribution: no offset window to map");
+        return;
+    };
+    let Some(bytes) = file_bytes else {
+        w.line("  layer attribution: unavailable (print file not readable — no layer model)");
+        return;
+    };
+    let file = recovery
+        .timeline
+        .contexts
+        .iter()
+        .rev()
+        .find_map(|c| c.virtual_sdcard.as_ref().map(|v| v.file_path.clone()));
+    let Some(file) = file else {
+        w.line("  layer attribution: unavailable (no context names a print file)");
+        return;
+    };
+    let Some(anchor) =
+        crate::detect::anchor_context(&recovery.timeline.contexts, &file, Some(window.start))
+    else {
+        w.line("  layer attribution: unavailable (no anchor context at/before the window)");
+        return;
+    };
+    let base_offset = anchor
+        .virtual_sdcard
+        .as_ref()
+        .map_or(0, |v| v.file_position);
+    let Ok(base_usize) = usize::try_from(base_offset) else {
+        w.line("  layer attribution: unavailable (context offset overflow)");
+        return;
+    };
+    if base_usize > bytes.len() {
+        w.line("  layer attribution: unavailable (context offset beyond the file — wrong file?)");
+        return;
+    }
+    let Ok(state) = anchor_state_from_context(&anchor.gcode) else {
+        w.line("  layer attribution: unavailable (anchor context state invalid)");
+        return;
+    };
+    let model = plr_analyzer::build_layer_model(
+        state,
+        &bytes[base_usize..],
+        base_offset,
+        &plr_analyzer::ModelConfig::default(),
+    );
+    // OffsetWindow.end is inclusive; layers_in_window takes an exclusive end.
+    let wl = model.layers_in_window(window.start, Some(window.end.saturating_add(1)));
+    w.line(&format!(
+        "  layer attribution: {} (layer model from byte {}: {} layers)",
+        wl.describe(),
+        base_offset,
+        model.layers.len()
+    ));
+    match anchor.current_layer {
+        None => w.line(
+            "  slicer layer marks: unavailable (no SET_PRINT_STATS_INFO); geometry carries the answer",
+        ),
+        Some(mark) => {
+            let of = anchor.total_layer.map_or_else(String::new, |t| format!(" of {t}"));
+            if wl.mark_is_consistent(mark) {
+                w.line(&format!(
+                    "  slicer layer mark: current_layer={mark}{of} (upper bound; consistent cross-check)"
+                ));
+            } else {
+                w.line(&format!(
+                    "  NOTE slicer layer mark current_layer={mark}{of} is below every attributed \
+                     layer (upper-bound violation; trusting geometry)"
+                ));
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{merge_scans, run_scan, segment_file_name, segment_index};
@@ -662,6 +749,53 @@ mod tests {
         assert!(
             report.contains("forward extension disabled"),
             "missing print file must be reported: {report}"
+        );
+    }
+
+    /// Part 2 + Part 3 in the scan report: with the print file readable, a
+    /// layer model is built and the offset window is attributed to layer(s),
+    /// and the slicer `current_layer` mark is folded in as an upper-bound
+    /// cross-check (here a large mark, so trivially consistent).
+    #[test]
+    fn recovery_reports_layer_attribution_and_a_consistent_slicer_mark() {
+        let dir = temp_dir("layerattr");
+        // A small two-layer print written to a real, readable path.
+        let gcode = "G90\nM83\nG1 Z0.2 F7200\nG1 X10 Y10 F9000\nG1 X20 Y10 E1 F1800\n\
+                     G1 Z0.4 F7200\nG1 X10 Y10 F9000\nG1 X20 Y10 E1\n";
+        let gpath = dir.join("part.gcode");
+        std::fs::write(&gpath, gcode).unwrap();
+        let path_str = gpath.to_str().unwrap().to_owned();
+        let pos = gcode.find("G1 X20 Y10 E1 F1800").unwrap() as u64;
+        // A slicer mark that is a safe upper bound (parse leads execution).
+        let mut ctx = context(5_000_000_000, pos, &path_str);
+        ctx.current_layer = Some(99);
+        ctx.total_layer = Some(120);
+        let full = write_segment(
+            &dir,
+            1,
+            &[
+                WalRecord::Heartbeat(heartbeat(3, 5_000_000_000, 42.0)),
+                WalRecord::Context(ctx),
+                WalRecord::Marker(Marker {
+                    mono_ns: 5_100_000_000,
+                    kind: MarkerKind::Resubscribed,
+                }),
+            ],
+        );
+        // Tear the tail: a realistic power-loss shape → RECOVERY.
+        std::fs::write(dir.join(segment_file_name(1)), &full[..full.len() - 5]).unwrap();
+
+        let report = scan_to_string(&dir);
+        assert!(report.contains("RECOVERY"), "{report}");
+        assert!(report.contains("layer attribution:"), "{report}");
+        assert!(
+            !report.contains("layer attribution: unavailable"),
+            "a readable file must build a model: {report}"
+        );
+        assert!(report.contains("layer model from byte"), "{report}");
+        assert!(
+            report.contains("current_layer=99") && report.contains("consistent"),
+            "the upper-bound mark must read as a consistent cross-check: {report}"
         );
     }
 
