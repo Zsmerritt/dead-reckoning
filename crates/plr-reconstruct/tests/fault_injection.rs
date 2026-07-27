@@ -349,7 +349,21 @@ fn build_truth(text: &str, lookahead: f64) -> Truth {
             };
             let start_pt = cursor;
             cursor += dur;
-            p_time = (cursor - lookahead).max(p_prev);
+            // Processing (read) leads execution by `lookahead`, but a line
+            // is ALWAYS read before its move begins to execute: Klipper's
+            // `virtual_sdcard.work_handler` dispatches a line (advancing
+            // `file_position`) into the lookahead queue strictly before the
+            // move it produced executes. So the read-frontier must never
+            // lag execution — it is the precondition the reconstruction's
+            // frontier cap is derived from (`stopset.rs`: "the executed file
+            // offset is <= the parse frontier at that instant"). For a move
+            // longer than `lookahead`, `cursor - lookahead` alone would date
+            // the read to near the move's execution *end*, placing the
+            // recorded frontier BEHIND a move already in flight — a state no
+            // real printer can produce, and the exact non-physical input that
+            // made the cap under-cover. Clamp the read to the move's
+            // execution start so `p_time <= start_pt` always holds.
+            p_time = (cursor - lookahead).min(start_pt).max(p_prev);
             pending.push((start_pt, cursor, m));
         }
         for (start_pt, end_pt, m) in pending {
