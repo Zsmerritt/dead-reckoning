@@ -468,6 +468,18 @@ pub struct Recorder {
     /// [`plr_wal::Context::print_state`]. `None` before the first
     /// observation of the session — which is exactly "not observed".
     print_state: Option<String>,
+    /// Newest `print_stats.info.current_layer` / `.total_layer`, the
+    /// slicer-fed layer marks, for [`plr_wal::Context::current_layer`] and
+    /// [`Context::total_layer`]. `None` = **not observed**: no
+    /// `SET_PRINT_STATS_INFO` from the slicer yet this session, or Klipper
+    /// reported `info` with null layers (`total_layer == 0`). Updated only
+    /// when a diff carries `print_stats.info` (a complete dict — see
+    /// [`PrintStatsStatus::info`]); absence of `info` leaves them intact.
+    /// Cleared by [`Self::reset_session`] for the same reason
+    /// [`Self::print_state`] is: the marks belong to the dead klippy
+    /// instance.
+    current_layer: Option<u32>,
+    total_layer: Option<u32>,
     /// Whether a print has been *positively* observed running this
     /// session — `virtual_sdcard.is_active == true`, or
     /// `print_stats.state` in `printing`/`paused`.
@@ -557,6 +569,8 @@ impl Recorder {
             file_size: 0,
             is_active: false,
             print_state: None,
+            current_layer: None,
+            total_layer: None,
             print_in_progress: false,
             transforms: TransformObservations {
                 bed_mesh_active: false,
@@ -619,6 +633,12 @@ impl Recorder {
     pub fn reset_session(&mut self) {
         self.is_active = false;
         self.print_state = None;
+        // The layer marks belong to the dead klippy instance's print, same
+        // as `print_state`; drop them so the next session re-observes from
+        // its own `SET_PRINT_STATS_INFO` rather than carrying a stale layer
+        // forward into a different (or absent) print.
+        self.current_layer = None;
+        self.total_layer = None;
         self.print_in_progress = false;
         self.est_sample = None;
         self.latest_print_time = 0.0;
@@ -698,8 +718,10 @@ impl Recorder {
         out.clean_shutdown = print_stats.clean_shutdown;
         // A print-state change is journaled immediately: it is the whole
         // point of recording the field, and it happens a handful of times
-        // per print, not per move.
+        // per print, not per move. A layer-mark change is journaled the same
+        // way and for the same reason.
         state_changed |= print_stats.state_changed;
+        state_changed |= print_stats.layer_changed;
         let mut position_advanced = false;
         if let Ok(Some(vsd)) = update.status.virtual_sdcard() {
             let vsd_result = self.merge_virtual_sdcard(&vsd);
@@ -971,6 +993,21 @@ impl Recorder {
         let Ok(Some(stats)) = update.status.get::<PrintStatsStatus>("print_stats") else {
             return merge;
         };
+        // Layer marks first, and unconditionally on the state below: a diff
+        // can carry `info` with no `state` key (the layer changed but the
+        // state did not), so this must run before the `state` early-return.
+        // When `info` is present it is the *complete* dict (see
+        // [`PrintStatsStatus::info`]); its absence means "unchanged", so the
+        // stored marks are kept. A `total_layer == 0` reset arrives as
+        // `info` with both fields null, which lands here as `None` — the
+        // honest "not observed", not a fabricated layer 0.
+        if let Some(info) = stats.info {
+            if self.current_layer != info.current_layer || self.total_layer != info.total_layer {
+                merge.layer_changed = true;
+                self.current_layer = info.current_layer;
+                self.total_layer = info.total_layer;
+            }
+        }
         let Some(reported_text) = stats.state else {
             return merge;
         };
@@ -1148,6 +1185,14 @@ impl Recorder {
             // first `print_stats` observation of the session, which is
             // exactly "not observed".
             print_state: self.print_state.clone(),
+            // The slicer-fed layer marks, verbatim. `None` until a
+            // `SET_PRINT_STATS_INFO` was observed this session (the
+            // operator's own OrcaSlicer emits none, so this is commonly
+            // `None`) — an honest "not observed", never layer 0. A consumer
+            // must treat `current_layer` as an *upper* bound on the
+            // physically-printing layer; see `plr_wal::Context::current_layer`.
+            current_layer: self.current_layer,
+            total_layer: self.total_layer,
             // The trapq append frontier, paired atomically with
             // `virtual_sdcard.file_position` below because Klipper
             // produced both in one `_do_query` pass under
@@ -1202,19 +1247,39 @@ fn exclude_definition(def: &ExcludeObjectDefinition) -> ExcludeObjectDef {
 ///
 /// `klippy/extras/print_stats.py`, `PrintStats.get_status`, returns
 /// `{filename, total_duration, print_duration, filament_used, state,
-/// message, info: {total_layer, current_layer}}`. Only `state` is
+/// message, info: {total_layer, current_layer}}`. `state` and `info` are
 /// consumed here; the rest is derived timing the WAL already records
 /// better. Declared locally rather than in `plr-klipper` because the
 /// generic [`plr_klipper::Status::get`] accessor already covers it and
 /// nothing outside this daemon needs the shape.
 ///
-/// `state` is `Option` because Klipper's subscription stream sends
-/// **diffs**: an update that changed only `print_duration` carries no
-/// `state` key.
+/// `state` and `info` are `Option` because Klipper's subscription stream
+/// sends **diffs**: an update that changed only `print_duration` carries
+/// neither key.
 #[derive(Debug, Clone, serde::Deserialize)]
 struct PrintStatsStatus {
     #[serde(default)]
     state: Option<String>,
+    /// `print_stats.info`, present in a diff only when *some* sub-field of
+    /// it changed. Klipper's subscription diff compares whole top-level
+    /// field values (`QueryStatusHelper._do_query`,
+    /// `klippy/webhooks.py`), so when `info` is present it carries the
+    /// **complete** dict — both `current_layer` and `total_layer`, each an
+    /// int or JSON `null` — never a partial. Absence means "unchanged
+    /// since the last update", so the recorder keeps its stored marks.
+    #[serde(default)]
+    info: Option<PrintStatsInfo>,
+}
+
+/// `print_stats.info`: the slicer-fed layer marks
+/// (`klippy/extras/print_stats.py`, set by `SET_PRINT_STATS_INFO`).
+/// Both are nullable: `total_layer == 0` makes Klipper report both `null`.
+#[derive(Debug, Clone, serde::Deserialize)]
+struct PrintStatsInfo {
+    #[serde(default)]
+    current_layer: Option<u32>,
+    #[serde(default)]
+    total_layer: Option<u32>,
 }
 
 /// `print_stats.state`, the authoritative print state machine.
@@ -1300,6 +1365,12 @@ struct PrintStatsMerge {
     /// `print_stats.state` differs from the recorded one, so a `Context`
     /// must be journaled immediately.
     state_changed: bool,
+    /// A layer mark (`print_stats.info.current_layer`/`.total_layer`)
+    /// changed, so a `Context` must be journaled immediately — the same
+    /// treatment [`Self::state_changed`] gets, and for the same reason: a
+    /// layer change happens a handful of times per print, not per move, and
+    /// pins the layer answer to the instant the layer-change line parsed.
+    layer_changed: bool,
     /// The state left `printing`/`paused` for a finished state: signal 1.
     clean_shutdown: bool,
 }
@@ -1660,6 +1731,129 @@ mod tests {
             false,
         );
         assert_eq!(out.records.len(), 1);
+    }
+
+    // -----------------------------------------------------------------
+    // Part 3: opportunistic `print_stats.info` layer-mark capture.
+    // -----------------------------------------------------------------
+
+    /// A `print_stats.info` diff carrying the slicer's layer marks updates
+    /// the recorder and triggers an immediate context (like the
+    /// `print_stats.state` path), and the context journals both marks.
+    #[test]
+    fn a_layer_mark_change_triggers_an_immediate_context() {
+        let mut r = recorder_with_snapshot();
+        let out = r.on_status(
+            &status(json!({"eventtime": 101.0, "status": {
+                "print_stats": {"info": {"current_layer": 7, "total_layer": 250}},
+            }})),
+            2_000,
+            false,
+        );
+        assert_eq!(
+            out.records.len(),
+            1,
+            "a layer change must journal a context"
+        );
+        let (WalRecord::Context(ctx), SyncPolicy::Immediate) = &out.records[0] else {
+            panic!("expected immediate context");
+        };
+        assert_eq!(ctx.current_layer, Some(7));
+        assert_eq!(ctx.total_layer, Some(250));
+    }
+
+    /// The layer marks arrive in a diff that carries **no `state` key** —
+    /// the common shape, since the slicer's `SET_PRINT_STATS_INFO` changes
+    /// only `info`. This is the regression the `merge_print_stats` early
+    /// return on a missing `state` used to cause: `info` must be read
+    /// before that return, or every layer mark is dropped.
+    #[test]
+    fn a_layer_mark_diff_without_a_state_key_is_not_dropped() {
+        let mut r = recorder_with_snapshot();
+        let out = r.on_status(
+            &status(json!({"eventtime": 101.0, "status": {
+                "print_stats": {"info": {"current_layer": 3, "total_layer": 120}},
+            }})),
+            2_000,
+            false,
+        );
+        assert_eq!(out.records.len(), 1);
+        let (WalRecord::Context(ctx), _) = &out.records[0] else {
+            panic!("expected context");
+        };
+        assert_eq!(ctx.current_layer, Some(3));
+        assert_eq!(ctx.total_layer, Some(120));
+    }
+
+    /// The same marks reported again do not re-trigger a context (a diff
+    /// echoing unchanged `info`), and an `info`-absent later diff keeps the
+    /// stored marks — Klipper omits `info` when it did not change, so the
+    /// next journaled context still carries the layer.
+    #[test]
+    fn unchanged_layer_marks_do_not_retrigger_but_persist() {
+        let mut r = recorder_with_snapshot();
+        let first = r.on_status(
+            &status(json!({"eventtime": 101.0, "status": {
+                "print_stats": {"info": {"current_layer": 5, "total_layer": 90}},
+            }})),
+            2_000,
+            false,
+        );
+        assert_eq!(first.records.len(), 1);
+        // Same marks again: no new context.
+        let repeat = r.on_status(
+            &status(json!({"eventtime": 102.0, "status": {
+                "print_stats": {"info": {"current_layer": 5, "total_layer": 90}},
+            }})),
+            3_000,
+            false,
+        );
+        assert!(
+            repeat.records.is_empty(),
+            "an unchanged layer must not re-journal"
+        );
+        // A later state change (with no `info` key) still carries the
+        // stored marks: absence means "unchanged", not "cleared".
+        let later = r.on_status(
+            &status(json!({"eventtime": 103.0, "status": {
+                "gcode_move": {"speed_factor": 0.5},
+            }})),
+            4_000,
+            false,
+        );
+        let (WalRecord::Context(ctx), _) = &later.records[0] else {
+            panic!("expected context");
+        };
+        assert_eq!(ctx.current_layer, Some(5));
+        assert_eq!(ctx.total_layer, Some(90));
+    }
+
+    /// A `total_layer == 0` reset arrives as `info` with both fields null;
+    /// the marks must go to `None` (the honest "not observed"), not a
+    /// fabricated layer 0, and the transition triggers a context.
+    #[test]
+    fn a_null_layer_info_resets_the_marks_to_not_observed() {
+        let mut r = recorder_with_snapshot();
+        r.on_status(
+            &status(json!({"eventtime": 101.0, "status": {
+                "print_stats": {"info": {"current_layer": 12, "total_layer": 200}},
+            }})),
+            2_000,
+            false,
+        );
+        let out = r.on_status(
+            &status(json!({"eventtime": 102.0, "status": {
+                "print_stats": {"info": {"current_layer": null, "total_layer": null}},
+            }})),
+            3_000,
+            false,
+        );
+        assert_eq!(out.records.len(), 1, "the reset transition must journal");
+        let (WalRecord::Context(ctx), _) = &out.records[0] else {
+            panic!("expected context");
+        };
+        assert_eq!(ctx.current_layer, None);
+        assert_eq!(ctx.total_layer, None);
     }
 
     #[test]
@@ -2026,6 +2220,37 @@ mod tests {
             false,
         );
         assert!(!out.clean_shutdown);
+    }
+
+    /// `reset_session` drops the layer marks too: they belong to the dead
+    /// klippy instance's print, so the next session must re-observe them
+    /// from its own `SET_PRINT_STATS_INFO` rather than journal a stale
+    /// layer against a different (or absent) print.
+    #[test]
+    fn reset_session_drops_the_layer_marks() {
+        let mut r = recorder_with_snapshot();
+        let _ = r.on_status(
+            &status(json!({"eventtime": 200.0, "status": {
+                "print_stats": {"info": {"current_layer": 33, "total_layer": 90}},
+            }})),
+            9_000_000_000,
+            false,
+        );
+        r.reset_session();
+        // A state change in the new session journals a context; the stale
+        // marks must not ride along on it.
+        let out = r.on_status(
+            &status(json!({"eventtime": 210.0, "status": {
+                "gcode_move": {"speed_factor": 0.5},
+            }})),
+            9_100_000_000,
+            false,
+        );
+        let (WalRecord::Context(ctx), _) = &out.records[0] else {
+            panic!("expected context");
+        };
+        assert_eq!(ctx.current_layer, None);
+        assert_eq!(ctx.total_layer, None);
     }
 
     #[test]

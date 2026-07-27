@@ -142,6 +142,8 @@ mod tests {
             fans,
             exclude: None,
             print_state: None,
+            current_layer: None,
+            total_layer: None,
         }
     }
 

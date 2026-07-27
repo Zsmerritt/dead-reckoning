@@ -198,6 +198,8 @@ fn any_context() -> impl Strategy<Value = Context> {
                     speed: target,
                 }],
                 exclude,
+                current_layer: None,
+                total_layer: None,
             },
         )
 }

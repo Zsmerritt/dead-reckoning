@@ -822,6 +822,49 @@ pub struct Context {
     /// pre-change decoder also ignores the key when it *is* present.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub print_time: Option<f64>,
+    /// `print_stats.info.current_layer` at capture time — the slicer-fed
+    /// current layer ordinal (`klippy/extras/print_stats.py`,
+    /// `PrintStats.get_status` returns `info: {total_layer, current_layer}`;
+    /// set by `SET_PRINT_STATS_INFO CURRENT_LAYER=`).
+    ///
+    /// # Direction: an upper bound on the physical layer
+    ///
+    /// The slicer emits `SET_PRINT_STATS_INFO CURRENT_LAYER=N` at the top
+    /// of layer `N`, so Klipper assigns this the instant that **line is
+    /// parsed** — which, like every other frontier field, *leads* physical
+    /// execution. The nozzle can still be finishing layer `N-1` when the
+    /// context is captured. So the physically-printing layer is
+    /// `<= current_layer`: this is an upper bound that only ever widens a
+    /// layer answer, never narrows it. A consumer must use it only as a
+    /// cross-check on geometric attribution (see `plr-analyzer`), never as
+    /// a replacement, and must state that direction at the consumption
+    /// site.
+    ///
+    /// `None` means **not observed** — the printer's slicer emits no
+    /// `SET_PRINT_STATS_INFO` (the operator's own `OrcaSlicer` is one such),
+    /// `total_layer` was 0 (Klipper then reports both as `null`), or a
+    /// pre-change WAL. Everything downstream must work without it and say
+    /// "layer marks unavailable" rather than infer over the silence.
+    ///
+    /// # WAL format compatibility
+    ///
+    /// Added after [`print_time`](Self::print_time), with the same
+    /// `#[serde(default)]` / `skip_serializing_if` treatment and for the
+    /// same reasons: every payload written before this field existed still
+    /// decodes (yielding `None`), a `Context` that never observed a layer
+    /// mark serializes byte-identically to what the recorder wrote before
+    /// it, and `Context` does not `deny_unknown_fields` so a pre-change
+    /// reader ignores the key when present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_layer: Option<u32>,
+    /// `print_stats.info.total_layer` at capture time — the slicer-fed
+    /// total layer count (`SET_PRINT_STATS_INFO TOTAL_LAYER=`). Journaled
+    /// alongside [`current_layer`](Self::current_layer) so a consumer can
+    /// report "layer N of M" and detect the `total_layer == 0` reset
+    /// (Klipper reports both `null` then). Same "not observed" meaning and
+    /// same WAL-compatibility treatment as `current_layer`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_layer: Option<u32>,
 }
 
 impl Context {
@@ -1236,6 +1279,8 @@ pub(crate) mod samples {
                 speed: 1.0,
             }],
             exclude: Some(Box::new(sample_exclude())),
+            current_layer: Some(42),
+            total_layer: Some(120),
         }
     }
 
@@ -1253,6 +1298,8 @@ pub(crate) mod samples {
             exclude: None,
             print_state: None,
             print_time: None,
+            current_layer: None,
+            total_layer: None,
             ..sample_context()
         }
     }
@@ -1453,6 +1500,82 @@ mod tests {
             panic!("variant changed");
         };
         assert_eq!(back.print_time.unwrap().to_bits(), pt.to_bits());
+    }
+
+    /// A pre-change payload decodes with both layer marks `None` — "not
+    /// observed" (the operator's own `OrcaSlicer` emits none), never layer 0.
+    #[test]
+    fn a_pre_layer_mark_context_still_decodes() {
+        let record: WalRecord = serde_json::from_str(PRE_EXCLUDE_CONTEXT_JSON).unwrap();
+        let WalRecord::Context(ctx) = &record else {
+            panic!("variant changed");
+        };
+        assert_eq!(ctx.current_layer, None);
+        assert_eq!(ctx.total_layer, None);
+        assert!(record.values_are_finite());
+    }
+
+    /// A `Context` that never observed a layer mark serializes
+    /// byte-identically to the pre-change format: a pre-change reader sees
+    /// exactly the bytes it used to (the keys are absent, not `null`).
+    #[test]
+    fn context_without_layer_marks_serializes_byte_identically() {
+        let json =
+            serde_json::to_string(&WalRecord::Context(sample_context_without_exclude())).unwrap();
+        assert_eq!(json, PRE_EXCLUDE_CONTEXT_JSON);
+        assert!(!json.contains("current_layer"), "{json}");
+        assert!(!json.contains("total_layer"), "{json}");
+    }
+
+    /// When observed the keys appear and the values survive a round trip.
+    /// Proves the forward direction too: a new reader recovers exactly what
+    /// the recorder journaled.
+    #[test]
+    fn layer_marks_roundtrip_when_present() {
+        let record = WalRecord::Context(Context {
+            current_layer: Some(7),
+            total_layer: Some(250),
+            ..sample_context_without_exclude()
+        });
+        let json = serde_json::to_string(&record).unwrap();
+        assert!(json.contains("current_layer"), "{json}");
+        assert!(json.contains("total_layer"), "{json}");
+        let WalRecord::Context(back) = roundtrip(&record) else {
+            panic!("variant changed");
+        };
+        assert_eq!(back.current_layer, Some(7));
+        assert_eq!(back.total_layer, Some(250));
+    }
+
+    /// An old reader built before these fields existed must ignore the new
+    /// keys rather than reject the record: `Context` does not
+    /// `deny_unknown_fields`. Simulated by decoding a payload that carries
+    /// the new keys into the shape via a superset — the presence of unknown
+    /// keys is tolerated. (The real old-reader proof runs against a
+    /// `git archive 6e67054` binary in the WAL-compat harness.)
+    #[test]
+    fn unknown_layer_keys_are_tolerated_by_the_decoder() {
+        // A Context payload carrying keys a pre-change reader never knew,
+        // interleaved with the layer marks, must still decode.
+        let with_extra = concat!(
+            r#"{"type":"Context","mono_ns":3333,"current_layer":9,"total_layer":40,"#,
+            r#""virtual_sdcard":{"file_path":"/home/pi/gcodes/benchy.gcode","file_position":123456},"#,
+            r#""gcode":{"speed_factor":1.0,"speed":150.0,"extrude_factor":0.95,"#,
+            r#""absolute_coordinates":true,"absolute_extrude":false,"#,
+            r#""homing_origin":[0.0,0.0,-0.12,0.0],"position":[10.0,20.0,0.4,512.7],"#,
+            r#""gcode_position":[10.0,20.0,0.52,512.7]},"#,
+            r#""transforms":{"bed_mesh_active":true,"bed_mesh_profile":"default","#,
+            r#""z_thermal_adjust_enabled":true,"z_thermal_adjust_offset":0.013,"#,
+            r#""skew_active":false,"skew_profile":null},"#,
+            r#""heaters":[{"name":"extruder","target":215.0},{"name":"heater_bed","target":60.0}],"#,
+            r#""fans":[{"name":"fan","speed":1.0}],"a_future_key":true}"#,
+        );
+        let record: WalRecord = serde_json::from_str(with_extra).unwrap();
+        let WalRecord::Context(ctx) = &record else {
+            panic!("variant changed");
+        };
+        assert_eq!(ctx.current_layer, Some(9));
+        assert_eq!(ctx.total_layer, Some(40));
     }
 
     /// A non-finite `print_time` must fail the finiteness gate, so the

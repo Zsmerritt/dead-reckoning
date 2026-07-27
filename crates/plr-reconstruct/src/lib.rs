@@ -304,6 +304,10 @@ pub(crate) mod testutil {
             // `None` = not observed, the pre-change WAL shape. No reader
             // consumes `print_time` yet (see `plr_wal::Context::print_time`).
             print_time: None,
+            // Layer marks default to not-observed; the attribution tests
+            // set them explicitly where they exercise the cross-check.
+            current_layer: None,
+            total_layer: None,
         }
     }
 }

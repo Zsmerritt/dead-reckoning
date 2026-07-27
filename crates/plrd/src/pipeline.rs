@@ -1407,6 +1407,8 @@ G1 X60 Y60 E0.02
             }],
             exclude: None,
             print_state: None,
+            current_layer: None,
+            total_layer: None,
         }
     }
 

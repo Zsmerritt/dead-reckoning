@@ -1007,6 +1007,8 @@ mod tests {
             fans: Vec::new(),
             exclude: None,
             print_state: None,
+            current_layer: None,
+            total_layer: None,
         })
     }
 

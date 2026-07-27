@@ -138,6 +138,8 @@ pub fn wal_context(transforms: TransformObservations) -> Context {
         }],
         exclude: None,
         print_state: None,
+        current_layer: None,
+        total_layer: None,
     }
 }
 

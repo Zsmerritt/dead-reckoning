@@ -467,6 +467,8 @@ fn context_record(pt: f64, file_position: u64, state: &GcodeState) -> WalRecord 
         fans: Vec::new(),
         exclude: None,
         print_state: None,
+        current_layer: None,
+        total_layer: None,
     })
 }
 
