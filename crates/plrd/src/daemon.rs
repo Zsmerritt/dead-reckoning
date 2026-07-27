@@ -43,6 +43,12 @@ fn wal_cfg(config: &Config) -> WalSvcCfg {
 
 /// Runs the daemon until a signal or a fatal error. Returns the process
 /// exit code.
+// Linear composition (bind control socket, boot detection, retention,
+// spawn WAL thread + power-fail watcher, build the runtime, select on
+// client/signal/power-fail, then the shutdown sequence). Splitting it would
+// scatter the ownership of `sender`/`config` across helpers for no clarity
+// gain — same call the project already made for `ctrlsock::cmd_recover_execute`.
+#[allow(clippy::too_many_lines)]
 pub fn run(config_path: &Path) -> u8 {
     let config = match Config::load(config_path) {
         Ok(config) => config,
@@ -87,7 +93,40 @@ pub fn run(config_path: &Path) -> u8 {
     let retention_url = config.moonraker_url.clone();
 
     let (tx, rx) = std::sync::mpsc::sync_channel::<WalCmd>(config.channel_capacity);
+    // A clone for the power-fail watcher (below) to journal its marker on
+    // the same never-dropped path. Cloned before `WalSender` takes `tx`.
+    let watcher_tx = tx.clone();
     let wal_thread = walsvc::spawn(wal_cfg(&config), rx);
+
+    // The power-failing GPIO watcher (dormant unless `[power_fail_gpio]` is
+    // configured — the operator's hold-up hardware does not exist yet). Its
+    // best-effort clean-exit hook fires `powerfail_exit`, which the
+    // runtime's `select!` below treats as a THIRD stop reason: distinct
+    // from a SIGTERM/SIGINT signal because it must NOT journal a
+    // `RecorderStopped` marker (that suppresses recovery — the exact wrong
+    // outcome after a real power loss), yet must still take the final WAL
+    // sync. `note_stop_reason` is the precedent for a side-channel WAL
+    // writer; this is a second one, journaling directly to the WAL thread.
+    let powerfail_exit = std::sync::Arc::new(tokio::sync::Notify::new());
+    if let Some(pf) = config.power_fail_gpio.clone() {
+        let exit = std::sync::Arc::clone(&powerfail_exit);
+        let response = crate::powerfail::WalChannelResponse::new(
+            watcher_tx,
+            // Best-effort tier: signal the clean exit. Runs only after the
+            // watcher's mandatory tier has journaled the marker (see
+            // `powerfail::run_watcher`), so it can never delay it.
+            Box::new(move || exit.notify_one()),
+        );
+        // Detached: the thread blocks on the GPIO edge for the daemon's
+        // life (or ends after firing once). Not joined — process exit at
+        // shutdown reaps a thread blocked in a kernel edge read.
+        drop(crate::powerfail::spawn(pf, response));
+        eprintln!("plrd: power-fail GPIO watcher armed");
+    } else {
+        // No hardware configured: drop the spare sender so it does not keep
+        // the WAL channel alive independently of `WalSender`.
+        drop(watcher_tx);
+    }
 
     // The daemon is operational once the WAL service owns its files —
     // Klipper being down is a normal state it records around.
@@ -131,6 +170,8 @@ pub fn run(config_path: &Path) -> u8 {
     let moonraker_url = config.moonraker_url.clone();
     // Set only on the signal path — see the recorder-stopped marker below.
     let mut graceful = false;
+    // Set only on the power-fail watcher's clean-exit path — see below.
+    let mut power_fail = false;
     let client_result = runtime.block_on(async {
         // The control server runs beside the recorder. Its handlers do
         // heavy work on spawn_blocking and its executions await
@@ -154,10 +195,26 @@ pub fn run(config_path: &Path) -> u8 {
                 graceful = true;
                 Ok(())
             }
+            () = powerfail_exit.notified() => {
+                power_fail = true;
+                Ok(())
+            }
         }
     });
 
-    note_stop_reason(&mut sender, graceful);
+    if power_fail {
+        // The watcher already journaled and fsync'd the PowerFailing
+        // marker (its mandatory tier). This is a CLEAN exit — final WAL
+        // sync below — but deliberately NOT a graceful *recorder* stop:
+        // journaling `RecorderStopped` here would suppress the very
+        // recovery announcement the power loss must produce.
+        eprintln!(
+            "plrd: power-fail clean exit — the PowerFailing marker is journaled; \
+             not writing a recorder-stopped marker"
+        );
+    } else {
+        note_stop_reason(&mut sender, graceful);
+    }
 
     // Final durability: ask the WAL thread to sync and exit, then judge
     // by its verdict.

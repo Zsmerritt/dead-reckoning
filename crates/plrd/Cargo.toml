@@ -32,6 +32,18 @@ futures-util = { workspace = true }
 # workspace dependency, not a new dependency.
 [target.'cfg(target_os = "linux")'.dependencies]
 rustix = { workspace = true, features = ["time"] }
+# Power-failing GPIO watcher (src/powerfail.rs). `gpiocdev` is a pure-Rust
+# client for the Linux GPIO character-device uABI (cdev v2) — it talks to
+# `/dev/gpiochipN` via ioctls directly, with NO libgpiod C-library
+# dependency to install on the printer's Pi, unlike the `gpiod`/`libgpiod`
+# bindings. That matters for a deploy-to-an-appliance daemon: one static
+# Rust binary, no apt package to keep in sync. It exposes exactly what the
+# watcher needs — a blocking edge-event read (`Request::read_edge_event`,
+# no polling) and a single-line value read for the debounce re-read. Chosen
+# over the older `gpio-cdev` crate (in maintenance mode, cdev v1 only) and
+# over `gpiod` (FFI to the C libgpiod). Linux-only by design and never
+# compiled on other platforms — `plrd` itself is Linux-only — and pinned.
+gpiocdev = "=0.7.3"
 
 [lints]
 workspace = true

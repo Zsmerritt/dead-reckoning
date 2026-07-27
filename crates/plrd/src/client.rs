@@ -710,6 +710,10 @@ mod tests {
             MarkerKind::ExclusionUpdateLost => "ExclusionUpdateLost",
             MarkerKind::RecorderStopped => "RecorderStopped",
             MarkerKind::RecordingQuiescent => "RecordingQuiescent",
+            // Required ripple: adding the sanctioned `MarkerKind::PowerFailing`
+            // variant forces an arm in every exhaustive match, including
+            // this `#[cfg(test)]` helper.
+            MarkerKind::PowerFailing => "PowerFailing",
             MarkerKind::Unknown => "Unknown",
         }
     }

@@ -57,6 +57,12 @@ mod scan;
 mod config;
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 mod convert;
+// The power-failing GPIO watcher. Its core (edge-source trait, response
+// contract, run loop) is pure and cross-platform, so it compiles and is
+// tested everywhere; the concrete `gpiocdev` source, WAL-channel response,
+// and `spawn` are Linux-only inside the module.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+mod powerfail;
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 mod sender;
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
