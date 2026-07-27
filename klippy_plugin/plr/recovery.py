@@ -595,8 +595,7 @@ class RecoverySession:
                 )
         if self.can_answer():
             lines.append(
-                "  a question can still be answered: %s or %s"
-                % (CMD_CONTINUE, CMD_ABORT)
+                "  a question can still be answered: %s" % (self._answer_commands(),)
             )
         return lines
 
@@ -749,17 +748,17 @@ class RecoverySession:
             "g-code mutex plrd needs for its own, so this must be the last "
             "line of any macro.\n"
             "If plrd stops to ask you something, a prompt appears and the "
-            "console names the exact command to answer it (%s / %s)."
-            % (source, CMD_CONTINUE, CMD_ABORT)
+            "console names the exact command to answer it (it depends on the "
+            "question — a resume-point preview is answered differently from a "
+            "yes/no confirmation)." % (source,)
         )
 
     def _busy_message(self, source):
         if self._state == STATE_AWAITING:
             return (
                 "%s: a recovery is already in flight and is WAITING FOR YOUR "
-                "ANSWER — run %s to continue it or %s to stop it. Run "
-                "PLR_STATUS to see the question again."
-                % (source, CMD_CONTINUE, CMD_ABORT)
+                "ANSWER — run %s. Run PLR_STATUS to see the question again."
+                % (source, self._answer_commands())
             )
         return (
             "%s: a recovery is already in flight (started by %s). plrd runs "
@@ -780,6 +779,29 @@ class RecoverySession:
         if isinstance(self._data, dict):
             return self._data.get("confirm_kind")
         return None
+
+    def _answer_commands(self):
+        """The console commands that answer the CURRENT outstanding pause,
+        branched on its kind.
+
+        A resume-preview pause (the routine first pause under the default
+        ``ask``) is answered with the reposition verbs, NOT continue/abort —
+        so every place the plugin tells an operator how to answer must name
+        the right ones. Pointing a preview operator at ``PLR_RECOVER_CONTINUE``
+        would hand them a command the daemon refuses on a healthy pause, and
+        would contradict the dialog's own fallback line on the same screen.
+        Falls back to the binary pair when the kind is unknown (no pause
+        cached yet, or a non-preview pause).
+        """
+        if self._pause_kind() == KIND_PREVIEW:
+            return "%s / %s / %s / %s FWD=|BACK= / %s" % (
+                CMD_ACCEPT,
+                CMD_NEXT,
+                CMD_PREV,
+                CMD_NUDGE,
+                CMD_ABORT,
+            )
+        return "%s or %s" % (CMD_CONTINUE, CMD_ABORT)
 
     def answer(self, gcmd, answer, source, count=None):
         """Answer the outstanding confirm-point.
@@ -994,12 +1016,26 @@ class RecoverySession:
                 ),
             )
             return
+        # A `malformed` reply to an ANSWER we sent (not a start — those carry
+        # no `_answering_token`) means plrd REFUSED the verb but KEPT the
+        # pause standing: `cmd_recover_confirm` returns malformed before
+        # taking the outstanding question, and RESTORES it on a wrong-kind
+        # answer (a preview verb on a binary pause, or `continue` on a
+        # preview pause; ctrlsock.rs). The question is still answerable, so
+        # the token is kept rather than thrown away — the daemon deliberately
+        # preserved it. (The plugin discriminates kind locally so it should
+        # never send a wrong-kind verb, but the daemon's guard is the
+        # backstop, and losing the token when the daemon kept the pause is
+        # the bug this branch removes.)
+        if outcome == "malformed" and self._answering_token is not None:
+            self._wrong_kind_restore(response)
+            return
         # Unclassifiable — including `error` (ctrlsock.rs:834: one tag for
         # "the pipeline failed before anything was sent" and "the execution
-        # task never returned, so its cleanup never ran") and `malformed`
-        # (:740-751 returns it BEFORE `session.outstanding.take()`, so plrd
-        # may be standing at a confirm point right now).  A protocol addition
-        # must not be able to make this plugin claim a finish it cannot see.
+        # task never returned, so its cleanup never ran") and a `malformed`
+        # with nothing in flight (a rejected recover_execute — nothing ran).
+        # A protocol addition must not be able to make this plugin claim a
+        # finish it cannot see.
         self._unresolved(
             response,
             "plrd answered %r, which this plugin cannot classify, so what it "
@@ -1036,6 +1072,44 @@ class RecoverySession:
                 "This says nothing about what plrd is doing, so the recovery "
                 "state is unchanged:\n%s" % ("\n".join(self.status_lines()),)
             )
+        self._notify_finished()
+
+    def _wrong_kind_restore(self, response):
+        """plrd refused an answer as ``malformed`` but KEPT the pause.
+
+        Mirrors :meth:`_plrd_busy`'s token handling: the daemon restored the
+        outstanding question (ctrlsock.rs), so the same token still answers
+        it — keep the token and the cached readout (so :meth:`reshow` still
+        works and :meth:`_answer_commands` still names the right verbs), and
+        re-arm the deadline plrd is still enforcing. The published state is
+        the honest uncertainty (UNKNOWN): the plugin cannot demonstrate the
+        pause is live, it can only infer it from the typed refusal, so it
+        does not re-claim ``awaiting_confirmation`` — but it never pretends
+        the recovery ended either.
+        """
+        answering_token = self._answering_token
+        self._answering = None
+        self._answering_token = None
+        # Keep the token (and, with it, the cached pause payload): the daemon
+        # deliberately preserved the question.
+        self._token = answering_token
+        if answering_token is None:
+            self._data = None
+        # Toward alarming — no reason required.
+        self._transition(STATE_UNKNOWN)
+        self._disarm_timer()
+        if answering_token is not None:
+            self._arm_timer()
+        text = response.get("text")
+        if isinstance(text, str) and text.strip():
+            self._respond(text)
+        self._end_dialog()
+        self._respond(
+            "PLR recovery: plrd refused that answer as malformed but KEPT the "
+            "question open (it restores the pause on a wrong-kind answer). It "
+            "is still answerable — run PLR_STATUS to see it again, then answer "
+            "with %s. Do NOT assume the recovery ended." % (self._answer_commands(),)
+        )
         self._notify_finished()
 
     def _plrd_busy(self, response):
@@ -1370,11 +1444,11 @@ class RecoverySession:
                     "plrd's own default deadline, so plrd may well have aborted "
                     "the recovery already — this plugin cannot tell, because "
                     "plrd does not report the deadline it is using.\n"
-                    "Nothing was answered on your behalf, and %s / %s still "
+                    "Nothing was answered on your behalf, and %s still "
                     "work: plrd's reply will say whether it moved on. Starting "
                     "a NEW recovery is no longer refused, but doing so ABANDONS "
                     "this question (plrd is told to drop it). Check PLR_STATUS "
-                    "first." % (CMD_CONTINUE, CMD_ABORT)
+                    "first." % (self._answer_commands(),)
                 )
         except Exception:
             logger.exception("plr: recovery confirm-claim handler failed")

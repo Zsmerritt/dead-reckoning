@@ -289,3 +289,13 @@ def unknown_token(
 def busy(text="another recover_execute is already running or awaiting confirmation"):
     """plrd's serialization refusal (ctrlsock.rs:631-645)."""
     return {"ok": False, "text": text, "data": {"outcome": "busy"}}
+
+
+def malformed(
+    text=('recover_confirm requires "answer": "continue" or "abort"'),
+):
+    """plrd's typed refusal of a malformed/wrong-kind answer
+    (ctrlsock.rs ``cmd_recover_confirm``). On a WRONG-KIND answer the pause
+    is RESTORED before this is returned, so the outstanding question — and
+    its token — survive."""
+    return {"ok": False, "text": text, "data": {"outcome": "malformed"}}
