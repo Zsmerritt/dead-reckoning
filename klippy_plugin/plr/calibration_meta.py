@@ -119,11 +119,18 @@ GroupValidation = collections.namedtuple(
 def plugin_version():
     """The single-source plugin version (``plr.__version__``).
 
-    Imported lazily to avoid an import cycle (``plr/__init__`` imports
-    ``plugin`` which imports this module during package initialization)."""
-    import plr
+    A bare ``import plr`` only resolves under pytest, where the package is
+    also importable as a top-level ``plr`` (see the pytest path config);
+    under real klippy the package is loaded as ``extras.plr`` and there is
+    no top-level ``plr`` module at all, so that import raises
+    ``ModuleNotFoundError``.  A relative import names the parent package
+    however it was actually loaded, so it works under both.  It stays
+    lazy (imported inside the function rather than at module scope) to
+    avoid an import cycle (``plr/__init__`` imports ``plugin`` which
+    imports this module during package initialization)."""
+    from . import __version__
 
-    return plr.__version__
+    return __version__
 
 
 # --- canonicalization -------------------------------------------------------
