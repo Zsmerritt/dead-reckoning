@@ -90,6 +90,15 @@ use std::process::ExitCode;
 
 use cli::Command;
 
+/// Full daemon version string: `<semver> (<git-hash>)`, e.g.
+/// `0.5.0 (a1b2c3d)` — or `0.5.0 (a1b2c3d-dirty)` from an uncommitted
+/// tree, or `0.5.0 (unknown)` for a build made outside a git checkout
+/// (a source tarball). The semver is `Cargo.toml`; the hash is embedded
+/// by `build.rs` as `PLRD_GIT_HASH`. Both halves are compile-time string
+/// literals, so this concatenation is a `const`. Used by `plrd version`
+/// and the control-socket `ping` so a production log names the exact tree.
+pub const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), " (", env!("PLRD_GIT_HASH"), ")");
+
 /// Success.
 pub const EXIT_OK: u8 = 0;
 /// Runtime failure.
@@ -115,7 +124,7 @@ fn main() -> ExitCode {
 fn run(command: &Command) -> u8 {
     match command {
         Command::Version => {
-            println!("plrd {}", env!("CARGO_PKG_VERSION"));
+            println!("plrd {VERSION}");
             EXIT_OK
         }
         Command::Help => {

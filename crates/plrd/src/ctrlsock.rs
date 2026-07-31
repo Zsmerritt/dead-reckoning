@@ -742,8 +742,12 @@ pub(crate) async fn respond_line(state: &CtrlState, line: &str) -> Value {
         .and_then(Value::as_object)
         .unwrap_or(&empty);
     match cmd {
+        // `text` carries the full `plrd <semver> (<hash>)` string (human
+        // field); `data.version` stays the bare semver (machine field the
+        // plugin may parse — see the ping test), so the hash rides only the
+        // human line.
         "ping" => ok_response(
-            &format!("plrd {}", env!("CARGO_PKG_VERSION")),
+            &format!("plrd {}", crate::VERSION),
             &json!({"version": env!("CARGO_PKG_VERSION")}),
         ),
         "status" => cmd_status(state).await,

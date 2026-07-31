@@ -328,7 +328,7 @@ checksum = "a89322df9ebe1c1578d689c92318e070967d1042b512afbe49518723f4e6d5cd"
 
 [[package]]
 name = "plr-analyzer"
-version = "0.1.0"
+version = "0.5.0"
 dependencies = [
  "plr-gcode",
  "proptest",
@@ -339,7 +339,7 @@ dependencies = [
 
 [[package]]
 name = "plr-gcode"
-version = "0.1.0"
+version = "0.5.0"
 dependencies = [
  "proptest",
  "serde",
@@ -349,7 +349,7 @@ dependencies = [
 
 [[package]]
 name = "plr-klipper"
-version = "0.1.0"
+version = "0.5.0"
 dependencies = [
  "proptest",
  "serde",
@@ -359,7 +359,7 @@ dependencies = [
 
 [[package]]
 name = "plr-reconstruct"
-version = "0.1.0"
+version = "0.5.0"
 dependencies = [
  "plr-gcode",
  "plr-klipper",
@@ -371,7 +371,7 @@ dependencies = [
 
 [[package]]
 name = "plr-recovery"
-version = "0.1.0"
+version = "0.5.0"
 dependencies = [
  "plr-analyzer",
  "plr-gcode",
@@ -386,7 +386,7 @@ dependencies = [
 
 [[package]]
 name = "plr-wal"
-version = "0.1.0"
+version = "0.5.0"
 dependencies = [
  "proptest",
  "serde",
@@ -396,7 +396,7 @@ dependencies = [
 
 [[package]]
 name = "plrd"
-version = "0.1.0"
+version = "0.5.0"
 dependencies = [
  "futures-util",
  "gpiocdev",
