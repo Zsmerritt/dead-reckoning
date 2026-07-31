@@ -5,6 +5,32 @@
 //! The fake binds `127.0.0.1:0`, speaks just enough JSON-RPC 2.0 for
 //! the client under test, records every call, and pushes a gratuitous
 //! notification before each response so clients prove they skip them.
+//!
+//! ## Why the fake runs on its own dedicated OS thread
+//!
+//! Every test that drives a [`FakeMoonraker`] shares the process with
+//! hundreds of sibling tests. Under full-suite parallelism the OS badly
+//! oversubscribes CPUs (cargo alone runs tests on as many threads as
+//! there are cores, and several of *those* tests each spin up their own
+//! multi-worker tokio runtime on top). A fake that merely `tokio::spawn`s
+//! its accept/serve loop onto whatever runtime happens to be driving the
+//! calling test shares that runtime's worker threads — and therefore its
+//! OS-level scheduling fate — with everything else the test does. When a
+//! worker thread carrying the fake's accept loop gets starved for long
+//! enough, the fake stops responding and any test whose timing assumed a
+//! prompt reply goes flaky, even though the code under test is fine.
+//!
+//! [`FakeMoonraker::spawn`] therefore binds the loopback listener
+//! synchronously (an instant syscall, so the bound address is known
+//! before any thread exists) and then hands the whole accept/serve loop
+//! to a brand-new OS thread running its own single-threaded tokio
+//! runtime. That thread does nothing else — it is never a party to
+//! whatever scheduling pressure the rest of the suite puts on the
+//! runtime under test — so suite-wide executor contention cannot stall
+//! it. This generalizes a pattern one test (`a_held_gcode_mutex_times_out
+//! _into_a_refusal` in `recover.rs`) already used by hand for a related
+//! reason (a blocking handler must not stall the runtime under test);
+//! every call site gets the isolation for free.
 
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
@@ -15,48 +41,104 @@ use tokio_tungstenite::tungstenite::Message;
 /// Handler: `(method, params)` → `Ok(result)` or `Err((code, message))`.
 pub type Handler = dyn Fn(&str, &Value) -> Result<Value, (i64, String)> + Send + Sync;
 
-/// A running fake Moonraker.
+/// A running fake Moonraker. Its accept/serve loop lives on a dedicated
+/// OS thread with its own tokio runtime — see the module docs.
 pub struct FakeMoonraker {
     addr: SocketAddr,
     calls: Arc<Mutex<Vec<(String, Value)>>>,
-    accept_task: tokio::task::JoinHandle<()>,
+    /// Dropping the sender tells the dedicated thread's accept loop to
+    /// stop; `None` once shutdown has been signalled.
+    shutdown: Option<tokio::sync::oneshot::Sender<()>>,
+    /// Joined on drop so the OS thread (and every connection it is
+    /// still serving) is torn down before `Drop::drop` returns, instead
+    /// of leaking a thread per test.
+    thread: Option<std::thread::JoinHandle<()>>,
 }
 
 impl Drop for FakeMoonraker {
     fn drop(&mut self) {
-        self.accept_task.abort();
+        if let Some(shutdown) = self.shutdown.take() {
+            // Best-effort: if the thread already exited, the receiver
+            // is gone and there is nothing left to signal.
+            let _ = shutdown.send(());
+        }
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
     }
 }
 
 impl FakeMoonraker {
     /// Binds a loopback listener and serves `handler` on every
-    /// connection (sequential reconnects supported).
+    /// connection (sequential reconnects supported), on a dedicated OS
+    /// thread isolated from whatever runtime the caller is on.
     pub async fn spawn(
         handler: impl Fn(&str, &Value) -> Result<Value, (i64, String)> + Send + Sync + 'static,
     ) -> Self {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind loopback");
+        // A plain std bind: instant, and it lets us hand the listener to
+        // the dedicated thread below without that thread needing to be
+        // the one to pick the port.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        listener
+            .set_nonblocking(true)
+            .expect("set loopback listener nonblocking");
         let addr = listener.local_addr().expect("local addr");
         let calls: Arc<Mutex<Vec<(String, Value)>>> = Arc::new(Mutex::new(Vec::new()));
         let handler: Arc<Handler> = Arc::new(handler);
         let calls_task = Arc::clone(&calls);
-        let accept_task = tokio::spawn(async move {
-            loop {
-                let Ok((stream, _)) = listener.accept().await else {
-                    return;
-                };
-                let handler = Arc::clone(&handler);
-                let calls = Arc::clone(&calls_task);
-                tokio::spawn(async move {
-                    let _ = serve_connection(stream, &handler, &calls).await;
+        let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        // Signalled once the listener is registered with the dedicated
+        // thread's own reactor, so `spawn` cannot return (and a caller
+        // cannot race a connection attempt) before the fake is actually
+        // able to accept.
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<()>();
+
+        let thread = std::thread::Builder::new()
+            .name("fake-moonraker".to_owned())
+            .spawn(move || {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("fake moonraker runtime");
+                rt.block_on(async move {
+                    // Registers the std listener with *this* runtime's
+                    // reactor; must happen inside the runtime it will be
+                    // polled on.
+                    let listener = tokio::net::TcpListener::from_std(listener)
+                        .expect("register loopback listener");
+                    let _ = ready_tx.send(());
+                    loop {
+                        tokio::select! {
+                            accepted = listener.accept() => {
+                                let Ok((stream, _)) = accepted else {
+                                    return;
+                                };
+                                let handler = Arc::clone(&handler);
+                                let calls = Arc::clone(&calls_task);
+                                tokio::spawn(async move {
+                                    let _ = serve_connection(stream, &handler, &calls).await;
+                                });
+                            }
+                            _ = &mut shutdown_rx => {
+                                return;
+                            }
+                        }
+                    }
                 });
-            }
-        });
+            })
+            .expect("spawn fake moonraker thread");
+
+        // If the thread died before registering the listener, the sender
+        // was dropped; `expect` surfaces that as a clear test failure
+        // instead of a silent race against an accept loop that never
+        // starts.
+        ready_rx.await.expect("fake moonraker thread came up");
+
         Self {
             addr,
             calls,
-            accept_task,
+            shutdown: Some(shutdown_tx),
+            thread: Some(thread),
         }
     }
 
