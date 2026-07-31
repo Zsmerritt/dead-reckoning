@@ -206,6 +206,7 @@ pub fn recovery(set: PossibleStopSet, context: Context) -> Reconstruction {
         window: stop_window(),
         stop_set: set,
         exclusions: ExclusionReport::unknown(),
+        power_fail_edge_mono_ns: None,
     }))
 }
 

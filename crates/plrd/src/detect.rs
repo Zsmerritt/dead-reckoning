@@ -298,15 +298,22 @@ pub struct PendingRecovery {
     /// The power-fail sidecar's host-monotonic edge (`CLOCK_MONOTONIC` ns),
     /// **persisted** here at boot detection so a later `plrd recover` — run
     /// after the daemon deleted the write-once sidecar — still has the
-    /// crash's exact-T fact. `None` when no genuine edge was present.
+    /// crash's exact-T fact.
+    ///
+    /// This is the edge the boot reconstruction **admitted**
+    /// ([`plr_reconstruct::RecoveryReconstruction::power_fail_edge_mono_ns`],
+    /// post-`sidecar_admits`), never the raw sidecar load: an edge that fell
+    /// OUTSIDE the epoch-admission band is `None` here, so a rejected edge is
+    /// never written as if admitted (NOTE-2 — "one loader, one answer": the
+    /// admission authority is `plr_reconstruct`, and detection persists only
+    /// its verdict). `None` when no genuine edge was admitted.
     ///
     /// The recover-time reconstruction feeds this back through the SAME
     /// `power_fail_edge_mono_ns` input the sidecar used, so it obeys the
     /// identical epoch-admission band (`sidecar_admits`,
-    /// `[tail\u{2212}1s, tail+10s]`): a persisted edge NOT adjacent to the
-    /// crash tail is rejected exactly as a stale sidecar would be, so an old
-    /// pending edge can never resurrect against an unrelated later crash.
-    /// `#[serde(default)]` so a pending file written before the field
+    /// `[tail\u{2212}1s, tail+10s]`): even a persisted edge is re-checked, so
+    /// an old pending edge can never resurrect against an unrelated later
+    /// crash. `#[serde(default)]` so a pending file written before the field
     /// existed still loads.
     #[serde(default)]
     pub power_fail_edge_mono_ns: Option<u64>,
@@ -576,8 +583,13 @@ pub fn detect(wal_dir: &Path, heartbeat_path: &Path, detected_wall_ns: u64) -> D
         frame_invalid,
         // Persist the exact-T sidecar edge (see the field docs): the daemon
         // deletes the write-once sidecar after this boot, so a later `plrd
-        // recover` reads it from here instead.
-        power_fail_edge_mono_ns,
+        // recover` reads it from here instead. Persist the edge the
+        // reconstruction ADMITTED (`recovery.power_fail_edge_mono_ns`,
+        // post-`sidecar_admits`), NOT the raw `power_fail_edge_mono_ns` load:
+        // an edge rejected by the epoch band must not be written as if
+        // admitted (NOTE-2 "one loader, one answer" — the admission authority
+        // is `plr_reconstruct`, and this records only its verdict).
+        power_fail_edge_mono_ns: recovery.power_fail_edge_mono_ns,
         interrupted_by,
     })
 }
@@ -1770,6 +1782,73 @@ mod tests {
         // the persisted edge too, so its reconstruction folds it exactly as
         // boot did.
         assert_eq!(crate::scan::power_fail_edge(&dir), Some(edge));
+    }
+
+    #[test]
+    fn a_band_rejected_sidecar_edge_is_not_persisted_as_admitted() {
+        // NOTE-2 regression: a sidecar edge that FAILS `sidecar_admits` (it
+        // sits outside the epoch band `[tail-1s, tail+10s]`) must not be
+        // written into `pending_recovery.json` as if admitted. Detection
+        // persists the reconstruction's ADMITTED verdict, not the raw load.
+        //
+        // FAIL-BEFORE / PASS-AFTER: before the fix, detect persisted the raw
+        // `power_fail_edge_mono_ns` load, so `pending.power_fail_edge_mono_ns`
+        // was `Some(out_of_band)` and the first assertion failed; after it,
+        // the field is `None`. `interrupted_by` was already gated on the
+        // admitted `power_failing_tail`, so it stays `None` either way — the
+        // frame interlock is armed here so the ONLY reason it is not
+        // "power-fail" is the edge rejection.
+        let dir = temp_dir("band-rejected-edge");
+        let gcode_path = unfinished_gcode(&dir);
+        let tail = 10_000_000_000u64;
+        // 20 s after the durable tail — past the 10 s drain slack, so the
+        // band rejects it. The edge is genuinely decodable and present; only
+        // admission fails.
+        let out_of_band = tail + 20_000_000_000u64;
+        write_wal(
+            &dir,
+            &[
+                WalRecord::Heartbeat(heartbeat(tail, 42.0)),
+                WalRecord::Context(context(tail, gcode_path.to_str().unwrap(), 500)),
+            ],
+        );
+        // Arm the Z-frame interlock just before the tail, so an ADMITTED edge
+        // would have postdated it and produced `interrupted_by == "power-fail"`.
+        // That isolates admission as the sole gate under test.
+        super::write_frame_invalid(
+            &dir,
+            &super::FrameInvalid {
+                detected_wall_ns: 1,
+                step_id: 5,
+                phase: "shifted-frame".to_owned(),
+                reason: "shifted-frame-declared".to_owned(),
+                arm_mono_ns: Some(tail - 500_000_000),
+            },
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join(crate::scan::POWER_FAIL_FILE_NAME),
+            crate::powerfail::encode_power_fail_edge(out_of_band),
+        )
+        .unwrap();
+        // The sidecar itself is present and decodable — the rejection is the
+        // epoch band's doing, not a torn/foreign file.
+        assert_eq!(
+            crate::scan::load_power_fail_edge(&dir.join(crate::scan::POWER_FAIL_FILE_NAME)),
+            Some(out_of_band),
+        );
+
+        let Detection::Pending(pending) = detect(&dir, &dir.join("heartbeat.bin"), 1) else {
+            panic!("expected pending");
+        };
+        // The rejected edge is NOT persisted as an admitted edge.
+        assert_eq!(
+            pending.power_fail_edge_mono_ns, None,
+            "a band-rejected sidecar edge must not be persisted as admitted",
+        );
+        // And the announcement label does not claim a power-fail interruption.
+        assert_ne!(pending.interrupted_by.as_deref(), Some("power-fail"));
+        assert_eq!(pending.interrupted_by, None);
     }
 
     #[test]

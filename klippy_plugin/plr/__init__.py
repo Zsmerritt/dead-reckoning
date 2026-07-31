@@ -19,7 +19,7 @@ Python 3.9 — see ``klippy_plugin/pyproject.toml``.
 # version invalidates the affected calibration at load time.  Defined BEFORE
 # the ``plugin`` import so calibration_meta.plugin_version() can read it during
 # package initialization without an import cycle.
-__version__ = "0.3.0"
+__version__ = "0.5.0"
 
 from . import plugin  # noqa: E402  (must follow __version__)
 

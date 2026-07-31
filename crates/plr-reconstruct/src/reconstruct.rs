@@ -72,6 +72,19 @@ pub struct RecoveryReconstruction {
     /// [`ExclusionReport::confirmation`] carries the per-object payload
     /// the operator prompt must be built from.
     pub exclusions: ExclusionReport,
+    /// The power-fail sidecar edge (`mono_ns`) THIS reconstruction
+    /// **admitted** — i.e. [`ReconstructInputs::power_fail_edge_mono_ns`]
+    /// after the [`sidecar_admits`] epoch-band filter — or `None` when no
+    /// sidecar edge was supplied or it fell outside the band.
+    ///
+    /// This is the single authority's verdict on the sidecar edge, published
+    /// so a caller that persists the edge (boot detection writes it into
+    /// `pending_recovery.json`) records only what was admitted, rather than
+    /// re-deriving the band and risking a second answer. It is NOT the same
+    /// as [`WalTimeline::power_failing_tail`](crate::WalTimeline::power_failing_tail):
+    /// that folds in WAL-journaled `PowerFailing` markers and liveness
+    /// neutralization; this is the sidecar copy alone.
+    pub power_fail_edge_mono_ns: Option<u64>,
 }
 
 /// Outcome of [`reconstruct`].
@@ -172,6 +185,11 @@ pub fn reconstruct(
         window,
         stop_set,
         exclusions,
+        // The already-admitted edge (post-`sidecar_admits`), published so a
+        // persisting caller records the authority's verdict, not the raw
+        // input. `power_fail_edge` is `Option<u64>` (Copy), untouched by the
+        // marker fold above.
+        power_fail_edge_mono_ns: power_fail_edge,
     })))
 }
 
