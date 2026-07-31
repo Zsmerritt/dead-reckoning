@@ -39,6 +39,12 @@ use serde_json::{json, Value};
 use tokio_tungstenite::tungstenite::Message;
 
 /// Handler: `(method, params)` → `Ok(result)` or `Err((code, message))`.
+///
+/// Called synchronously, inline in the connection task, on the fake's
+/// dedicated single-threaded runtime (see the module docs) — never on
+/// the runtime under test. It must never block unboundedly: `Drop`
+/// joins that thread, so a blocking handler delays shutdown by however
+/// long it blocks, and one that never returns hangs the drop.
 pub type Handler = dyn Fn(&str, &Value) -> Result<Value, (i64, String)> + Send + Sync;
 
 /// A running fake Moonraker. Its accept/serve loop lives on a dedicated
@@ -72,6 +78,9 @@ impl FakeMoonraker {
     /// Binds a loopback listener and serves `handler` on every
     /// connection (sequential reconnects supported), on a dedicated OS
     /// thread isolated from whatever runtime the caller is on.
+    ///
+    /// `handler` must never block unboundedly — see [`Handler`]'s docs
+    /// for why.
     pub async fn spawn(
         handler: impl Fn(&str, &Value) -> Result<Value, (i64, String)> + Send + Sync + 'static,
     ) -> Self {
