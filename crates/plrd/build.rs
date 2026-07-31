@@ -11,10 +11,12 @@
 //!   `unknown`.
 //! * **No spurious rebuilds.** Emitting any `cargo:rerun-if-changed`
 //!   opts out of cargo's default "rescan the whole package every build"
-//!   behavior. We point it at `.git/HEAD` and the ref HEAD names (resolved
-//!   via `git rev-parse --git-path`, which is correct inside a worktree
-//!   where `.git` is a file and HEAD lives under `.git/worktrees/<name>/`),
-//!   so the hash is recomputed only when the checkout actually moves.
+//!   behavior. We point it at `.git/logs/HEAD` (plus `.git/HEAD` and the
+//!   named ref as extras), resolved via `git rev-parse --git-path` — correct
+//!   inside a worktree where `.git` is a file and HEAD/logs live under
+//!   `.git/worktrees/<name>/` — so the hash is recomputed only when the
+//!   checkout actually moves. See [`rerun_paths`] for why `logs/HEAD` is the
+//!   load-bearing one.
 
 use std::process::Command;
 
@@ -24,14 +26,14 @@ fn main() {
 
     // Scope the rebuild triggers. Without at least one rerun-if line, cargo
     // reruns this script whenever ANY package file changes; with them, only
-    // a real HEAD/ref move recomputes the hash. `build.rs` is always watched
+    // a real HEAD move recomputes the hash. `build.rs` is always watched
     // by cargo regardless, and naming it keeps a git-less (tarball) build
     // from falling back to the whole-package scan.
     //
     // Only EXISTING paths are emitted: cargo treats a `rerun-if-changed`
     // target that does not exist as perpetually-changed and rebuilds every
-    // compile — so watching e.g. a `packed-refs` that this repo (loose refs)
-    // does not have would defeat the whole point. See [`rerun_paths`].
+    // compile. See [`rerun_paths`] for the watched set and why `logs/HEAD`
+    // is the one that actually guarantees freshness.
     println!("cargo:rerun-if-changed=build.rs");
     for path in rerun_paths() {
         println!("cargo:rerun-if-changed={path}");
@@ -56,39 +58,50 @@ fn git_hash() -> Option<String> {
     })
 }
 
-/// Files whose change means HEAD moved: `.git/HEAD` and, when HEAD is a
-/// symbolic ref, the ref file it points at (plus `packed-refs`, which is
-/// where a ref lives after `git gc`/`git pack-refs`). Resolved through
-/// `git rev-parse --git-path` so it is correct for worktrees and unusual
-/// `GIT_DIR` layouts. Only paths that EXIST are returned (see the caller);
-/// empty when git is unavailable.
+/// Files whose change means HEAD moved.
 ///
-/// The loose-ref file and `packed-refs` are mutually exclusive for a given
-/// ref, and packing/unpacking DELETES one and CREATES the other — a change
-/// cargo sees on the file it was already watching, so whichever exists now
-/// is enough to catch the transition.
+/// **`logs/HEAD` is the load-bearing one** — the invariant the freshness
+/// guarantee actually rests on. It is a single per-worktree file that git
+/// APPENDS a line to on EVERY ref movement of HEAD (commit, checkout, reset,
+/// pull, merge), regardless of whether refs are loose or packed. Watching the
+/// ref file alone is not enough: after `git pack-refs --all` the loose ref is
+/// deleted, and a subsequent commit writes a BRAND-NEW loose ref that was not
+/// in the watched set while leaving `packed-refs` and `HEAD` byte-identical —
+/// so cargo would never rerun and the embedded hash would go stale. The
+/// appended reflog entry closes that hole.
+///
+/// `.git/HEAD` and the named ref file are kept as best-effort EXTRAS (they
+/// help the rare `core.logAllRefUpdates=false` config where no reflog exists,
+/// and `HEAD` itself changes on a branch switch that leaves the old branch's
+/// tip untouched). All three are resolved through `git rev-parse --git-path`
+/// so they are correct for worktrees and unusual `GIT_DIR` layouts.
+///
+/// Only paths that EXIST are returned (see the caller); empty when git is
+/// unavailable (a tarball build — hash is `unknown`, nothing to watch).
 fn rerun_paths() -> Vec<String> {
     let mut paths = Vec::new();
     let Some(head_path) = git(&["rev-parse", "--git-path", "HEAD"]) else {
         return paths;
     };
-    // If HEAD is detached, its content IS the hash and there is no ref file
-    // to also watch; watching HEAD alone suffices.
+    // The universal ref-movement signal (see the doc comment): appended to on
+    // every HEAD move whether refs are loose or packed.
+    if let Some(logs_head) = git(&["rev-parse", "--git-path", "logs/HEAD"]) {
+        paths.push(logs_head);
+    }
+    // Best-effort extras. If HEAD is detached, its content IS the hash and
+    // there is no ref file to also watch; watching HEAD alone suffices.
     if let Ok(head) = std::fs::read_to_string(&head_path) {
         if let Some(reference) = head.strip_prefix("ref:") {
             let reference = reference.trim();
             if let Some(ref_path) = git(&["rev-parse", "--git-path", reference]) {
                 paths.push(ref_path);
             }
-            if let Some(packed) = git(&["rev-parse", "--git-path", "packed-refs"]) {
-                paths.push(packed);
-            }
         }
     }
     paths.push(head_path);
     // Drop any that do not exist: cargo rebuilds every compile for a
-    // `rerun-if-changed` path it cannot stat (e.g. `packed-refs` in a
-    // loose-ref repo, or a ref that is currently packed).
+    // `rerun-if-changed` path it cannot stat (a currently-packed ref, or
+    // `logs/HEAD` under `core.logAllRefUpdates=false`).
     paths.retain(|p| std::path::Path::new(p).exists());
     paths
 }
