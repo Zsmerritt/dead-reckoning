@@ -2816,6 +2816,7 @@ mod tests {
             e_file: None,
             file_window: window,
             extension: None,
+            power_fail_window_cut: None,
             // `..Degradation::default()` (every flag clear) so that adding
             // a degradation flag upstream cannot break this fixture. The
             // two fields kept explicit are not read by `stop_evidence`;

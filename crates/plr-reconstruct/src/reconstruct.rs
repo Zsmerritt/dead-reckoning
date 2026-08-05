@@ -415,6 +415,75 @@ mod tests {
         );
     }
 
+    /// **Epoch-boundary edge (window collapse, end-to-end).** A sidecar
+    /// power-fail edge admitted for the crash epoch collapses the
+    /// reconstruction's `wal_eval_end` to `edge_pt + hold-up`, dropping the
+    /// planned-ahead trapq — and it reads ONLY crash-epoch data: an older
+    /// boot's giant frontier, partitioned away before ingestion, can neither
+    /// anchor the edge mapping nor survive in the window. The two-epoch
+    /// result is bit-identical to isolating the crash epoch alone.
+    #[test]
+    fn a_sidecar_edge_collapses_the_window_within_the_crash_epoch_only() {
+        // Edge at mono 22 s: admitted (in band), maps through the crash
+        // heartbeat anchor to print time 11.5 -> cut 12.5, narrowing the
+        // 14.0 planned-ahead high end.
+        const EDGE: u64 = 22 * S;
+        // Crash epoch: Z committed to 10.3, trapq PLANNED AHEAD to 14.0,
+        // newest heartbeat anchors print time 10.5 at mono 21 s. Durable
+        // tail mono 21 s -> sidecar band [20 s, 31 s].
+        let crash = || {
+            vec![
+                WalRecord::Heartbeat(heartbeat_at(20 * S, 10.0)),
+                WalRecord::Context(context_at(20 * S, 500)),
+                WalRecord::StepperRange(stepper_range("stepper_z", 10.3, 20 * S)),
+                WalRecord::TrapqSegment(trapq_segment("toolhead", 10.0, 4.0, 20 * S)),
+                WalRecord::Heartbeat(heartbeat_at(21 * S, 10.5)),
+            ]
+        };
+        let eval_end = |scan: &plr_wal::RecoveryScan| -> f64 {
+            let inputs = ReconstructInputs {
+                power_fail_edge_mono_ns: Some(EDGE),
+                ..inputs(scan)
+            };
+            let Reconstruction::Recovery(r) =
+                reconstruct(&inputs, &ReconstructConfig::default()).unwrap()
+            else {
+                panic!("expected a recovery");
+            };
+            assert_eq!(
+                r.power_fail_edge_mono_ns,
+                Some(EDGE),
+                "edge must be admitted"
+            );
+            assert!(
+                (r.stop_set.wal_eval_end - 12.5).abs() < 1e-9,
+                "{}",
+                r.stop_set.wal_eval_end
+            );
+            assert_eq!(r.stop_set.power_fail_window_cut, Some(12.5));
+            assert!(!r.stop_set.degradation.power_fail_cut_degenerate);
+            r.stop_set.wal_eval_end
+        };
+
+        // Isolated single-epoch reconstruction.
+        let isolated = eval_end(&scan_of(crash()));
+
+        // Two-epoch: an older boot with a giant 60_000 s frontier planned
+        // even further ahead. Partitioned away; must not poison the collapse.
+        let old_boot = vec![
+            WalRecord::Heartbeat(heartbeat_at(40_000 * S, 60_000.0)),
+            WalRecord::Context(context_at(40_000 * S, 900_000)),
+            WalRecord::TrapqSegment(trapq_segment("toolhead", 60_000.0, 500.0, 40_000 * S)),
+            WalRecord::StepperRange(stepper_range("stepper_z", 60_000.0, 40_000 * S)),
+        ];
+        let full = scan_of_segments(vec![old_boot, crash()]);
+        let two_epoch = eval_end(&full);
+        assert!(
+            (two_epoch - isolated).abs() < 1e-12,
+            "the collapse must read the crash epoch alone: {two_epoch} vs {isolated}"
+        );
+    }
+
     const S: u64 = 1_000_000_000; // one second in ns
 
     /// Reconstructs an unclean stop or panics with the error/outcome.

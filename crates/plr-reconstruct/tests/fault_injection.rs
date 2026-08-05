@@ -32,7 +32,7 @@
 use plr_gcode::{GcodeState, Line, LineIter, PlannedMove};
 use plr_reconstruct::{
     reconstruct, CrashClass, FileTail, ReceiveSeqObservation, ReconstructConfig, ReconstructInputs,
-    Reconstruction,
+    Reconstruction, RecoveryReconstruction,
 };
 use plr_wal::heartbeat::{HEARTBEAT_FILE_LEN, HEARTBEAT_SLOT_LEN};
 use plr_wal::{
@@ -742,10 +742,14 @@ fn synthesize_heartbeat_file(events: &[(f64, WalRecord)], cut: f64, tear_newest:
 // The property
 // ---------------------------------------------------------------------
 
-// One linear assertion battery per case; splitting it would obscure the
-// property being asserted.
-#[allow(clippy::too_many_lines)]
-fn run_case(scenario: &Scenario) -> Result<(), TestCaseError> {
+/// Reconstructs one scenario, optionally injecting a power-fail sidecar
+/// edge (`edge_mono_ns`), and returns the truth, the true cut time, and the
+/// recovery. Shared by the plain containment property and the power-fail
+/// window-collapse property so both drive identical WAL synthesis.
+fn reconstruct_case(
+    scenario: &Scenario,
+    edge_mono_ns: Option<u64>,
+) -> Result<(Truth, f64, RecoveryReconstruction), TestCaseError> {
     let text = render(&scenario.ops);
     let truth = build_truth(&text, scenario.lookahead);
     prop_assume!(truth.total_end > T0 + 2.0);
@@ -776,7 +780,7 @@ fn run_case(scenario: &Scenario) -> Result<(), TestCaseError> {
             bytes: text.as_bytes(),
         }),
         receive_seq: obs,
-        power_fail_edge_mono_ns: None,
+        power_fail_edge_mono_ns: edge_mono_ns,
     };
     let config = ReconstructConfig {
         mcu_freq: scenario.with_mcu_freq.then_some(MCU_FREQ),
@@ -790,12 +794,25 @@ fn run_case(scenario: &Scenario) -> Result<(), TestCaseError> {
             "unclean stop misread as clean",
         )));
     };
+    Ok((truth, cut, *recovery))
+}
+
+/// The containment battery: the possible-stop set MUST contain the true
+/// stop state. This is the crate's core safety invariant, and it must hold
+/// identically whether or not a power-fail edge collapsed the window —
+/// which is exactly why the collapse only ever narrows toward, never past,
+/// the true death point.
+fn assert_contains_true_state(
+    recovery: &RecoveryReconstruction,
+    truth: &Truth,
+    cut: f64,
+) -> Result<(), TestCaseError> {
     prop_assert!(
         recovery.window.class != CrashClass::CleanShutdown,
         "unclean stop classified clean"
     );
 
-    let (pos, file_e, offset) = true_state_at(&truth, cut);
+    let (pos, file_e, offset) = true_state_at(truth, cut);
     let set = &recovery.stop_set;
 
     // t_a must never exceed the true stop time.
@@ -882,6 +899,85 @@ fn run_case(scenario: &Scenario) -> Result<(), TestCaseError> {
     Ok(())
 }
 
+fn run_case(scenario: &Scenario) -> Result<(), TestCaseError> {
+    let (truth, cut, recovery) = reconstruct_case(scenario, None)?;
+    assert_contains_true_state(&recovery, &truth, cut)
+}
+
+/// The power-fail window-collapse property. Injects an admitted sidecar
+/// edge whose print time sits `edge_lag` seconds before the true cut (so
+/// the true stop lies inside `[edge_pt, edge_pt + POWER_FAIL_HOLD_UP_MARGIN]`
+/// — the physical hold-up interval, `edge_lag ∈ [0, 1]`), then asserts:
+///
+/// 1. **Containment still holds** — the collapse never moves the true death
+///    point out of the set (the one non-negotiable invariant).
+/// 2. **Never wider than the no-edge window** — the edge window's
+///    `wal_eval_end` and offset high-end are `<=` the no-edge reconstruction's
+///    (the collapse only narrows).
+/// 3. **Collapse is the sound intersection** — when a cut was applied
+///    (`power_fail_window_cut`), `wal_eval_end` is exactly
+///    `min(no_edge_wal_eval_end, cut)`, i.e. it covers the trapq position at
+///    every `t ∈ [edge_pt, min(edge_pt + margin, tail)]` and no further; and
+///    it never drops below the proven `t_b`.
+fn run_edge_case(scenario: &Scenario, edge_lag: f64) -> Result<(), TestCaseError> {
+    // Reference: the same scenario with no edge. Its window is the
+    // uncollapsed baseline the edge case must not exceed.
+    let (truth, cut, reference) = reconstruct_case(scenario, None)?;
+    let edge_pt = cut - edge_lag;
+    let (_, cut2, edged) = reconstruct_case(scenario, Some(pt_to_mono_ns(edge_pt)))?;
+    // Same synthesis path, so the cut is identical.
+    prop_assert!((cut - cut2).abs() < 1e-9);
+
+    // (1) The safety invariant survives the collapse.
+    assert_contains_true_state(&edged, &truth, cut)?;
+
+    let ref_set = &reference.stop_set;
+    let set = &edged.stop_set;
+
+    // (2) Never wider than the no-edge window.
+    prop_assert!(
+        set.wal_eval_end <= ref_set.wal_eval_end + 1e-6,
+        "edge wal_eval_end {} exceeds no-edge {}",
+        set.wal_eval_end,
+        ref_set.wal_eval_end
+    );
+    if let (Some(ew), Some(rw)) = (set.file_window, ref_set.file_window) {
+        prop_assert!(
+            ew.end <= rw.end,
+            "edge offset high-end {} exceeds no-edge {}",
+            ew.end,
+            rw.end
+        );
+    }
+
+    // (3) When the edge produced a sound cut, the collapse is exactly the
+    // intersection min(no-edge high end, cut), never below t_b.
+    if let Some(cut_pt) = set.power_fail_window_cut {
+        let expected = ref_set.wal_eval_end.min(cut_pt);
+        prop_assert!(
+            (set.wal_eval_end - expected).abs() < 1e-6,
+            "wal_eval_end {} != min(no-edge {}, cut {}) = {}",
+            set.wal_eval_end,
+            ref_set.wal_eval_end,
+            cut_pt,
+            expected
+        );
+        prop_assert!(
+            set.wal_eval_end >= edged.window.t_b - 1e-6,
+            "collapse dropped below the proven t_b {} to {}",
+            edged.window.t_b,
+            set.wal_eval_end
+        );
+        prop_assert!(!set.degradation.power_fail_cut_degenerate);
+    } else {
+        // No sound cut applied: either the edge was not admitted, or the
+        // mapping was degenerate — in both cases the window falls back to
+        // the uncollapsed baseline exactly.
+        prop_assert!((set.wal_eval_end - ref_set.wal_eval_end).abs() < 1e-6);
+    }
+    Ok(())
+}
+
 proptest! {
     // Case count comes from ProptestConfig::default(), so
     // PROPTEST_CASES can crank it up for soak runs (256 by default).
@@ -905,6 +1001,18 @@ proptest! {
     #[test]
     fn possible_stop_set_always_contains_true_state(scenario in scenario_strategy()) {
         run_case(&scenario)?;
+    }
+
+    /// The power-fail window collapse never breaks containment and never
+    /// widens the window. `edge_lag ∈ [0, 0.9]` s places an admitted edge
+    /// inside the hold-up interval before the true cut, exercising the
+    /// collapse across the same randomized cut/tear/hop/layer space.
+    #[test]
+    fn power_fail_edge_collapse_preserves_containment_and_never_widens(
+        scenario in scenario_strategy(),
+        edge_lag in 0.0f64..0.9f64,
+    ) {
+        run_edge_case(&scenario, edge_lag)?;
     }
 }
 
