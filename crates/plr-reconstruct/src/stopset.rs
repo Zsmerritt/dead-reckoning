@@ -797,9 +797,26 @@ pub fn compute_stop_set(
             None => (base_high, None, false),
         };
 
-    let (mut z_candidates, mut xy) =
-        eval_toolhead_span(&timeline.toolhead_segments, window.t_a, wal_eval_end);
-    let wal_e = eval_extruder_span(&timeline.extruder_segments, window.t_a, wal_eval_end);
+    // `first_after` (the high-end gap repair in the eval spans below) is a
+    // consequence of the collapse and must fire ONLY when the collapse
+    // actually ran with a sound cut — otherwise a negative-duration segment
+    // (a supported input: `TrapqSegment::end_time` clamps but ingest keeps
+    // the row) whose `end_time < print_time` can push `base_high` below its
+    // own `print_time`, tripping `first_after` on a pure no-edge path and
+    // smuggling coordinates the uncollapsed evaluation correctly discards.
+    let collapse_active = power_fail_window_cut.is_some();
+    let (mut z_candidates, mut xy) = eval_toolhead_span(
+        &timeline.toolhead_segments,
+        window.t_a,
+        wal_eval_end,
+        collapse_active,
+    );
+    let wal_e = eval_extruder_span(
+        &timeline.extruder_segments,
+        window.t_a,
+        wal_eval_end,
+        collapse_active,
+    );
 
     let mut degradation = Degradation {
         observation_gap: observation_gap_overlaps_window(timeline, window, config),
@@ -948,10 +965,19 @@ fn first_four(v: &[f64]) -> Option<[f64; 4]> {
 /// (dwells) hold the previous segment's end, which the clamped
 /// end-sample covers; a dwell *at* `t_a` is covered by sampling the
 /// last segment that ended before the window.
+///
+/// `collapse_active` gates the high-end gap repair (`first_after`): it is
+/// meaningful only when the power-fail window collapse narrowed `t_end`
+/// below a durable segment, so it is passed `true` only on that pathway
+/// (see [`compute_stop_set`]). On every other path the repair is inert,
+/// which keeps this function byte-identical to its pre-collapse behaviour —
+/// including for negative-duration segments, where `t_end` can legitimately
+/// sit below a segment's `print_time` with no edge in play.
 fn eval_toolhead_span(
     segments: &[TrapqSegment],
     t_a: f64,
     t_end: f64,
+    collapse_active: bool,
 ) -> (Vec<ZCandidate>, Option<XyRegion>) {
     let mut z = Vec::new();
     let mut xy: Option<XyRegion> = None;
@@ -1040,13 +1066,15 @@ fn eval_toolhead_span(
             }
         }
     }
-    // Symmetric high-end gap: a power-fail-collapsed `t_end` that lands
-    // below the nearest durable segment leaves the approaching trajectory
-    // unbounded. Include that segment's start position — the point the
-    // machine coasts toward — so the collapse never drops coverage of a
-    // stop in the gap. Byte-identical without the collapse (see
-    // [`eval_extruder_span`]).
-    if !covers_t_end {
+    // Symmetric high-end gap, ACTIVE ONLY UNDER THE COLLAPSE: a
+    // power-fail-collapsed `t_end` that lands below the nearest durable
+    // segment leaves the approaching trajectory unbounded, so include that
+    // segment's start position — the point the machine coasts toward — to
+    // keep coverage of a stop in the gap. Gated on `collapse_active`
+    // (never fires on the no-edge/degenerate path), which is what makes
+    // this function byte-identical to its pre-collapse behaviour there,
+    // including for negative-duration segments (see [`eval_extruder_span`]).
+    if collapse_active && !covers_t_end {
         if let Some(seg) = first_after {
             let p = seg.position_at(seg.print_time);
             expand_xy(p[0], p[1]);
@@ -1065,7 +1093,17 @@ fn eval_toolhead_span(
 
 /// Evaluates extruder trapq segments over `[t_a, t_end]` into an
 /// internal-E interval (filament position rides in the X slot).
-fn eval_extruder_span(segments: &[TrapqSegment], t_a: f64, t_end: f64) -> Option<Interval> {
+///
+/// `collapse_active` gates the high-end gap repair exactly as in
+/// [`eval_toolhead_span`]: `first_after` participates only under an active
+/// power-fail window collapse, so with no edge the result is byte-identical
+/// to the pre-collapse behaviour (including for negative-duration segments).
+fn eval_extruder_span(
+    segments: &[TrapqSegment],
+    t_a: f64,
+    t_end: f64,
+    collapse_active: bool,
+) -> Option<Interval> {
     let mut e: Option<Interval> = None;
     let mut expand = |v: f64| {
         if v.is_finite() {
@@ -1109,16 +1147,17 @@ fn eval_extruder_span(segments: &[TrapqSegment], t_a: f64, t_end: f64) -> Option
             expand(seg.position_at(t_a)[0]);
         }
     }
-    // Symmetric high-end gap (introduced only by the power-fail window
-    // collapse, [`compute_stop_set`]): if a narrowed `t_end` lands *below*
-    // the nearest durable segment, no in-window segment reaches `t_end`, so
-    // the trajectory approaching the stop would go unbounded. Include that
-    // segment's start — the real point the machine coasts toward — so the
-    // interval never loses coverage of a stop in the gap. Never fires
-    // without the collapse (`t_end == max(t_b, trapq_end)` always reaches
-    // the last segment or exceeds every print time), keeping the no-edge
-    // result byte-identical.
-    if !covers_t_end {
+    // Symmetric high-end gap, ACTIVE ONLY UNDER THE COLLAPSE
+    // ([`compute_stop_set`] passes `collapse_active`): if a narrowed `t_end`
+    // lands *below* the nearest durable segment, no in-window segment
+    // reaches `t_end`, so the trajectory approaching the stop would go
+    // unbounded. Include that segment's start — the real point the machine
+    // coasts toward — so the interval never loses coverage of a stop in the
+    // gap. Gated off the no-edge path because there a negative-duration
+    // segment (`end_time < print_time`) can also drop `t_end` below a
+    // `print_time` without any collapse, and firing there would inject a
+    // coordinate the uncollapsed evaluation correctly discards.
+    if collapse_active && !covers_t_end {
         if let Some(seg) = first_after {
             expand(seg.position_at(seg.print_time)[0]);
         }
@@ -3362,6 +3401,97 @@ mod tests {
         let cut = set.power_fail_window_cut.expect("a sound cut applied");
         assert!((cut - 11.2).abs() < 1e-9, "{cut}");
         assert!(!set.degradation.power_fail_cut_degenerate);
+    }
+
+    /// A negative-duration toolhead segment (`end_time < print_time`), no
+    /// edge.
+    fn negative_duration_march(mono_ns: u64) -> WalRecord {
+        WalRecord::TrapqSegment(trapq_segment_xyz(
+            "toolhead",
+            20.0,
+            -1.0, // end_time() = 19.0, BELOW print_time
+            [999.0, 888.0, 0.2],
+            [1.0, 0.0, 0.0],
+            25.0,
+            mono_ns,
+        ))
+    }
+
+    /// **D2 regression.** A negative-duration segment is a supported input
+    /// (`TrapqSegment::end_time` does not clamp; ingest keeps the row), so
+    /// `base_high = max(t_b, trapq_end)` can sit BELOW the segment's own
+    /// `print_time`. With no edge the collapse never runs, so the `first_after`
+    /// high-end repair must stay inert and the eval must discard the segment
+    /// exactly as the pre-collapse code did — never injecting its start
+    /// coordinates. Byte-for-byte identical to the pre-`first_after` behaviour:
+    /// `xy == None`, `z == []`.
+    #[test]
+    fn a_negative_duration_segment_with_no_edge_injects_nothing() {
+        let records = base_records(
+            10.0,
+            10.1,
+            vec![
+                negative_duration_march(10_000_000_000),
+                WalRecord::Context(context_at(10_000_000_000, 0)),
+            ],
+        );
+        let timeline = ingest_records(records);
+        // base_high = max(t_b 10.1, trapq_end 19.0) = 19.0, which is below
+        // the segment's print_time (20.0): the shape that tripped first_after.
+        let window = compute_stop_window(&timeline, None, &cfg()).unwrap();
+        let set = compute_stop_set(&timeline, &window, None, &cfg()).unwrap();
+
+        assert_eq!(
+            set.xy, None,
+            "no-edge path leaked the negative-duration segment's XY"
+        );
+        assert!(
+            set.z_candidates.is_empty(),
+            "no-edge path leaked Z: {:?}",
+            set.z_candidates
+        );
+        assert_eq!(set.power_fail_window_cut, None);
+        assert!(!set.degradation.power_fail_cut_degenerate);
+    }
+
+    /// The mirror of the D2 regression: under an ADMITTED edge the collapse
+    /// is active, so `first_after` legitimately fires and the just-beyond
+    /// segment's start is included — the widening direction that preserves
+    /// containment. Documents the expected asymmetry: the exact same segment
+    /// that the no-edge path discards is bounded here because the collapse
+    /// narrowed `t_end` and would otherwise leave the approach uncovered.
+    #[test]
+    fn a_negative_duration_segment_with_an_edge_is_bounded_by_first_after() {
+        let records = base_records(
+            10.0,
+            10.1,
+            vec![
+                negative_duration_march(10_000_000_000),
+                WalRecord::Context(context_at(10_000_000_000, 0)),
+                // Admitted tail edge -> cut 11.2, narrowing t_end below the
+                // segment's print_time (20.0): first_after fires.
+                WalRecord::Marker(Marker {
+                    mono_ns: 10_200_000_000,
+                    kind: MarkerKind::PowerFailing,
+                }),
+            ],
+        );
+        let timeline = ingest_records(records);
+        let window = compute_stop_window(&timeline, None, &cfg()).unwrap();
+        let set = compute_stop_set(&timeline, &window, None, &cfg()).unwrap();
+
+        assert_eq!(set.power_fail_window_cut, Some(11.2));
+        // The collapse is active: the segment's start (999, 888, 0.2) is now
+        // included as the high-end coverage of the narrowed window.
+        let xy = set
+            .xy
+            .expect("first_after must bound XY under the collapse");
+        assert!(xy.contains(999.0, 888.0, 1e-9), "{xy:?}");
+        assert!(
+            set.z_candidates.iter().any(|c| c.z.contains(0.2, 1e-9)),
+            "first_after must bound Z under the collapse: {:?}",
+            set.z_candidates
+        );
     }
 
     #[test]

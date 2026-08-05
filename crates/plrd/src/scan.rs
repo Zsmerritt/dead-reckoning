@@ -533,6 +533,16 @@ fn report_stop_set(w: &mut Report<'_>, set: &PossibleStopSet) {
         "  WAL evaluation span: {:.4}s .. {:.4}s",
         set.t_a, set.wal_eval_end
     ));
+    if let Some(cut) = set.power_fail_window_cut {
+        w.line(&format!(
+            "  power-fail edge collapsed the span to <= {cut:.4}s (hold-up bound)"
+        ));
+    } else if set.degradation.power_fail_cut_degenerate {
+        w.line(
+            "  power-fail edge present but its mapped cut fell below t_b (stale anchor); \
+             collapse refused, span left uncollapsed (fail-safe)",
+        );
+    }
     if let Some(window) = &set.file_window {
         w.line(&format!(
             "  file offset window: bytes {} .. {}",
