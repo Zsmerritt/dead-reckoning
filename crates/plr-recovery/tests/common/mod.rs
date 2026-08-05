@@ -195,6 +195,7 @@ pub fn stop_set(z_plateaus: &[f64]) -> PossibleStopSet {
         e_file: None,
         file_window: None,
         extension: None,
+        power_fail_window_cut: None,
         degradation: Degradation::default(),
     }
 }

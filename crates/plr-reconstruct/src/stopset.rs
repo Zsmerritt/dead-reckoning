@@ -349,27 +349,45 @@ use crate::window::{is_observation_gap, ns_to_s, StopWindow};
 /// module-level "Frontier cap".
 const SUBSCRIPTION_REFRESH_S: f64 = 0.25;
 
-/// Conservative hold-up margin, seconds: how long motion may keep
-/// executing *after* a [`plr_wal::MarkerKind::PowerFailing`] edge before
-/// the 24 V rail actually browns out and the MCU/heaters die.
+/// Conservative rail hold-up allowance (`δ`), seconds: how long motion
+/// may keep executing *after* a [`plr_wal::MarkerKind::PowerFailing`] edge
+/// before the 24 V rail actually browns out and the MCU/heaters die.
+///
+/// **This is a physics allowance, not a software term.** It measures how
+/// long the machine keeps *moving* after the edge fires — the PSU output
+/// caps and the motor rail sag out under load — not any host-side latency
+/// (journaling, draws, fsync). Those software terms are priced separately
+/// in the `Δt_tail` chain above; this constant is the one contributor no
+/// amount of host or upstream work can shrink, because it is a property of
+/// the power supply and the rail, not of the daemon.
 ///
 /// The edge fires when power *begins* failing, so the physical cut is a
-/// print time `>= edge`; this margin is the admitted upper bound on how
+/// print time `>= edge`; this allowance is the admitted upper bound on how
 /// far past the edge the machine can still have moved (the DC-rail-fed
 /// hold-up module keeps the Pi alive `>= 1 s`, and the watcher's debounce
-/// re-read — a few ms — is dwarfed by it and folded in here). Used by the
-/// frontier cap: the cut is at most `edge_print_time + this`, an
-/// **independent, tighter** upper bound on `t_cut` than the priced
-/// `Δt_tail` chain. **Widening is safe**: a larger value only loosens the
-/// cap (never excludes the true stop), so it is set generously rather than
-/// tuned; 1.0 s comfortably covers observed rail-collapse behaviour while
-/// still trimming multiple seconds off the extension-only high end.
+/// re-read — a few ms — is dwarfed by it and folded in here).
 ///
-/// A `const`, not a config knob, deliberately: the brief calls for "a
-/// conservative hold-up margin constant, documented", and a single audited
-/// value avoids widening `ReconstructConfig` (a public, struct-literal-
-/// constructed type) for a bound whose only safe direction is "large
-/// enough".
+/// Two consumers, both taking it as an upper bound on `t_cut`:
+///   * the frontier cap ([`frontier_cap_offset`]) bounds the stop *offset*
+///     at `edge_print_time + this`, an **independent, tighter** bound than
+///     the priced `Δt_tail` chain; and
+///   * the window collapse ([`compute_stop_set`]) bounds the trapq
+///     evaluation high end `wal_eval_end` at the same print time, dropping
+///     the planned-but-never-executed trajectory the WAL journals 1.7–2.5 s
+///     ahead of execution.
+///
+/// **Widening is safe**: a larger value only loosens both (never excludes
+/// the true stop), so it is set generously rather than tuned. 1.0 s
+/// comfortably covers observed rail-collapse behaviour while still trimming
+/// multiple seconds off the horizon. A future **hardware-measurement
+/// milestone** (scope the 24 V rail collapse, or the planned ADXL drag
+/// oracle) will measure `δ` per machine and shrink this toward the
+/// 0.1–0.3 s class — at which point resolution is single-move for all but
+/// the shortest moves. That milestone also owns the config plumbing; until
+/// it lands this stays a single audited `const`, deliberately **not** a
+/// config knob (widening `ReconstructConfig` — a public, struct-literal-
+/// constructed type — for a bound whose only safe direction is "large
+/// enough" buys nothing before there is a measured value to carry).
 pub(crate) const POWER_FAIL_HOLD_UP_MARGIN_S: f64 = 1.0;
 
 /// A closed interval `[lo, hi]` (mm or mm-of-filament).
@@ -646,6 +664,16 @@ pub struct Degradation {
     /// Recompute [`crate::select_crash_epoch`] over the scan for the
     /// per-epoch detail behind this flag.
     pub cross_epoch_evidence_discarded: bool,
+    /// An admitted power-fail edge existed but mapped to a cut print time
+    /// **below the proven committed boundary `t_b`** (or non-finite), so the
+    /// window collapse was refused and `wal_eval_end` fell back to its
+    /// uncollapsed value. Fail-safe: a bad edge mapping (e.g. a stale
+    /// heartbeat anchor placing the edge before `t_b`) must never narrow the
+    /// window in a way that could exclude the true death point — the
+    /// collapse only ever applies as a sound upper bound, never as a floor.
+    /// Informational; does not move [`Self::confidence`] (the fallback is
+    /// exactly the no-edge window, which is already sound).
+    pub power_fail_cut_degenerate: bool,
 }
 
 /// The possible-stop set: everything downstream recovery needs to
@@ -671,6 +699,19 @@ pub struct PossibleStopSet {
     pub file_window: Option<OffsetWindow>,
     /// What the forward extension did, `None` when it could not run.
     pub extension: Option<ExtensionSummary>,
+    /// The print-time upper bound an admitted power-fail edge imposed on
+    /// [`Self::wal_eval_end`]: `edge_print_time + POWER_FAIL_HOLD_UP_MARGIN_S`
+    /// (see [`POWER_FAIL_HOLD_UP_MARGIN_S`]). `Some` only when the crash
+    /// epoch's tail carried a [`WalTimeline::power_failing_tail`] edge that
+    /// mapped to a **sound** cut (finite and `>= t_b`, so it never excludes
+    /// proven committed motion); the trapq evaluation and the extension
+    /// horizon were both bounded by it, collapsing the window from the
+    /// planned-ahead trajectory to the hold-up span. `None` when no edge was
+    /// admitted, or when the mapping was degenerate and the collapse was
+    /// refused as a fail-safe (see
+    /// [`Degradation::power_fail_cut_degenerate`]). Reporting only — the
+    /// narrowing itself already lives in [`Self::wal_eval_end`].
+    pub power_fail_window_cut: Option<f64>,
     /// Honest evidence-quality report.
     pub degradation: Degradation,
 }
@@ -723,16 +764,63 @@ pub fn compute_stop_set(
         .contexts
         .last()
         .ok_or(ReconstructError::NoContext)?;
-    let wal_eval_end = timeline
+    // Base (no-edge) high end: `max(t_b, end of durable trapq knowledge)`.
+    // Rows are journaled as Klipper *plans* them, 1.7–2.5 s ahead of
+    // execution, so this generally exceeds the committed boundary `t_b` —
+    // see the module docs.
+    let base_high = timeline
         .trapq_end_time()
         .map_or(window.t_b, |end| end.max(window.t_b));
+    // Window collapse (the power-fail exact-T term, applied to the
+    // time/position axis). When the crash epoch's tail carries an admitted
+    // [`WalTimeline::power_failing_tail`] edge, motion provably stopped by
+    // `edge_pt + POWER_FAIL_HOLD_UP_MARGIN_S`, so the trajectory the WAL
+    // journals beyond that was planned but never executed. Cap the trapq
+    // evaluation high end at that cut — the SAME bound the frontier cap
+    // applies to the offset, from the SAME [`power_fail_cut_pt`] seam, so
+    // the offset cap and the time collapse can never disagree.
+    //
+    // Soundness / fail-safe. The collapse only ever NARROWS and only as an
+    // upper bound: applied only when the cut is `>= t_b`, so the high end
+    // can never drop below the proven committed boundary (the intersection
+    // `[t_b, cut]` is non-empty). A degenerate mapping — a stale heartbeat
+    // anchor placing the cut before `t_b`, or a non-finite result (already
+    // filtered by `power_fail_cut_pt`) — is refused: keep the uncollapsed
+    // `base_high` and flag it, because a bad edge must NEVER exclude the
+    // true death point (clamping at the *tail* end is the only safe
+    // direction; clamping at the low end is not). With no admitted edge the
+    // value is byte-for-byte the old `base_high`.
+    let (wal_eval_end, power_fail_window_cut, cut_degenerate) =
+        match power_fail_cut_pt(timeline, window) {
+            Some(cut) if cut >= window.t_b => (base_high.min(cut), Some(cut), false),
+            Some(_) => (base_high, None, true),
+            None => (base_high, None, false),
+        };
 
-    let (mut z_candidates, mut xy) =
-        eval_toolhead_span(&timeline.toolhead_segments, window.t_a, wal_eval_end);
-    let wal_e = eval_extruder_span(&timeline.extruder_segments, window.t_a, wal_eval_end);
+    // `first_after` (the high-end gap repair in the eval spans below) is a
+    // consequence of the collapse and must fire ONLY when the collapse
+    // actually ran with a sound cut — otherwise a negative-duration segment
+    // (a supported input: `TrapqSegment::end_time` clamps but ingest keeps
+    // the row) whose `end_time < print_time` can push `base_high` below its
+    // own `print_time`, tripping `first_after` on a pure no-edge path and
+    // smuggling coordinates the uncollapsed evaluation correctly discards.
+    let collapse_active = power_fail_window_cut.is_some();
+    let (mut z_candidates, mut xy) = eval_toolhead_span(
+        &timeline.toolhead_segments,
+        window.t_a,
+        wal_eval_end,
+        collapse_active,
+    );
+    let wal_e = eval_extruder_span(
+        &timeline.extruder_segments,
+        window.t_a,
+        wal_eval_end,
+        collapse_active,
+    );
 
     let mut degradation = Degradation {
         observation_gap: observation_gap_overlaps_window(timeline, window, config),
+        power_fail_cut_degenerate: cut_degenerate,
         ..Degradation::default()
     };
 
@@ -794,6 +882,7 @@ pub fn compute_stop_set(
         e_file,
         file_window,
         extension: extension.map(|e| e.summary),
+        power_fail_window_cut,
         degradation,
     })
 }
@@ -876,10 +965,19 @@ fn first_four(v: &[f64]) -> Option<[f64; 4]> {
 /// (dwells) hold the previous segment's end, which the clamped
 /// end-sample covers; a dwell *at* `t_a` is covered by sampling the
 /// last segment that ended before the window.
+///
+/// `collapse_active` gates the high-end gap repair (`first_after`): it is
+/// meaningful only when the power-fail window collapse narrowed `t_end`
+/// below a durable segment, so it is passed `true` only on that pathway
+/// (see [`compute_stop_set`]). On every other path the repair is inert,
+/// which keeps this function byte-identical to its pre-collapse behaviour —
+/// including for negative-duration segments, where `t_end` can legitimately
+/// sit below a segment's `print_time` with no edge in play.
 fn eval_toolhead_span(
     segments: &[TrapqSegment],
     t_a: f64,
     t_end: f64,
+    collapse_active: bool,
 ) -> (Vec<ZCandidate>, Option<XyRegion>) {
     let mut z = Vec::new();
     let mut xy: Option<XyRegion> = None;
@@ -897,7 +995,9 @@ fn eval_toolhead_span(
         }
     };
     let mut last_before: Option<&TrapqSegment> = None;
+    let mut first_after: Option<&TrapqSegment> = None;
     let mut covers_t_a = false;
+    let mut covers_t_end = false;
     for seg in segments {
         if seg.end_time() < t_a {
             let newer = last_before.is_none_or(|prev| seg.end_time() >= prev.end_time());
@@ -907,6 +1007,9 @@ fn eval_toolhead_span(
             continue;
         }
         if seg.print_time > t_end {
+            if first_after.is_none_or(|next| seg.print_time <= next.print_time) {
+                first_after = Some(seg);
+            }
             continue;
         }
         // Overlap is non-empty: end_time >= t_a and print_time <= t_end.
@@ -914,6 +1017,9 @@ fn eval_toolhead_span(
         let hi = t_end.min(seg.end_time());
         if seg.print_time <= t_a {
             covers_t_a = true;
+        }
+        if seg.end_time() >= t_end {
+            covers_t_end = true;
         }
         let samples = sample_extrema(seg, lo, hi);
         for s in &samples {
@@ -960,12 +1066,44 @@ fn eval_toolhead_span(
             }
         }
     }
+    // Symmetric high-end gap, ACTIVE ONLY UNDER THE COLLAPSE: a
+    // power-fail-collapsed `t_end` that lands below the nearest durable
+    // segment leaves the approaching trajectory unbounded, so include that
+    // segment's start position — the point the machine coasts toward — to
+    // keep coverage of a stop in the gap. Gated on `collapse_active`
+    // (never fires on the no-edge/degenerate path), which is what makes
+    // this function byte-identical to its pre-collapse behaviour there,
+    // including for negative-duration segments (see [`eval_extruder_span`]).
+    if collapse_active && !covers_t_end {
+        if let Some(seg) = first_after {
+            let p = seg.position_at(seg.print_time);
+            expand_xy(p[0], p[1]);
+            if p[2].is_finite() {
+                z.push(ZCandidate {
+                    z: Interval::point(p[2]),
+                    provenance: Provenance::Wal,
+                    z_known: true,
+                    kind: ZKind::Plateau,
+                });
+            }
+        }
+    }
     (z, xy)
 }
 
 /// Evaluates extruder trapq segments over `[t_a, t_end]` into an
 /// internal-E interval (filament position rides in the X slot).
-fn eval_extruder_span(segments: &[TrapqSegment], t_a: f64, t_end: f64) -> Option<Interval> {
+///
+/// `collapse_active` gates the high-end gap repair exactly as in
+/// [`eval_toolhead_span`]: `first_after` participates only under an active
+/// power-fail window collapse, so with no edge the result is byte-identical
+/// to the pre-collapse behaviour (including for negative-duration segments).
+fn eval_extruder_span(
+    segments: &[TrapqSegment],
+    t_a: f64,
+    t_end: f64,
+    collapse_active: bool,
+) -> Option<Interval> {
     let mut e: Option<Interval> = None;
     let mut expand = |v: f64| {
         if v.is_finite() {
@@ -976,7 +1114,9 @@ fn eval_extruder_span(segments: &[TrapqSegment], t_a: f64, t_end: f64) -> Option
         }
     };
     let mut last_before: Option<&TrapqSegment> = None;
+    let mut first_after: Option<&TrapqSegment> = None;
     let mut covers_t_a = false;
+    let mut covers_t_end = false;
     for seg in segments {
         if seg.end_time() < t_a {
             if last_before.is_none_or(|prev| seg.end_time() >= prev.end_time()) {
@@ -985,10 +1125,16 @@ fn eval_extruder_span(segments: &[TrapqSegment], t_a: f64, t_end: f64) -> Option
             continue;
         }
         if seg.print_time > t_end {
+            if first_after.is_none_or(|next| seg.print_time <= next.print_time) {
+                first_after = Some(seg);
+            }
             continue;
         }
         if seg.print_time <= t_a {
             covers_t_a = true;
+        }
+        if seg.end_time() >= t_end {
+            covers_t_end = true;
         }
         let lo = t_a.max(seg.print_time);
         let hi = t_end.min(seg.end_time());
@@ -999,6 +1145,21 @@ fn eval_extruder_span(segments: &[TrapqSegment], t_a: f64, t_end: f64) -> Option
     if !covers_t_a {
         if let Some(seg) = last_before {
             expand(seg.position_at(t_a)[0]);
+        }
+    }
+    // Symmetric high-end gap, ACTIVE ONLY UNDER THE COLLAPSE
+    // ([`compute_stop_set`] passes `collapse_active`): if a narrowed `t_end`
+    // lands *below* the nearest durable segment, no in-window segment
+    // reaches `t_end`, so the trajectory approaching the stop would go
+    // unbounded. Include that segment's start — the real point the machine
+    // coasts toward — so the interval never loses coverage of a stop in the
+    // gap. Gated off the no-edge path because there a negative-duration
+    // segment (`end_time < print_time`) can also drop `t_end` below a
+    // `print_time` without any collapse, and firing there would inject a
+    // coordinate the uncollapsed evaluation correctly discards.
+    if collapse_active && !covers_t_end {
+        if let Some(seg) = first_after {
+            expand(seg.position_at(seg.print_time)[0]);
         }
     }
     e
@@ -1380,21 +1541,40 @@ fn frontier_cap_offset(
     Some(raw.max(slacked).min(tail_end))
 }
 
+/// The absolute print-time upper bound on the physical cut implied by a
+/// **tail** power-fail edge, or `None` when there is none or it cannot be
+/// placed on the print-time axis.
+///
+/// A [`WalTimeline::power_failing_tail`] at host-monotonic `edge` maps —
+/// through the heartbeat-anchored correlation, [`StopWindow::mono_ns_to_print_time`]
+/// (the same est-sample seam `t_a` and the receive-seq bound use) — to
+/// print time `edge_pt`; the physical cut is at most
+/// `edge_pt + POWER_FAIL_HOLD_UP_MARGIN_S` (the edge is a *lower* bound on
+/// the cut, the allowance the admitted hold-up overshoot). Required finite.
+///
+/// This is the single seam through which the edge reaches the window
+/// arithmetic: both the frontier cap ([`power_fail_dt`], as a `Δt` relative
+/// to the anchor) and the window collapse ([`compute_stop_set`], as an
+/// absolute high-end bound on `wal_eval_end`) derive from this one value,
+/// so they can never disagree about where the edge places the cut.
+fn power_fail_cut_pt(timeline: &WalTimeline, window: &StopWindow) -> Option<f64> {
+    let edge = timeline.power_failing_tail()?;
+    let edge_pt = window.mono_ns_to_print_time(edge)?;
+    let cut = edge_pt + POWER_FAIL_HOLD_UP_MARGIN_S;
+    cut.is_finite().then_some(cut)
+}
+
 /// The `Δt` upper bound implied by a **tail** power-fail edge, or `None`
 /// when there is none or it cannot be placed on the print-time axis.
 ///
-/// A [`WalTimeline::power_failing_tail`] at host-monotonic `edge` maps to
-/// print time `edge_pt`; the physical cut is at most
-/// `edge_pt + POWER_FAIL_HOLD_UP_MARGIN_S` (the edge is a *lower* bound on
-/// the cut, the margin the admitted overshoot). Subtracting the anchor's
-/// print time gives an upper bound on `t_cut - t_ctx` = `Δt`. Clamped at 0
-/// (an edge that maps before the anchor means the cut is essentially at
-/// the frontier; the frontier + one line of skew still applies downstream)
-/// and required finite.
+/// The cut print time ([`power_fail_cut_pt`]) minus the anchor's print time
+/// is an upper bound on `t_cut - t_ctx` = `Δt`. Clamped at 0 (an edge that
+/// maps before the anchor means the cut is essentially at the frontier; the
+/// frontier + one line of skew still applies downstream) and required
+/// finite.
 fn power_fail_dt(timeline: &WalTimeline, window: &StopWindow, anchor_pt: f64) -> Option<f64> {
-    let edge = timeline.power_failing_tail()?;
-    let edge_pt = window.mono_ns_to_print_time(edge)?;
-    let dt = (edge_pt + POWER_FAIL_HOLD_UP_MARGIN_S) - anchor_pt;
+    let cut = power_fail_cut_pt(timeline, window)?;
+    let dt = cut - anchor_pt;
     dt.is_finite().then(|| dt.max(0.0))
 }
 
@@ -3027,6 +3207,290 @@ mod tests {
             cap_of(spurious),
             plain,
             "a spurious (non-tail) edge must not narrow the window"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // Power-fail window collapse (`wal_eval_end`): the time/position axis.
+    // -----------------------------------------------------------------
+
+    /// A toolhead trapq X-march covering `[print_time, print_time + dur]`,
+    /// journaled at `mono_ns`.
+    fn toolhead_march(print_time: f64, dur: f64, mono_ns: u64) -> WalRecord {
+        WalRecord::TrapqSegment(trapq_segment_xyz(
+            "toolhead",
+            print_time,
+            dur,
+            [10.0, 20.0, 0.2],
+            [1.0, 0.0, 0.0],
+            25.0,
+            mono_ns,
+        ))
+    }
+
+    /// No admitted edge: the window high end is exactly the uncollapsed
+    /// `max(t_b, trapq_end)`, and a spurious (neutralized, pre-motion) edge
+    /// gives a **byte-identical** stop set. This is the no-edge invariant
+    /// the collapse must never disturb.
+    #[test]
+    fn no_admitted_edge_leaves_the_window_uncollapsed() {
+        // Heartbeat/anchor at pt 10, Z commit 10.1, trapq planned out to
+        // 15.0 (5 s of planned-ahead trajectory beyond t_b).
+        let base = || {
+            base_records(
+                10.0,
+                10.1,
+                vec![
+                    toolhead_march(10.0, 5.0, 10_000_000_000),
+                    WalRecord::Context(context_at(10_000_000_000, 0)),
+                ],
+            )
+        };
+        let timeline = ingest_records(base());
+        let window = compute_stop_window(&timeline, None, &cfg()).unwrap();
+        let set = compute_stop_set(&timeline, &window, None, &cfg()).unwrap();
+        // Uncollapsed: the full planned-ahead trapq end.
+        assert!(
+            (set.wal_eval_end - 15.0).abs() < 1e-9,
+            "{}",
+            set.wal_eval_end
+        );
+        assert_eq!(set.power_fail_window_cut, None);
+        assert!(!set.degradation.power_fail_cut_degenerate);
+
+        // A spurious edge BEFORE the motion (mono 5 s, neutralized by the
+        // 10.1 s liveness past the 1 s margin) is not a tail fact: the whole
+        // set is byte-identical to the no-edge set.
+        let mut spurious = base();
+        spurious.insert(
+            0,
+            WalRecord::Marker(Marker {
+                mono_ns: 5_000_000_000,
+                kind: MarkerKind::PowerFailing,
+            }),
+        );
+        let sp_timeline = ingest_records(spurious);
+        let sp_window = compute_stop_window(&sp_timeline, None, &cfg()).unwrap();
+        let sp_set = compute_stop_set(&sp_timeline, &sp_window, None, &cfg()).unwrap();
+        assert_eq!(sp_set, set, "a spurious edge must not alter the stop set");
+    }
+
+    /// An admitted tail edge collapses `wal_eval_end` to `edge_pt + margin`,
+    /// dropping the planned-ahead trajectory: the window is a strict subset
+    /// of the no-edge window and covers exactly `[edge_pt, edge_pt+margin]`.
+    #[test]
+    fn an_admitted_edge_collapses_the_window_to_the_holdup_span() {
+        let records = base_records(
+            10.0,
+            10.1,
+            vec![
+                toolhead_march(10.0, 5.0, 10_000_000_000), // planned to 15.0
+                WalRecord::Context(context_at(10_000_000_000, 0)),
+                // Tail edge at mono 10.2 s (after the 10.1 s commit): admitted,
+                // maps to print time 10.2, cut = 11.2.
+                WalRecord::Marker(Marker {
+                    mono_ns: 10_200_000_000,
+                    kind: MarkerKind::PowerFailing,
+                }),
+            ],
+        );
+        let timeline = ingest_records(records);
+        let window = compute_stop_window(&timeline, None, &cfg()).unwrap();
+        let set = compute_stop_set(&timeline, &window, None, &cfg()).unwrap();
+
+        // Collapsed to edge_pt (10.2) + POWER_FAIL_HOLD_UP_MARGIN_S (1.0).
+        assert!(
+            (set.wal_eval_end - 11.2).abs() < 1e-9,
+            "{}",
+            set.wal_eval_end
+        );
+        // Strict subset of the uncollapsed 15.0 window.
+        assert!(set.wal_eval_end < 15.0);
+        // Never below the proven committed boundary t_b.
+        assert!(set.wal_eval_end >= window.t_b - 1e-9);
+        // Covers the whole hold-up span [edge_pt, edge_pt+margin].
+        let cut = set.power_fail_window_cut.expect("a sound cut applied");
+        assert!((cut - 11.2).abs() < 1e-9, "{cut}");
+        assert!(window.t_a <= 10.2 && set.wal_eval_end >= cut - 1e-9);
+        assert!(!set.degradation.power_fail_cut_degenerate);
+    }
+
+    /// A degenerate mapping — a stale/misaligned heartbeat anchor that maps
+    /// the (tail-admitted) edge to a cut print time BELOW the proven `t_b` —
+    /// is a fail-safe: the collapse is refused, the window keeps its
+    /// uncollapsed high end, and the degeneracy is recorded. A bad edge must
+    /// never narrow the window past the true death point.
+    #[test]
+    fn a_degenerate_edge_mapping_falls_back_to_the_uncollapsed_window() {
+        // Stale anchor: est-sample says print time 0.5 at mono 10.2 s, while
+        // the machine's committed Z reaches 10.1 s — so the edge maps far
+        // below t_b.
+        let mut hb = heartbeat_at(10_200_000_000, 10.0);
+        hb.est_sample_print_time = 0.5; // misaligned vs. the true frontier
+        let records = vec![
+            WalRecord::Heartbeat(hb),
+            WalRecord::StepperRange(stepper_range_with_clock(
+                "stepper_z",
+                10.1,
+                FREQ,
+                10_100_000_000,
+            )),
+            toolhead_march(9.0, 3.0, 10_000_000_000), // planned to 12.0
+            WalRecord::Context(context_at(10_000_000_000, 0)),
+            // Tail edge just above the durable tail: admitted, but the stale
+            // anchor maps it to ~0.6 -> cut ~1.6, below t_b (10.1).
+            WalRecord::Marker(Marker {
+                mono_ns: 10_300_000_000,
+                kind: MarkerKind::PowerFailing,
+            }),
+        ];
+        let timeline = ingest_records(records);
+        assert_eq!(
+            timeline.power_failing_tail(),
+            Some(10_300_000_000),
+            "the edge must be admitted for this test to exercise the fallback"
+        );
+        let window = compute_stop_window(&timeline, None, &cfg()).unwrap();
+        let set = compute_stop_set(&timeline, &window, None, &cfg()).unwrap();
+
+        // Fail-safe: uncollapsed high end (max(t_b, trapq_end) = 12.0),
+        // no cut applied, degeneracy flagged.
+        assert!(
+            (set.wal_eval_end - 12.0).abs() < 1e-9,
+            "{}",
+            set.wal_eval_end
+        );
+        assert_eq!(set.power_fail_window_cut, None);
+        assert!(set.degradation.power_fail_cut_degenerate);
+        // The true death point is still inside the window: t_b <= wal_eval_end.
+        assert!(set.wal_eval_end >= window.t_b - 1e-9);
+    }
+
+    /// The hold-up allowance elapsing PAST the last durable trapq record
+    /// clamps to what the WAL actually contains: `wal_eval_end` stays at the
+    /// durable tail, never inflated to `edge_pt + margin`. Clamping at the
+    /// tail end is sound because records beyond the tail do not exist.
+    #[test]
+    fn the_collapse_clamps_to_the_durable_tail_not_past_it() {
+        let records = base_records(
+            10.0,
+            10.1,
+            vec![
+                // Durable trapq ends at 10.5 — only 0.4 s past t_b.
+                toolhead_march(10.0, 0.5, 10_000_000_000),
+                WalRecord::Context(context_at(10_000_000_000, 0)),
+                // Edge maps to 10.2, cut = 11.2, which is PAST the 10.5 tail.
+                WalRecord::Marker(Marker {
+                    mono_ns: 10_200_000_000,
+                    kind: MarkerKind::PowerFailing,
+                }),
+            ],
+        );
+        let timeline = ingest_records(records);
+        let window = compute_stop_window(&timeline, None, &cfg()).unwrap();
+        let set = compute_stop_set(&timeline, &window, None, &cfg()).unwrap();
+
+        // Clamped to the durable tail (10.5), NOT extended to the 11.2 cut.
+        assert!(
+            (set.wal_eval_end - 10.5).abs() < 1e-9,
+            "{}",
+            set.wal_eval_end
+        );
+        // The sound cut is still recorded for reporting, even though it did
+        // not bite (the tail was already inside it).
+        let cut = set.power_fail_window_cut.expect("a sound cut applied");
+        assert!((cut - 11.2).abs() < 1e-9, "{cut}");
+        assert!(!set.degradation.power_fail_cut_degenerate);
+    }
+
+    /// A negative-duration toolhead segment (`end_time < print_time`), no
+    /// edge.
+    fn negative_duration_march(mono_ns: u64) -> WalRecord {
+        WalRecord::TrapqSegment(trapq_segment_xyz(
+            "toolhead",
+            20.0,
+            -1.0, // end_time() = 19.0, BELOW print_time
+            [999.0, 888.0, 0.2],
+            [1.0, 0.0, 0.0],
+            25.0,
+            mono_ns,
+        ))
+    }
+
+    /// **D2 regression.** A negative-duration segment is a supported input
+    /// (`TrapqSegment::end_time` does not clamp; ingest keeps the row), so
+    /// `base_high = max(t_b, trapq_end)` can sit BELOW the segment's own
+    /// `print_time`. With no edge the collapse never runs, so the `first_after`
+    /// high-end repair must stay inert and the eval must discard the segment
+    /// exactly as the pre-collapse code did — never injecting its start
+    /// coordinates. Byte-for-byte identical to the pre-`first_after` behaviour:
+    /// `xy == None`, `z == []`.
+    #[test]
+    fn a_negative_duration_segment_with_no_edge_injects_nothing() {
+        let records = base_records(
+            10.0,
+            10.1,
+            vec![
+                negative_duration_march(10_000_000_000),
+                WalRecord::Context(context_at(10_000_000_000, 0)),
+            ],
+        );
+        let timeline = ingest_records(records);
+        // base_high = max(t_b 10.1, trapq_end 19.0) = 19.0, which is below
+        // the segment's print_time (20.0): the shape that tripped first_after.
+        let window = compute_stop_window(&timeline, None, &cfg()).unwrap();
+        let set = compute_stop_set(&timeline, &window, None, &cfg()).unwrap();
+
+        assert_eq!(
+            set.xy, None,
+            "no-edge path leaked the negative-duration segment's XY"
+        );
+        assert!(
+            set.z_candidates.is_empty(),
+            "no-edge path leaked Z: {:?}",
+            set.z_candidates
+        );
+        assert_eq!(set.power_fail_window_cut, None);
+        assert!(!set.degradation.power_fail_cut_degenerate);
+    }
+
+    /// The mirror of the D2 regression: under an ADMITTED edge the collapse
+    /// is active, so `first_after` legitimately fires and the just-beyond
+    /// segment's start is included — the widening direction that preserves
+    /// containment. Documents the expected asymmetry: the exact same segment
+    /// that the no-edge path discards is bounded here because the collapse
+    /// narrowed `t_end` and would otherwise leave the approach uncovered.
+    #[test]
+    fn a_negative_duration_segment_with_an_edge_is_bounded_by_first_after() {
+        let records = base_records(
+            10.0,
+            10.1,
+            vec![
+                negative_duration_march(10_000_000_000),
+                WalRecord::Context(context_at(10_000_000_000, 0)),
+                // Admitted tail edge -> cut 11.2, narrowing t_end below the
+                // segment's print_time (20.0): first_after fires.
+                WalRecord::Marker(Marker {
+                    mono_ns: 10_200_000_000,
+                    kind: MarkerKind::PowerFailing,
+                }),
+            ],
+        );
+        let timeline = ingest_records(records);
+        let window = compute_stop_window(&timeline, None, &cfg()).unwrap();
+        let set = compute_stop_set(&timeline, &window, None, &cfg()).unwrap();
+
+        assert_eq!(set.power_fail_window_cut, Some(11.2));
+        // The collapse is active: the segment's start (999, 888, 0.2) is now
+        // included as the high-end coverage of the narrowed window.
+        let xy = set
+            .xy
+            .expect("first_after must bound XY under the collapse");
+        assert!(xy.contains(999.0, 888.0, 1e-9), "{xy:?}");
+        assert!(
+            set.z_candidates.iter().any(|c| c.z.contains(0.2, 1e-9)),
+            "first_after must bound Z under the collapse: {:?}",
+            set.z_candidates
         );
     }
 
